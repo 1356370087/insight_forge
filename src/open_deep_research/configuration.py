@@ -2,10 +2,10 @@
 
 import os
 from enum import Enum
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from langchain_core.runnables import RunnableConfig
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class SearchAPI(Enum):
@@ -35,6 +35,41 @@ class MCPConfig(BaseModel):
     )
     """Whether the MCP server requires authentication"""
 
+
+class BrowserMCPConfig(BaseModel):
+    """Configuration for browser-level MCP exploration tools."""
+
+    transport: Literal["stdio", "streamable_http", "sse", "websocket"] = Field(
+        default="stdio",
+        optional=True,
+    )
+    """MCP transport used by the browser server."""
+    url: Optional[str] = Field(
+        default=None,
+        optional=True,
+    )
+    """Exact MCP endpoint URL for HTTP/SSE/WebSocket transports."""
+    command: Optional[str] = Field(
+        default="npx",
+        optional=True,
+    )
+    """Executable used for stdio transport."""
+    args: Optional[List[str]] = Field(
+        default_factory=lambda: ["@playwright/mcp@latest"],
+        optional=True,
+    )
+    """Command arguments used for stdio transport."""
+    env: Optional[Dict[str, str]] = Field(
+        default=None,
+        optional=True,
+    )
+    """Optional environment variables for stdio transport."""
+    tools: Optional[List[str]] = Field(
+        default=None,
+        optional=True,
+    )
+    """Optional browser tool allowlist. None exposes all tools returned by the server."""
+
 class Configuration(BaseModel):
     """Main configuration class for the Deep Research agent."""
     
@@ -60,6 +95,92 @@ class Configuration(BaseModel):
                 "description": "Whether to allow the researcher to ask the user clarifying questions before starting research"
             }
         }
+    )
+    # Observability / Operations
+    observability_enabled: bool = Field(
+        default=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": True,
+                "description": "Enable local SQLite tracing and token aggregation.",
+            }
+        },
+    )
+    trace_store_path: str = Field(
+        default=".runs/traces.sqlite3",
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": ".runs/traces.sqlite3",
+                "description": "SQLite path used for run/span/usage observability data.",
+            }
+        },
+    )
+    trace_payload_mode: Literal["none", "preview", "full"] = Field(
+        default="preview",
+        metadata={
+            "x_oap_ui_config": {
+                "type": "select",
+                "default": "preview",
+                "description": "How much prompt/output payload to persist in trace spans.",
+                "options": [
+                    {"label": "None", "value": "none"},
+                    {"label": "Preview", "value": "preview"},
+                    {"label": "Full", "value": "full"},
+                ],
+            }
+        },
+    )
+    trace_preview_chars: int = Field(
+        default=2000,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 2000,
+                "description": "Maximum characters stored for trace payload previews.",
+            }
+        },
+    )
+    helicone_enabled: bool = Field(
+        default=False,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": False,
+                "description": "Enable optional Helicone headers/base URL enrichment for LLM calls.",
+            }
+        },
+    )
+    helicone_api_key: Optional[str] = Field(
+        default=None,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": "",
+                "description": "Helicone API key used when helicone_enabled is true.",
+            }
+        },
+    )
+    helicone_base_url: Optional[str] = Field(
+        default=None,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": "",
+                "description": "Optional Helicone provider gateway base URL.",
+            }
+        },
+    )
+    helicone_headers_enabled: bool = Field(
+        default=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": True,
+                "description": "Attach Helicone session/property headers to model configs.",
+            }
+        },
     )
     max_concurrent_research_units: int = Field(
         default=5,
@@ -231,7 +352,624 @@ class Configuration(BaseModel):
             }
         }
     )
+    browser_mcp_enabled: bool = Field(
+        default=False,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": False,
+                "description": "Enable optional browser-level exploration tools via Playwright MCP.",
+            }
+        },
+    )
+    """Whether to load browser-level MCP tools for researcher agents."""
+    browser_mcp_config: Optional[BrowserMCPConfig] = Field(
+        default=None,
+        optional=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "object",
+                "description": "Playwright MCP connection configuration. Defaults to stdio npx @playwright/mcp@latest when enabled.",
+            }
+        },
+    )
+    """Connection details for the optional Playwright MCP browser tool server."""
+    browser_mcp_prompt: Optional[str] = Field(
+        default=None,
+        optional=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "description": "Additional researcher instructions for using browser MCP tools.",
+            }
+        },
+    )
+    """Additional prompt guidance for browser MCP tool usage."""
+    # Tool Governance Configuration
+    # Per-role tool name whitelists. None = backward compatible (all assembled tools allowed).
+    supervisor_tool_whitelist: Optional[List[str]] = Field(
+        default=None,
+        optional=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "array",
+                "default": None,
+                "description": "If set, only these tool names may be used by the supervisor (main graph). None = all assembled tools allowed."
+            }
+        }
+    )
+    """Whitelist of tool names the supervisor is permitted to call. None disables the whitelist (all assembled tools allowed)."""
+    researcher_tool_whitelist: Optional[List[str]] = Field(
+        default=None,
+        optional=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "array",
+                "default": None,
+                "description": "If set, only these tool names may be used by researchers (subgraph). None = all assembled tools allowed."
+            }
+        }
+    )
+    """Whitelist of tool names a researcher is permitted to call. None disables the whitelist (all assembled tools allowed)."""
+    # Per-role origin filters. Values: "system", "search", "mcp", "provider_native". None/empty = no origin blocked.
+    supervisor_blocked_origins: Optional[List[str]] = Field(
+        default=None,
+        optional=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "array",
+                "default": None,
+                "description": "Tool origins blocked for the supervisor. Values: system, search, mcp, provider_native. None = none blocked."
+            }
+        }
+    )
+    """Tool origins the supervisor is forbidden from using (system/search/mcp/provider_native). None = no origin blocked."""
+    researcher_blocked_origins: Optional[List[str]] = Field(
+        default=None,
+        optional=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "array",
+                "default": None,
+                "description": "Tool origins blocked for researchers. Values: system, search, mcp, provider_native. None = none blocked."
+            }
+        }
+    )
+    """Tool origins a researcher is forbidden from using (system/search/mcp/provider_native). None = no origin blocked."""
+    # Tool execution retry (applied on the researcher path for network-bound tools).
+    max_tool_retries: int = Field(
+        default=3,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 3,
+                "min": 0,
+                "max": 10,
+                "description": "Max retries for retryable tool errors (network/timeout/429/503) using exponential backoff. 0 = no retry. Retry assumes tool idempotency."
+            }
+        }
+    )
+    """Maximum retry attempts for retryable tool errors (network/timeout/429/503). 0 disables retry."""
+    tool_retry_base_delay: float = Field(
+        default=1.0,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 1.0,
+                "min": 0,
+                "max": 60,
+                "description": "Base delay in seconds for exponential backoff between tool retries."
+            }
+        }
+    )
+    """Base delay (seconds) for exponential backoff between tool retries."""
+    tool_retry_max_delay: float = Field(
+        default=30.0,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 30.0,
+                "min": 1,
+                "max": 300,
+                "description": "Maximum delay cap in seconds for tool retry backoff."
+            }
+        }
+    )
+    """Maximum delay cap (seconds) for tool retry backoff."""
+    # Optional per-tool parameter constraints, layered on top of JSON-Schema checks.
+    # Shape: {tool_name: {param_name: {minItems, maxItems, minLength, maxLength, minimum, maximum}}}
+    tool_param_constraints: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = Field(
+        default=None,
+        optional=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "object",
+                "default": None,
+                "description": "Per-tool parameter constraints layered on top of schema checks. Shape: {tool_name: {param: {minItems, maxItems, minLength, maxLength, minimum, maximum}}}. None = no extra constraints."
+            }
+        }
+    )
+    """Optional per-tool parameter bounds (e.g. queries maxItems, per-query maxLength) applied after JSON-Schema validation."""
+    # User-role blacklists (deny). Applied on top of agent-scope whitelists.
+    # Maps a user role (from JWT app_metadata) to blocked tool names / origins.
+    role_tool_blacklist: Optional[Dict[str, List[str]]] = Field(
+        default=None,
+        optional=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "object",
+                "default": None,
+                "description": "Map of user role -> blocked tool names. Applied on top of agent-scope whitelists. None = no role-based tool blocking."
+            }
+        }
+    )
+    """Map of user role (from JWT app_metadata) to blocked tool names. None = no role-based blocking."""
+    role_blocked_origins: Optional[Dict[str, List[str]]] = Field(
+        default=None,
+        optional=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "object",
+                "default": None,
+                "description": "Map of user role -> blocked tool origins. Applied on top of agent-scope origin filters. None = no role-based origin blocking."
+            }
+        }
+    )
+    """Map of user role (from JWT app_metadata) to blocked tool origins. None = no role-based blocking."""
+    # Async SubAgent Configuration
+    enable_async_research: bool = Field(
+        default=False,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": False,
+                "description": "Enable async SubAgent research with StartResearchTask/CheckResearchTask tools instead of synchronous ConductResearch."
+            }
+        }
+    )
+    runs_dir: str = Field(
+        default=".runs",
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": ".runs",
+                "description": "Directory for run event logs, task outputs, and checkpoints."
+            }
+        }
+    )
+    task_timeout_seconds: int = Field(
+        default=600,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "slider",
+                "default": 600,
+                "min": 60,
+                "max": 3600,
+                "step": 60,
+                "description": "Maximum seconds a single SubAgent task can run before timeout."
+            }
+        }
+    )
+    max_in_flight_tasks: int = Field(
+        default=10,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "slider",
+                "default": 10,
+                "min": 1,
+                "max": 50,
+                "step": 1,
+                "description": "Maximum number of concurrently running async research tasks."
+            }
+        }
+    )
+    task_checkpoint_enabled: bool = Field(
+        default=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": True,
+                "description": "Enable checkpoint-based recovery for failed/cancelled async tasks."
+            }
+        }
+    )
+    event_log_enabled: bool = Field(
+        default=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": True,
+                "description": "Enable structured JSONL event logging per run."
+            }
+        }
+    )
+    task_state_backend: Literal["memory", "redis", "postgres"] = Field(
+        default="memory",
+        metadata={
+            "x_oap_ui_config": {
+                "type": "select",
+                "default": "memory",
+                "description": "Shared latest-state backend for async research tasks.",
+                "options": [
+                    {"label": "Memory", "value": "memory"},
+                    {"label": "Redis", "value": "redis"},
+                    {"label": "Postgres", "value": "postgres"},
+                ],
+            }
+        },
+    )
+    redis_url: Optional[str] = Field(
+        default=None,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": "",
+                "description": "Redis URL for task state or Pub/Sub notifications. Falls back to REDIS_URL.",
+            }
+        },
+    )
+    task_state_postgres_uri: Optional[str] = Field(
+        default=None,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": "",
+                "description": "Postgres URI for async task latest-state storage. Falls back to TASK_STATE_POSTGRES_URI, LANGGRAPH_POSTGRES_URI, POSTGRES_URI, or DATABASE_URL.",
+            }
+        },
+    )
+    task_notification_enabled: bool = Field(
+        default=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": True,
+                "description": "Publish and listen for Redis Pub/Sub notifications when async task state changes.",
+            }
+        },
+    )
+    task_notification_wait_seconds: float = Field(
+        default=5,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 5,
+                "min": 0,
+                "max": 60,
+                "description": "Seconds the orchestrator waits for task state notifications after async tool handling.",
+            }
+        },
+    )
+    task_state_ttl_seconds: Optional[int] = Field(
+        default=86400,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 86400,
+                "description": "Optional TTL for Redis-backed task state snapshots, in seconds.",
+            }
+        },
+    )
+    # Main Graph Message Summarization
+    enable_message_summarization: bool = Field(
+        default=False,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": False,
+                "description": "Summarize long main-graph message histories and keep only recent raw messages."
+            }
+        }
+    )
+    message_summary_trigger_tokens: int = Field(
+        default=24000,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 24000,
+                "description": "Approximate message-token threshold that triggers conversation summarization."
+            }
+        }
+    )
+    message_summary_keep_last: int = Field(
+        default=8,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 8,
+                "description": "Number of recent raw messages to keep after summarization."
+            }
+        }
+    )
+    message_summary_model: Optional[str] = Field(
+        default=None,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": "",
+                "description": "Optional model for conversation summarization. Defaults to summarization_model."
+            }
+        }
+    )
+    message_summary_model_max_tokens: int = Field(
+        default=1024,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 1024,
+                "description": "Maximum output tokens for conversation summaries."
+            }
+        }
+    )
+    # Docker Sandbox Configuration
+    enable_docker_sandbox: bool = Field(
+        default=False,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": False,
+                "description": "Run async Researcher SubAgents in isolated Docker containers."
+            }
+        }
+    )
+    sandbox_provider: Literal["docker"] = Field(
+        default="docker",
+        metadata={
+            "x_oap_ui_config": {
+                "type": "select",
+                "default": "docker",
+                "description": "Sandbox provider for async Researcher isolation.",
+                "options": [{"label": "Docker", "value": "docker"}],
+            }
+        }
+    )
+    sandbox_image: str = Field(
+        default="open-deep-research-sandbox:latest",
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": "open-deep-research-sandbox:latest",
+                "description": "Docker image used to run isolated Researcher workers."
+            }
+        }
+    )
+    sandbox_workspace_root: Optional[str] = Field(
+        default=None,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": "",
+                "description": "Optional root directory for sandbox workspaces. Defaults to runs_dir/<run_id>/workspaces."
+            }
+        }
+    )
+    sandbox_network_mode: Literal[
+        "no-network",
+        "allow-search-only",
+        "allowlist-domain",
+        "open-network",
+    ] = Field(
+        default="allow-search-only",
+        metadata={
+            "x_oap_ui_config": {
+                "type": "select",
+                "default": "allow-search-only",
+                "description": "Network isolation policy for sandbox containers.",
+                "options": [
+                    {"label": "No network", "value": "no-network"},
+                    {"label": "Allow search only", "value": "allow-search-only"},
+                    {"label": "Allowlist domain", "value": "allowlist-domain"},
+                    {"label": "Open network", "value": "open-network"},
+                ],
+            }
+        }
+    )
+    sandbox_allowed_domains: list[str] = Field(
+        default_factory=list,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": "",
+                "description": "Additional allowed domains for proxy-backed sandbox network policies."
+            }
+        }
+    )
+    sandbox_cleanup_policy: Literal["always", "on_success", "never"] = Field(
+        default="always",
+        metadata={
+            "x_oap_ui_config": {
+                "type": "select",
+                "default": "always",
+                "description": "When to remove sandbox containers and temporary files.",
+                "options": [
+                    {"label": "Always", "value": "always"},
+                    {"label": "On success", "value": "on_success"},
+                    {"label": "Never", "value": "never"},
+                ],
+            }
+        }
+    )
+    sandbox_timeout_seconds: Optional[int] = Field(
+        default=None,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": "",
+                "description": "Optional sandbox-specific task timeout. Defaults to task_timeout_seconds."
+            }
+        }
+    )
+    sandbox_memory: str = Field(
+        default="1g",
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": "1g",
+                "description": "Memory limit for each sandbox container."
+            }
+        }
+    )
+    sandbox_cpus: float = Field(
+        default=1.0,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 1.0,
+                "description": "CPU quota for each sandbox container."
+            }
+        }
+    )
+    sandbox_pids_limit: int = Field(
+        default=256,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 256,
+                "description": "Maximum process count for each sandbox container."
+            }
+        }
+    )
+    sandbox_read_only_rootfs: bool = Field(
+        default=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": True,
+                "description": "Mount the sandbox container root filesystem read-only."
+            }
+        }
+    )
+    sandbox_user: str = Field(
+        default="1000:1000",
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": "1000:1000",
+                "description": "User id and group id used inside sandbox containers."
+            }
+        }
+    )
+    # Mem0 Long-Term Memory Configuration
+    enable_memory: bool = Field(
+        default=False,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": False,
+                "description": "Enable mem0 long-term memory for user preferences, domain profile, and project memory across research sessions."
+            }
+        }
+    )
+    memory_provider: Literal["platform", "oss"] = Field(
+        default="platform",
+        metadata={
+            "x_oap_ui_config": {
+                "type": "select",
+                "default": "platform",
+                "description": "Mem0 backend: 'platform' uses AsyncMemoryClient (cloud), 'oss' uses open-source Memory.",
+                "options": [
+                    {"label": "Platform (Cloud)", "value": "platform"},
+                    {"label": "OSS (Open Source)", "value": "oss"},
+                ]
+            }
+        }
+    )
+    memory_app_id: Optional[str] = Field(
+        default=None,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": "",
+                "description": "Mem0 app_id for multi-tenancy. Falls back to org_id or 'default'."
+            }
+        }
+    )
+    memory_agent_id: Optional[str] = Field(
+        default=None,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": "",
+                "description": "Mem0 agent_id. Falls back to 'deep_researcher'."
+            }
+        }
+    )
+    memory_project_id: Optional[str] = Field(
+        default=None,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": "",
+                "description": "Mem0 project ID for scoping memories. Override with MEM0_MEMORY_PROJECT_ID env var."
+            }
+        }
+    )
+    memory_top_k: int = Field(
+        default=8,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "slider",
+                "default": 8,
+                "min": 1,
+                "max": 50,
+                "step": 1,
+                "description": "Maximum number of memories to recall per query."
+            }
+        }
+    )
+    memory_min_confidence: float = Field(
+        default=0.75,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "slider",
+                "default": 0.75,
+                "min": 0.0,
+                "max": 1.0,
+                "step": 0.05,
+                "description": "Minimum confidence threshold for extracting memory candidates."
+            }
+        }
+    )
+    memory_auto_write: bool = Field(
+        default=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": True,
+                "description": "Whether to automatically extract and write memory candidates after report generation."
+            }
+        }
+    )
+    memory_write_after_report: bool = Field(
+        default=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": True,
+                "description": "If True, memory extraction happens after the final report. If False, memory is only recalled on entry."
+            }
+        }
+    )
+    memory_fail_open: bool = Field(
+        default=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": True,
+                "description": "If True, memory write failures are logged but never block the final report."
+            }
+        }
+    )
 
+    @field_validator("sandbox_allowed_domains", mode="before")
+    @classmethod
+    def parse_sandbox_allowed_domains(cls, value: Any) -> list[str]:
+        """Accept comma-separated env values for sandbox domain allowlists."""
+        if value is None or value == "":
+            return []
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
 
     @classmethod
     def from_runnable_config(
@@ -244,6 +982,11 @@ class Configuration(BaseModel):
             field_name: os.environ.get(field_name.upper(), configurable.get(field_name))
             for field_name in field_names
         }
+        # Explicit env-var overrides for fields with non-standard env names
+        if os.environ.get("MEM0_PROVIDER") and "memory_provider" not in (configurable or {}):
+            values["memory_provider"] = os.environ["MEM0_PROVIDER"]
+        if os.environ.get("MEM0_MEMORY_PROJECT_ID") and "memory_project_id" not in (configurable or {}):
+            values["memory_project_id"] = os.environ["MEM0_MEMORY_PROJECT_ID"]
         return cls(**{k: v for k, v in values.items() if v is not None})
 
     class Config:
