@@ -4,7 +4,6 @@ import operator
 from typing import Annotated, Optional
 
 from langchain_core.messages import MessageLikeRepresentation
-from langgraph.graph import MessagesState
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
@@ -59,38 +58,50 @@ def override_reducer(current_value, new_value):
     else:
         return operator.add(current_value, new_value)
     
-class AgentInputState(MessagesState):
-    """InputState is only 'messages'."""
+class AgentInputState(TypedDict):
+    """InputState is only messages."""
 
-class AgentState(MessagesState):
+    messages: list[MessageLikeRepresentation]
+
+class AgentState(AgentInputState, total=False):
     """Main agent state containing messages and research data."""
-    
+
     supervisor_messages: Annotated[list[MessageLikeRepresentation], override_reducer]
     research_brief: Optional[str]
-    raw_notes: Annotated[list[str], override_reducer] = []
-    notes: Annotated[list[str], override_reducer] = []
+    raw_notes: Annotated[list[str], override_reducer]
+    notes: Annotated[list[str], override_reducer]
     final_report: str
+    # Async SubAgent: collected outputs from completed background tasks.
+    completed_task_outputs: Annotated[list[dict], override_reducer]
+    # Mem0 long-term memory
+    memory_context: Optional[str]
+    memory_candidates: Annotated[list[dict], override_reducer]
+    # Running short-term summary used after compacting long message histories.
+    conversation_summary: Optional[str]
 
-class SupervisorState(TypedDict):
+class SupervisorState(TypedDict, total=False):
     """State for the supervisor that manages research tasks."""
-    
+
     supervisor_messages: Annotated[list[MessageLikeRepresentation], override_reducer]
     research_brief: str
-    notes: Annotated[list[str], override_reducer] = []
-    research_iterations: int = 0
-    raw_notes: Annotated[list[str], override_reducer] = []
+    notes: Annotated[list[str], override_reducer]
+    research_iterations: int
+    raw_notes: Annotated[list[str], override_reducer]
+    enable_async_research: bool
+    memory_context: Optional[str]
 
-class ResearcherState(TypedDict):
+class ResearcherState(TypedDict, total=False):
     """State for individual researchers conducting research."""
     
     researcher_messages: Annotated[list[MessageLikeRepresentation], operator.add]
-    tool_call_iterations: int = 0
+    tool_call_iterations: int
     research_topic: str
     compressed_research: str
-    raw_notes: Annotated[list[str], override_reducer] = []
+    raw_notes: Annotated[list[str], override_reducer]
+    memory_context: Optional[str]
 
 class ResearcherOutputState(BaseModel):
     """Output state from individual researchers."""
     
     compressed_research: str
-    raw_notes: Annotated[list[str], override_reducer] = []
+    raw_notes: Annotated[list[str], override_reducer]
