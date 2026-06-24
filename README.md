@@ -40,28 +40,27 @@ uv pip install -r pyproject.toml
 cp .env.example .env
 ```
 
-4. Launch agent with the LangGraph server locally:
+4. Launch the FastAPI research service locally:
 
 ```bash
-# Install dependencies and start the LangGraph server
-uvx --refresh --from "langgraph-cli[inmem]" --with-editable . --python 3.11 langgraph dev --allow-blocking
+# Install dependencies first with uv sync, then start the HTTP service
+uvicorn open_deep_research.server:app --reload --host 127.0.0.1 --port 2024
 ```
 
-This will open the LangGraph Studio UI in your browser.
+The service exposes:
 
+```text
+- API: http://127.0.0.1:2024
+- API Docs: http://127.0.0.1:2024/docs
+- Streaming runs: POST /runs/stream
+- Background runs: POST /runs, GET /runs/{run_id}, GET /runs/{run_id}/events
 ```
-- 🚀 API: http://127.0.0.1:2024
-- 🎨 Studio UI: https://smith.langchain.com/studio/?baseUrl=http://127.0.0.1:2024
-- 📚 API Docs: http://127.0.0.1:2024/docs
-```
-
-Ask a question in the `messages` input field and click `Submit`. Select different configuration in the "Manage Assistants" tab.
 
 ### ⚙️ Configurations
 
 #### LLM :brain:
 
-Open Deep Research supports a wide range of LLM providers via the [init_chat_model() API](https://python.langchain.com/docs/how_to/chat_models_universal_init/). It uses LLMs for a few different tasks. See the below model fields in the [configuration.py](https://github.com/langchain-ai/open_deep_research/blob/main/src/open_deep_research/configuration.py) file for more details. This can be accessed via the LangGraph Studio UI. 
+Open Deep Research supports a wide range of LLM providers via the [init_chat_model() API](https://python.langchain.com/docs/how_to/chat_models_universal_init/). It uses LLMs for a few different tasks. See the below model fields in the [configuration.py](https://github.com/langchain-ai/open_deep_research/blob/main/src/open_deep_research/configuration.py) file for more details. This can be passed in the HTTP request `configurable` object or Python runtime config. 
 
 - **Summarization** (default: `openai:gpt-4.1-mini`): Summarizes search API results
 - **Research** (default: `openai:gpt-4.1`): Power the search agent
@@ -74,7 +73,7 @@ Open Deep Research supports a wide range of LLM providers via the [init_chat_mod
 
 #### Search API :mag:
 
-Open Deep Research supports a wide range of search tools. By default it uses the [Tavily](https://www.tavily.com/) search API. Has full MCP compatibility and work native web search for Anthropic and OpenAI. See the `search_api` and `mcp_config` fields in the [configuration.py](https://github.com/langchain-ai/open_deep_research/blob/main/src/open_deep_research/configuration.py) file for more details. This can be accessed via the LangGraph Studio UI. 
+Open Deep Research supports a wide range of search tools. By default it uses the [Tavily](https://www.tavily.com/) search API. Has full MCP compatibility and work native web search for Anthropic and OpenAI. See the `search_api` and `mcp_config` fields in the [configuration.py](https://github.com/langchain-ai/open_deep_research/blob/main/src/open_deep_research/configuration.py) file for more details. This can be passed in the HTTP request `configurable` object or Python runtime config. 
 
 #### Other 
 
@@ -114,13 +113,9 @@ This creates `tests/expt_results/deep_research_bench_model-name.jsonl` with the 
 
 ### 🚀 Deployments and Usage
 
-#### LangGraph Studio
+#### FastAPI service
 
-Follow the [quickstart](#-quickstart) to start LangGraph server locally and test the agent out on LangGraph Studio.
-
-#### Hosted deployment
- 
-You can easily deploy to [LangGraph Platform](https://langchain-ai.github.io/langgraph/concepts/#deployment-options). 
+Follow the quickstart to start the FastAPI service locally and test the agent through `/runs/stream` or `/docs`.
 
 #### Open Agent Platform
 
@@ -147,3 +142,4 @@ The `src/legacy/` folder contains two earlier implementations that provide alter
 - **Parallel Processing**: Multiple researchers work simultaneously
 - **Speed Optimized**: Faster report generation through concurrency
 - **MCP Support**: Extensive Model Context Protocol integration
+
