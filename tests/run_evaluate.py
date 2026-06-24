@@ -1,10 +1,18 @@
-from langsmith import Client
-from tests.evaluators import eval_overall_quality, eval_relevance, eval_structure, eval_correctness, eval_groundedness, eval_completeness
-from dotenv import load_dotenv
 import asyncio
-from open_deep_research.deep_researcher import deep_researcher_builder
-from langgraph.checkpoint.memory import MemorySaver
 import uuid
+
+from dotenv import load_dotenv
+from langsmith import Client
+
+from open_deep_research.agents.query_engine import QueryEngine
+from tests.evaluators import (
+    eval_completeness,
+    eval_correctness,
+    eval_groundedness,
+    eval_overall_quality,
+    eval_relevance,
+    eval_structure,
+)
 
 load_dotenv("../.env")
 
@@ -32,7 +40,6 @@ final_report_model_max_tokens = 10000
 async def target(
     inputs: dict,
 ):
-    graph = deep_researcher_builder.compile(checkpointer=MemorySaver())
     config = {
         "configurable": {
             "thread_id": str(uuid.uuid4()),
@@ -54,9 +61,9 @@ async def target(
     config["configurable"]["final_report_model"] = final_report_model
     config["configurable"]["final_report_model_max_tokens"] = final_report_model_max_tokens
     # NOTE: We do not use MCP tools to stay consistent
-    final_state = await graph.ainvoke(
-        {"messages": [{"role": "user", "content": inputs["messages"][0]["content"]}]},
-        config
+    final_state = await QueryEngine(config).submit_message(
+        [{"role": "user", "content": inputs["messages"][0]["content"]}],
+        config,
     )
     return final_state
 
@@ -65,7 +72,7 @@ async def main():
         target,
         data=dataset_name,
         evaluators=evaluators,
-        experiment_prefix=f"ODR GPT-5, Tavily Search",
+        experiment_prefix="ODR GPT-5, Tavily Search",
         max_concurrency=10,
         metadata={
             "max_structured_output_retries": max_structured_output_retries,
@@ -87,4 +94,5 @@ async def main():
 
 if __name__ == "__main__":
     results = asyncio.run(main())
-    print(results)
+    print(results)  # noqa: T201
+

@@ -1,8 +1,9 @@
-from open_deep_research.deep_researcher import deep_researcher_builder
-from langgraph.checkpoint.memory import MemorySaver
-import uuid
 import asyncio
+import uuid
+
 from langsmith import Client
+
+from open_deep_research.agents.query_engine import QueryEngine
 
 client = Client()
 
@@ -13,11 +14,10 @@ def right_parallelism_evaluator(
 ) -> dict:
     return {
         "key": "right_parallelism", 
-        "score": len(outputs["output"].values["supervisor_messages"][-1].tool_calls) == reference_outputs["parallel"]
+        "score": len(outputs["output"]["supervisor_messages"][-1].tool_calls) == reference_outputs["parallel"]
     }
 
 async def target(inputs: dict):
-    graph = deep_researcher_builder.compile(checkpointer=MemorySaver())
     config = {
         "configurable": {
             "thread_id": str(uuid.uuid4()),
@@ -39,11 +39,12 @@ async def target(inputs: dict):
     config["configurable"]["final_report_model"] = "openai:gpt-4.1"
     config["configurable"]["final_report_model_max_tokens"] = 10000
     # NOTE: We do not use MCP tools to stay consistent
-    await graph.ainvoke(
-        {"messages": [{"role": "user", "content": inputs["messages"][0]["content"]}]},
-        config
+    engine = QueryEngine(config)
+    final_state = await engine.submit_message(
+        [{"role": "user", "content": inputs["messages"][0]["content"]}],
+        config,
     )
-    return graph.get_state(config, subgraphs=True).tasks[0].state
+    return final_state
 
 
 
@@ -52,10 +53,12 @@ async def main():
         target,
         data=dataset_name,
         evaluators=[right_parallelism_evaluator],
-        experiment_prefix=f"v1 #",
+        experiment_prefix="v1 #",
         max_concurrency=1,
     )
 
 if __name__ == "__main__":
     results = asyncio.run(main())
-    print(results)
+    print(results)  # noqa: T201
+
+
