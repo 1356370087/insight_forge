@@ -26,24 +26,21 @@ from langchain_core.tools import tool as lc_tool
 
 from open_deep_research.state import ConductResearch, ResearchComplete
 from open_deep_research.tasks.registry import TaskStatus
+from open_deep_research.tools.adapters import adapt_langchain_tool
+from open_deep_research.tools.base import Tool, ToolContext, ToolOrigin, ToolResult
 from open_deep_research.tools.governance import (
     AgentRole,
     ToolErrorType,
     ToolExecutionFailure,
-    ToolOrigin,
-    build_origin_index,
-    check_permission,
+    check_permission as _check_permission,
     classify_retryable_error,
-    execute_governed_tool_call,
+    execute_governed_tool_call as _execute_governed_tool_call,
     filter_tools_by_permission,
-    gate_supervisor_tool_call,
     get_tool_origin,
     get_tool_retryable,
     get_user_permissions,
-    invoke_tool_with_retry,
+    invoke_tool_with_retry as _invoke_tool_with_retry,
     resolve_allowed_tools,
-    tag_tool_origin,
-    tag_tool_retryable,
     validate_tool_args,
 )
 from open_deep_research.tools.utils import tavily_search, think_tool
@@ -66,7 +63,7 @@ def _client_response_error(status: int, message: str = "err") -> aiohttp.ClientR
 
 
 def _make_tool(fn, *, origin: ToolOrigin, retryable: bool, name: str | None = None) -> Any:
-    """Wrap a coroutine as a @tool and tag origin + retryable metadata.
+    """Wrap a coroutine behind the project Tool Adapter.
 
     ``fn`` is a bare async function (with a docstring) -- we apply ``lc_tool``
     fresh so the resulting StructuredTool has a clean schema, then tag metadata.
@@ -74,9 +71,22 @@ def _make_tool(fn, *, origin: ToolOrigin, retryable: bool, name: str | None = No
     t = lc_tool(fn)
     if name is not None:
         t.name = name
-    tag_tool_origin(t, origin)
-    tag_tool_retryable(t, retryable)
-    return t
+    return adapt_langchain_tool(t, origin=origin, retryable=retryable)
+
+
+def _research_complete_tool(
+    *,
+    origin: ToolOrigin = ToolOrigin.SYSTEM,
+    retryable: bool = False,
+    auth_satisfied: bool = False,
+):
+    """Build a fresh ResearchComplete Tool Adapter."""
+    return adapt_langchain_tool(
+        lc_tool(ResearchComplete),
+        origin=origin,
+        retryable=retryable,
+        auth_satisfied=auth_satisfied,
+    )
 
 
 @lc_tool
@@ -97,8 +107,13 @@ async def _bad_request_404_fn() -> str:
 
 # Module-level @tool wrappers (kept for the retry-unit tests that call
 # invoke_tool_with_retry directly with a StructuredTool).
-flaky_503 = lc_tool(_flaky_503_fn)
-bad_request_404 = lc_tool(_bad_request_404_fn)
+ok_tool = adapt_langchain_tool(ok_tool, origin=ToolOrigin.SYSTEM)
+flaky_503 = adapt_langchain_tool(
+    lc_tool(_flaky_503_fn), origin=ToolOrigin.SEARCH, retryable=True
+)
+bad_request_404 = adapt_langchain_tool(
+    lc_tool(_bad_request_404_fn), origin=ToolOrigin.SEARCH, retryable=True
+)
 
 
 async def _probe_search_fn(query: str) -> str:
@@ -119,89 +134,81 @@ def _is_denied(msg) -> bool:
         return False  # non-JSON content means the tool executed (success)
 
 
+def check_permission(
+    tool_name,
+    tool,
+    role,
+    allowed,
+    origin_index=None,
+    config=None,
+):
+    """Bridge the former test call shape to the Tool-owned origin contract."""
+    del origin_index
+    return _check_permission(tool_name, tool, role, allowed, config)
+
+
+async def execute_governed_tool_call(*args, **kwargs):
+    """Return the transport message for legacy scenario assertions."""
+    kwargs.pop("origin_index", None)
+    outcome = await _execute_governed_tool_call(*args, **kwargs)
+    return outcome.message
+
+
+async def invoke_tool_with_retry(
+    tool,
+    args,
+    config,
+    **kwargs,
+):
+    """Invoke the new typed retry seam while preserving scenario assertions."""
+    config = config or _config()
+    if not isinstance(tool, Tool):
+        tool = adapt_langchain_tool(
+            tool,
+            origin=ToolOrigin.SEARCH,
+            retryable=True,
+        )
+    input = tool.input_schema.model_validate(args)
+    result = await _invoke_tool_with_retry(
+        tool,
+        input,
+        ToolContext(config=config, role="researcher", tool_call_id="retry-test"),
+        **kwargs,
+    )
+    return result.output
+
+
 # ---------------------------------------------------------------------------
 # Tool origin tagging (4-category model)
 # ---------------------------------------------------------------------------
 
 
-class TestToolOriginTagging:
-    def test_tag_system_sets_metadata(self):
-        # Arrange
-        tool = lc_tool(ResearchComplete)
-        # Act
-        tag_tool_origin(tool, ToolOrigin.SYSTEM)
-        # Assert
-        assert tool.metadata["tool_origin"] == "system"
-        assert get_tool_origin(tool) == ToolOrigin.SYSTEM
+class TestToolOriginFields:
+    def test_system_origin_is_declared_on_tool(self):
+        tool = _make_tool(
+            _probe_search_fn,
+            origin=ToolOrigin.SYSTEM,
+            retryable=False,
+        )
+        assert get_tool_origin(tool) is ToolOrigin.SYSTEM
 
-    def test_tag_search_sets_metadata(self):
-        # Arrange -- tavily_search is a search tool
-        # Act
-        tag_tool_origin(tavily_search, ToolOrigin.SEARCH)
-        # Assert
-        assert get_tool_origin(tavily_search) == ToolOrigin.SEARCH
-
-    def test_tag_is_idempotent(self):
-        # Arrange
-        tool = lc_tool(ResearchComplete)
-        tag_tool_origin(tool, ToolOrigin.SYSTEM)
-        # Act -- re-tag with a different origin
-        tag_tool_origin(tool, ToolOrigin.MCP)
-        # Assert
-        assert tool.metadata["tool_origin"] == "mcp"
-        assert get_tool_origin(tool) == ToolOrigin.MCP
-
-    def test_get_origin_defaults_to_system(self):
-        # Arrange -- a BaseTool with no origin metadata
-        tool = lc_tool(ResearchComplete)
-        assert tool.metadata is None or "tool_origin" not in (tool.metadata or {})
-        # Act / Assert
-        assert get_tool_origin(tool) == ToolOrigin.SYSTEM
-
-    def test_get_origin_dict_uses_index(self):
-        # Arrange
-        provider_dict = {"type": "web_search_preview", "name": "web_search"}
-        index = {"web_search": ToolOrigin.PROVIDER_NATIVE}
-        # Act / Assert
-        assert get_tool_origin(provider_dict, index) == ToolOrigin.PROVIDER_NATIVE
-
-    def test_get_origin_dict_defaults_to_provider_native(self):
-        # Arrange
-        provider_dict = {"type": "web_search_20250305", "name": "web_search"}
-        # Act / Assert
-        assert get_tool_origin(provider_dict) == ToolOrigin.PROVIDER_NATIVE
-
-    def test_build_origin_index_covers_all_categories(self):
-        # Arrange
-        system_tool = lc_tool(ResearchComplete)
-        tag_tool_origin(system_tool, ToolOrigin.SYSTEM)
-        search_tool = _make_tool(_probe_search_fn, origin=ToolOrigin.SEARCH, retryable=True, name="probe_search")
-        provider_dict = {"type": "web_search_preview", "name": "web_search"}
-        # Act
-        index = build_origin_index([system_tool, search_tool, provider_dict])
-        # Assert
-        assert index["ResearchComplete"] == ToolOrigin.SYSTEM
-        assert index["probe_search"] == ToolOrigin.SEARCH
-        assert index["web_search"] == ToolOrigin.PROVIDER_NATIVE
-
-    def test_retryable_tagging(self):
-        # Arrange
-        tool = lc_tool(ResearchComplete)
-        # Act
-        tag_tool_retryable(tool, True)
-        # Assert
+    def test_search_origin_and_retry_policy_are_direct_fields(self):
+        tool = _make_tool(
+            _probe_search_fn,
+            origin=ToolOrigin.SEARCH,
+            retryable=True,
+        )
+        assert tool.origin is ToolOrigin.SEARCH
         assert get_tool_retryable(tool) is True
-        tag_tool_retryable(tool, False)
-        assert get_tool_retryable(tool) is False
 
-    def test_retryable_defaults_false(self):
-        # Arrange / Act / Assert -- untagged tools are non-retryable (system default)
-        assert get_tool_retryable(lc_tool(ResearchComplete)) is False
+    def test_retryable_defaults_are_conservative(self):
+        assert get_tool_retryable(ok_tool) is False
 
 
 # ---------------------------------------------------------------------------
 # Whitelist filtering + pre-bind filtering
 # ---------------------------------------------------------------------------
+
 
 
 class TestWhitelistFiltering:
@@ -231,7 +238,7 @@ class TestWhitelistFiltering:
 
     def test_permission_denied_when_tool_not_in_whitelist(self):
         # Arrange
-        tool = lc_tool(ResearchComplete)
+        tool = _research_complete_tool()
         config = _config(researcher_tool_whitelist=["think_tool"])
         # Act
         err = check_permission(
@@ -245,7 +252,7 @@ class TestWhitelistFiltering:
 
     def test_permission_passes_when_whitelist_is_none(self):
         # Arrange
-        tool = lc_tool(ResearchComplete)
+        tool = _research_complete_tool()
         config = _config()
         # Act
         err = check_permission(
@@ -257,8 +264,7 @@ class TestWhitelistFiltering:
 
     def test_permission_denied_by_origin_blocklist(self):
         # Arrange -- a tool tagged MCP, blocked for researchers
-        mcp_tool = lc_tool(ResearchComplete)
-        tag_tool_origin(mcp_tool, ToolOrigin.MCP)
+        mcp_tool = _research_complete_tool(origin=ToolOrigin.MCP)
         config = _config(researcher_blocked_origins=["mcp"])
         # Act
         err = check_permission(
@@ -274,7 +280,7 @@ class TestWhitelistFiltering:
 class TestPreBindFiltering:
     def test_no_filter_config_returns_all(self):
         # Arrange
-        tools = [lc_tool(ResearchComplete), think_tool, tavily_search]
+        tools = [_research_complete_tool(), think_tool, tavily_search]
         # Act
         out = filter_tools_by_permission(tools, AgentRole.RESEARCHER, _config())
         # Assert -- backward compatible: everything passes
@@ -282,7 +288,7 @@ class TestPreBindFiltering:
 
     def test_whitelist_filters_before_bind(self):
         # Arrange -- whitelist allows only tavily_search
-        tools = [lc_tool(ResearchComplete), think_tool, tavily_search]
+        tools = [_research_complete_tool(), think_tool, tavily_search]
         config = _config(researcher_tool_whitelist=["tavily_search"])
         # Act
         out = filter_tools_by_permission(tools, AgentRole.RESEARCHER, config)
@@ -292,8 +298,7 @@ class TestPreBindFiltering:
 
     def test_origin_blocklist_filters_system_tools(self):
         # Arrange -- block system origin -> only search/MCP remain
-        tools = [lc_tool(ResearchComplete), think_tool, tavily_search]
-        tag_tool_origin(tools[0], ToolOrigin.SYSTEM)
+        tools = [_research_complete_tool(), think_tool, tavily_search]
         config = _config(researcher_blocked_origins=["system"])
         # Act
         out = filter_tools_by_permission(tools, AgentRole.RESEARCHER, config)
@@ -303,15 +308,20 @@ class TestPreBindFiltering:
         assert "think_tool" not in names
         assert "tavily_search" in names
 
-    def test_provider_native_dict_filtered_by_name(self):
+    def test_skill_tool_filtered_by_name(self):
         # Arrange
-        provider_dict = {"type": "web_search_preview", "name": "web_search"}
-        tools = [lc_tool(ResearchComplete), provider_dict]
+        skill_tool = _make_tool(
+            _probe_search_fn,
+            origin=ToolOrigin.SKILL,
+            retryable=True,
+            name="skill_search",
+        )
+        tools = [_research_complete_tool(), skill_tool]
         config = _config(researcher_tool_whitelist=["ResearchComplete"])
         # Act
         out = filter_tools_by_permission(tools, AgentRole.RESEARCHER, config)
-        names = {t.name if hasattr(t, "name") else t.get("name") for t in out}
-        # Assert -- the dict tool is filtered out by name
+        names = {t.name for t in out}
+        # Assert -- the non-whitelisted Tool is filtered out by name
         assert names == {"ResearchComplete"}
 
 
@@ -353,7 +363,7 @@ class TestParamValidation:
 
     def test_empty_schema_passes(self):
         # Arrange -- ResearchComplete has no fields
-        tool = lc_tool(ResearchComplete)
+        tool = _research_complete_tool()
         # Act / Assert
         assert validate_tool_args(tool, {}) is None
 
@@ -368,7 +378,10 @@ class TestParamValidation:
 
     def test_conduct_research_missing_topic(self):
         # Arrange
-        tool = lc_tool(ConductResearch)
+        tool = adapt_langchain_tool(
+            lc_tool(ConductResearch),
+            origin=ToolOrigin.SYSTEM,
+        )
         # Act
         err = validate_tool_args(tool, {})
         # Assert
@@ -549,18 +562,12 @@ class TestExecuteGovernedToolCall:
         assert msg.name == "nope"
 
     @pytest.mark.asyncio
-    async def test_provider_native_dict_returns_permission_error(self):
-        # Arrange
+    async def test_provider_native_dict_must_be_adapted_before_execution(self):
+        from open_deep_research.tools.base import build_tool_registry
+
         provider_dict = {"type": "web_search_preview", "name": "web_search"}
-        tc = {"name": "web_search", "args": {}, "id": "tc2"}
-        # Act
-        msg = await execute_governed_tool_call(
-            tc, {"web_search": provider_dict}, AgentRole.RESEARCHER, _config(),
-        )
-        # Assert
-        parsed = json.loads(msg.content)
-        assert parsed["error_type"] == "permission_denied"
-        assert parsed["detail"]["origin"] == "provider_native"
+        with pytest.raises(TypeError):
+            build_tool_registry([provider_dict])
 
     @pytest.mark.asyncio
     async def test_validation_error_short_circuits_before_invoke(self):
@@ -635,9 +642,10 @@ class TestExecuteGovernedToolCall:
         """An auth-required MCP tool loaded with a token (mcp_auth_satisfied=True)
         is permitted to execute -- not wrongly denied (P1#3)."""
         # Arrange
-        mcp_tool = lc_tool(ResearchComplete)
-        tag_tool_origin(mcp_tool, ToolOrigin.MCP)
-        mcp_tool.metadata["mcp_auth_satisfied"] = True
+        mcp_tool = _research_complete_tool(
+            origin=ToolOrigin.MCP,
+            auth_satisfied=True,
+        )
         config = _config()
         config["configurable"]["mcp_config"] = {"url": "http://x", "tools": ["ResearchComplete"], "auth_required": True}
         tc = {"name": "ResearchComplete", "args": {}, "id": "tc6"}
@@ -652,8 +660,7 @@ class TestExecuteGovernedToolCall:
     @pytest.mark.asyncio
     async def test_mcp_auth_required_without_marker_denied(self):
         # Arrange -- MCP tool without the auth_satisfied marker + auth_required
-        mcp_tool = lc_tool(ResearchComplete)
-        tag_tool_origin(mcp_tool, ToolOrigin.MCP)  # no mcp_auth_satisfied
+        mcp_tool = _research_complete_tool(origin=ToolOrigin.MCP)
         config = _config()
         config["configurable"]["mcp_config"] = {"url": "http://x", "tools": ["ResearchComplete"], "auth_required": True}
         tc = {"name": "ResearchComplete", "args": {}, "id": "tc7"}
@@ -720,63 +727,87 @@ class TestExecuteGovernedToolCall:
 # ---------------------------------------------------------------------------
 
 
-class TestSupervisorGate:
-    def test_gate_blocks_unknown_tool(self):
-        # Arrange
-        registry = {"think_tool": think_tool}
-        tc = {"name": "ghost", "args": {}, "id": "g1"}
-        # Act
-        err = gate_supervisor_tool_call(tc, registry, None, None, _config())
-        # Assert
-        assert err is not None
-        assert err.error_type == ToolErrorType.tool_not_found
-
-    def test_gate_blocks_provider_native_dict(self):
-        # Arrange
-        registry = {"web_search": {"type": "web_search_preview"}}
-        tc = {"name": "web_search", "args": {}, "id": "g2"}
-        # Act
-        err = gate_supervisor_tool_call(tc, registry, None, None, _config())
-        # Assert
-        assert err is not None
-        assert err.error_type == ToolErrorType.permission_denied
-
-    def test_gate_blocks_whitelist_violation(self):
-        # Arrange
-        registry = {"ConductResearch": lc_tool(ConductResearch), "think_tool": think_tool}
-        config = _config(supervisor_tool_whitelist=["think_tool"])
-        tc = {"name": "ConductResearch", "args": {"research_topic": "x"}, "id": "g3"}
-        # Act
-        err = gate_supervisor_tool_call(
-            tc, registry, {"ConductResearch": ToolOrigin.SYSTEM, "think_tool": ToolOrigin.SYSTEM},
-            {"think_tool"}, config,
+class TestSupervisorGovernedExecution:
+    @pytest.mark.asyncio
+    async def test_executor_blocks_unknown_tool(self):
+        message = await execute_governed_tool_call(
+            {"name": "ghost", "args": {}, "id": "g1"},
+            {"think_tool": think_tool},
+            AgentRole.SUPERVISOR,
+            _config(),
         )
-        # Assert
-        assert err is not None
-        assert err.error_type == ToolErrorType.permission_denied
+        assert json.loads(message.content)["error_type"] == "tool_not_found"
 
-    def test_gate_blocks_invalid_args(self):
-        # Arrange -- ConductResearch missing research_topic
-        registry = {"ConductResearch": lc_tool(ConductResearch)}
-        tc = {"name": "ConductResearch", "args": {}, "id": "g4"}
-        # Act
-        err = gate_supervisor_tool_call(tc, registry, None, None, _config())
-        # Assert
-        assert err is not None
-        assert err.error_type == ToolErrorType.validation_error
-        assert err.detail["missing"] == ["research_topic"]
+    def test_registry_rejects_unadapted_langchain_tool(self):
+        from open_deep_research.tools.base import build_tool_registry
 
-    def test_gate_passes_valid_call(self):
-        # Arrange
-        registry = {"ConductResearch": lc_tool(ConductResearch)}
-        tc = {"name": "ConductResearch", "args": {"research_topic": "ai safety"}, "id": "g5"}
-        # Act / Assert
-        assert gate_supervisor_tool_call(tc, registry, None, None, _config()) is None
+        with pytest.raises(TypeError):
+            build_tool_registry([lc_tool(ConductResearch)])
+
+    @pytest.mark.asyncio
+    async def test_executor_blocks_whitelist_violation(self):
+        tool = _make_tool(
+            _probe_search_fn,
+            origin=ToolOrigin.SYSTEM,
+            retryable=False,
+            name="ConductResearch",
+        )
+        message = await execute_governed_tool_call(
+            {
+                "name": "ConductResearch",
+                "args": {"query": "x"},
+                "id": "g3",
+            },
+            {"ConductResearch": tool},
+            AgentRole.SUPERVISOR,
+            _config(supervisor_tool_whitelist=["think_tool"]),
+            allowed_tools={"think_tool"},
+        )
+        assert json.loads(message.content)["error_type"] == "permission_denied"
+
+    @pytest.mark.asyncio
+    async def test_executor_blocks_invalid_args(self):
+        tool = _make_tool(
+            _probe_search_fn,
+            origin=ToolOrigin.SYSTEM,
+            retryable=False,
+            name="ConductResearch",
+        )
+        message = await execute_governed_tool_call(
+            {"name": "ConductResearch", "args": {}, "id": "g4"},
+            {"ConductResearch": tool},
+            AgentRole.SUPERVISOR,
+            _config(),
+        )
+        payload = json.loads(message.content)
+        assert payload["error_type"] == "validation_error"
+        assert payload["detail"]["missing"] == ["query"]
+
+    @pytest.mark.asyncio
+    async def test_executor_passes_valid_call(self):
+        tool = _make_tool(
+            _probe_search_fn,
+            origin=ToolOrigin.SYSTEM,
+            retryable=False,
+            name="ConductResearch",
+        )
+        message = await execute_governed_tool_call(
+            {
+                "name": "ConductResearch",
+                "args": {"query": "ai safety"},
+                "id": "g5",
+            },
+            {"ConductResearch": tool},
+            AgentRole.SUPERVISOR,
+            _config(),
+        )
+        assert message.content == "ai safety"
 
 
 # ---------------------------------------------------------------------------
 # JWT user role extraction (security/auth.py)
 # ---------------------------------------------------------------------------
+
 
 
 def _load_auth_module():
@@ -840,8 +871,12 @@ class TestResearcherToolsIntegration:
     async def test_retryable_search_failure_yields_structured_error(self):
         """A SEARCH researcher tool raising HTTP 503 returns max_retries_exceeded."""
         # Arrange -- a SEARCH+retryable tool that always 503s
-        search_503 = _make_tool(_flaky_503_fn, origin=ToolOrigin.SEARCH, retryable=True)
-        search_503.name = "flaky_503"
+        search_503 = _make_tool(
+            _flaky_503_fn,
+            origin=ToolOrigin.SEARCH,
+            retryable=True,
+            name="flaky_503",
+        )
         from open_deep_research.agents.deep_researcher import researcher_tools
         ai_msg = AIMessage(content="", tool_calls=[{"name": "flaky_503", "args": {}, "id": "it1"}])
         state = {
@@ -961,13 +996,14 @@ class TestSupervisorToolsIntegration:
         bad = [m for m in msgs if m.tool_call_id == "cr-bad"]
         good = [m for m in msgs if m.tool_call_id == "cr-good"]
         assert len(bad) == 1 and json.loads(bad[0].content)["error_type"] == "validation_error"
-        assert len(good) == 1 and good[0].content == "GOOD-RAN"  # valid call still dispatched
+        assert len(good) == 1
+        assert json.loads(good[0].content)["compressed_research"] == "GOOD-RAN"
 
-    def test_build_supervisor_tool_models_includes_approve_domain(self):
-        from open_deep_research.agents.deep_researcher import build_supervisor_tool_models
+    def test_build_supervisor_tools_includes_approve_domain(self):
+        from open_deep_research.agents.deep_researcher import build_supervisor_tools
 
-        async_tools = build_supervisor_tool_models({"enable_async_research": True})
-        names = [getattr(t, "__name__", getattr(t, "name", "")) for t in async_tools]
+        async_tools = build_supervisor_tools({"enable_async_research": True})
+        names = [t.name for t in async_tools]
         assert "ApproveResearchDomain" in names
 
     @pytest.mark.asyncio
@@ -1042,12 +1078,14 @@ def egress_env(monkeypatch):
 
 
 def _fetch_tool() -> Any:
-    """A fetch_webpage-named SYSTEM tool tagged retryable (egress target by name)."""
+    """Build a retryable fetch_webpage Tool used by egress scenarios."""
     t = lc_tool(_ok_fetch_fn)
     t.name = "fetch_webpage"
-    tag_tool_origin(t, ToolOrigin.SYSTEM)
-    tag_tool_retryable(t, True)
-    return t
+    return adapt_langchain_tool(
+        t,
+        origin=ToolOrigin.SYSTEM,
+        retryable=True,
+    )
 
 
 def _egress_config(**configurable: Any) -> RunnableConfig:

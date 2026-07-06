@@ -141,19 +141,28 @@ class TestFetchWebpageTool:
     @pytest.mark.asyncio
     async def test_fetch_webpage_returns_content_no_summarize(self, monkeypatch):
         from open_deep_research.tools import utils
+        from open_deep_research.tools.base import ToolContext
 
         monkeypatch.setattr(utils.aiohttp, "ClientSession", _FakeSession)
-        result = await utils.fetch_webpage.ainvoke(
-            {"url": "https://example.com/page", "summarize": False},
-            {"configurable": {"search_api": "none"}, "metadata": {"run_id": "test"}},
-        )
+        tool = utils.fetch_webpage
+        config = {"configurable": {"search_api": "none"}, "metadata": {"run_id": "test"}}
+        result = (
+            await tool.call(
+                tool.input_schema.model_validate(
+                    {"url": "https://example.com/page", "summarize": False}
+                ),
+                ToolContext(config=config, role="researcher", tool_call_id="fetch-1"),
+            )
+        ).output
         assert "hello world page content" in result
         assert "example.com/page" in result
 
     @pytest.mark.asyncio
     async def test_fetch_webpage_raises_on_http_error(self, monkeypatch):
-        from open_deep_research.tools import utils
         from langchain_core.tools import ToolException
+
+        from open_deep_research.tools import utils
+        from open_deep_research.tools.base import ToolContext
 
         class _ErrSession(_FakeSession):
             def __init__(self, *a, **k):
@@ -162,9 +171,13 @@ class TestFetchWebpageTool:
 
         monkeypatch.setattr(utils.aiohttp, "ClientSession", _ErrSession)
         with pytest.raises(ToolException):
-            await utils.fetch_webpage.ainvoke(
-                {"url": "https://example.com/missing", "summarize": False},
-                {"configurable": {"search_api": "none"}, "metadata": {"run_id": "test"}},
+            tool = utils.fetch_webpage
+            config = {"configurable": {"search_api": "none"}, "metadata": {"run_id": "test"}}
+            await tool.call(
+                tool.input_schema.model_validate(
+                    {"url": "https://example.com/missing", "summarize": False}
+                ),
+                ToolContext(config=config, role="researcher", tool_call_id="fetch-2"),
             )
 
 
@@ -176,14 +189,12 @@ class TestFetchWebpageTool:
 class TestRunTaskPauseAndResume:
     @pytest.mark.asyncio
     async def test_clear_run_on_terminal(self, tmp_path):
+        import open_deep_research.tasks.registry as registry_mod
         from open_deep_research.tasks.executor import run_task_with_control
         from open_deep_research.tasks.registry import (
-            TaskRegistry,
             TaskStatus,
             get_task_registry,
         )
-        import open_deep_research.tasks.registry as registry_mod
-        from open_deep_research.configuration import Configuration
 
         registry_mod._registry = None
         registry = get_task_registry()
@@ -218,21 +229,21 @@ class TestRunTaskPauseAndResume:
         """End-to-end in-process: a researcher tool hitting an unapproved domain
         pauses the task (WAITING_FOR_CONFIRMATION); ApproveResearchDomain resumes
         it and the task completes."""
+        from langchain_core.tools import tool as lc_tool
+
         import open_deep_research.tasks.registry as registry_mod
+        from open_deep_research.tasks.async_tools import handle_approve_research_domain
+        from open_deep_research.tasks.executor import run_task_with_control
         from open_deep_research.tasks.registry import (
             TaskStatus,
             get_task_registry,
         )
-        from open_deep_research.tasks.executor import run_task_with_control
-        from open_deep_research.tasks.async_tools import handle_approve_research_domain
+        from open_deep_research.tools.adapters import adapt_langchain_tool
+        from open_deep_research.tools.base import ToolOrigin
         from open_deep_research.tools.governance import (
             AgentRole,
-            ToolOrigin,
             execute_governed_tool_call,
-            tag_tool_origin,
-            tag_tool_retryable,
         )
-        from langchain_core.tools import tool as lc_tool
 
         registry_mod._registry = None
         registry = get_task_registry()
@@ -242,10 +253,13 @@ class TestRunTaskPauseAndResume:
             """A fetch_webpage-named tool whose body only runs if egress allows."""
             return f"fetched:{url}"
 
-        fetch_tool = lc_tool(_fetch_fn)
-        fetch_tool.name = "fetch_webpage"
-        tag_tool_origin(fetch_tool, ToolOrigin.SYSTEM)
-        tag_tool_retryable(fetch_tool, True)
+        langchain_fetch = lc_tool(_fetch_fn)
+        langchain_fetch.name = "fetch_webpage"
+        fetch_tool = adapt_langchain_tool(
+            langchain_fetch,
+            origin=ToolOrigin.SYSTEM,
+            retryable=True,
+        )
 
         record = registry.create("topic", run_id="run-e2e")
         cfg = {
@@ -261,7 +275,7 @@ class TestRunTaskPauseAndResume:
 
         async def fake_execute(state, config):
             # The researcher "calls" fetch_webpage on an unapproved domain.
-            msg = await execute_governed_tool_call(
+            outcome = await execute_governed_tool_call(
                 {"name": "fetch_webpage", "id": "fw-1",
                  "args": {"url": "https://untrusted.example/page"}},
                 {"fetch_webpage": fetch_tool},
@@ -270,7 +284,7 @@ class TestRunTaskPauseAndResume:
                 apply_retry=False,
             )
             return {
-                "compressed_research": msg.content,
+                "compressed_research": outcome.message.content,
                 "raw_notes": [],
                 "metrics": {"sources_read": 1},
             }

@@ -13,16 +13,24 @@ from open_deep_research.agents.query import (
     prepare_messages_for_query,
     query,
 )
+from open_deep_research.tools.adapters import adapt_langchain_tool
+from open_deep_research.tools.base import ToolOrigin
 
 
 def _config(**configurable: Any) -> dict[str, Any]:
     return {"configurable": configurable, "metadata": {"run_id": "query-test"}}
 
 
-@lc_tool
-async def echo_tool(text: str) -> str:
+@lc_tool("echo_tool")
+async def _echo_tool_impl(text: str) -> str:
     """Echo text."""
     return f"echo:{text}"
+
+
+echo_tool = adapt_langchain_tool(
+    _echo_tool_impl,
+    origin=ToolOrigin.SYSTEM,
+)
 
 
 class FakeModel:

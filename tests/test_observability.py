@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage, HumanMessage
+from prometheus_client import generate_latest
 
 from open_deep_research.agents.query import QueryParams, query
 from open_deep_research.observability import (
@@ -13,8 +14,15 @@ from open_deep_research.observability import (
     TokenUsage,
     get_trace_recorder,
     invoke_model_with_observability,
+    invoke_model_with_retry_observability,
 )
+from open_deep_research.observability.telemetry import LangfuseSpanBridge
 from open_deep_research.server import app
+from open_deep_research.tools.governance import (
+    ToolErrorType,
+    classify_llm_retryable_error,
+    invoke_tool_with_retry,
+)
 from security.auth import get_current_user
 
 
@@ -95,7 +103,11 @@ async def test_model_wrapper_persists_span_and_usage(tmp_path):
     spans = store.list_spans("obs-run")
 
     assert result.content == "ok"
-    assert usage == {"input_tokens": 2, "output_tokens": 4, "total_tokens": 6}
+    assert usage["input_tokens"] == 2
+    assert usage["output_tokens"] == 4
+    assert usage["total_tokens"] == 6
+    assert usage["retry_count"] == 0
+    assert usage["rate_429"] == 0.0
     assert any(span["name"] == "test.model" and span["total_tokens"] == 6 for span in spans)
     assert store.get_run("obs-run")["total_tokens"] == 6
 
@@ -163,3 +175,463 @@ def test_observability_endpoints_return_persisted_trace(tmp_path, monkeypatch):
     assert spans_resp.json()["spans"][0]["name"] == "lead.run"
     assert ui_resp.status_code == 200
     assert "Open Deep Research Observability" in ui_resp.text
+
+
+def test_metrics_endpoint_returns_aggregated_metrics(tmp_path, monkeypatch):
+    trace_path = tmp_path / "trace.sqlite3"
+    monkeypatch.setenv("TRACE_STORE_PATH", str(trace_path))
+    store = SQLiteTraceStore(str(trace_path))
+    store.start_run("metrics-run", "user-1", {})
+    store.start_span(
+        span_id="span-m",
+        run_id="metrics-run",
+        parent_span_id=None,
+        name="test.model",
+        kind="llm",
+        agent_role="lead",
+        attributes={},
+        input_preview=None,
+        provider="openai",
+        model="gpt-test",
+    )
+    store.record_retry_event(
+        run_id="metrics-run",
+        span_id="span-m",
+        attempt=1,
+        error_type="rate_limited",
+        http_status=429,
+        retryable=True,
+        delay_s=0.5,
+        message="429",
+    )
+    store.finish_span(span_id="span-m", status="success", retry_count=1)
+    store.finish_run("metrics-run", "success")
+
+    app.dependency_overrides[get_current_user] = lambda: {"id": "user-1"}
+    try:
+        client = TestClient(app)
+        resp = client.get("/observability/runs/metrics-run/metrics")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    metrics = resp.json()["metrics"]
+    assert metrics["retry_count"] == 1
+    assert metrics["rate_limited_count"] == 1
+    assert metrics["total_llm_tool_calls"] == 1
+    assert metrics["rate_429"] == 1.0
+    assert metrics["by_span"][0]["retry_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Retry observability (Phase 1)
+# ---------------------------------------------------------------------------
+
+
+class FlakyModel:
+    """Model that raises a configured sequence of exceptions before succeeding."""
+
+    def __init__(self, failures, response):
+        self.failures = list(failures)
+        self.response = response
+        self.calls = 0
+
+    def with_config(self, _config):
+        return self
+
+    def bind_tools(self, _tools):
+        return self
+
+    async def ainvoke(self, messages):
+        self.calls += 1
+        if self.failures:
+            raise self.failures.pop(0)
+        return self.response
+
+
+def _fake_openai_sdk():
+    """A stand-in for the openai SDK module with the exception classes we inspect."""
+    return SimpleNamespace(
+        RateLimitError=type("RateLimitError", (Exception,), {}),
+        APITimeoutError=type("APITimeoutError", (Exception,), {}),
+        APIConnectionError=type("APIConnectionError", (Exception,), {}),
+        APIStatusError=type("APIStatusError", (Exception,), {}),
+    )
+
+
+def test_classify_llm_retryable_error_native_429(monkeypatch):
+    import open_deep_research.tools.governance as gov
+
+    fake = _fake_openai_sdk()
+    monkeypatch.setattr(gov, "_openai_sdk", fake)
+    error_type, retryable = classify_llm_retryable_error(fake.RateLimitError())
+    assert error_type is ToolErrorType.rate_limited
+    assert retryable is True
+
+
+def test_classify_llm_retryable_error_api_status_5xx(monkeypatch):
+    import open_deep_research.tools.governance as gov
+
+    fake = _fake_openai_sdk()
+    monkeypatch.setattr(gov, "_openai_sdk", fake)
+    err = fake.APIStatusError()
+    err.status_code = 503
+    error_type, retryable = classify_llm_retryable_error(err)
+    assert error_type is ToolErrorType.service_unavailable
+    assert retryable is True
+
+
+def test_classify_llm_retryable_error_parse_failure_not_retryable():
+    from langchain_core.exceptions import OutputParserException
+
+    error_type, retryable = classify_llm_retryable_error(OutputParserException("bad json"))
+    assert retryable is False
+
+
+@pytest.mark.asyncio
+async def test_llm_retry_loop_records_retry_and_429(tmp_path, monkeypatch):
+    import open_deep_research.tools.governance as gov
+
+    fake = _fake_openai_sdk()
+    monkeypatch.setattr(gov, "_openai_sdk", fake)
+
+    trace_path = tmp_path / "trace.sqlite3"
+    config = _config(trace_path, run_id="retry-run")
+    recorder = get_trace_recorder(config)
+    response = AIMessage(
+        content="recovered",
+        usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    )
+    model = FlakyModel([fake.RateLimitError("429")], response)
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    with recorder.start_run("retry-run", user_id="user-1"):
+        result = await invoke_model_with_retry_observability(
+            model,
+            [HumanMessage(content="q")],
+            config,
+            span_name="test.retry",
+            agent_role="lead",
+            model_name="openai:gpt-test",
+            max_attempts=3,
+            base_delay=0.1,
+            max_delay=1.0,
+            sleeper=fake_sleep,
+        )
+        usage = recorder.finish_run("retry-run", "success")
+
+    store = SQLiteTraceStore(str(trace_path))
+    spans = store.list_spans("retry-run")
+    retry_summary = store.get_retry_summary("retry-run")
+    metrics = store.get_metrics("retry-run")
+
+    assert result.content == "recovered"
+    assert len(sleeps) == 1  # one backoff before the successful attempt
+    assert any(span["retry_count"] == 1 for span in spans)
+    assert retry_summary["retry_count"] == 1
+    assert retry_summary["rate_limited_count"] == 1
+    assert metrics["rate_limited_count"] == 1
+    assert metrics["total_llm_tool_calls"] == 1
+    assert metrics["rate_429"] == 1.0
+    assert usage["retry_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_llm_retry_loop_exhausts_and_records_outcome(tmp_path, monkeypatch):
+    import open_deep_research.tools.governance as gov
+
+    fake = _fake_openai_sdk()
+    monkeypatch.setattr(gov, "_openai_sdk", fake)
+
+    trace_path = tmp_path / "trace.sqlite3"
+    config = _config(trace_path, run_id="exhaust-run")
+    recorder = get_trace_recorder(config)
+    response = AIMessage(content="never", usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})
+    model = FlakyModel([fake.RateLimitError("429"), fake.RateLimitError("429")], response)
+
+    async def fake_sleep(_delay):
+        return None
+
+    with recorder.start_run("exhaust-run", user_id="user-1"):
+        with pytest.raises(fake.RateLimitError):
+            await invoke_model_with_retry_observability(
+                model,
+                [HumanMessage(content="q")],
+                config,
+                span_name="test.exhaust",
+                agent_role="lead",
+                model_name="openai:gpt-test",
+                max_attempts=2,
+                base_delay=0.1,
+                max_delay=1.0,
+                sleeper=fake_sleep,
+            )
+        usage = recorder.finish_run("exhaust-run", "error", "exhausted")
+
+    store = SQLiteTraceStore(str(trace_path))
+    spans = store.list_spans("exhaust-run")
+    metrics = store.get_metrics("exhaust-run")
+
+    assert any(span["retry_count"] == 1 and span["error_type"] == "rate_limited" for span in spans)
+    assert metrics["retry_count"] == 1
+    assert metrics["rate_limited_count"] == 1
+    assert usage["retry_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_llm_parse_failure_is_not_retried(tmp_path):
+    from langchain_core.exceptions import OutputParserException
+
+    trace_path = tmp_path / "trace.sqlite3"
+    config = _config(trace_path, run_id="parse-run")
+    recorder = get_trace_recorder(config)
+    response = AIMessage(content="ok")
+    model = FlakyModel([OutputParserException("bad")], response)
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    with recorder.start_run("parse-run", user_id="user-1"):
+        with pytest.raises(OutputParserException):
+            await invoke_model_with_retry_observability(
+                model,
+                [HumanMessage(content="q")],
+                config,
+                span_name="test.parse",
+                agent_role="lead",
+                model_name="openai:gpt-test",
+                sleeper=fake_sleep,
+            )
+
+    assert sleeps == []  # parse failures must not trigger a backoff/retry
+
+
+@pytest.mark.asyncio
+async def test_tool_retry_records_retry_event(tmp_path):
+    from langchain_core.tools import ToolException
+    from pydantic import BaseModel
+
+    from open_deep_research.tools.base import (
+        ToolContext,
+        ToolOrigin,
+        ToolResult,
+    )
+
+    trace_path = tmp_path / "trace.sqlite3"
+    config = _config(trace_path, run_id="tool-retry")
+    recorder = get_trace_recorder(config)
+
+    calls = {"n": 0}
+
+    class FakeInput(BaseModel):
+        pass
+
+    class FakeTool:
+        name = "fake_search"
+        input_schema = FakeInput
+        origin = ToolOrigin.SEARCH
+        retryable = True
+
+        async def description(self, input=None):
+            return "fake"
+
+        async def call(self, input, context, on_progress=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ToolException("429 rate limit exceeded")
+            return ToolResult(output="tool-result")
+
+    async def fake_sleep(_delay):
+        return None
+
+    with recorder.start_run("tool-retry", user_id="user-1"):
+        with recorder.start_span(name="tool.fake_search", kind="tool", agent_role="researcher"):
+            result = await invoke_tool_with_retry(
+                FakeTool(),
+                FakeInput(),
+                ToolContext(config=config, role="researcher", tool_call_id="retry"),
+                max_retries=3,
+                base_delay=0.1,
+                max_delay=1.0,
+                sleeper=fake_sleep,
+            )
+        metrics_from_run = recorder.finish_run("tool-retry", "success")
+
+    store = SQLiteTraceStore(str(trace_path))
+    retry_summary = store.get_retry_summary("tool-retry")
+    metrics = store.get_metrics("tool-retry")
+
+    assert result.output == "tool-result"
+    assert calls["n"] == 2  # one failed attempt + one successful
+    assert retry_summary["retry_count"] == 1
+    assert retry_summary["rate_limited_count"] == 1
+    assert metrics["total_llm_tool_calls"] == 1  # one tool span
+    assert metrics["rate_429"] == 1.0
+    assert metrics_from_run["retry_count"] == 1
+
+
+def test_get_metrics_empty_run(tmp_path):
+    store = SQLiteTraceStore(str(tmp_path / "trace.sqlite3"))
+    metrics = store.get_metrics("nonexistent")
+    assert metrics["input_tokens"] == 0
+    assert metrics["retry_count"] == 0
+    assert metrics["rate_429"] == 0.0
+    assert metrics["total_llm_tool_calls"] == 0
+    assert metrics["by_span"] == []
+
+
+@pytest.mark.asyncio
+async def test_prometheus_records_llm_tokens_and_run_metrics(tmp_path):
+    trace_path = tmp_path / "prometheus.sqlite3"
+    config = _config(trace_path, run_id="prom-run")
+    config["configurable"].update({
+        "prometheus_enabled": True,
+        "prometheus_namespace": "odr_observability_test",
+    })
+    recorder = get_trace_recorder(config)
+    model = FakeModel(
+        AIMessage(
+            content="ok",
+            usage_metadata={"input_tokens": 3, "output_tokens": 5, "total_tokens": 8},
+        )
+    )
+
+    with recorder.start_run("prom-run", user_id="user-1"):
+        await invoke_model_with_observability(
+            model,
+            [HumanMessage(content="hello")],
+            config,
+            span_name="lead.test",
+            agent_role="lead",
+            model_name="openai:gpt-test",
+        )
+        recorder.finish_run("prom-run", "success")
+
+    exposition = generate_latest().decode()
+    assert 'odr_observability_test_llm_requests_total{agent_role="lead"' in exposition
+    assert 'direction="input",model="gpt-test",provider="openai"} 3.0' in exposition
+    assert 'direction="output",model="gpt-test",provider="openai"} 5.0' in exposition
+    assert 'odr_observability_test_runs_total{status="success"} 1.0' in exposition
+
+
+def test_langfuse_bridge_maps_generation_usage_and_trace_id():
+    class FakeObservation:
+        def __init__(self):
+            self.updates = []
+
+        def update(self, **kwargs):
+            self.updates.append(kwargs)
+
+    class FakeContext:
+        def __init__(self, observation):
+            self.observation = observation
+
+        def __enter__(self):
+            return self.observation
+
+        def __exit__(self, *_args):
+            return None
+
+    class FakeClient:
+        def __init__(self):
+            self.started = []
+            self.observation = FakeObservation()
+
+        def create_trace_id(self, *, seed):
+            assert seed == "run-1"
+            return "a" * 32
+
+        def start_as_current_observation(self, **kwargs):
+            self.started.append(kwargs)
+            return FakeContext(self.observation)
+
+    class FakeSink:
+        def __init__(self):
+            self.client = FakeClient()
+            self.user_id = "user-1"
+            self.session_id = "session-1"
+
+        @staticmethod
+        def propagate_attributes(**_kwargs):
+            return FakeContext(FakeObservation())
+
+    span = SimpleNamespace(
+        kind="llm",
+        name="lead.model",
+        input_preview="prompt",
+        output_preview="answer",
+        attributes={},
+        run_id="run-1",
+        parent_span_id=None,
+        agent_role="lead",
+        provider="openai",
+        model="gpt-test",
+        usage=TokenUsage(input_tokens=2, output_tokens=4, total_tokens=6),
+        retry_count=0,
+        error_type=None,
+        http_status=None,
+    )
+    sink = FakeSink()
+    bridge = LangfuseSpanBridge(sink, span)
+
+    bridge.enter()
+    bridge.exit(None, None, None)
+
+    started = sink.client.started[0]
+    assert started["as_type"] == "generation"
+    assert started["trace_context"] == {"trace_id": "a" * 32}
+    assert started["model"] == "gpt-test"
+    assert sink.client.observation.updates[0]["usage_details"] == {
+        "input": 2,
+        "output": 4,
+        "total": 6,
+    }
+
+
+@pytest.mark.asyncio
+async def test_optional_langchain_callback_is_passed_to_model(tmp_path, monkeypatch):
+    import open_deep_research.observability.core as core
+
+    marker = object()
+
+    class FakeLangfuseSink:
+        @staticmethod
+        def callback_handler():
+            return marker
+
+        @staticmethod
+        def span(_span):
+            return None
+
+    class CallbackAwareModel:
+        def __init__(self):
+            self.config = None
+
+        async def ainvoke(self, _messages, config=None):
+            self.config = config
+            return AIMessage(content="ok")
+
+    config = _config(tmp_path / "callback.sqlite3", run_id="callback-run")
+    config["configurable"]["langfuse_langchain_callback_enabled"] = True
+    recorder = get_trace_recorder(config)
+    recorder.langfuse = FakeLangfuseSink()
+    monkeypatch.setattr(core, "get_trace_recorder", lambda _config: recorder)
+    model = CallbackAwareModel()
+
+    with recorder.start_run("callback-run"):
+        await invoke_model_with_observability(
+            model,
+            [HumanMessage(content="hello")],
+            config,
+            span_name="callback.model",
+            model_name="openai:gpt-test",
+        )
+
+    assert model.config is not None
+    assert model.config["callbacks"][-1] is marker
