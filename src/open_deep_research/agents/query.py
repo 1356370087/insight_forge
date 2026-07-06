@@ -9,7 +9,6 @@ from typing import Any, Literal
 
 from langchain_core.messages import BaseMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
-from langchain_core.tools import BaseTool
 
 from open_deep_research.observability import (
     apply_helicone_config,
@@ -18,9 +17,13 @@ from open_deep_research.observability import (
     observe_tool_call,
 )
 from open_deep_research.runtime import normalize_messages
+from open_deep_research.tools.base import (
+    Tool,
+    build_tool_registry,
+    tools_to_model_definitions,
+)
 from open_deep_research.tools.governance import (
     AgentRole,
-    build_origin_index,
     execute_governed_tool_call,
     resolve_allowed_tools,
 )
@@ -80,7 +83,7 @@ class QueryParams:
     system_prompt: str | BaseMessage | None
     model: Any
     config: RunnableConfig
-    tools: Sequence[BaseTool | dict[str, Any]] = field(default_factory=list)
+    tools: Sequence[Tool] = field(default_factory=list)
     role: AgentRole = AgentRole.RESEARCHER
     model_config: dict[str, Any] = field(default_factory=dict)
     max_turns: int | None = None
@@ -121,7 +124,9 @@ def prepare_messages_for_query(
 async def _default_call_model(params: QueryParams, messages: list[BaseMessage]) -> BaseMessage:
     model = params.model
     if params.tools and hasattr(model, "bind_tools"):
-        model = model.bind_tools(list(params.tools))
+        model = model.bind_tools(
+            await tools_to_model_definitions(list(params.tools))
+        )
     model_config = apply_helicone_config(
         params.model_config,
         params.config,
@@ -139,10 +144,6 @@ async def _default_call_model(params: QueryParams, messages: list[BaseMessage]) 
         model_name=model_config.get("model"),
         attributes={"tool_count": len(params.tools)},
     )
-
-
-def _tool_name(tool: BaseTool | dict[str, Any]) -> str:
-    return tool.name if isinstance(tool, BaseTool) else tool.get("name", "web_search")
 
 
 async def query(params: QueryParams) -> AsyncIterator[QueryEvent]:
@@ -221,13 +222,12 @@ async def query(params: QueryParams) -> AsyncIterator[QueryEvent]:
                 return
             continue
 
-        tools_by_name = {_tool_name(tool): tool for tool in params.tools}
-        origin_index = build_origin_index(list(params.tools))
+        tools_by_name = build_tool_registry(list(params.tools))
         allowed = resolve_allowed_tools(params.role, params.config, set(tools_by_name))
         yield QueryEvent("query.tool_call", {"turn": turn, "tool_calls": tool_calls})
 
         async def _execute_tool(tool_call: dict[str, Any]) -> BaseMessage:
-            return await observe_tool_call(
+            outcome = await observe_tool_call(
                 tool_call,
                 params.role.value,
                 params.config,
@@ -237,10 +237,10 @@ async def query(params: QueryParams) -> AsyncIterator[QueryEvent]:
                     params.role,
                     params.config,
                     allowed_tools=allowed,
-                    origin_index=origin_index,
                     apply_retry=True,
                 ),
             )
+            return outcome.message
 
         tool_tasks = [_execute_tool(tool_call) for tool_call in tool_calls]
         tool_results = await asyncio.gather(*tool_tasks)

@@ -15,12 +15,11 @@ from langchain_core.messages import (
 )
 from langchain_core.messages.utils import count_tokens_approximately
 from langchain_core.runnables import RunnableConfig
-from langchain_core.tools import BaseTool
-from langchain_core.tools import tool as structured_tool
 
 from open_deep_research.agents.query_engine import QueryEngine, ResearcherQueryEngine
 from open_deep_research.configuration import (
     Configuration,
+    get_model_compatibility_kwargs,
 )
 from open_deep_research.memory.policy import extract_memory_candidates
 from open_deep_research.memory.store import (
@@ -28,14 +27,13 @@ from open_deep_research.memory.store import (
 )
 from open_deep_research.observability import (
     apply_helicone_config,
-    invoke_model_with_observability,
+    invoke_model_with_retry_observability,
     observe_tool_call,
 )
 from open_deep_research.prompts import (
     clarify_with_user_instructions,
     compress_research_simple_human_message,
     compress_research_system_prompt,
-    final_report_generation_prompt,
     lead_researcher_async_prompt,
     lead_researcher_prompt,
     research_system_prompt,
@@ -48,6 +46,7 @@ from open_deep_research.runtime import (
 from open_deep_research.runtime import (
     RuntimeCommand as Command,
 )
+from open_deep_research.skills import get_skill_researcher_context
 from open_deep_research.state import (
     AgentState,
     ClarifyWithUser,
@@ -79,35 +78,35 @@ from open_deep_research.tasks.notifications import wait_for_task_notifications
 from open_deep_research.tasks.recovery import CheckpointManager
 from open_deep_research.tasks.registry import get_task_registry
 from open_deep_research.tasks.state import get_task_state_store
+from open_deep_research.tools.base import (
+    Tool,
+    ToolContext,
+    ToolOrigin,
+    ToolResult,
+    build_tool,
+    build_tool_registry,
+    tools_to_model_definitions,
+)
 from open_deep_research.tools.governance import (
     AgentRole,
-    ToolError,
-    ToolErrorType,
-    ToolOrigin,
-    build_origin_index,
+    GovernedToolCallResult,
     execute_governed_tool_call,
     filter_tools_by_permission,
-    gate_supervisor_tool_call,
     resolve_allowed_tools,
-    tag_tool_origin,
-    tag_tool_retryable,
 )
 from open_deep_research.tools.utils import (
-    anthropic_websearch_called,
     get_all_tools,
     get_api_key_for_model,
-    get_model_token_limit,
     get_notes_from_tool_calls,
     get_today_str,
     is_token_limit_exceeded,
-    openai_websearch_called,
     remove_up_to_last_ai_message,
     think_tool,
 )
 
 # Initialize a configurable model that we will use throughout the agent
 configurable_model = init_chat_model(
-    configurable_fields=("model", "max_tokens", "api_key", "base_url", "default_headers", "headers"),
+    configurable_fields=("model", "max_tokens", "api_key", "base_url", "default_headers", "headers", "extra_body"),
 )
 
 
@@ -165,9 +164,10 @@ async def summarize_messages(
         "max_tokens": configurable.message_summary_model_max_tokens,
         "api_key": get_api_key_for_model(model_name, config),
         "tags": ["langsmith:nostream"],
+        **get_model_compatibility_kwargs(model_name),
     }, config, span_name="lead.summarize_messages", agent_role="lead")
     summary_model = configurable_model.with_config(summary_model_config)
-    response = await invoke_model_with_observability(
+    response = await invoke_model_with_retry_observability(
         summary_model,
         [HumanMessage(content=prompt)],
         config,
@@ -339,15 +339,15 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
         "model": configurable.research_model,
         "max_tokens": configurable.research_model_max_tokens,
         "api_key": get_api_key_for_model(configurable.research_model, config),
-        "tags": ["langsmith:nostream"]
+        "tags": ["langsmith:nostream"],
+        **get_model_compatibility_kwargs(configurable.research_model),
     }, config, span_name="lead.clarify_with_user", agent_role="lead")
     
-    # Configure model with structured output and retry logic
+    # Configure model with structured output (retry is handled by the
+    # observability retry wrapper at the call site).
     clarification_model = (
-        configurable_model
-        .with_structured_output(ClarifyWithUser)
-        .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
-        .with_config(model_config)
+        init_chat_model(**model_config)
+        .with_structured_output(ClarifyWithUser, method="function_calling")
     )
     
     # Step 3: Analyze whether clarification is needed
@@ -359,7 +359,7 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
         messages=message_history, 
         date=get_today_str()
     )
-    response = await invoke_model_with_observability(
+    response = await invoke_model_with_retry_observability(
         clarification_model,
         [HumanMessage(content=prompt_content)],
         config,
@@ -403,15 +403,15 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
         "model": configurable.research_model,
         "max_tokens": configurable.research_model_max_tokens,
         "api_key": get_api_key_for_model(configurable.research_model, config),
-        "tags": ["langsmith:nostream"]
+        "tags": ["langsmith:nostream"],
+        **get_model_compatibility_kwargs(configurable.research_model),
     }, config, span_name="lead.write_research_brief", agent_role="lead")
     
-    # Configure model for structured research question generation
+    # Configure model for structured research question generation (retry is
+    # handled by the observability retry wrapper at the call site).
     research_model = (
-        configurable_model
-        .with_structured_output(ResearchQuestion)
-        .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
-        .with_config(research_model_config)
+        init_chat_model(**research_model_config)
+        .with_structured_output(ResearchQuestion, method="function_calling")
     )
     
     # Step 2: Generate structured research brief from user messages
@@ -425,7 +425,7 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
         date=get_today_str()
     )
     prompt_content = f"{memory_context}\n\n{brief_prompt}" if memory_context else brief_prompt
-    response = await invoke_model_with_observability(
+    response = await invoke_model_with_retry_observability(
         research_model,
         [HumanMessage(content=prompt_content)],
         config,
@@ -488,7 +488,8 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
         "model": configurable.research_model,
         "max_tokens": configurable.research_model_max_tokens,
         "api_key": get_api_key_for_model(configurable.research_model, config),
-        "tags": ["langsmith:nostream"]
+        "tags": ["langsmith:nostream"],
+        **get_model_compatibility_kwargs(configurable.research_model),
     }, config, span_name="supervisor.model", agent_role="supervisor")
     
     # Available tools: conditional — async or sync. Built as StructuredTools via
@@ -496,22 +497,25 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
     # filtered to what this supervisor is permitted to bind *before* exposing
     # them to the model. Disallowed tool names/schemas are never shown; the
     # execution-time gate remains as a second line of defense.
-    sup_registry, _ = build_supervisor_tool_registry(state)
+    sup_registry = build_supervisor_tool_registry(state)
     lead_researcher_tools = filter_tools_by_permission(
         list(sup_registry.values()), AgentRole.SUPERVISOR, config,
     )
+    lead_researcher_tool_definitions = await tools_to_model_definitions(
+        lead_researcher_tools
+    )
 
-    # Configure model with tools, retry logic, and model settings
+    # Configure model with tools (retry is handled by the observability retry
+    # wrapper at the call site).
     research_model = (
         configurable_model
-        .bind_tools(lead_researcher_tools)
-        .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
+        .bind_tools(lead_researcher_tool_definitions)
         .with_config(research_model_config)
     )
 
     # Step 2: Generate supervisor response based on current context
     supervisor_messages = state.get("supervisor_messages", [])
-    response = await invoke_model_with_observability(
+    response = await invoke_model_with_retry_observability(
         research_model,
         supervisor_messages,
         config,
@@ -587,299 +591,347 @@ def _merge_task_update_context(
     return tool_messages
 
 
-def build_supervisor_tool_models(state: SupervisorState) -> list[Any]:
-    """Return the raw supervisor tool list (Pydantic models + think_tool) to bind.
-
-    Mirrors the conditional list in :func:`supervisor`: sync =
-    ConductResearch/ResearchComplete/think_tool; async = the five task management
-    tools plus ResearchComplete/think_tool. Returned in the same form ``bind_tools``
-    accepts (Pydantic models + the think_tool BaseTool).
-    """
-    if state.get("enable_async_research", False):
-        return [
-            StartResearchTask, CheckResearchTask, ListResearchTasks,
-            UpdateResearchTask, CancelResearchTask, ApproveResearchDomain,
-            ResearchComplete, think_tool,
-        ]
-    return [ConductResearch, ResearchComplete, think_tool]
+def _tool_call_payload(name: str, input: Any, context: ToolContext) -> dict[str, Any]:
+    """Translate validated input for legacy task handlers during migration."""
+    return {
+        "name": name,
+        "args": input.model_dump(),
+        "id": context.tool_call_id,
+    }
 
 
-def build_supervisor_tool_registry(state: SupervisorState) -> tuple[dict[str, BaseTool], dict[str, ToolOrigin]]:
-    """Build the supervisor's own tool registry (name -> BaseTool) and origin index.
-
-    Converts the supervisor's Pydantic tool models to ``StructuredTool`` via
-    ``structured_tool`` and tags them as system/non-retryable, so the governance
-    gate can validate names, origins, and arguments before the custom dispatch.
-    All supervisor tools are system-orchestration tools.
-    """
-    models = build_supervisor_tool_models(state)
-
-    registry: dict[str, BaseTool] = {}
-    for model in models:
-        # Pydantic models become StructuredTool; think_tool is already a BaseTool.
-        t = model if isinstance(model, BaseTool) else structured_tool(model)
-        tag_tool_origin(t, ToolOrigin.SYSTEM)
-        tag_tool_retryable(t, False)
-        registry[t.name] = t
-
-    origin_index = {name: ToolOrigin.SYSTEM for name in registry}
-    return registry, origin_index
+def _event_writer(configurable: Configuration, run_id: str) -> JSONLEventWriter | None:
+    """Create the optional per-invocation task event writer."""
+    if not configurable.event_log_enabled:
+        return None
+    return JSONLEventWriter(run_id=run_id, runs_dir=configurable.runs_dir)
 
 
-async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Command[Literal["supervisor", "__end__"]]:
-    """Execute tools called by the supervisor, including research delegation and strategic thinking.
-    
-    This function handles three types of supervisor tool calls:
-    1. think_tool - Strategic reflection that continues the conversation
-    2. ConductResearch - Delegates research tasks to sub-researchers
-    3. ResearchComplete - Signals completion of research phase
-    
-    Args:
-        state: Current supervisor state with messages and iteration count
-        config: Runtime configuration with research limits and model settings
-        
-    Returns:
-        Command to either continue supervision loop or end research phase
-    """
-    # Step 1: Extract current state.
+def build_supervisor_tools(state: SupervisorState) -> list[Tool]:
+    """Build fully executable supervisor tools with runtime dependencies injected."""
+
+    async def complete_call(input, context, on_progress=None):
+        del input, context, on_progress
+        return ToolResult(output="Research complete.")
+
+    complete_tool = build_tool(
+        name="ResearchComplete",
+        description=ResearchComplete.__doc__ or "Signal that research is complete.",
+        input_schema=ResearchComplete,
+        call=complete_call,
+        origin=ToolOrigin.SYSTEM,
+    )
+    reflection_tool = think_tool
+
+    if not state.get("enable_async_research", False):
+        async def conduct_call(input, context, on_progress=None):
+            del on_progress
+            observation = await researcher_runtime.ainvoke(
+                {
+                    "researcher_messages": [
+                        HumanMessage(content=input.research_topic)
+                    ],
+                    "research_topic": input.research_topic,
+                    "memory_context": state.get("memory_context"),
+                },
+                context.config,
+            )
+            return ToolResult(output=observation)
+
+        conduct_tool = build_tool(
+            name="ConductResearch",
+            description=ConductResearch.__doc__ or "Delegate a research topic.",
+            input_schema=ConductResearch,
+            call=conduct_call,
+            origin=ToolOrigin.SYSTEM,
+        )
+        return [conduct_tool, complete_tool, reflection_tool]
+
+    async def start_call(input, context, on_progress=None):
+        del on_progress
+        configurable = Configuration.from_runnable_config(context.config)
+        registry = get_task_registry()
+        run_id = context.config.get("metadata", {}).get("run_id", "default")
+        writer = _event_writer(configurable, run_id)
+        checkpoint = (
+            CheckpointManager(runs_dir=configurable.runs_dir, run_id=run_id)
+            if configurable.task_checkpoint_enabled
+            else None
+        )
+        try:
+            message = await handle_start_research_task(
+                _tool_call_payload("StartResearchTask", input, context),
+                context.config,
+                registry,
+                launch_task=lambda record, cfg: run_task_with_control(
+                    record,
+                    cfg,
+                    registry,
+                    researcher_runtime.ainvoke,
+                    checkpoint_manager=checkpoint,
+                    runs_dir=configurable.runs_dir,
+                    run_id=run_id,
+                    event_log_enabled=configurable.event_log_enabled,
+                ),
+                event_writer=writer,
+                memory_context=state.get("memory_context"),
+            )
+            return ToolResult(output=message.content)
+        finally:
+            if writer is not None:
+                writer.close()
+
+    async def check_call(input, context, on_progress=None):
+        del on_progress
+        configurable = Configuration.from_runnable_config(context.config)
+        registry = get_task_registry()
+        run_id = context.config.get("metadata", {}).get("run_id", "default")
+        writer = _event_writer(configurable, run_id)
+        try:
+            message = await handle_check_research_task(
+                _tool_call_payload("CheckResearchTask", input, context),
+                registry,
+                writer,
+                get_task_state_store(configurable),
+            )
+            return ToolResult(output=message.content)
+        finally:
+            if writer is not None:
+                writer.close()
+
+    async def list_call(input, context, on_progress=None):
+        del on_progress
+        configurable = Configuration.from_runnable_config(context.config)
+        run_id = context.config.get("metadata", {}).get("run_id", "default")
+        message = await handle_list_research_tasks(
+            _tool_call_payload("ListResearchTasks", input, context),
+            get_task_registry(),
+            run_id=run_id,
+            state_store=get_task_state_store(configurable),
+        )
+        return ToolResult(output=message.content)
+
+    async def update_call(input, context, on_progress=None):
+        del on_progress
+        configurable = Configuration.from_runnable_config(context.config)
+        run_id = context.config.get("metadata", {}).get("run_id", "default")
+        writer = _event_writer(configurable, run_id)
+        try:
+            message = await handle_update_research_task(
+                _tool_call_payload("UpdateResearchTask", input, context),
+                get_task_registry(),
+                writer,
+            )
+            return ToolResult(output=message.content)
+        finally:
+            if writer is not None:
+                writer.close()
+
+    async def cancel_call(input, context, on_progress=None):
+        del on_progress
+        configurable = Configuration.from_runnable_config(context.config)
+        run_id = context.config.get("metadata", {}).get("run_id", "default")
+        writer = _event_writer(configurable, run_id)
+        try:
+            message = await handle_cancel_research_task(
+                _tool_call_payload("CancelResearchTask", input, context),
+                get_task_registry(),
+                writer,
+                get_task_state_store(configurable),
+                configurable,
+            )
+            return ToolResult(output=message.content)
+        finally:
+            if writer is not None:
+                writer.close()
+
+    async def approve_call(input, context, on_progress=None):
+        del on_progress
+        configurable = Configuration.from_runnable_config(context.config)
+        run_id = context.config.get("metadata", {}).get("run_id", "default")
+        writer = _event_writer(configurable, run_id)
+        try:
+            message = await handle_approve_research_domain(
+                _tool_call_payload("ApproveResearchDomain", input, context),
+                context.config,
+                get_task_registry(),
+                writer,
+                get_task_state_store(configurable),
+            )
+            return ToolResult(output=message.content)
+        finally:
+            if writer is not None:
+                writer.close()
+
+    definitions = [
+        (StartResearchTask, start_call),
+        (CheckResearchTask, check_call),
+        (ListResearchTasks, list_call),
+        (UpdateResearchTask, update_call),
+        (CancelResearchTask, cancel_call),
+        (ApproveResearchDomain, approve_call),
+    ]
+    tools = [
+        build_tool(
+            name=model.__name__,
+            description=model.__doc__ or model.__name__,
+            input_schema=model,
+            call=call,
+            origin=ToolOrigin.SYSTEM,
+        )
+        for model, call in definitions
+    ]
+    return [*tools, complete_tool, reflection_tool]
+
+
+def build_supervisor_tool_registry(state: SupervisorState) -> dict[str, Tool]:
+    """Build the unique supervisor Tool registry."""
+    return build_tool_registry(build_supervisor_tools(state))
+
+
+async def _execute_supervisor_tools(
+    state: SupervisorState,
+    config: RunnableConfig,
+) -> Command[Literal["supervisor", "__end__"]]:
+    """Execute every supervisor request through the governed Tool.call pipeline."""
     configurable = Configuration.from_runnable_config(config)
     supervisor_messages = state.get("supervisor_messages", [])
-    research_iterations = state.get("research_iterations", 0)
     most_recent_message = supervisor_messages[-1]
+    tool_calls = most_recent_message.tool_calls
 
-    # Governance gate FIRST: validate permission (whitelist + origin + MCP auth)
-    # and arguments for every tool call BEFORE any exit decision or dispatch.
-    # This ensures ResearchComplete cannot bypass the supervisor whitelist to
-    # end research -- a denied ResearchComplete does not trigger exit. Denied
-    # calls are tracked by tool_call id (not name) so a same-name invalid call
-    # never drags a same-name valid call out of the active set.
-    sup_tools, sup_origin_index = build_supervisor_tool_registry(state)
-    allowed = resolve_allowed_tools(AgentRole.SUPERVISOR, config, set(sup_tools))
-    all_tool_messages: list[ToolMessage] = []
-    denied_ids: set[str] = set()
-    for tool_call in most_recent_message.tool_calls:
-        gate_err = gate_supervisor_tool_call(
-            tool_call, sup_tools, sup_origin_index, allowed, config,
+    if (
+        state.get("research_iterations", 0)
+        > configurable.max_researcher_iterations
+        or not tool_calls
+    ):
+        return Command(
+            goto=END,
+            update={
+                "notes": get_notes_from_tool_calls(supervisor_messages),
+                "research_brief": state.get("research_brief", ""),
+            },
         )
-        if gate_err is not None:
-            all_tool_messages.append(gate_err.to_tool_message(tool_call["id"]))
-            denied_ids.add(tool_call["id"])
-    active_tool_calls = [
-        tool_call for tool_call in most_recent_message.tool_calls
-        if tool_call["id"] not in denied_ids
-    ]
 
-    # Define exit criteria for research phase. ``research_complete_tool_call`` is
-    # only true when a ResearchComplete call *passed the gate* -- a denied
-    # ResearchComplete (e.g. excluded by the supervisor whitelist) must NOT end
-    # the research phase; it is reported as a structured error and the loop
-    # continues so the model can reconsider.
-    exceeded_allowed_iterations = research_iterations > configurable.max_researcher_iterations
-    no_tool_calls = not most_recent_message.tool_calls
-    research_complete_tool_call = any(
-        tool_call["name"] == "ResearchComplete"
-        for tool_call in active_tool_calls
+    registry = build_supervisor_tool_registry(state)
+    allowed = resolve_allowed_tools(
+        AgentRole.SUPERVISOR,
+        config,
+        set(registry),
     )
 
-    # Exit if any termination condition is met. (When exiting due to a gate-denied
-    # ResearchComplete that was the only call, no_tool_calls-over-active is false
-    # but research_complete_tool_call is also false, so we fall through to the
-    # continue-loop path and surface the denied error to the model.)
-    if exceeded_allowed_iterations or no_tool_calls or research_complete_tool_call:
-        update = {
+    conduct_calls = [call for call in tool_calls if call["name"] == "ConductResearch"]
+    runnable_conduct_ids = {
+        call["id"]
+        for call in conduct_calls[: configurable.max_concurrent_research_units]
+    }
+    overflow_conduct = conduct_calls[configurable.max_concurrent_research_units :]
+    ordinary_calls = [
+        call
+        for call in tool_calls
+        if call["name"] != "ConductResearch" or call["id"] in runnable_conduct_ids
+    ]
+
+    async def execute_one(tool_call: dict[str, Any]):
+        return await observe_tool_call(
+            tool_call,
+            AgentRole.SUPERVISOR.value,
+            config,
+            lambda: execute_governed_tool_call(
+                tool_call,
+                registry,
+                AgentRole.SUPERVISOR,
+                config,
+                allowed_tools=allowed,
+                apply_retry=True,
+                max_retries=configurable.max_tool_retries,
+                base_delay=configurable.tool_retry_base_delay,
+                max_delay=configurable.tool_retry_max_delay,
+            ),
+        )
+
+    if state.get("enable_async_research", False):
+        outcomes = []
+        for tool_call in ordinary_calls:
+            outcomes.append(await execute_one(tool_call))
+    else:
+        non_conduct = [
+            call for call in ordinary_calls if call["name"] != "ConductResearch"
+        ]
+        conduct = [
+            call for call in ordinary_calls if call["name"] == "ConductResearch"
+        ]
+        outcomes = []
+        for tool_call in non_conduct:
+            outcomes.append(await execute_one(tool_call))
+        outcomes.extend(await asyncio.gather(*(execute_one(call) for call in conduct)))
+
+    tool_messages = [outcome.message for outcome in outcomes]
+    for overflow in overflow_conduct:
+        tool_messages.append(
+            ToolMessage(
+                content=(
+                    "Error: Did not run this research because the maximum number "
+                    "of concurrent research units was exceeded. Retry with "
+                    f"{configurable.max_concurrent_research_units} or fewer units."
+                ),
+                name="ConductResearch",
+                tool_call_id=overflow["id"],
+            )
+        )
+
+    outcomes_by_id = {
+        outcome.message.tool_call_id: outcome
+        for outcome in outcomes
+    }
+    successful_complete = any(
+        call["name"] == "ResearchComplete"
+        and outcomes_by_id[call["id"]].error is None
+        for call in ordinary_calls
+    )
+    if successful_complete:
+        update: dict[str, Any] = {
             "notes": get_notes_from_tool_calls(supervisor_messages),
             "research_brief": state.get("research_brief", ""),
         }
-        # In async mode, collect completed task outputs for the final report
-        if research_complete_tool_call and state.get("enable_async_research", False):
-            registry = get_task_registry()
+        if state.get("enable_async_research", False):
             run_id = config.get("metadata", {}).get("run_id", "default")
-            state_store = get_task_state_store(configurable)
             update["completed_task_outputs"] = await collect_completed_task_outputs(
-                registry, run_id=run_id, state_store=state_store,
+                get_task_registry(),
+                run_id=run_id,
+                state_store=get_task_state_store(configurable),
             )
         return Command(goto=END, update=update)
 
-    # Step 2: Process all (gate-passing) tool calls together.
-    update_payload = {"supervisor_messages": all_tool_messages}
+    raw_notes: list[str] = []
+    for call in ordinary_calls:
+        outcome = outcomes_by_id[call["id"]]
+        if call["name"] != "ConductResearch" or outcome.result is None:
+            continue
+        observation = outcome.result.output
+        if isinstance(observation, dict):
+            notes = observation.get("raw_notes", [])
+            if notes:
+                raw_notes.extend(str(note) for note in notes)
 
-    # Handle think_tool calls (strategic reflection)
-    think_tool_calls = [
-        tool_call for tool_call in active_tool_calls
-        if tool_call["name"] == "think_tool"
-    ]
-
-    for tool_call in think_tool_calls:
-        reflection_content = tool_call["args"]["reflection"]
-        all_tool_messages.append(ToolMessage(
-            content=f"Reflection recorded: {reflection_content}",
-            name="think_tool",
-            tool_call_id=tool_call["id"]
-        ))
-
-    # === Async SubAgent dispatch (when enable_async_research is True) ==========
-    if state.get("enable_async_research", False):
-        # Set up event writer and registry
-        registry = get_task_registry()
+    if state.get("enable_async_research", False) and tool_messages:
         run_id = config.get("metadata", {}).get("run_id", "default")
-        state_store = get_task_state_store(configurable)
-        event_writer = None
-        if configurable.event_log_enabled:
-            event_writer = JSONLEventWriter(run_id=run_id, runs_dir=configurable.runs_dir)
+        update_context = await _collect_task_update_context(configurable, run_id)
+        tool_messages = _merge_task_update_context(
+            tool_messages,
+            update_context,
+            tool_calls[0],
+        )
 
-        # Route each tool call to its handler
-        for tool_call in active_tool_calls:
-            name = tool_call["name"]
-            try:
-                if name == "StartResearchTask":
-                    checkpoint_mgr = CheckpointManager(
-                        runs_dir=configurable.runs_dir, run_id=run_id,
-                    ) if configurable.task_checkpoint_enabled else None
-                    msg = await handle_start_research_task(
-                        tool_call, config, registry,
-                        launch_task=lambda record, cfg: run_task_with_control(
-                            record, cfg, registry,
-                            researcher_runtime.ainvoke,
-                            checkpoint_manager=checkpoint_mgr,
-                            runs_dir=configurable.runs_dir,
-                            run_id=run_id,
-                            event_log_enabled=configurable.event_log_enabled,
-                        ),
-                        event_writer=event_writer,
-                        memory_context=state.get("memory_context"),
-                    )
-                elif name == "CheckResearchTask":
-                    msg = await handle_check_research_task(
-                        tool_call, registry, event_writer, state_store
-                    )
-                elif name == "ListResearchTasks":
-                    msg = await handle_list_research_tasks(
-                        tool_call, registry, run_id=run_id, state_store=state_store
-                    )
-                elif name == "UpdateResearchTask":
-                    msg = await handle_update_research_task(tool_call, registry, event_writer)
-                elif name == "CancelResearchTask":
-                    msg = await handle_cancel_research_task(
-                        tool_call,
-                        registry,
-                        event_writer,
-                        state_store,
-                        configurable,
-                    )
-                elif name == "ApproveResearchDomain":
-                    msg = await handle_approve_research_domain(
-                        tool_call, config, registry, event_writer, state_store
-                    )
-                else:
-                    continue  # think_tool and ResearchComplete handled separately
-                all_tool_messages.append(msg)
-            except Exception as exc:
-                # Wrap handler failures in a structured ToolError so the model sees
-                # a consistent, machine-readable failure shape.
-                all_tool_messages.append(
-                    ToolError(
-                        error_type=ToolErrorType.unknown,
-                        tool_name=name,
-                        message=f"Error handling {name}: {exc}",
-                    ).to_tool_message(tool_call["id"])
-                )
+    update_payload: dict[str, Any] = {"supervisor_messages": tool_messages}
+    if raw_notes:
+        update_payload["raw_notes"] = ["\n".join(raw_notes)]
+    return Command(goto="supervisor", update=update_payload)
 
-        if event_writer is not None:
-            event_writer.close()
 
-        if all_tool_messages and most_recent_message.tool_calls:
-            update_context = await _collect_task_update_context(configurable, run_id)
-            all_tool_messages = _merge_task_update_context(
-                all_tool_messages,
-                update_context,
-                most_recent_message.tool_calls[0],
-            )
+async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Command[Literal["supervisor", "__end__"]]:
+    """Execute supervisor calls through the unified Tool runtime."""
+    return await _execute_supervisor_tools(state, config)
 
-        # Fall through to step 3 (skip sync ConductResearch handling)
-        update_payload["supervisor_messages"] = all_tool_messages
-        return Command(goto="supervisor", update=update_payload)
-
-    # === Sync ConductResearch dispatch (original behaviour) ====================
-    # Handle ConductResearch calls (research delegation) -- only over calls that
-    # passed the governance gate (active_tool_calls).
-    conduct_research_calls = [
-        tool_call for tool_call in active_tool_calls
-        if tool_call["name"] == "ConductResearch"
-    ]
-
-    if conduct_research_calls:
-        try:
-            # Limit concurrent research units to prevent resource exhaustion
-            allowed_conduct_research_calls = conduct_research_calls[:configurable.max_concurrent_research_units]
-            overflow_conduct_research_calls = conduct_research_calls[configurable.max_concurrent_research_units:]
-
-            # Execute research tasks in parallel
-            sync_memory_ctx = state.get("memory_context")
-
-            async def _run_conduct_research(tool_call: dict[str, Any]) -> dict[str, Any]:
-                return await observe_tool_call(
-                    tool_call,
-                    AgentRole.SUPERVISOR.value,
-                    config,
-                    lambda: researcher_runtime.ainvoke({
-                        "researcher_messages": [
-                            HumanMessage(content=tool_call["args"]["research_topic"])
-                        ],
-                        "research_topic": tool_call["args"]["research_topic"],
-                        "memory_context": sync_memory_ctx,
-                    }, config),
-                )
-
-            research_tasks = [
-                _run_conduct_research(tool_call)
-                for tool_call in allowed_conduct_research_calls
-            ]
-
-            tool_results = await asyncio.gather(*research_tasks)
-
-            # Create tool messages with research results
-            for observation, tool_call in zip(tool_results, allowed_conduct_research_calls):
-                all_tool_messages.append(ToolMessage(
-                    content=observation.get("compressed_research", "Error synthesizing research report: Maximum retries exceeded"),
-                    name=tool_call["name"],
-                    tool_call_id=tool_call["id"]
-                ))
-
-            # Handle overflow research calls with error messages
-            for overflow_call in overflow_conduct_research_calls:
-                all_tool_messages.append(ToolMessage(
-                    content=f"Error: Did not run this research as you have already exceeded the maximum number of concurrent research units. Please try again with {configurable.max_concurrent_research_units} or fewer research units.",
-                    name="ConductResearch",
-                    tool_call_id=overflow_call["id"]
-                ))
-
-            # Aggregate raw notes from all research results
-            raw_notes_concat = "\n".join([
-                "\n".join(observation.get("raw_notes", []))
-                for observation in tool_results
-            ])
-
-            if raw_notes_concat:
-                update_payload["raw_notes"] = [raw_notes_concat]
-
-        except Exception as e:
-            # Handle research execution errors
-            if is_token_limit_exceeded(e, configurable.research_model) or True:
-                # Token limit exceeded or other error - end research phase
-                return Command(
-                    goto=END,
-                    update={
-                        "notes": get_notes_from_tool_calls(supervisor_messages),
-                        "research_brief": state.get("research_brief", "")
-                    }
-                )
-    
-    # Step 3: Return command with all tool results
-    update_payload["supervisor_messages"] = all_tool_messages
-    return Command(
-        goto="supervisor",
-        update=update_payload
-    ) 
 
 async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[Literal["researcher_tools"]]:
     """Individual researcher that conducts focused research on specific topics.
@@ -917,7 +969,8 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
         "model": configurable.research_model,
         "max_tokens": configurable.research_model_max_tokens,
         "api_key": get_api_key_for_model(configurable.research_model, config),
-        "tags": ["langsmith:nostream"]
+        "tags": ["langsmith:nostream"],
+        **get_model_compatibility_kwargs(configurable.research_model),
     }, config, span_name="researcher.model", agent_role="researcher")
     
     # Prepare system prompt with MCP context if available
@@ -925,6 +978,9 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
     tool_prompt_parts = [configurable.mcp_prompt or ""]
     if configurable.browser_mcp_enabled and configurable.browser_mcp_prompt:
         tool_prompt_parts.append(configurable.browser_mcp_prompt)
+    skill_researcher_context = get_skill_researcher_context(configurable.skills)
+    if skill_researcher_context:
+        tool_prompt_parts.append(skill_researcher_context)
     tool_prompt = "\n\n".join(part for part in tool_prompt_parts if part)
 
     base_prompt = research_system_prompt.format(
@@ -933,17 +989,18 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
     )
     researcher_prompt = f"{memory_context}\n\n{base_prompt}" if memory_context else base_prompt
     
-    # Configure model with tools, retry logic, and settings
+    # Configure model with tools (retry is handled by the observability retry
+    # wrapper at the call site).
+    model_tool_definitions = await tools_to_model_definitions(tools)
     research_model = (
         configurable_model
-        .bind_tools(tools)
-        .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
+        .bind_tools(model_tool_definitions)
         .with_config(research_model_config)
     )
     
     # Step 3: Generate researcher response with system context
     messages = [SystemMessage(content=researcher_prompt)] + researcher_messages
-    response = await invoke_model_with_observability(
+    response = await invoke_model_with_retry_observability(
         research_model,
         messages,
         config,
@@ -983,25 +1040,17 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
     researcher_messages = state.get("researcher_messages", [])
     most_recent_message = researcher_messages[-1]
     
-    # Early exit if no tool calls were made (including native web search)
-    has_tool_calls = bool(most_recent_message.tool_calls)
-    has_native_search = (
-        openai_websearch_called(most_recent_message) or 
-        anthropic_websearch_called(most_recent_message)
-    )
-    
-    if not has_tool_calls and not has_native_search:
+    # Early exit if no tool calls were made. All search backends (Tavily, OpenAI,
+    # Anthropic) are now explicit StructuredTools the model emits as tool_calls,
+    # so the prior server-side-native-search detection is no longer needed.
+    if not most_recent_message.tool_calls:
         return Command(goto="compress_research")
     
     # Step 2: Handle other tool calls (search, MCP tools, etc.)
     # Tools are assembled with origin tags (see utils.get_all_tools); build the
     # name->tool map and a parallel origin index for provider-native search dicts.
     tools = await get_all_tools(config)
-    tools_by_name = {
-        (t.name if isinstance(t, BaseTool) else t.get("name", "web_search")): t
-        for t in tools
-    }
-    origin_index = build_origin_index(tools)
+    tools_by_name = build_tool_registry(tools)
     allowed = resolve_allowed_tools(AgentRole.RESEARCHER, config, set(tools_by_name))
 
     # Execute all tool calls in parallel under the governance layer. Each call
@@ -1009,7 +1058,9 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
     # raises, so one failing tool cannot abort the gather. Retry with exponential
     # backoff is applied for retryable errors (network/timeout/429/503).
     tool_calls = most_recent_message.tool_calls
-    async def _execute_researcher_tool(tool_call: dict[str, Any]) -> ToolMessage:
+    async def _execute_researcher_tool(
+        tool_call: dict[str, Any],
+    ) -> GovernedToolCallResult:
         return await observe_tool_call(
             tool_call,
             AgentRole.RESEARCHER.value,
@@ -1020,7 +1071,6 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
                 AgentRole.RESEARCHER,
                 config,
                 allowed_tools=allowed,
-                origin_index=origin_index,
                 apply_retry=True,
                 max_retries=configurable.max_tool_retries,
                 base_delay=configurable.tool_retry_base_delay,
@@ -1032,7 +1082,8 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
         _execute_researcher_tool(tool_call)
         for tool_call in tool_calls
     ]
-    tool_outputs = await asyncio.gather(*tool_execution_tasks)
+    tool_outcomes = await asyncio.gather(*tool_execution_tasks)
+    tool_outputs = [outcome.message for outcome in tool_outcomes]
 
     # Step 3: Check late exit conditions (after processing tools)
     exceeded_iterations = state.get("tool_call_iterations", 0) >= configurable.max_react_tool_calls
@@ -1074,7 +1125,8 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
         "model": configurable.compression_model,
         "max_tokens": configurable.compression_model_max_tokens,
         "api_key": get_api_key_for_model(configurable.compression_model, config),
-        "tags": ["langsmith:nostream"]
+        "tags": ["langsmith:nostream"],
+        **get_model_compatibility_kwargs(configurable.compression_model),
     }, config, span_name="researcher.compress", agent_role="researcher")
     synthesizer_model = configurable_model.with_config(compression_model_config)
     
@@ -1095,7 +1147,7 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
             messages = [SystemMessage(content=compression_prompt)] + researcher_messages
             
             # Execute compression
-            response = await invoke_model_with_observability(
+            response = await invoke_model_with_retry_observability(
                 synthesizer_model,
                 messages,
                 config,
@@ -1139,132 +1191,29 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
     }
 
 async def final_report_generation(state: AgentState, config: RunnableConfig):
-    """Generate the final comprehensive research report with retry logic for token limits.
-    
-    This function takes all collected research findings and synthesizes them into a 
-    well-structured, comprehensive final report using the configured report generation model.
-    
-    Args:
-        state: Agent state containing research findings and context
-        config: Runtime configuration with model settings and API keys
-        
-    Returns:
-        Dictionary containing the final report and cleared state
-    """
-    # Step 1: Extract research findings and prepare state cleanup
-    notes = state.get("notes", [])
-    cleared_state = {
-        "notes": {"type": "override", "value": []},
-        "completed_task_outputs": {"type": "override", "value": []},
-    }
+    """Generate the final research report.
 
-    # In async mode, also include completed task outputs
-    task_outputs = state.get("completed_task_outputs", [])
-    if task_outputs:
-        task_findings = "\n\n".join(
-            f"## Research Task: {op.get('research_topic', 'Unknown')}\n\n{op.get('compressed_research', '')}"
-            for op in task_outputs if op.get("compressed_research")
-        )
-        supervisor_notes = "\n".join(notes)
-        findings = f"{supervisor_notes}\n\n{task_findings}" if supervisor_notes else task_findings
-    else:
-        findings = "\n".join(notes)
-    
-    # Step 2: Configure the final report generation model
-    configurable = Configuration.from_runnable_config(config)
-    writer_model_config = {
-        "model": configurable.final_report_model,
-        "max_tokens": configurable.final_report_model_max_tokens,
-        "api_key": get_api_key_for_model(configurable.final_report_model, config),
-        "tags": ["langsmith:nostream"]
-    }
-    
-    # Step 3: Attempt report generation with token limit retry logic
-    max_retries = 3
-    current_retry = 0
-    findings_token_limit = None
-    
-    while current_retry <= max_retries:
-        try:
-            # Create comprehensive prompt with all research context
-            final_report_prompt = final_report_generation_prompt.format(
-                research_brief=state.get("research_brief", ""),
-                messages=(
-                    f"{_format_conversation_summary(state.get('conversation_summary'))}\n\n"
-                    f"{get_buffer_string(state.get('messages', []))}"
-                    if state.get("conversation_summary")
-                    else get_buffer_string(state.get("messages", []))
-                ),
-                findings=findings,
-                date=get_today_str()
-            )
-            # Prepend memory context if available
-            memory_context = state.get("memory_context") or ""
-            if memory_context:
-                final_report_prompt = f"{memory_context}\n\n{final_report_prompt}"
-            
-            # Generate the final report
-            writer_model = configurable_model.with_config(
-                apply_helicone_config(
-                    writer_model_config,
-                    config,
-                    span_name="lead.final_report",
-                    agent_role="lead",
-                )
-            )
-            final_report = await invoke_model_with_observability(
-                writer_model,
-                [HumanMessage(content=final_report_prompt)],
-                config,
-                span_name="lead.final_report",
-                agent_role="lead",
-                model_name=configurable.final_report_model,
-            )
-            
-            # Return successful report generation
-            return {
-                "final_report": final_report.content, 
-                "messages": [final_report],
-                **cleared_state
-            }
-            
-        except Exception as e:
-            # Handle token limit exceeded errors with progressive truncation
-            if is_token_limit_exceeded(e, configurable.final_report_model):
-                current_retry += 1
-                
-                if current_retry == 1:
-                    # First retry: determine initial truncation limit
-                    model_token_limit = get_model_token_limit(configurable.final_report_model)
-                    if not model_token_limit:
-                        return {
-                            "final_report": f"Error generating final report: Token limit exceeded, however, we could not determine the model's maximum context length. Please update the model map in deep_researcher/utils.py with this information. {e}",
-                            "messages": [AIMessage(content="Report generation failed due to token limits")],
-                            **cleared_state
-                        }
-                    # Use 4x token limit as character approximation for truncation
-                    findings_token_limit = model_token_limit * 4
-                else:
-                    # Subsequent retries: reduce by 10% each time
-                    findings_token_limit = int(findings_token_limit * 0.9)
-                
-                # Truncate findings and retry
-                findings = findings[:findings_token_limit]
-                continue
-            else:
-                # Non-token-limit error: return error immediately
-                return {
-                    "final_report": f"Error generating final report: {e}",
-                    "messages": [AIMessage(content="Report generation failed due to an error")],
-                    **cleared_state
-                }
-    
-    # Step 4: Return failure result if all retries exhausted
-    return {
-        "final_report": "Error generating final report: Maximum retries exceeded",
-        "messages": [AIMessage(content="Report generation failed after maximum retries")],
-        **cleared_state
-    }
+    Delegates to the registry-based report product system
+    (``open_deep_research.report.build_report``). The ``default`` report type
+    reproduces the original single-call synthesis byte-for-byte; other report
+    types and output formats are opt-in via ``Configuration``. On failure,
+    returns an error string in ``final_report`` rather than raising, preserving
+    the original error contract.
+    """
+    from open_deep_research.report import build_report
+
+    try:
+        return await build_report(state, config)
+    except Exception as e:
+        cleared_state = {
+            "notes": {"type": "override", "value": []},
+            "completed_task_outputs": {"type": "override", "value": []},
+        }
+        return {
+            "final_report": f"Error generating final report: {e}",
+            "messages": [AIMessage(content="Report generation failed due to an error")],
+            **cleared_state,
+        }
 
 
 async def memory_extract_and_write(
