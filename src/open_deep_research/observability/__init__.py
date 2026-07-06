@@ -9,6 +9,7 @@ from open_deep_research.observability.core import (
     current_span_ids,
     get_trace_recorder,
     invoke_model_with_observability,
+    invoke_model_with_retry_observability,
     observe_tool_call,
 )
 
@@ -21,5 +22,6 @@ __all__ = [
     "current_span_ids",
     "get_trace_recorder",
     "invoke_model_with_observability",
+    "invoke_model_with_retry_observability",
     "observe_tool_call",
 ]
