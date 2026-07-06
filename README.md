@@ -79,6 +79,23 @@ Open Deep Research supports a wide range of search tools. By default it uses the
 
 See the fields in the [configuration.py](https://github.com/langchain-ai/open_deep_research/blob/main/src/open_deep_research/configuration.py) for various other settings to customize the behavior of Open Deep Research. 
 
+#### Observability
+
+The handwritten runtime uses `TraceRecorder` as its primary instrumentation boundary. It can keep the local SQLite trace store while also mirroring detailed runs, agent/tool spans, prompts, outputs, token usage, and inferred model cost to Langfuse. Low-cardinality counters and histograms are exposed for Prometheus/Grafana.
+
+```env
+LANGFUSE_ENABLED=true
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_BASE_URL=https://cloud.langfuse.com
+LANGFUSE_ENVIRONMENT=production
+
+PROMETHEUS_ENABLED=true
+PROMETHEUS_METRICS_PATH=/metrics
+```
+
+Prometheus should scrape `GET /metrics`. The exported series cover run and LLM/tool latency, request counts, input/output tokens, retries, and rate limits. Run IDs, trace IDs, and user IDs remain in Langfuse and are deliberately not used as Prometheus labels. Set `LANGFUSE_LANGCHAIN_CALLBACK_ENABLED=true` only when additional LangChain callback-level detail is needed; direct `TraceRecorder` instrumentation remains authoritative.
+
 ### 📊 Evaluation
 
 Open Deep Research is configured for evaluation with [Deep Research Bench](https://huggingface.co/spaces/Ayanami0730/DeepResearch-Leaderboard). This benchmark has 100 PhD-level research tasks (50 English, 50 Chinese), crafted by domain experts across 22 fields (e.g., Science & Tech, Business & Finance) to mirror real-world deep-research needs. It has 2 evaluation metrics, but the leaderboard is based on the RACE score. This uses LLM-as-a-judge (Gemini) to evaluate research reports against a golden set of reports compiled by experts across a set of metrics.
