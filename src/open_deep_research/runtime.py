@@ -19,7 +19,6 @@ END = "__end__"
 REMOVE_ALL_MESSAGES = "__remove_all__"
 GotoT = TypeVar("GotoT")
 
-
 @dataclass
 class RuntimeCommand(Generic[GotoT]):
     """A tiny command object used by the hand-written runtime.
@@ -34,7 +33,6 @@ class RuntimeCommand(Generic[GotoT]):
     def __class_getitem__(cls, _item: Any) -> type[RuntimeCommand]:
         """Allow legacy annotations such as ``Command[Literal[...]]``."""
         return cls
-
 
 def message_from_dict(message: Mapping[str, Any]) -> BaseMessage:
     """Convert an API-style message dict into a LangChain message."""
@@ -54,7 +52,6 @@ def message_from_dict(message: Mapping[str, Any]) -> BaseMessage:
         )
     raise ValueError(f"Unsupported message role: {role!r}")
 
-
 def normalize_messages(messages: list[Any]) -> list[Any]:
     """Normalize API dictionaries while preserving existing message objects."""
     normalized: list[Any] = []
@@ -66,7 +63,6 @@ def normalize_messages(messages: list[Any]) -> list[Any]:
         else:
             normalized.append(message)
     return normalized
-
 
 def _merge_sequence(current: Any, new_value: Any) -> list[Any]:
     base = list(current or [])
@@ -83,7 +79,6 @@ def _merge_sequence(current: Any, new_value: Any) -> list[Any]:
         base = []
     return base + normalize_messages(values)
 
-
 def _merge_reducer_value(current: Any, new_value: Any) -> Any:
     if isinstance(new_value, dict) and new_value.get("type") == "override":
         return new_value.get("value")
@@ -91,15 +86,14 @@ def _merge_reducer_value(current: Any, new_value: Any) -> Any:
         return list(current or []) + list(new_value or [])
     return new_value
 
-
 MESSAGE_KEYS = {"messages", "supervisor_messages", "researcher_messages"}
 REDUCER_KEYS = {
     "raw_notes",
     "notes",
     "completed_task_outputs",
     "memory_candidates",
+    "human_feedback",
 }
-
 
 def apply_update_to_state(state: dict[str, Any], update: Mapping[str, Any] | None) -> dict[str, Any]:
     """Apply a node update using the reducer semantics the graph used to own."""
@@ -107,7 +101,10 @@ def apply_update_to_state(state: dict[str, Any], update: Mapping[str, Any] | Non
         return state
     for key, value in update.items():
         if key in MESSAGE_KEYS:
-            state[key] = _merge_sequence(state.get(key), value)
+            if isinstance(value, dict) and value.get("type") == "override":
+                state[key] = normalize_messages(list(value.get("value") or []))
+            else:
+                state[key] = _merge_sequence(state.get(key), value)
         elif key in REDUCER_KEYS:
             state[key] = _merge_reducer_value(state.get(key), value)
         else:
@@ -116,7 +113,6 @@ def apply_update_to_state(state: dict[str, Any], update: Mapping[str, Any] | Non
             else:
                 state[key] = value
     return state
-
 
 def coerce_command(result: Any, default_goto: str = END) -> RuntimeCommand:
     """Normalize plain dict node outputs and command outputs."""

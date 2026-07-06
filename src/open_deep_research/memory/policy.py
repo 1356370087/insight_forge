@@ -17,8 +17,9 @@ from pydantic import BaseModel, Field
 from open_deep_research.memory.store import MemoryCandidate, MemoryCategory
 from open_deep_research.observability import (
     apply_helicone_config,
-    invoke_model_with_observability,
+    invoke_model_with_retry_observability,
 )
+from open_deep_research.configuration import get_model_compatibility_kwargs
 from open_deep_research.tools.utils import get_api_key_for_model, get_today_str
 
 # ---------------------------------------------------------------------------
@@ -238,23 +239,24 @@ async def extract_memory_candidates(
     api_key = get_api_key_for_model(research_model, config) if config else None
     structured_model = (
         model
-        .with_structured_output(MemoryExtractionResult)
-        .with_retry(stop_after_attempt=max_structured_output_retries)
+        .with_structured_output(MemoryExtractionResult, method="function_calling")
         .with_config(apply_helicone_config({
             "model": research_model,
             "max_tokens": research_model_max_tokens,
             "api_key": api_key,
             "tags": ["langsmith:nostream"],
+            **get_model_compatibility_kwargs(research_model),
         }, config, span_name="lead.memory_extract", agent_role="lead"))
     )
 
-    response: MemoryExtractionResult = await invoke_model_with_observability(
+    response: MemoryExtractionResult = await invoke_model_with_retry_observability(
         structured_model,
         [HumanMessage(content=prompt)],
         config,
         span_name="lead.memory_extract",
         agent_role="lead",
         model_name=research_model,
+        max_attempts=max_structured_output_retries,
     )
 
     return filter_candidates(response.candidates, min_confidence)

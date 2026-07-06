@@ -417,3 +417,195 @@ Remember, your goal is to create a summary that can be easily understood and uti
 
 Today's date is {date}.
 """
+
+
+# ---------------------------------------------------------------------------
+# Report-type (genre) prompt templates.
+#
+# Each genre reuses the SAME four placeholders as ``final_report_generation_prompt``
+# ({research_brief}, {messages}, {findings}, {date}) so the report profile
+# registry can dispatch them generically via ``.format(...)``. Shared
+# instruction blocks are composed in at module load (``_compose``) to stay DRY;
+# the resulting constants contain only the four standard placeholders.
+# ---------------------------------------------------------------------------
+
+_LANGUAGE_RULES = """CRITICAL: Make sure the answer is written in the same language as the human messages!
+For example, if the user's messages are in English, then MAKE SURE you write your response in English. If the user's messages are in Chinese, then MAKE SURE you write your entire response in Chinese.
+This is critical. The user will only understand the answer if it is written in the same language as their input message.
+"""
+
+_CITATION_RULES = """<Citation Rules>
+- Assign each unique URL a single citation number in your text
+- End with ### Sources that lists each source with corresponding numbers
+- IMPORTANT: Number sources sequentially without gaps (1,2,3,4...) in the final list regardless of which sources you choose
+- Each source should be a separate line item in a list, so that in markdown it is rendered as a list.
+- Example format:
+  [1] Source Title: URL
+  [2] Source Title: URL
+- Citations are extremely important. Make sure to include these, and pay a lot of attention to getting them right. Users will often use these citations to look into more information.
+</Citation Rules>
+"""
+
+_FINDINGS_BLOCK = """Here are the findings from the research that you conducted:
+<Findings>
+{findings}
+</Findings>
+"""
+
+
+def _compose(body: str) -> str:
+    """Substitute shared instruction blocks into a genre prompt body.
+
+    Leaves the four standard placeholders ({research_brief}, {messages},
+    {findings}, {date}) intact for the downstream ``.format(...)`` call.
+    """
+    return (
+        body.replace("{_language_rules}", _LANGUAGE_RULES)
+        .replace("{_citation_rules}", _CITATION_RULES)
+        .replace("{findings_block}", _FINDINGS_BLOCK)
+    )
+
+
+executive_summary_prompt = _compose(
+    """Based on all the research conducted, write a concise EXECUTIVE SUMMARY for a decision-maker who has limited time.
+<Research Brief>
+{research_brief}
+</Research Brief>
+
+For more context, here is the conversation so far. Focus on the research brief above, but consider these messages as well for more context.
+<Messages>
+{messages}
+</Messages>
+{_language_rules}
+Today's date is {date}.
+
+{findings_block}
+
+Write a tight, high-signal executive summary that:
+1. Opens with a 2-3 sentence TL;DR answering the research brief directly.
+2. Lists 3-6 key findings as concise bullet points, each with the single most important supporting fact.
+3. Closes with a clear recommendation or bottom line.
+
+Keep it short and skimmable with no long prose. Use ## headings for "TL;DR", "Key Findings", and "Recommendation".
+
+{_citation_rules}
+"""
+)
+
+decision_brief_prompt = _compose(
+    """Based on all the research conducted, write a DECISION BRIEF that helps the reader make a specific choice.
+<Research Brief>
+{research_brief}
+</Research Brief>
+
+For more context, here is the conversation so far. Focus on the research brief above, but consider these messages as well for more context.
+<Messages>
+{messages}
+</Messages>
+{_language_rules}
+Today's date is {date}.
+
+{findings_block}
+
+Structure the brief with exactly these ## sections, in order:
+1. ## Recommendation - state the recommended decision in 1-2 sentences.
+2. ## Rationale - the evidence-based reasoning, in 1-2 short paragraphs.
+3. ## Alternatives Considered - the next-best options and why they were not chosen.
+4. ## Risks - key risks, uncertainties, and mitigations.
+5. ## Next Actions - concrete next steps.
+
+Be specific and cite evidence. Avoid hedging filler.
+
+{_citation_rules}
+"""
+)
+
+faq_prompt = _compose(
+    """Based on all the research conducted, write a structured FAQ (Frequently Asked Questions) document answering the research brief.
+<Research Brief>
+{research_brief}
+</Research Brief>
+
+For more context, here is the conversation so far. Focus on the research brief above, but consider these messages as well for more context.
+<Messages>
+{messages}
+</Messages>
+{_language_rules}
+Today's date is {date}.
+
+{findings_block}
+
+Produce a FAQ document:
+- Start with a one-line # title.
+- Then list 4-8 questions, each as a ## "Q: <question>" heading followed by a 1-3 sentence "A:" answer grounded in the findings.
+- Anticipate the most useful questions a reader would ask about this topic.
+
+Keep answers specific and factual.
+
+{_citation_rules}
+"""
+)
+
+
+# ---------------------------------------------------------------------------
+# Sectioned-assembly prompt templates (used by SectionedStrategy).
+#
+# These have their OWN placeholders (not the 4 standard ones) because they drive
+# distinct LLM calls: outline planning, per-section writing, and intro/conclusion
+# writing. They are NOT composed with the shared blocks.
+# ---------------------------------------------------------------------------
+
+report_outline_planner_prompt = """You are planning the structure of a research report. Given the research brief and a preview of the research findings, decide on a clear, cohesive set of sections.
+
+<Research Brief>
+{research_brief}
+</Research Brief>
+
+<Findings Preview>
+{findings_preview}
+</Findings Preview>
+
+Today's date is {date}.
+
+{section_skeleton}
+
+Produce a report title and 3-6 sections. Each section needs a concise name and a one-sentence description of what it covers. Do NOT write the section content — only the plan. Write the title and section names in the same language as the research brief.
+"""
+
+section_writer_prompt = """You are writing ONE section of a research report. Write only this section, in depth, grounded strictly in the provided research context.
+
+<Topic>
+{topic}
+</Topic>
+
+<Section to Write>
+{section_name}: {section_description}
+</Section to Write>
+
+Today's date is {date}.
+
+<Research Context>
+{context}
+</Research Context>
+
+Requirements:
+- Write 2-4 paragraphs of substantive, specific content for THIS section only.
+- Do not repeat the section heading; start with the content directly.
+- Cite sources inline as [Title](URL) when you use a specific fact.
+- Write in the same language as the topic.
+"""
+
+final_section_writer_prompt = """You are writing the {section_type} of a research report, given the sections already written. Keep it short (1-2 paragraphs).
+
+<Topic>
+{topic}
+</Topic>
+
+Today's date is {date}.
+
+<Written Sections>
+{context}
+</Written Sections>
+
+Write only the {section_type} — no heading, no meta-commentary. Write in the same language as the topic.
+"""

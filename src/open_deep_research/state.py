@@ -46,7 +46,6 @@ class ResearchQuestion(BaseModel):
         description="A research question that will be used to guide the research.",
     )
 
-
 ###################
 # State Definitions
 ###################
@@ -71,6 +70,11 @@ class AgentState(AgentInputState, total=False):
     raw_notes: Annotated[list[str], override_reducer]
     notes: Annotated[list[str], override_reducer]
     final_report: str
+    research_plan: Optional[str]
+    approved_research_plan: Optional[str]
+    report_outline: Optional[str]
+    human_feedback: Annotated[list[dict], override_reducer]
+    pending_human_action: Optional[dict]
     # Async SubAgent: collected outputs from completed background tasks.
     completed_task_outputs: Annotated[list[dict], override_reducer]
     # Mem0 long-term memory
@@ -78,6 +82,13 @@ class AgentState(AgentInputState, total=False):
     memory_candidates: Annotated[list[dict], override_reducer]
     # Running short-term summary used after compacting long message histories.
     conversation_summary: Optional[str]
+    # Report product system: non-markdown output artifacts (structured_json,
+    # slides, one_pager, ...). Absent for the default markdown profile.
+    report_artifacts: Optional[dict]
+    # Structured sources (title+url) recovered from research findings, used to
+    # render the References section in the selected style. Populated by the
+    # report orchestrator only when reference handling runs (non-default style).
+    sources: Annotated[list[dict], override_reducer]
 
 class SupervisorState(TypedDict, total=False):
     """State for the supervisor that manages research tasks."""
@@ -89,6 +100,8 @@ class SupervisorState(TypedDict, total=False):
     raw_notes: Annotated[list[str], override_reducer]
     enable_async_research: bool
     memory_context: Optional[str]
+    approved_research_plan: Optional[str]
+    human_feedback: Annotated[list[dict], override_reducer]
 
 class ResearcherState(TypedDict, total=False):
     """State for individual researchers conducting research."""

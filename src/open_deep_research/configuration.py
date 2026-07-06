@@ -1,5 +1,6 @@
 """Configuration management for the Open Deep Research system."""
 
+import json
 import os
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
@@ -15,6 +16,19 @@ class SearchAPI(Enum):
     OPENAI = "openai"
     TAVILY = "tavily"
     NONE = "none"
+
+
+def get_model_compatibility_kwargs(model_name: str) -> dict[str, Any]:
+    """Return provider-specific request options for a configured model.
+
+    DeepSeek V4 enables thinking by default. The handwritten agent runtime uses
+    forced tool choices for structured output, which DeepSeek rejects while
+    thinking is enabled, so OpenAI-compatible DeepSeek models run in
+    non-thinking mode.
+    """
+    if model_name.strip().lower().startswith("openai:deepseek"):
+        return {"extra_body": {"thinking": {"type": "disabled"}}}
+    return {}
 
 class MCPConfig(BaseModel):
     """Configuration for Model Context Protocol (MCP) servers."""
@@ -103,7 +117,17 @@ class Configuration(BaseModel):
             "x_oap_ui_config": {
                 "type": "boolean",
                 "default": True,
-                "description": "Enable local SQLite tracing and token aggregation.",
+                "description": "Master switch for SQLite, Langfuse, and Prometheus observability.",
+            }
+        },
+    )
+    sqlite_observability_enabled: bool = Field(
+        default=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": True,
+                "description": "Keep the local SQLite trace store as a development/failover backend.",
             }
         },
     )
@@ -142,6 +166,45 @@ class Configuration(BaseModel):
             }
         },
     )
+    langfuse_enabled: bool = Field(
+        default=False,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": False,
+                "description": "Mirror TraceRecorder runs/spans to Langfuse.",
+            }
+        },
+    )
+    langfuse_public_key: Optional[str] = Field(default=None)
+    langfuse_secret_key: Optional[str] = Field(default=None)
+    langfuse_base_url: str = Field(default="https://cloud.langfuse.com")
+    langfuse_environment: str = Field(default="development")
+    langfuse_release: Optional[str] = Field(default=None)
+    langfuse_sample_rate: float = Field(default=1.0, ge=0.0, le=1.0)
+    langfuse_flush_on_run_end: bool = Field(
+        default=False,
+        description="Synchronously flush Langfuse after every run (useful for short-lived jobs).",
+    )
+    langfuse_langchain_callback_enabled: bool = Field(
+        default=False,
+        description=(
+            "Attach Langfuse's LangChain CallbackHandler to model calls as supplemental "
+            "instrumentation. Disabled by default because TraceRecorder already records generations."
+        ),
+    )
+    prometheus_enabled: bool = Field(
+        default=False,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": False,
+                "description": "Publish low-cardinality aggregate metrics for Prometheus/Grafana.",
+            }
+        },
+    )
+    prometheus_metrics_path: str = Field(default="/metrics")
+    prometheus_namespace: str = Field(default="open_deep_research")
     helicone_enabled: bool = Field(
         default=False,
         metadata={
@@ -238,6 +301,64 @@ class Configuration(BaseModel):
             }
         }
     )
+    # Human-in-the-loop collaboration
+    enable_human_in_loop: bool = Field(
+        default=False,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": False,
+                "description": "Enable human approval and feedback checkpoints during research runs.",
+            }
+        },
+    )
+    hitl_require_plan_approval: bool = Field(
+        default=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": True,
+                "description": "Pause after drafting a research plan until the user approves, revises, or cancels.",
+            }
+        },
+    )
+    hitl_require_outline_approval: bool = Field(
+        default=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": True,
+                "description": "Pause before final report generation until the user approves, revises, or cancels the outline.",
+            }
+        },
+    )
+    hitl_max_plan_revisions: int = Field(
+        default=3,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 3,
+                "min": 0,
+                "max": 10,
+                "description": "Maximum number of user-requested research plan revisions before failing the run.",
+            }
+        },
+    )
+    hitl_feedback_mode: Literal["safe_points", "task_queue"] = Field(
+        default="safe_points",
+        metadata={
+            "x_oap_ui_config": {
+                "type": "select",
+                "default": "safe_points",
+                "description": "How mid-run feedback is applied: at supervisor safe points or queued to running research tasks when possible.",
+                "options": [
+                    {"label": "Safe points", "value": "safe_points"},
+                    {"label": "Task queue", "value": "task_queue"},
+                ],
+            }
+        },
+    )
+
     # Model Configuration
     summarization_model: str = Field(
         default="openai:gpt-4.1-mini",
@@ -331,6 +452,56 @@ class Configuration(BaseModel):
             }
         }
     )
+    # Report Output Configuration
+    report_type: str = Field(
+        default="default",
+        metadata={
+            "x_oap_ui_config": {
+                "type": "select",
+                "default": "default",
+                "description": "Report product form / genre. Unknown values fall back to 'default'.",
+                "options": [
+                    {"label": "Default (comprehensive report)", "value": "default"},
+                    {"label": "Executive Summary", "value": "executive_summary"},
+                    {"label": "Decision Brief", "value": "decision_brief"},
+                    {"label": "FAQ", "value": "faq"},
+                    {"label": "Comparison Matrix (sectioned)", "value": "comparison_matrix"},
+                    {"label": "Pros & Cons (sectioned)", "value": "pros_cons"},
+                    {"label": "Literature Review (sectioned)", "value": "literature_review"},
+                ],
+            }
+        },
+    )
+    output_format: Optional[str] = Field(
+        default=None,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "select",
+                "default": None,
+                "description": "Output format for the report deliverable. When unset, inherits the report type's default. Unknown values fall back to that profile default.",
+                "options": [
+                    {"label": "Markdown", "value": "markdown"},
+                    {"label": "Structured JSON", "value": "structured_json"},
+                    {"label": "Slides", "value": "slides"},
+                    {"label": "One-pager", "value": "one_pager"},
+                ],
+            }
+        },
+    )
+    reference_style: Optional[str] = Field(
+        default=None,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "select",
+                "default": None,
+                "description": "Citation/reference rendering style. When unset, inherits the report type's default.",
+                "options": [
+                    {"label": "Numbered ([1] Title: URL)", "value": "numbered"},
+                    {"label": "BibTeX-like (@misc{...})", "value": "bibtex_like"},
+                ],
+            }
+        },
+    )
     # MCP server configuration
     mcp_config: Optional[MCPConfig] = Field(
         default=None,
@@ -385,6 +556,23 @@ class Configuration(BaseModel):
         },
     )
     """Additional prompt guidance for browser MCP tool usage."""
+    # Agent Skills: domain context packs for research/report orchestration.
+    skills: Optional[List[str]] = Field(
+        default=None,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "array",
+                "default": None,
+                "description": "Domain skill packs to enable (e.g. medical, legal, finance). Adds curated research/report context. Unknown keys are ignored.",
+                "options": [
+                    {"label": "Medical", "value": "medical"},
+                    {"label": "Legal", "value": "legal"},
+                    {"label": "Finance", "value": "finance"},
+                ],
+            }
+        },
+    )
+    """Enabled domain skill keys (context-only builtins in v1)."""
     # Tool Governance Configuration
     # Per-role tool name whitelists. None = backward compatible (all assembled tools allowed).
     supervisor_tool_whitelist: Optional[List[str]] = Field(
@@ -968,6 +1156,21 @@ class Configuration(BaseModel):
         if value is None or value == "":
             return []
         if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
+
+    @field_validator("skills", mode="before")
+    @classmethod
+    def parse_skills(cls, value: Any) -> Optional[List[str]]:
+        """Accept JSON arrays or comma-separated values for enabled skills."""
+        if value is None or value == "":
+            return None
+        if isinstance(value, str):
+            if value.lstrip().startswith("["):
+                parsed = json.loads(value)
+                if not isinstance(parsed, list):
+                    raise ValueError("skills JSON value must be an array")
+                return parsed
             return [item.strip() for item in value.split(",") if item.strip()]
         return value
 

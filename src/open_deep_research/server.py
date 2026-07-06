@@ -6,10 +6,11 @@ import asyncio
 import html
 import json
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
 from open_deep_research.agents.query_engine import QueryEngine
@@ -26,6 +27,23 @@ class RunRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class HumanActionRequest(BaseModel):
+    """Approval/revision/cancellation response for a pending HITL action."""
+
+    action: Literal["approve", "revise", "cancel"]
+    message: str | None = None
+
+
+class HumanFeedbackRequest(BaseModel):
+    """Mid-run human direction or evidence follow-up."""
+
+    type: Literal["direction", "evidence_question"]
+    message: str
+    task_id: str | None = None
+    source_url: str | None = None
+    claim_text: str | None = None
+
+
 @dataclass
 class RunRecord:
     """In-memory HTTP run state."""
@@ -40,6 +58,13 @@ class RunRecord:
 
 app = FastAPI(title="Open Deep Research", version="0.1.0")
 _runs: dict[str, RunRecord] = {}
+_metrics_path = Configuration.from_runnable_config(None).prometheus_metrics_path
+
+
+@app.get(_metrics_path, include_in_schema=False)
+async def prometheus_metrics() -> Response:
+    """Expose process-wide aggregate metrics for Prometheus scraping."""
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 def _sse(event: dict[str, Any]) -> str:
@@ -75,12 +100,15 @@ def _span_tree_rows(spans: list[dict[str, Any]]) -> str:
         kind = html.escape(str(span.get("kind") or ""))
         duration = span.get("duration_ms") or 0
         tokens = span.get("total_tokens") or 0
+        retry_count = span.get("retry_count") or 0
+        error_type = html.escape(str(span.get("error_type") or ""))
         error = html.escape(str(span.get("error") or ""))
         indent = "&nbsp;" * depth * 4
         cls = "error" if status == "error" else "ok"
         rows.append(
             f"<tr class='{cls}'><td>{indent}{name}</td><td>{kind}</td>"
-            f"<td>{status}</td><td>{duration}</td><td>{tokens}</td><td>{error}</td></tr>"
+            f"<td>{status}</td><td>{duration}</td><td>{tokens}</td>"
+            f"<td>{retry_count}</td><td>{error_type}</td><td>{error}</td></tr>"
         )
         for child in children.get(span.get("span_id"), []):
             visit(child, depth + 1)
@@ -99,8 +127,18 @@ async def _run_background(record: RunRecord, request: RunRequest, config: dict[s
     try:
         async for event in record.engine.stream_message(request.messages, config):
             record.events.append(event)
+            status = event.get("data", {}).get("status")
+            if status in {
+                "running",
+                "awaiting_plan_approval",
+                "awaiting_outline_approval",
+                "completed",
+                "failed",
+                "cancelled",
+            }:
+                record.status = status
         record.result = record.engine.final_state
-        record.status = "completed"
+        record.status = "cancelled" if record.engine.status == "cancelled" else "completed"
     except Exception as exc:  # noqa: BLE001 - surface in run state
         event = {"event": "run.failed", "data": {"run_id": record.run_id, "error": str(exc)}}
         record.events.append(event)
@@ -150,9 +188,49 @@ async def get_run(
     return {
         "run_id": run_id,
         "status": record.status,
+        "pending_human_action": getattr(record.engine, "pending_human_action", None),
         "result": record.result,
         "event_count": len(record.events),
     }
+
+
+@app.post("/runs/{run_id}/human-actions/{action_id}")
+async def submit_human_action(
+    run_id: str,
+    action_id: str,
+    request: HumanActionRequest,
+    _user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Resolve a pending human approval, revision, or cancellation action."""
+    record = _runs.get(run_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    try:
+        result = record.engine.handle_human_action(action_id, request.action, request.message or "")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if request.action == "cancel":
+        record.status = "cancelled"
+    return result
+
+
+@app.post("/runs/{run_id}/feedback")
+async def submit_feedback(
+    run_id: str,
+    request: HumanFeedbackRequest,
+    _user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Accept mid-run human direction or evidence questions."""
+    record = _runs.get(run_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    try:
+        result = await record.engine.submit_feedback(request.model_dump(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    event_name = "hitl.evidence_question_received" if request.type == "evidence_question" else "hitl.feedback_received"
+    record.events.append({"event": event_name, "data": {"run_id": run_id, **result}})
+    return result
 
 
 @app.get("/runs/{run_id}/events")
@@ -225,6 +303,18 @@ async def get_observed_run_usage(
     return {"run_id": run_id, "usage": store.get_usage(run_id)}
 
 
+@app.get("/observability/runs/{run_id}/metrics")
+async def get_observed_run_metrics(
+    run_id: str,
+    _user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Return token usage, retry counts, and 429 rate for a persisted observed run."""
+    store = _observability_store()
+    if store.get_run(run_id) is None:
+        raise HTTPException(status_code=404, detail="Observed run not found")
+    return {"run_id": run_id, "metrics": store.get_metrics(run_id)}
+
+
 @app.get("/observability/ui", response_class=HTMLResponse)
 async def observability_ui(
     run_id: str | None = None,
@@ -249,9 +339,13 @@ async def observability_ui(
         for run in runs
     )
     usage = store.get_usage(selected) if selected else {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    metrics = store.get_metrics(selected) if selected else {
+        "retry_count": 0, "rate_limited_count": 0, "rate_429": 0.0, "total_llm_tool_calls": 0,
+    }
     run_title = html.escape(str(selected or "No observed runs"))
     run_status = html.escape(str((selected_run or {}).get("status") or ""))
     rows = _span_tree_rows(spans)
+    rate_pct = f"{(metrics.get('rate_429') or 0) * 100:.1f}%"
     body = f"""
     <!doctype html>
     <html>
@@ -285,8 +379,10 @@ async def observability_ui(
           <div class='metric'>input: {usage['input_tokens']}</div>
           <div class='metric'>output: {usage['output_tokens']}</div>
           <div class='metric'>total: {usage['total_tokens']}</div>
+          <div class='metric'>retries: {metrics.get('retry_count', 0)}</div>
+          <div class='metric'>429 rate: {rate_pct} ({metrics.get('rate_limited_count', 0)}/{metrics.get('total_llm_tool_calls', 0)})</div>
           <table>
-            <thead><tr><th>Span</th><th>Kind</th><th>Status</th><th>Duration ms</th><th>Tokens</th><th>Error</th></tr></thead>
+            <thead><tr><th>Span</th><th>Kind</th><th>Status</th><th>Duration ms</th><th>Tokens</th><th>Retries</th><th>Error type</th><th>Error</th></tr></thead>
             <tbody>{rows}</tbody>
           </table>
         </section>

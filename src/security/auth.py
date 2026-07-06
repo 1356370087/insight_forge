@@ -52,8 +52,25 @@ if supabase_url and supabase_key:
     supabase = create_client(supabase_url, supabase_key)
 
 
+def _local_dev_auth_bypass_enabled() -> bool:
+    """Return whether the explicit local-development auth bypass is enabled."""
+    return os.environ.get("LOCAL_DEV_AUTH_BYPASS", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 async def get_current_user(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     """Validate a Supabase Bearer token and return runtime user metadata."""
+    if _local_dev_auth_bypass_enabled():
+        return {
+            "identity": "local-dev-user",
+            "permissions": ["local_developer"],
+            "is_authenticated": True,
+        }
+
     if not authorization:
         raise HTTPException(status_code=401, detail="Authorization header missing")
 
