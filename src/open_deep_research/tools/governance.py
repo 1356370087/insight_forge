@@ -1,23 +1,20 @@
-"""Tool governance: permission control, whitelisting, origin labeling, and retry.
+"""Tool governance: permission control, validation, egress policy, and retry.
 
 This module centralizes all cross-cutting concerns for *how* tools are invoked
 by the LangGraph agents in this project:
 
-* **Origin labeling** -- distinguishing system-native tools (``@tool`` / Pydantic
-  structured tools) from MCP-registered tools and provider-native search tools
-  (Anthropic/OpenAI web search, executed inside the model call).
+* **Origin policy** -- using origin declared on the project ``Tool`` Interface.
 * **Permission control** -- a per-role gate combining a tool-name whitelist with
   an origin blocklist, plus an MCP auth-required token presence check.
-* **Parameter validation** -- a dependency-free JSON-Schema-subset validator that
-  runs against the tool's LLM-facing schema (``tool.args``) before execution.
+* **Parameter validation** -- configured JSON-Schema constraints followed by
+  Pydantic model validation before any side effect.
 * **Retry with exponential backoff** -- for retryable tool errors (network,
   timeout, rate-limit/429, service-unavailable/503), returning a structured
   ``ToolError`` (machine-readable JSON) to the model when retries are exhausted.
 
-The public entry point is :func:`execute_governed_tool_call`, which returns a
-:class:`langchain_core.messages.ToolMessage` in *every* branch and never raises
-to its caller, so ``asyncio.gather`` over several tool calls cannot be killed by
-a single failing tool.
+The public entry point is :func:`execute_governed_tool_call`. It returns both a
+transport message and the original ``ToolResult`` while containing failures so
+one call cannot abort a concurrent batch.
 """
 
 from __future__ import annotations
@@ -26,16 +23,19 @@ import asyncio
 import logging
 import os
 import random
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Optional
 
 import aiohttp
+from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import ToolMessage
 from langchain_core.runnables import RunnableConfig
-from langchain_core.tools import BaseTool, ToolException
-from pydantic import BaseModel, Field
+from langchain_core.tools import ToolException
+from pydantic import BaseModel, Field, ValidationError
 
 from open_deep_research.configuration import Configuration
+from open_deep_research.observability import get_trace_recorder
 from open_deep_research.sandbox.policy import (
     allowed_domains,
     egress_host_from_url,
@@ -49,28 +49,31 @@ from open_deep_research.tasks.registry import (
     TaskStatus,
     get_task_registry,
 )
+from open_deep_research.tools.base import (
+    Tool,
+    ToolContext,
+    ToolOrigin,
+    ToolResult,
+    serialize_tool_output,
+)
+
+# Native OpenAI/Anthropic SDKs are optional direct dependencies. They are guarded
+# so this module imports cleanly even when the SDKs are absent; classification
+# just falls back to the shared error classifier in that case.
+try:  # pragma: no cover - import guard
+    import openai as _openai_sdk
+except ImportError:  # pragma: no cover
+    _openai_sdk = None
+try:  # pragma: no cover - import guard
+    import anthropic as _anthropic_sdk
+except ImportError:  # pragma: no cover
+    _anthropic_sdk = None
 
 logger = logging.getLogger(__name__)
 
 ##########################
 # Enums
 ##########################
-
-
-class ToolOrigin(str, Enum):
-    """Where a tool comes from."""
-
-    SYSTEM = "system"
-    """In-process orchestration/control tools (think_tool, ResearchComplete, ConductResearch, async task tools)."""
-
-    SEARCH = "search"
-    """Search tools executed in-process (e.g. Tavily ``tavily_search``). Network-bound, retryable."""
-
-    MCP = "mcp"
-    """Tools dynamically loaded from an MCP server."""
-
-    PROVIDER_NATIVE = "provider_native"
-    """Provider-native tool definitions (Anthropic/OpenAI web search dicts) executed inside the model call."""
 
 
 class AgentRole(str, Enum):
@@ -100,95 +103,14 @@ class ToolErrorType(str, Enum):
 # Origin labeling
 ##########################
 
-TOOL_ORIGIN_KEY = "tool_origin"
-"""Metadata key under which a tool's :class:`ToolOrigin` is recorded."""
-
-TOOL_RETRYABLE_KEY = "tool_retryable"
-"""Metadata key recording whether a tool's execution should be retried on transient errors."""
+def get_tool_retryable(tool: Tool) -> bool:
+    """Return retry policy declared directly by the Tool Interface."""
+    return tool.retryable
 
 
-def tag_tool_origin(tool: Any, origin: ToolOrigin) -> Any:
-    """Attach the origin to a ``BaseTool`` via its metadata (idempotent).
-
-    Provider-native search tools are plain ``dict`` objects (not ``BaseTool``)
-    and cannot carry metadata; callers record their origin in a parallel index
-    instead. This helper is a no-op for dicts.
-
-    Returns the tool unchanged so it can be used inline.
-    """
-    if isinstance(tool, BaseTool):
-        metadata = dict(tool.metadata or {})
-        metadata[TOOL_ORIGIN_KEY] = origin.value
-        tool.metadata = metadata
-    return tool
-
-
-def tag_tool_retryable(tool: Any, retryable: bool) -> Any:
-    """Record whether a tool should be retried on transient errors (idempotent).
-
-    No-op for provider-native ``dict`` tools (they execute inside the model call
-    and are never retried by the governance layer).
-    """
-    if isinstance(tool, BaseTool):
-        metadata = dict(tool.metadata or {})
-        metadata[TOOL_RETRYABLE_KEY] = bool(retryable)
-        tool.metadata = metadata
-    return tool
-
-
-def get_tool_retryable(tool: Any) -> bool:
-    """Whether a tool should be retried on transient errors.
-
-    Defaults to ``False`` for untagged tools (conservative: orchestration/system
-    tools are the majority and should not be retried). Network-bound origins
-    (``SEARCH``/``MCP``) are tagged ``True`` at assembly time.
-    """
-    if isinstance(tool, BaseTool):
-        return bool((tool.metadata or {}).get(TOOL_RETRYABLE_KEY, False))
-    return False
-
-
-def get_tool_origin(tool: Any, origin_index: Optional[dict[str, ToolOrigin]] = None) -> ToolOrigin:
-    """Resolve a tool's origin.
-
-    Resolution order:
-    1. ``BaseTool`` with a recorded ``metadata['tool_origin']`` -> that origin.
-    2. ``dict`` (provider-native) -> looked up in ``origin_index`` by name,
-       defaulting to :attr:`ToolOrigin.PROVIDER_NATIVE`.
-    3. ``BaseTool`` without a tag -> :attr:`ToolOrigin.SYSTEM` (safe default:
-       most in-process tools are orchestration/control tools).
-    """
-    if isinstance(tool, dict):
-        name = tool.get("name", "web_search")
-        if origin_index and name in origin_index:
-            return origin_index[name]
-        return ToolOrigin.PROVIDER_NATIVE
-    if isinstance(tool, BaseTool):
-        raw = (tool.metadata or {}).get(TOOL_ORIGIN_KEY)
-        if raw:
-            try:
-                return ToolOrigin(raw)
-            except ValueError:
-                pass
-        return ToolOrigin.SYSTEM
-    # Unknown shape -- treat as system orchestration to avoid surprising failures.
-    return ToolOrigin.SYSTEM
-
-
-def build_origin_index(tools: list[Any]) -> dict[str, ToolOrigin]:
-    """Build a ``name -> origin`` index covering both ``BaseTool`` and dict tools.
-
-    Useful for resolving the origin of provider-native search dicts that cannot
-    carry metadata on themselves.
-    """
-    index: dict[str, ToolOrigin] = {}
-    for t in tools:
-        if isinstance(t, dict):
-            name = t.get("name", "web_search")
-            index[name] = ToolOrigin.PROVIDER_NATIVE
-        elif isinstance(t, BaseTool):
-            index[t.name] = get_tool_origin(t)
-    return index
+def get_tool_origin(tool: Tool) -> ToolOrigin:
+    """Return origin declared directly by the Tool Interface."""
+    return tool.origin
 
 
 ##########################
@@ -216,6 +138,23 @@ class ToolError(BaseModel):
             name=self.tool_name,
             tool_call_id=tool_call_id,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class GovernedToolCallResult:
+    """Transport message plus the original typed result of one invocation."""
+
+    message: ToolMessage
+    result: Optional[ToolResult[Any]] = None
+    error: Optional[ToolError] = None
+
+
+def _error_result(error: ToolError, tool_call_id: str) -> GovernedToolCallResult:
+    """Build a governed outcome for a structured failure."""
+    return GovernedToolCallResult(
+        message=error.to_tool_message(tool_call_id),
+        error=error,
+    )
 
 
 def _safe_exc_str(exc: BaseException) -> str:
@@ -306,6 +245,94 @@ def classify_retryable_error(exc: BaseException) -> tuple[ToolErrorType, bool]:
                 return et, retryable
 
     return ToolErrorType.unknown, False
+
+
+def _classify_http_status(status: Any) -> Optional[tuple[ToolErrorType, bool]]:
+    """Map an HTTP status to (error_type, retryable); None if not retryable-coded."""
+    if not isinstance(status, int):
+        return None
+    if status == 429:
+        return ToolErrorType.rate_limited, True
+    if status == 503 or status >= 500:
+        return ToolErrorType.service_unavailable, True
+    if status in (408, 425):
+        return ToolErrorType.rate_limited, True
+    return None
+
+
+def _is_llm_parse_failure(exc: BaseException) -> bool:
+    """Return whether a non-transient schema or parse failure occurred."""
+    if isinstance(exc, ValidationError):
+        return True
+    if isinstance(exc, OutputParserException):
+        return True
+    return False
+
+
+def _classify_openai_error(exc: BaseException) -> Optional[tuple[ToolErrorType, bool]]:
+    """Classify a native OpenAI SDK exception, or None if it is not one."""
+    if _openai_sdk is None:
+        return None
+    if isinstance(exc, _openai_sdk.RateLimitError):
+        return ToolErrorType.rate_limited, True
+    if isinstance(exc, _openai_sdk.APITimeoutError):
+        return ToolErrorType.timeout, True
+    if isinstance(exc, _openai_sdk.APIConnectionError):
+        return ToolErrorType.network_error, True
+    if isinstance(exc, _openai_sdk.APIStatusError):
+        mapped = _classify_http_status(getattr(exc, "status_code", None))
+        if mapped is not None:
+            return mapped
+        return ToolErrorType.unknown, False
+    return None
+
+
+def _classify_anthropic_error(exc: BaseException) -> Optional[tuple[ToolErrorType, bool]]:
+    """Classify a native Anthropic SDK exception, or None if it is not one."""
+    if _anthropic_sdk is None:
+        return None
+    if isinstance(exc, _anthropic_sdk.RateLimitError):
+        return ToolErrorType.rate_limited, True
+    if isinstance(exc, _anthropic_sdk.APITimeoutError):
+        return ToolErrorType.timeout, True
+    if isinstance(exc, _anthropic_sdk.APIConnectionError):
+        return ToolErrorType.network_error, True
+    if isinstance(exc, _anthropic_sdk.APIStatusError):
+        mapped = _classify_http_status(getattr(exc, "status_code", None))
+        if mapped is not None:
+            return mapped
+        return ToolErrorType.unknown, False
+    return None
+
+
+def classify_llm_retryable_error(exc: BaseException) -> tuple[ToolErrorType, bool]:
+    """Classify an LLM / native-SDK exception into (error_type, retryable).
+
+    Extends :func:`classify_retryable_error` with explicit branches for the
+    native OpenAI/Anthropic SDK exception types so that LLM 429s and transient
+    transport errors are retried (and recorded by the observability retry loop).
+    Schema/parse failures (``OutputParserException``, pydantic ``ValidationError``)
+    are explicitly non-retryable -- retrying them would spin. Anything not matched
+    here falls through to the shared classifier, which handles aiohttp status
+    codes, ``ConnectionError``/``TimeoutError``, ``ToolException`` keyword hints,
+    and the ``__cause__``/``__context__``/``ExceptionGroup`` chains.
+    """
+    # 1. Schema/parse failures are not transient.
+    if _is_llm_parse_failure(exc):
+        return ToolErrorType.unknown, False
+
+    # 2. Native OpenAI SDK errors.
+    result = _classify_openai_error(exc)
+    if result is not None:
+        return result
+
+    # 3. Native Anthropic SDK errors.
+    result = _classify_anthropic_error(exc)
+    if result is not None:
+        return result
+
+    # 4. Fall back to the shared classifier (aiohttp/connection/timeout/cause chain).
+    return classify_retryable_error(exc)
 
 
 ##########################
@@ -434,7 +461,7 @@ def _check_value(name: str, value: Any, spec: dict[str, Any]) -> Optional[ToolEr
 
 
 def validate_tool_args(
-    tool: BaseTool, args: dict[str, Any], config: Optional[RunnableConfig] = None,
+    tool: Tool, args: dict[str, Any], config: Optional[RunnableConfig] = None,
 ) -> Optional[ToolError]:
     """Validate ``args`` against the tool's LLM-facing input schema.
 
@@ -454,13 +481,9 @@ def validate_tool_args(
     ``minimum``/``maximum``) are layered on top of the schema's own constraints.
     """
     try:
-        # ``tool.input_schema`` is typed as a pydantic v1|v2 union; resolve the
-        # v2 JSON-schema method via getattr so mypy accepts it (the try/except
-        # covers the v1/absent case at runtime).
-        model_json_schema = getattr(tool.input_schema, "model_json_schema", None)
-        schema = model_json_schema() if callable(model_json_schema) else tool.args
-    except Exception:  # noqa: BLE001 -- fall back to tool.args if schema unavailable
-        schema = tool.args
+        schema = tool.input_schema.model_json_schema()
+    except Exception:  # noqa: BLE001 -- malformed adapters fail leniently here
+        return None
     if not isinstance(schema, dict):
         return None  # Unknown schema shape -- lenient.
 
@@ -523,16 +546,16 @@ def validate_tool_args(
 
 
 async def invoke_tool_with_retry(
-    tool: BaseTool,
-    args: dict[str, Any],
-    config: RunnableConfig,
+    tool: Tool,
+    input: BaseModel,
+    context: ToolContext,
     *,
     max_retries: int = 3,
     base_delay: float = 1.0,
     max_delay: float = 30.0,
     sleeper: Optional[Callable[[float], Any]] = None,
-) -> Any:
-    """Invoke ``tool.ainvoke`` with exponential backoff on retryable errors.
+) -> ToolResult[Any]:
+    """Invoke ``Tool.call`` with exponential backoff on retryable errors.
 
     Backoff: ``delay = min(max_delay, base_delay * 2**attempt) + jitter``, where
     jitter is ``random.uniform(0, base_delay)``. Retries only for retryable
@@ -547,7 +570,7 @@ async def invoke_tool_with_retry(
     attempt = 0
     while True:
         try:
-            return await tool.ainvoke(args, config)
+            return await tool.call(input, context)
         except Exception as exc:  # noqa: BLE001 -- classify then decide
             error_type, retryable = classify_retryable_error(exc)
             if not retryable or attempt >= max_retries:
@@ -561,6 +584,16 @@ async def invoke_tool_with_retry(
             logger.debug(
                 "Tool %s failed with %s (retryable); retry %d/%d after %.2fs",
                 tool.name, error_type.value, attempt + 1, max_retries, delay,
+            )
+            # Record this retry on the span opened by observe_tool_call (noop if
+            # observability is disabled or no span is active).
+            get_trace_recorder(context.config).active_span().record_retry(
+                attempt=attempt + 1,
+                error_type=error_type.value,
+                http_status=_safe_status(exc),
+                retryable=True,
+                delay_s=delay,
+                message=_safe_exc_str(exc),
             )
             await sleeper(delay)
             attempt += 1
@@ -646,10 +679,9 @@ def get_user_permissions(config: RunnableConfig) -> list[str]:
 
 def check_permission(
     tool_name: str,
-    tool: Any,
+    tool: Tool,
     role: AgentRole,
     allowed: Optional[set[str]],
-    origin_index: Optional[dict[str, ToolOrigin]],
     config: RunnableConfig,
 ) -> Optional[ToolError]:
     """Run the permission gate: whitelist membership + origin policy + MCP auth.
@@ -666,7 +698,7 @@ def check_permission(
         )
 
     # 2. Origin policy.
-    origin = get_tool_origin(tool, origin_index)
+    origin = get_tool_origin(tool)
     blocked = _origin_blocklist(role, config)
     if origin in blocked:
         return ToolError(
@@ -685,9 +717,7 @@ def check_permission(
     if origin is ToolOrigin.MCP:
         configurable = Configuration.from_runnable_config(config)
         if configurable.mcp_config and configurable.mcp_config.auth_required:
-            auth_satisfied = False
-            if isinstance(tool, BaseTool):
-                auth_satisfied = bool((tool.metadata or {}).get("mcp_auth_satisfied"))
+            auth_satisfied = bool(getattr(tool, "auth_satisfied", False))
             if not auth_satisfied and not _peek_mcp_tokens(config):
                 return ToolError(
                     error_type=ToolErrorType.permission_denied,
@@ -705,28 +735,28 @@ def check_permission(
         configurable = Configuration.from_runnable_config(config)
         role_tool_bl = configurable.role_tool_blacklist or {}
         role_origin_bl = configurable.role_blocked_origins or {}
-        for role in user_roles:
-            role_blocked_tools = role_tool_bl.get(role) or []
+        for user_role in user_roles:
+            role_blocked_tools = role_tool_bl.get(user_role) or []
             if tool_name in role_blocked_tools:
                 return ToolError(
                     error_type=ToolErrorType.permission_denied,
                     tool_name=tool_name,
-                    message=f"Tool '{tool_name}' is blocked for user role '{role}'.",
-                    detail={"user_role": role, "scope": "tool"},
+                    message=f"Tool '{tool_name}' is blocked for user role '{user_role}'.",
+                    detail={"user_role": user_role, "scope": "tool"},
                 )
-            role_blocked_origins = role_origin_bl.get(role) or []
+            role_blocked_origins = role_origin_bl.get(user_role) or []
             if origin.value in role_blocked_origins:
                 return ToolError(
                     error_type=ToolErrorType.permission_denied,
                     tool_name=tool_name,
-                    message=f"Tool '{tool_name}' (origin={origin.value}) is blocked for user role '{role}'.",
-                    detail={"user_role": role, "scope": "origin", "origin": origin.value},
+                    message=f"Tool '{tool_name}' (origin={origin.value}) is blocked for user role '{user_role}'.",
+                    detail={"user_role": user_role, "scope": "origin", "origin": origin.value},
                 )
     return None
 
 
 def filter_tools_by_permission(
-    tools: list[Any],
+    tools: list[Tool],
     role: AgentRole,
     config: RunnableConfig,
 ) -> list[Any]:
@@ -743,20 +773,16 @@ def filter_tools_by_permission(
     When no whitelist, no origin blocklist, and no user-role blacklist apply,
     every tool passes through unchanged (zero-cost backward compatibility).
     """
-    names = {
-        (t.name if isinstance(t, BaseTool) else t.get("name", "web_search"))
-        for t in tools
-    }
-    origin_index = build_origin_index(tools)
+    names = {t.name for t in tools}
     allowed = resolve_allowed_tools(role, config, names)
     # Fast path: nothing to enforce -> return input as-is.
     if allowed is None and not _origin_blocklist(role, config) and not _user_role_blocklists_active(config):
         return tools
 
-    filtered: list[Any] = []
+    filtered: list[Tool] = []
     for t in tools:
-        name = t.name if isinstance(t, BaseTool) else t.get("name", "web_search")
-        if check_permission(name, t, role, allowed, origin_index, config) is None:
+        name = t.name
+        if check_permission(name, t, role, allowed, config) is None:
             filtered.append(t)
     return filtered
 
@@ -773,7 +799,7 @@ def _user_role_blocklists_active(config: RunnableConfig) -> bool:
 
 
 def _egress_host_for_tool(
-    tool: Any, args: dict[str, Any], configurable: Configuration
+    tool: Tool, args: dict[str, Any], configurable: Configuration
 ) -> Optional[str]:
     """Return the egress host a URL-bearing tool targets, or ``None`` to skip.
 
@@ -787,7 +813,7 @@ def _egress_host_for_tool(
         if configurable.mcp_config and configurable.mcp_config.url:
             return egress_host_from_url(configurable.mcp_config.url)
         return None
-    if getattr(tool, "name", None) == "fetch_webpage":
+    if tool.name == "fetch_webpage":
         url = args.get("url")
         if isinstance(url, str):
             return egress_host_from_url(url)
@@ -825,7 +851,7 @@ def _find_task_for_run(
 
 async def check_egress_domain(
     tool_call: dict[str, Any],
-    tool: Any,
+    tool: Tool,
     args: dict[str, Any],
     config: RunnableConfig,
 ) -> Optional[ToolMessage]:
@@ -948,28 +974,25 @@ async def check_egress_domain(
 
 async def execute_governed_tool_call(
     tool_call: dict[str, Any],
-    tools_by_name: dict[str, Any],
+    tools_by_name: dict[str, Tool],
     role: AgentRole,
     config: RunnableConfig,
     *,
     allowed_tools: Optional[set[str]] = None,
-    origin_index: Optional[dict[str, ToolOrigin]] = None,
     apply_retry: bool = True,
     max_retries: int = 3,
     base_delay: float = 1.0,
     max_delay: float = 30.0,
     sleeper: Optional[Callable[[float], Any]] = None,
-) -> ToolMessage:
+) -> GovernedToolCallResult:
     """Execute a single tool call under full governance.
 
-    Pipeline (each branch returns a ``ToolMessage``, never raises):
+    Pipeline (each branch returns a ``GovernedToolCallResult``, never raises):
     1. ``tool_not_found`` if the named tool is not registered for this role.
-    2. Provider-native ``dict`` tools cannot be invoked directly -> structured
-       permission error (the model should not emit tool_calls for these).
-    3. Permission gate (whitelist + origin + MCP auth).
-    4. Parameter validation against ``tool.args``.
-    5. Execution: ``invoke_tool_with_retry`` when ``apply_retry`` else a single
-       ``tool.ainvoke``; failures render a structured error.
+    2. Permission gate (whitelist + origin + MCP auth).
+    3. Configured constraints and Pydantic input validation.
+    4. Egress policy.
+    5. ``Tool.call`` with optional retry and stable result rendering.
     """
     name = tool_call["name"]
     tool_call_id = tool_call["id"]
@@ -978,40 +1001,46 @@ async def execute_governed_tool_call(
     # tool_not_found
     tool = tools_by_name.get(name)
     if tool is None:
-        return ToolError(
+        return _error_result(ToolError(
             error_type=ToolErrorType.tool_not_found,
             tool_name=name,
             message=f"No tool named '{name}' is registered for the {role.value}.",
             detail={"role": role.value},
-        ).to_tool_message(tool_call_id)
-
-    # Provider-native dicts are executed inside the model call, not here.
-    if isinstance(tool, dict):
-        return ToolError(
-            error_type=ToolErrorType.permission_denied,
-            tool_name=name,
-            message=(
-                f"Tool '{name}' is a provider-native tool executed inside the model "
-                f"call and cannot be invoked directly."
-            ),
-            detail={"origin": ToolOrigin.PROVIDER_NATIVE.value},
-        ).to_tool_message(tool_call_id)
+        ), tool_call_id)
 
     # Permission gate.
-    perm_err = check_permission(name, tool, role, allowed_tools, origin_index, config)
+    perm_err = check_permission(name, tool, role, allowed_tools, config)
     if perm_err is not None:
-        return perm_err.to_tool_message(tool_call_id)
+        return _error_result(perm_err, tool_call_id)
 
     # Parameter validation (with per-tool configured constraints).
     val_err = validate_tool_args(tool, args, config)
     if val_err is not None:
-        return val_err.to_tool_message(tool_call_id)
+        return _error_result(val_err, tool_call_id)
+    try:
+        validated_input = tool.input_schema.model_validate(args)
+    except ValidationError as exc:
+        return _error_result(
+            ToolError(
+                error_type=ToolErrorType.validation_error,
+                tool_name=name,
+                message="Input failed Pydantic validation.",
+                detail={"errors": exc.errors(include_url=False)},
+            ),
+            tool_call_id,
+        )
 
     # Egress domain allowlist for URL-bearing tools (MCP + fetch_webpage). May
     # block inline (in-process) until a supervisor decision arrives.
     egress_err = await check_egress_domain(tool_call, tool, args, config)
     if egress_err is not None:
-        return egress_err
+        return GovernedToolCallResult(message=egress_err)
+
+    context = ToolContext(
+        config=config,
+        role=role.value,
+        tool_call_id=tool_call_id,
+    )
 
     # Execution. Retry is applied only when the caller enables it (apply_retry)
     # AND the tool is marked retryable (network-bound SEARCH/MCP tools). System
@@ -1019,83 +1048,64 @@ async def execute_governed_tool_call(
     effective_retry = apply_retry and get_tool_retryable(tool)
     if not effective_retry:
         try:
-            content = await tool.ainvoke(args, config)
-            return ToolMessage(content=content, name=name, tool_call_id=tool_call_id)
+            result = await tool.call(validated_input, context)
+            return GovernedToolCallResult(
+                message=ToolMessage(
+                    content=serialize_tool_output(result.output),
+                    name=name,
+                    tool_call_id=tool_call_id,
+                ),
+                result=result,
+            )
         except Exception as exc:  # noqa: BLE001
             error_type, _ = classify_retryable_error(exc)
-            return ToolError(
+            get_trace_recorder(config).active_span().record_outcome(
+                error_type=error_type.value,
+                http_status=_safe_status(exc),
+            )
+            return _error_result(ToolError(
                 error_type=error_type,
                 tool_name=name,
                 message=f"Tool execution failed: {_safe_exc_str(exc)}",
                 detail={"status": _safe_status(exc)},
-            ).to_tool_message(tool_call_id)
+            ), tool_call_id)
 
     try:
-        content = await invoke_tool_with_retry(
-            tool, args, config,
+        result = await invoke_tool_with_retry(
+            tool, validated_input, context,
             max_retries=max_retries, base_delay=base_delay, max_delay=max_delay, sleeper=sleeper,
         )
-        return ToolMessage(content=content, name=name, tool_call_id=tool_call_id)
+        return GovernedToolCallResult(
+            message=ToolMessage(
+                content=serialize_tool_output(result.output),
+                name=name,
+                tool_call_id=tool_call_id,
+            ),
+            result=result,
+        )
     except ToolExecutionFailure as failure:
-        return ToolError(
+        get_trace_recorder(config).active_span().record_outcome(
+            error_type=failure.error_type.value,
+            http_status=_safe_status(failure.inner),
+            retry_count=failure.attempts - 1,
+        )
+        return _error_result(ToolError(
             error_type=failure.error_type,
             tool_name=name,
             message=f"Tool execution failed after {failure.attempts} attempt(s): {_safe_exc_str(failure.inner)}",
             attempts=failure.attempts,
             retryable=False,
             detail={"status": _safe_status(failure.inner)},
-        ).to_tool_message(tool_call_id)
+        ), tool_call_id)
     except Exception as exc:  # noqa: BLE001 -- non-retryable, surfaced directly
         error_type, _ = classify_retryable_error(exc)
-        return ToolError(
+        get_trace_recorder(config).active_span().record_outcome(
+            error_type=error_type.value,
+            http_status=_safe_status(exc),
+        )
+        return _error_result(ToolError(
             error_type=error_type,
             tool_name=name,
             message=f"Tool execution failed: {_safe_exc_str(exc)}",
             detail={"status": _safe_status(exc)},
-        ).to_tool_message(tool_call_id)
-
-
-##########################
-# Supervisor gate (permission + validation only, no execution/retry)
-##########################
-
-
-def gate_supervisor_tool_call(
-    tool_call: dict[str, Any],
-    tools_by_name: dict[str, Any],
-    origin_index: Optional[dict[str, ToolOrigin]],
-    allowed: Optional[set[str]],
-    config: RunnableConfig,
-) -> Optional[ToolError]:
-    """Run only the permission + validation gate for a supervisor tool call.
-
-    The supervisor dispatches its tools via custom logic (ConductResearch /
-    StartResearchTask / think_tool are not invoked through ``tool.ainvoke``),
-    so no execution or retry happens here -- this only enforces the whitelist,
-    origin policy, MCP auth, and parameter validation, returning a
-    :class:`ToolError` (or ``None`` when the call is permitted).
-    """
-    name = tool_call["name"]
-    tool = tools_by_name.get(name)
-
-    # tool_not_found / provider-native dict -> block the same way as the executor.
-    if tool is None:
-        return ToolError(
-            error_type=ToolErrorType.tool_not_found,
-            tool_name=name,
-            message=f"No tool named '{name}' is registered for the supervisor.",
-            detail={"role": AgentRole.SUPERVISOR.value},
-        )
-    if isinstance(tool, dict):
-        return ToolError(
-            error_type=ToolErrorType.permission_denied,
-            tool_name=name,
-            message=f"Tool '{name}' is a provider-native tool and cannot be invoked directly.",
-            detail={"origin": ToolOrigin.PROVIDER_NATIVE.value},
-        )
-
-    perm_err = check_permission(name, tool, AgentRole.SUPERVISOR, allowed, origin_index, config)
-    if perm_err is not None:
-        return perm_err
-
-    return validate_tool_args(tool, tool_call.get("args", {}) or {}, config)
+        ), tool_call_id)

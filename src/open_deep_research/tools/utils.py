@@ -3,11 +3,13 @@
 import asyncio
 import logging
 import os
+import random
 import warnings
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Any, Dict, List, Literal, Optional
+from typing import Annotated, Any, Awaitable, Callable, Dict, List, Literal, Optional
 
 import aiohttp
+from anthropic import AsyncAnthropic
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
@@ -18,7 +20,6 @@ from langchain_core.messages import (
 )
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import (
-    BaseTool,
     InjectedToolArg,
     StructuredTool,
     ToolException,
@@ -26,16 +27,26 @@ from langchain_core.tools import (
 )
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from mcp import McpError
+from openai import AsyncOpenAI
 from tavily import AsyncTavilyClient
 
-from open_deep_research.configuration import BrowserMCPConfig, Configuration, SearchAPI
-from open_deep_research.observability import invoke_model_with_observability
+from open_deep_research.configuration import (
+    BrowserMCPConfig,
+    Configuration,
+    SearchAPI,
+    get_model_compatibility_kwargs,
+)
+from open_deep_research.observability import (
+    TokenUsage,
+    get_trace_recorder,
+    invoke_model_with_retry_observability,
+)
 from open_deep_research.prompts import summarize_webpage_prompt
 from open_deep_research.state import ResearchComplete, Summary
+from open_deep_research.tools.adapters import adapt_langchain_tool
+from open_deep_research.tools.base import Tool, ToolOrigin, build_tool_registry
 from open_deep_research.tools.governance import (
-    ToolOrigin,
-    tag_tool_origin,
-    tag_tool_retryable,
+    classify_llm_retryable_error,
 )
 from open_deep_research.tools.token_store import get_token_store
 
@@ -87,16 +98,16 @@ async def tavily_search(
     # Character limit to stay within model token limits (configurable)
     max_char_to_include = configurable.max_content_length
     
-    # Initialize summarization model with retry logic
+    # Initialize summarization model (retry is handled by the observability
+    # retry wrapper inside summarize_webpage).
     model_api_key = get_api_key_for_model(configurable.summarization_model, config)
     summarization_model = init_chat_model(
         model=configurable.summarization_model,
         max_tokens=configurable.summarization_model_max_tokens,
         api_key=model_api_key,
-        tags=["langsmith:nostream"]
-    ).with_structured_output(Summary).with_retry(
-        stop_after_attempt=configurable.max_structured_output_retries
-    )
+        tags=["langsmith:nostream"],
+        **get_model_compatibility_kwargs(configurable.summarization_model),
+    ).with_structured_output(Summary, method="function_calling")
     
     # Step 4: Create summarization tasks (skip empty content)
     async def noop():
@@ -203,9 +214,11 @@ async def summarize_webpage(
             date=get_today_str()
         )
         
-        # Execute summarization with timeout to prevent hanging
+        # Execute summarization with timeout to prevent hanging. The retry loop
+        # runs inside this budget (matching the prior .with_retry-under-wait_for
+        # behavior); the budget is 120s to absorb a couple of transient retries.
         summary = await asyncio.wait_for(
-            invoke_model_with_observability(
+            invoke_model_with_retry_observability(
                 model,
                 [HumanMessage(content=prompt_content)],
                 config,
@@ -213,7 +226,7 @@ async def summarize_webpage(
                 agent_role="researcher",
                 model_name=model_name,
             ),
-            timeout=60.0,  # 60 second timeout for summarization
+            timeout=120.0,  # 120 second budget for summarization (incl. retries)
         )
         
         # Format the summary with structured sections
@@ -287,9 +300,8 @@ async def fetch_webpage(
         max_tokens=configurable.summarization_model_max_tokens,
         api_key=model_api_key,
         tags=["langsmith:nostream"],
-    ).with_structured_output(Summary).with_retry(
-        stop_after_attempt=configurable.max_structured_output_retries
-    )
+        **get_model_compatibility_kwargs(configurable.summarization_model),
+    ).with_structured_output(Summary, method="function_calling")
     summary = await summarize_webpage(summarization_model, raw)
     return f"<url>{url}</url>\n{summary}"
 
@@ -510,7 +522,7 @@ def wrap_mcp_authenticate_tool(tool: StructuredTool) -> StructuredTool:
 async def load_mcp_tools(
     config: RunnableConfig,
     existing_tool_names: set[str],
-) -> list[BaseTool]:
+) -> list[Tool]:
     """Load and configure MCP (Model Context Protocol) tools with authentication.
     
     Args:
@@ -565,7 +577,7 @@ async def load_mcp_tools(
         return []
     
     # Step 5: Filter and configure tools
-    configured_tools = []
+    configured_tools: list[Tool] = []
     for mcp_tool in available_mcp_tools:
         # Skip tools with conflicting names
         if mcp_tool.name in existing_tool_names:
@@ -578,20 +590,20 @@ async def load_mcp_tools(
         if mcp_tool.name not in set(configurable.mcp_config.tools):
             continue
         
-        # Wrap tool with authentication handling and add to list
+        # Wrap the external implementation and place it behind the project Tool seam.
         enhanced_tool = wrap_mcp_authenticate_tool(mcp_tool)
-        # Tag origin so the governance layer can distinguish MCP tools from native ones.
-        tag_tool_origin(enhanced_tool, ToolOrigin.MCP)
-        # Record that auth was satisfied at load time so the governance gate can
-        # permit execution without re-checking tokens (which are never written
-        # back into the run config). When auth_required is True, load_mcp_tools
-        # only reaches this point if fetch_tokens succeeded (see Step 2), so any
-        # MCP tool assembled here has implicitly satisfied authentication.
-        if configurable.mcp_config and configurable.mcp_config.auth_required:
-            metadata = dict(enhanced_tool.metadata or {})
-            metadata["mcp_auth_satisfied"] = True
-            enhanced_tool.metadata = metadata
-        configured_tools.append(enhanced_tool)
+        configured_tools.append(
+            adapt_langchain_tool(
+                enhanced_tool,
+                origin=ToolOrigin.MCP,
+                retryable=True,
+                auth_satisfied=bool(
+                    configurable.mcp_config
+                    and configurable.mcp_config.auth_required
+                    and mcp_tokens
+                ),
+            )
+        )
     
     return configured_tools
 
@@ -624,7 +636,7 @@ def _build_browser_mcp_connection(browser_config: BrowserMCPConfig) -> dict[str,
 async def load_browser_mcp_tools(
     config: RunnableConfig,
     existing_tool_names: set[str],
-) -> list[BaseTool]:
+) -> list[Tool]:
     """Load optional browser-level MCP tools for dynamic web exploration."""
     configurable = Configuration.from_runnable_config(config)
     if not configurable.browser_mcp_enabled:
@@ -642,7 +654,7 @@ async def load_browser_mcp_tools(
         return []
 
     allowed_browser_tools = set(browser_config.tools or [])
-    configured_tools = []
+    configured_tools: list[Tool] = []
     for browser_tool in available_browser_tools:
         if browser_tool.name in existing_tool_names:
             warnings.warn(
@@ -653,14 +665,412 @@ async def load_browser_mcp_tools(
             continue
 
         enhanced_tool = wrap_mcp_authenticate_tool(browser_tool)
-        tag_tool_origin(enhanced_tool, ToolOrigin.MCP)
-        configured_tools.append(enhanced_tool)
+        configured_tools.append(
+            adapt_langchain_tool(
+                enhanced_tool,
+                origin=ToolOrigin.MCP,
+                retryable=True,
+            )
+        )
 
     return configured_tools
 
 ##########################
 # Tool Utils
 ##########################
+
+##########################
+# Native SDK Web Search Tools (OpenAI / Anthropic)
+##########################
+# These tools call the provider's server-side web search directly via the native
+# SDK (AsyncOpenAI / AsyncAnthropic) rather than relying on LangChain bind_tools
+# to pass a server-side tool dict. This makes the search a real StructuredTool on
+# parity with tavily_search: it is observable (span + token usage + retry/429),
+# governed like any SEARCH tool, and returns a summarized multi-source digest.
+
+
+def _strip_provider_prefix(model_name: str, provider: str) -> str:
+    """Return the model id without its ``provider:`` prefix (or unchanged)."""
+    if model_name and ":" in model_name and model_name.split(":", 1)[0] == provider:
+        return model_name.split(":", 1)[1]
+    return model_name
+
+
+def _to_int(value: Any) -> int:
+    """Coerce to int, tolerating None / bad values (observability must not throw)."""
+    try:
+        return int(value) if value is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _exc_status(exc: BaseException) -> int | None:
+    """Best-effort HTTP status from an SDK exception."""
+    for attr in ("status_code", "status"):
+        status = getattr(exc, attr, None)
+        if isinstance(status, int):
+            return status
+    return None
+
+
+def _safe_exc_msg(exc: BaseException) -> str:
+    """Render an exception message, tolerating exceptions whose ``__str__`` raises.
+
+    Some exceptions (e.g. aiohttp ClientResponseError with request_info=None)
+    raise from within ``__str__``; the retry loop must not crash while recording.
+    """
+    try:
+        text = str(exc)
+    except Exception:  # noqa: BLE001
+        text = ""
+    return text or type(exc).__name__
+
+
+def _sdk_usage(response: Any) -> TokenUsage:
+    """Build a TokenUsage from a native SDK response's ``.usage``."""
+    usage_obj = getattr(response, "usage", None)
+    if usage_obj is None:
+        return TokenUsage()
+    input_tokens = 0
+    output_tokens = 0
+    for attr in ("input_tokens", "prompt_tokens", "input_token_count"):
+        input_tokens = _to_int(getattr(usage_obj, attr, None))
+        if input_tokens:
+            break
+    for attr in ("output_tokens", "completion_tokens", "output_token_count"):
+        output_tokens = _to_int(getattr(usage_obj, attr, None))
+        if output_tokens:
+            break
+    total_tokens = _to_int(getattr(usage_obj, "total_tokens", None)) or (input_tokens + output_tokens)
+    return TokenUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+        raw_usage={"input_tokens": input_tokens, "output_tokens": output_tokens, "total_tokens": total_tokens},
+    )
+
+
+def _sdk_response_text(response: Any) -> str:
+    """Best-effort text extraction from a native SDK search response (for preview)."""
+    text = getattr(response, "output_text", None)
+    if text:
+        return str(text)
+    parts: list[str] = []
+    for block in getattr(response, "content", None) or []:
+        if getattr(block, "type", None) == "text":
+            parts.append(str(getattr(block, "text", "") or ""))
+    return "\n".join(parts)
+
+
+async def _sdk_call_with_observability(
+    call: Callable[[], Awaitable[Any]],
+    *,
+    span_name: str,
+    provider: str,
+    model: str,
+    config: RunnableConfig,
+    input_preview: Any = None,
+) -> Any:
+    """Run a native SDK call inside an LLM span, capturing usage and retries.
+
+    ``call`` is a zero-arg async callable returning the SDK response. Retries on
+    retryable errors (classified via :func:`classify_llm_retryable_error`), records
+    each retry on the span, and persists the response's token usage. Mirrors
+    :func:`invoke_model_with_retry_observability` for raw SDK responses.
+    """
+    recorder = get_trace_recorder(config)
+    configurable = recorder.configuration
+    max_attempts = configurable.max_structured_output_retries
+    base_delay = configurable.tool_retry_base_delay
+    max_delay = configurable.tool_retry_max_delay
+
+    with recorder.start_span(
+        name=span_name,
+        kind="llm",
+        agent_role="researcher",
+        attributes={"provider": provider, "model": str(model)},
+        input_payload=input_preview,
+        provider=provider,
+        model=str(model),
+    ) as span:
+        attempt = 0
+        while True:
+            try:
+                response = await call()
+            except Exception as exc:  # noqa: BLE001 -- classify then decide
+                error_type, retryable = classify_llm_retryable_error(exc)
+                attempts_made = attempt + 1
+                if not retryable or attempts_made >= max_attempts:
+                    span.record_outcome(error_type=error_type.value, http_status=_exc_status(exc))
+                    raise
+                delay = min(max_delay, base_delay * (2 ** attempt)) + random.uniform(0, base_delay)
+                span.record_retry(
+                    attempt=attempts_made,
+                    error_type=error_type.value,
+                    http_status=_exc_status(exc),
+                    retryable=True,
+                    delay_s=delay,
+                    message=_safe_exc_msg(exc),
+                )
+                await asyncio.sleep(delay)
+                attempt += 1
+                continue
+            usage = _sdk_usage(response)
+            if hasattr(span, "add_usage") and usage.total_tokens > 0:
+                span.add_usage(usage, provider, str(model))
+            if getattr(recorder.configuration, "trace_payload_mode", "preview") != "none":
+                preview_text = _sdk_response_text(response)
+                limit = None if recorder.configuration.trace_payload_mode == "full" else recorder.configuration.trace_preview_chars
+                span.output_preview = preview_text[:limit] if (limit and preview_text) else preview_text
+            return response
+
+
+def _build_openai_client(config: RunnableConfig) -> AsyncOpenAI:
+    """Build an AsyncOpenAI client using the configured research-provider key/base URL."""
+    configurable = Configuration.from_runnable_config(config)
+    api_key = get_api_key_for_model(configurable.research_model, config) or os.getenv("OPENAI_API_KEY")
+    kwargs: dict[str, Any] = {"api_key": api_key, "timeout": 60.0}
+    base_url = os.getenv("OPENAI_BASE_URL")
+    if base_url:
+        kwargs["base_url"] = base_url
+    return AsyncOpenAI(**kwargs)
+
+
+def _build_anthropic_client(config: RunnableConfig) -> AsyncAnthropic:
+    """Build an AsyncAnthropic client using the configured research-provider key/base URL."""
+    configurable = Configuration.from_runnable_config(config)
+    api_key = get_api_key_for_model(configurable.research_model, config) or os.getenv("ANTHROPIC_API_KEY")
+    kwargs: dict[str, Any] = {"api_key": api_key, "timeout": 60.0}
+    base_url = os.getenv("ANTHROPIC_BASE_URL")
+    if base_url:
+        kwargs["base_url"] = base_url
+    return AsyncAnthropic(**kwargs)
+
+
+def _build_summarization_model(config: RunnableConfig):
+    """Build the structured-output summarization model shared by the search tools."""
+    configurable = Configuration.from_runnable_config(config)
+    model_api_key = get_api_key_for_model(configurable.summarization_model, config)
+    return init_chat_model(
+        model=configurable.summarization_model,
+        max_tokens=configurable.summarization_model_max_tokens,
+        api_key=model_api_key,
+        tags=["langsmith:nostream"],
+        **get_model_compatibility_kwargs(configurable.summarization_model),
+    ).with_structured_output(Summary, method="function_calling")
+
+
+def _openai_search_parse(response: Any) -> tuple[str, list[dict[str, str]]]:
+    """Extract (synthesized_text, sources) from an OpenAI Responses web-search response.
+
+    OpenAI's web_search_preview returns a synthesized answer whose citations are
+    ``url_citation`` annotations on the message content.
+    """
+    text = str(getattr(response, "output_text", "") or "")
+    sources: list[dict[str, str]] = []
+    for item in getattr(response, "output", None) or []:
+        if getattr(item, "type", None) == "message":
+            for part in getattr(item, "content", None) or []:
+                for ann in getattr(part, "annotations", None) or []:
+                    url = getattr(ann, "url", None)
+                    if url:
+                        sources.append({"url": str(url), "title": str(getattr(ann, "title", None) or url)})
+    return text, sources
+
+
+def _anthropic_search_parse(response: Any) -> tuple[str, list[dict[str, str]]]:
+    """Extract (synthesized_text, sources) from an Anthropic web-search response.
+
+    Anthropic's web_search tool yields text blocks plus ``web_search_tool_result``
+    blocks whose content lists discrete results (url/title).
+    """
+    text_parts: list[str] = []
+    sources: list[dict[str, str]] = []
+    for block in getattr(response, "content", None) or []:
+        btype = getattr(block, "type", None)
+        if btype == "text":
+            text_parts.append(str(getattr(block, "text", "") or ""))
+        elif btype == "web_search_tool_result":
+            for res in getattr(block, "content", None) or []:
+                url = getattr(res, "url", None)
+                if url:
+                    sources.append({"url": str(url), "title": str(getattr(res, "title", None) or url)})
+    return "\n".join(text_parts), sources
+
+
+def _dedup_sources(sources: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Deduplicate sources by URL, preserving first-seen order."""
+    seen: set[str] = set()
+    unique: list[dict[str, str]] = []
+    for s in sources:
+        if s["url"] in seen:
+            continue
+        seen.add(s["url"])
+        unique.append(s)
+    return unique
+
+
+async def _format_synthesized_search(
+    synthesized_text: str,
+    sources: list[dict[str, str]],
+    config: RunnableConfig,
+) -> str:
+    """Summarize the synthesized answer and format it with the source list.
+
+    Mirrors Tavily's multi-source output shape. Because the provider's web search
+    returns a synthesized answer (not per-page raw content like Tavily), the
+    summary covers the whole answer and the cited sources are listed above it.
+    """
+    if not sources and not synthesized_text.strip():
+        return "No valid search results found. Please try different search queries or use a different search API."
+    configurable = Configuration.from_runnable_config(config)
+    summarization_model = _build_summarization_model(config)
+    summary = await summarize_webpage(
+        summarization_model,
+        synthesized_text[:configurable.max_content_length] if synthesized_text else "",
+        config=config,
+        model_name=configurable.summarization_model,
+    )
+    output = "Search results: \n"
+    for i, src in enumerate(sources, 1):
+        output += f"\n\n--- SOURCE {i}: {src['title']} ---\nURL: {src['url']}\n"
+    output += f"\n\nSUMMARY:\n{summary}\n\n" + ("-" * 80) + "\n"
+    return output
+
+
+@tool(
+    description=(
+        "Search the web via OpenAI's built-in web search (web_search_preview) and "
+        "return a summarized, source-cited digest. Pass one or more search queries."
+    )
+)
+async def openai_web_search(
+    queries: List[str],
+    max_results: Annotated[int, InjectedToolArg] = 5,
+    config: RunnableConfig = None,
+) -> str:
+    """Run OpenAI server-side web search for each query and summarize the digest.
+
+    Args:
+        queries: List of search queries to execute.
+        max_results: Hint for the number of results (kept for parity with Tavily).
+        config: Runtime configuration for API keys and model settings.
+
+    Returns:
+        Formatted multi-source string of the summarized search digest.
+    """
+    configurable = Configuration.from_runnable_config(config)
+    client = _build_openai_client(config)
+    model = _strip_provider_prefix(configurable.research_model, "openai")
+
+    async def _run_one(query: str) -> Any:
+        async def call():
+            return await client.responses.create(
+                model=model,
+                input=query,
+                tools=[{"type": "web_search_preview"}],
+            )
+
+        return await _sdk_call_with_observability(
+            call,
+            span_name="tool.openai.web_search",
+            provider="openai",
+            model=model,
+            config=config,
+            input_preview=query,
+        )
+
+    responses = await asyncio.gather(*[_run_one(q) for q in queries])
+    text_parts: list[str] = []
+    all_sources: list[dict[str, str]] = []
+    for resp in responses:
+        text, srcs = _openai_search_parse(resp)
+        if text:
+            text_parts.append(text)
+        all_sources.extend(srcs)
+    synthesized = "\n\n".join(t for t in text_parts if t)
+    return await _format_synthesized_search(synthesized, _dedup_sources(all_sources), config)
+
+
+@tool(
+    description=(
+        "Search the web via Anthropic's built-in web search (web_search tool) and "
+        "return a summarized, source-cited digest. Pass one or more search queries."
+    )
+)
+async def anthropic_web_search(
+    queries: List[str],
+    max_results: Annotated[int, InjectedToolArg] = 5,
+    config: RunnableConfig = None,
+) -> str:
+    """Run Anthropic server-side web search for each query and summarize the digest.
+
+    Args:
+        queries: List of search queries to execute.
+        max_results: Hint for the number of results (kept for parity with Tavily).
+        config: Runtime configuration for API keys and model settings.
+
+    Returns:
+        Formatted multi-source string of the summarized search digest.
+    """
+    configurable = Configuration.from_runnable_config(config)
+    client = _build_anthropic_client(config)
+    model = _strip_provider_prefix(configurable.research_model, "anthropic")
+
+    async def _run_one(query: str) -> Any:
+        async def call():
+            return await client.messages.create(
+                model=model,
+                max_tokens=configurable.research_model_max_tokens,
+                messages=[{"role": "user", "content": query}],
+                tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
+            )
+
+        return await _sdk_call_with_observability(
+            call,
+            span_name="tool.anthropic.web_search",
+            provider="anthropic",
+            model=model,
+            config=config,
+            input_preview=query,
+        )
+
+    responses = await asyncio.gather(*[_run_one(q) for q in queries])
+    text_parts: list[str] = []
+    all_sources: list[dict[str, str]] = []
+    for resp in responses:
+        text, srcs = _anthropic_search_parse(resp)
+        if text:
+            text_parts.append(text)
+        all_sources.extend(srcs)
+    synthesized = "\n\n".join(t for t in text_parts if t)
+    return await _format_synthesized_search(synthesized, _dedup_sources(all_sources), config)
+
+
+# Public built-ins expose the project Tool Interface. Their LangChain
+# StructuredTool implementations remain private behind these adapters.
+tavily_search = adapt_langchain_tool(
+    tavily_search,
+    origin=ToolOrigin.SEARCH,
+    retryable=True,
+)
+openai_web_search = adapt_langchain_tool(
+    openai_web_search,
+    origin=ToolOrigin.SEARCH,
+    retryable=True,
+)
+anthropic_web_search = adapt_langchain_tool(
+    anthropic_web_search,
+    origin=ToolOrigin.SEARCH,
+    retryable=True,
+)
+fetch_webpage = adapt_langchain_tool(
+    fetch_webpage,
+    origin=ToolOrigin.SYSTEM,
+    retryable=True,
+)
+think_tool = adapt_langchain_tool(think_tool, origin=ToolOrigin.SYSTEM)
+
 
 async def get_search_tool(search_api: SearchAPI):
     """Configure and return search tools based on the specified API provider.
@@ -672,26 +1082,17 @@ async def get_search_tool(search_api: SearchAPI):
         List of configured search tool objects for the specified provider
     """
     if search_api == SearchAPI.ANTHROPIC:
-        # Anthropic's native web search with usage limits
-        return [{
-            "type": "web_search_20250305", 
-            "name": "web_search", 
-            "max_uses": 5
-        }]
-        
+        # Native SDK-driven Anthropic web search (a real StructuredTool, on parity
+        # with tavily_search): observable, governed as SEARCH, retryable.
+        return [anthropic_web_search]
+
     elif search_api == SearchAPI.OPENAI:
-        # OpenAI's web search preview functionality
-        return [{"type": "web_search_preview"}]
-        
+        # Native SDK-driven OpenAI web search (a real StructuredTool, on parity
+        # with tavily_search): observable, governed as SEARCH, retryable.
+        return [openai_web_search]
+
     elif search_api == SearchAPI.TAVILY:
-        # Configure Tavily search tool with metadata
-        search_tool = tavily_search
-        search_tool.metadata = {
-            **(search_tool.metadata or {}), 
-            "type": "search", 
-            "name": "web_search"
-        }
-        return [search_tool]
+        return [tavily_search]
         
     elif search_api == SearchAPI.NONE:
         # No search functionality configured
@@ -700,125 +1101,73 @@ async def get_search_tool(search_api: SearchAPI):
     # Default fallback for unknown search API types
     return []
     
-async def get_all_tools(config: RunnableConfig):
+async def get_all_tools(config: RunnableConfig) -> list[Tool]:
     """Assemble complete toolkit including research, search, and MCP tools.
 
     Args:
         config: Runtime configuration specifying search API and MCP settings
 
     Returns:
-        List of all configured and available tools for research operations. Each
-        ``BaseTool`` is tagged with its origin (``tool.metadata['tool_origin']``)
-        so the governance layer can distinguish system, search, MCP, and
-        provider-native tools. Provider-native search tools (Anthropic/OpenAI
-        web search) are plain ``dict`` objects and carry no metadata; their
-        origin is resolved via a parallel index built by the caller.
+        Unique project ``Tool`` objects. External LangChain and MCP
+        implementations are hidden behind adapters before registration.
     """
-    # Start with core orchestration tools (system origin). fetch_webpage is
-    # network-bound so it is retryable; the governance layer egress-checks it by name.
-    tools = [tool(ResearchComplete), think_tool, fetch_webpage]
-    for t in tools:
-        tag_tool_origin(t, ToolOrigin.SYSTEM)
-    tag_tool_retryable(tool(ResearchComplete), False)
-    tag_tool_retryable(think_tool, False)
-    tag_tool_retryable(fetch_webpage, True)
+    # Existing implementations are kept behind the LangChain Adapter; callers
+    # only receive project-owned Tool objects.
+    tools: list[Tool] = [
+        adapt_langchain_tool(tool(ResearchComplete), origin=ToolOrigin.SYSTEM),
+        think_tool,
+        fetch_webpage,
+    ]
 
     # Add configured search tools
     configurable = Configuration.from_runnable_config(config)
     search_api = SearchAPI(get_config_value(configurable.search_api))
     search_tools = await get_search_tool(search_api)
-    # Tag real BaseTool search tools (Tavily) as SEARCH and retryable; provider-
-    # native dicts (Anthropic/OpenAI web search) carry no metadata and are
-    # tracked separately by callers via get_tool_origin/build_origin_index.
-    for t in search_tools:
-        tag_tool_origin(t, ToolOrigin.SEARCH)
-        tag_tool_retryable(t, True)
     tools.extend(search_tools)
 
     # Track existing tool names to prevent conflicts
-    existing_tool_names = {
-        tool.name if hasattr(tool, "name") else tool.get("name", "web_search")
-        for tool in tools
-    }
+    existing_tool_names = {tool.name for tool in tools}
 
-    # Add MCP tools if configured (already tagged as MCP inside load_mcp_tools)
-    mcp_tools = await load_mcp_tools(config, existing_tool_names)
-    for t in mcp_tools:
-        tag_tool_origin(t, ToolOrigin.MCP)  # belt-and-suspenders in case loading changed it
-        tag_tool_retryable(t, True)  # MCP tools are network-bound and retryable
+    # Add MCP tools if configured (already adapted inside load_mcp_tools).
+    loaded_mcp_tools = await load_mcp_tools(config, existing_tool_names)
+    mcp_tools = [
+        t
+        if isinstance(t, Tool)
+        else adapt_langchain_tool(t, origin=ToolOrigin.MCP, retryable=True)
+        for t in loaded_mcp_tools
+    ]
     tools.extend(mcp_tools)
     existing_tool_names.update(t.name for t in mcp_tools)
 
     # Add optional browser MCP tools as a separate tool source, so a user can run
     # ordinary business MCP servers and Playwright-MCP side by side.
-    browser_mcp_tools = await load_browser_mcp_tools(config, existing_tool_names)
-    for t in browser_mcp_tools:
-        tag_tool_origin(t, ToolOrigin.MCP)
-        tag_tool_retryable(t, True)
+    loaded_browser_tools = await load_browser_mcp_tools(config, existing_tool_names)
+    browser_mcp_tools = [
+        t
+        if isinstance(t, Tool)
+        else adapt_langchain_tool(t, origin=ToolOrigin.MCP, retryable=True)
+        for t in loaded_browser_tools
+    ]
     tools.extend(browser_mcp_tools)
+    existing_tool_names.update(t.name for t in browser_mcp_tools)
 
+    # Add tools contributed by agent skills (v1: context-only -> none).
+    from open_deep_research.skills import load_skill_tools
+
+    skill_tools = await load_skill_tools(config, existing_tool_names)
+    tools.extend(
+        t
+        if isinstance(t, Tool)
+        else adapt_langchain_tool(t, origin=ToolOrigin.SKILL, retryable=True)
+        for t in skill_tools
+    )
+
+    build_tool_registry(tools)
     return tools
 
 def get_notes_from_tool_calls(messages: list[MessageLikeRepresentation]):
     """Extract notes from tool call messages."""
     return [tool_msg.content for tool_msg in filter_messages(messages, include_types="tool")]
-
-##########################
-# Model Provider Native Websearch Utils
-##########################
-
-def anthropic_websearch_called(response):
-    """Detect if Anthropic's native web search was used in the response.
-    
-    Args:
-        response: The response object from Anthropic's API
-        
-    Returns:
-        True if web search was called, False otherwise
-    """
-    try:
-        # Navigate through the response metadata structure
-        usage = response.response_metadata.get("usage")
-        if not usage:
-            return False
-        
-        # Check for server-side tool usage information
-        server_tool_use = usage.get("server_tool_use")
-        if not server_tool_use:
-            return False
-        
-        # Look for web search request count
-        web_search_requests = server_tool_use.get("web_search_requests")
-        if web_search_requests is None:
-            return False
-        
-        # Return True if any web search requests were made
-        return web_search_requests > 0
-        
-    except (AttributeError, TypeError):
-        # Handle cases where response structure is unexpected
-        return False
-
-def openai_websearch_called(response):
-    """Detect if OpenAI's web search functionality was used in the response.
-    
-    Args:
-        response: The response object from OpenAI's API
-        
-    Returns:
-        True if web search was called, False otherwise
-    """
-    # Check for tool outputs in the response metadata
-    tool_outputs = response.additional_kwargs.get("tool_outputs")
-    if not tool_outputs:
-        return False
-    
-    # Look for web search calls in the tool outputs
-    for tool_output in tool_outputs:
-        if tool_output.get("type") == "web_search_call":
-            return True
-    
-    return False
 
 
 ##########################
