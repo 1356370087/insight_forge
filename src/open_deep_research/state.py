@@ -14,7 +14,12 @@ from typing_extensions import TypedDict
 class ConductResearch(BaseModel):
     """Call this tool to conduct research on a specific topic."""
     research_topic: str = Field(
-        description="The topic to research. Should be a single topic, and should be described in high detail (at least a paragraph).",
+        description=(
+            "A complete, self-contained research objective focused on one independent direction. "
+            "Describe what the sub-agent needs to learn and any essential context. This is a "
+            "research objective, not a search-engine query to copy verbatim; the sub-agent will "
+            "begin with short, broad queries and narrow them based on evidence."
+        ),
     )
 
 class ResearchComplete(BaseModel):
@@ -77,6 +82,7 @@ class AgentState(AgentInputState, total=False):
     pending_human_action: Optional[dict]
     # Async SubAgent: collected outputs from completed background tasks.
     completed_task_outputs: Annotated[list[dict], override_reducer]
+    processed_mailbox_message_ids: Annotated[list[str], override_reducer]
     # Mem0 long-term memory
     memory_context: Optional[str]
     memory_candidates: Annotated[list[dict], override_reducer]
@@ -102,6 +108,9 @@ class SupervisorState(TypedDict, total=False):
     memory_context: Optional[str]
     approved_research_plan: Optional[str]
     human_feedback: Annotated[list[dict], override_reducer]
+    handoff_assessments: Annotated[list[dict], override_reducer]
+    pending_mailbox_acks: Annotated[list[dict], override_reducer]
+    processed_mailbox_message_ids: Annotated[list[str], override_reducer]
 
 class ResearcherState(TypedDict, total=False):
     """State for individual researchers conducting research."""
@@ -112,6 +121,9 @@ class ResearcherState(TypedDict, total=False):
     compressed_research: str
     raw_notes: Annotated[list[str], override_reducer]
     memory_context: Optional[str]
+    pending_tool_results: list[dict]
+    research_complete_requested: bool
+    result_assessment: dict
 
 class ResearcherOutputState(BaseModel):
     """Output state from individual researchers."""

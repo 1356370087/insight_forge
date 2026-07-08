@@ -14,13 +14,11 @@ from langchain_core.messages import HumanMessage, message_to_dict
 from langchain_core.runnables import RunnableConfig
 
 from open_deep_research.configuration import Configuration
+from open_deep_research.run_context import RunContextStore
 from open_deep_research.sandbox.manager import DockerSandboxManager
+from open_deep_research.tasks.coordination import publish_task_update
 from open_deep_research.tasks.domain_approvals import get_domain_approval_registry
 from open_deep_research.tasks.events import EventType, JSONLEventWriter, ResearchEvent
-from open_deep_research.tasks.notifications import (
-    notification_failure_event,
-    publish_task_notification,
-)
 from open_deep_research.tasks.recovery import CheckpointManager, ResearcherCheckpoint
 from open_deep_research.tasks.registry import (
     TaskPhase,
@@ -74,7 +72,7 @@ async def _emit_state_change(
     data: Optional[dict[str, Any]] = None,
     notify: bool = True,
 ) -> None:
-    """Append JSONL, persist latest state, and publish a lightweight notice."""
+    """Append JSONL, persist latest state, then notify the Lead mailbox."""
     event = ResearchEvent(
         event_type=event_type,
         task_id=task_record.task_id,
@@ -90,19 +88,21 @@ async def _emit_state_change(
     if not notify:
         return
     try:
-        await publish_task_notification(configurable, snapshot, event_type)
+        await publish_task_update(configurable, snapshot, event_type)
     except Exception as exc:
         _emit_event(
-            notification_failure_event(
+            ResearchEvent(
+                event_type=EventType.TASK_MAILBOX_DELIVERY_FAILED,
                 task_id=task_record.task_id,
                 run_id=run_id,
                 phase=phase or task_record.phase.value,
-                error=exc,
+                data={"error": str(exc)},
             ),
             runs_dir=runs_dir,
             run_id=run_id,
             enabled=event_log_enabled,
         )
+        raise
 
 
 async def emit_task_state_change(
@@ -120,7 +120,7 @@ async def emit_task_state_change(
     """Public wrapper over :func:`_emit_state_change` for cross-module callers.
 
     The tool-governance layer uses this to emit domain-confirmation transitions
-    (JSONL event + state-store snapshot + Redis notification) without duplicating
+    (JSONL event + state-store snapshot + Mailbox notification) without duplicating
     the plumbing.
     """
     await _emit_state_change(
@@ -359,6 +359,10 @@ async def run_task_with_control(
             phase=phase,
             messages_snapshot=messages_dicts,
             tool_call_iterations=researcher_state.get("tool_call_iterations", 0),
+            research_topic=task_record.research_topic,
+            run_id=task_record.run_id,
+            user_id=task_record.user_id,
+            memory_context=task_record.memory_context,
         )
         checkpoint_manager.save(cp)
         await _emit_state_change(
@@ -428,14 +432,34 @@ async def run_task_with_control(
                 return
 
             # --- Success ----------------------------------------------------
+            durable_result = {
+                "task_id": task_record.task_id,
+                "research_topic": task_record.research_topic,
+                "compressed_research": result.get("compressed_research", ""),
+                "raw_notes": result.get("raw_notes", []),
+                "metrics": result.get("metrics", {}),
+            }
             registry.update_status(
                 task_record.task_id,
                 TaskStatus.COMPLETED,
                 phase=TaskPhase.COMPLETED,
                 completed_at=time.time(),
-                result=result,
-                source_count=result.get("metrics", {}).get("sources_read", task_record.source_count),
+                result=durable_result,
+                source_count=durable_result.get("metrics", {}).get(
+                    "sources_read", task_record.source_count
+                ),
             )
+
+            context_store = RunContextStore(
+                run_id,
+                runs_dir=configurable.runs_dir,
+                inline_content_max_chars=configurable.query_journal_inline_content_max_chars,
+            )
+            digest = context_store.persist_task_result(task_record.task_id, durable_result)
+            task_record.result_artifact_path = (
+                f"context/artifacts/research_tasks/{task_record.task_id}.json"
+            )
+            task_record.result_artifact_sha256 = digest
 
             if checkpoint_manager is not None:
                 checkpoint_manager.delete(task_record.task_id)

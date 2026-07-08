@@ -1,9 +1,8 @@
 """Async SubAgent tool models and handler functions.
 
-Defines the five Pydantic tool models that replace the synchronous
+Defines the Pydantic tool models that replace the synchronous
 ``ConductResearch`` tool when ``enable_async_research`` is True, together
-with their handler functions that interact with the TaskRegistry and
-background executor.
+with handlers backed by the persistent teammate pool and file Mailbox.
 """
 
 from __future__ import annotations
@@ -17,12 +16,11 @@ from pydantic import BaseModel, Field
 
 from open_deep_research.configuration import Configuration
 from open_deep_research.sandbox.manager import stop_sandbox_container
-from open_deep_research.tasks.domain_approvals import get_domain_approval_registry
-from open_deep_research.tasks.events import EventType, JSONLEventWriter, ResearchEvent
-from open_deep_research.tasks.notifications import (
-    notification_failure_event,
-    publish_task_notification,
+from open_deep_research.tasks.coordination import (
+    FileDomainDecisionStore,
+    publish_task_update,
 )
+from open_deep_research.tasks.events import EventType, JSONLEventWriter, ResearchEvent
 from open_deep_research.tasks.registry import (
     TaskRecord,
     TaskRegistry,
@@ -48,7 +46,12 @@ class StartResearchTask(BaseModel):
     """
 
     research_topic: str = Field(
-        description="The topic to research. Should be a single topic, described in high detail (at least a paragraph).",
+        description=(
+            "A complete, self-contained research objective focused on one independent direction. "
+            "Describe what the sub-agent needs to learn and any essential context. This is a "
+            "research objective, not a search-engine query to copy verbatim; the sub-agent will "
+            "begin with short, broad queries and narrow them based on evidence."
+        ),
     )
 
 
@@ -123,6 +126,12 @@ class ApproveResearchDomain(BaseModel):
     )
 
 
+class WaitForResearchUpdates(BaseModel):
+    """Wait for durable SubAgent mailbox updates without another model call."""
+
+    timeout_seconds: int = Field(default=15, ge=1, le=60)
+
+
 # Type alias for the function that actually launches a background researcher.
 LaunchTaskFn = Callable[
     [TaskRecord, RunnableConfig],
@@ -181,6 +190,9 @@ async def _get_snapshot_with_registry_fallback(
     registry: TaskRegistry,
     task_id: str,
 ) -> Optional[TaskSnapshot]:
+    record = registry.get(task_id)
+    if record is not None and not record.run_id:
+        return _record_to_snapshot(record)
     snapshot = await store.get(task_id)
     if snapshot is not None:
         return snapshot
@@ -199,6 +211,11 @@ async def _list_snapshots_with_registry_fallback(
     status_filter: Optional[TaskStatus] = None,
     run_id: Optional[str] = None,
 ) -> list[TaskSnapshot]:
+    if not run_id:
+        return [
+            _record_to_snapshot(record)
+            for record in registry.list(status_filter=status_filter)
+        ]
     snapshots = await store.list(status_filter=status_filter, run_id=run_id)
     if snapshots:
         return snapshots
@@ -280,15 +297,17 @@ async def _publish_snapshot_update(
     event_writer: Optional[JSONLEventWriter],
 ) -> None:
     try:
-        await publish_task_notification(configurable, snapshot, event_type)
+        await publish_task_update(configurable, snapshot, event_type)
     except Exception as exc:
         if event_writer is not None:
-            event_writer.write(notification_failure_event(
+            event_writer.write(ResearchEvent(
+                event_type=EventType.TASK_MAILBOX_DELIVERY_FAILED,
                 task_id=snapshot.task_id,
                 run_id=snapshot.run_id,
                 phase=snapshot.phase.value,
-                error=exc,
+                data={"error": str(exc)},
             ))
+        raise
 
 
 async def handle_start_research_task(
@@ -349,10 +368,8 @@ async def handle_start_research_task(
         configurable, snapshot, EventType.TASK_CREATED, event_writer
     )
 
-    # Spawn background task (fire-and-forget from the supervisor's perspective)
-    record.background_task = asyncio.create_task(
-        launch_task(record, config)
-    )
+    # Submit to the persistent pool. Assignment is durable before this returns.
+    await launch_task(record, config)
 
     return ToolMessage(
         content=(
@@ -439,7 +456,7 @@ async def handle_list_research_tasks(
 
     summary = (
         f"Total: {len(records)} tasks | "
-        f"Running: {await store.count_running(run_id=run_id)} | "
+        f"Running: {sum(record.status == TaskStatus.RUNNING for record in records)} | "
         f"Max in-flight: (see configuration)\n\n"
         + "\n".join(lines)
     )
@@ -478,10 +495,21 @@ async def handle_update_research_task(
             tool_call_id=tool_call["id"],
         )
 
-    await record.control_queue.put({
-        "type": "update",
-        "instruction": instruction,
-    })
+    if record.run_id:
+        from open_deep_research.tasks.teammate_pool import find_active_teammate_pool
+
+        pool = find_active_teammate_pool(record.run_id)
+        if pool is not None:
+            await pool.send_control(
+                task_id=task_id,
+                message_type="task_update",
+                payload={"instruction": instruction},
+                priority=10,
+            )
+        else:
+            await record.control_queue.put({"type": "update", "instruction": instruction})
+    else:
+        await record.control_queue.put({"type": "update", "instruction": instruction})
 
     if event_writer is not None:
         event_writer.write(ResearchEvent(
@@ -527,11 +555,32 @@ async def handle_cancel_research_task(
             results.append(f"- {task_id}: already {record.status.value}")
             continue
 
-        record.cancelled.set()
+        if record.run_id:
+            from open_deep_research.tasks.teammate_pool import find_active_teammate_pool
+
+            pool = find_active_teammate_pool(record.run_id)
+            if pool is not None:
+                await pool.send_control(
+                    task_id=task_id,
+                    message_type="cancel_request",
+                    payload={"reason": reason},
+                    priority=0,
+                )
+            else:
+                record.cancelled.set()
+                from open_deep_research.tasks.domain_approvals import (
+                    get_domain_approval_registry,
+                )
+
+                get_domain_approval_registry().clear_run(record.run_id)
+        else:
+            record.cancelled.set()
+            from open_deep_research.tasks.domain_approvals import (
+                get_domain_approval_registry,
+            )
+
+            get_domain_approval_registry().clear_run(record.run_id)
         registry.update_status(task_id, TaskStatus.CANCELLED)
-        # Drop any pending domain-approval futures for this run so a blocked
-        # tool call surfaces a cancellation denial instead of hanging.
-        get_domain_approval_registry().clear_run(record.run_id)
         stop_error = None
         if record.container_id:
             try:
@@ -600,21 +649,46 @@ async def handle_approve_research_domain(
             tool_call_id=tool_call["id"],
         )
 
-    approvals = get_domain_approval_registry()
-    approvals.record_decision(record.run_id, domain, allow)  # caches + resolves future
+    configurable = Configuration.from_runnable_config(config)
+    if record.run_id:
+        await FileDomainDecisionStore(configurable, record.run_id).record(domain, allow)
+        from open_deep_research.tasks.teammate_pool import find_active_teammate_pool
+
+        pool = find_active_teammate_pool(record.run_id)
+        if pool is not None:
+            await pool.send_control(
+                task_id=task_id,
+                message_type="domain_decision",
+                payload={"domain": domain.lower(), "allow": allow},
+                priority=0,
+            )
+        else:
+            from open_deep_research.tasks.domain_approvals import (
+                get_domain_approval_registry,
+            )
+
+            get_domain_approval_registry().record_decision(record.run_id, domain, allow)
+            await record.control_queue.put({
+                "type": "domain_decision",
+                "domain": domain.lower(),
+                "allow": allow,
+            })
+    else:
+        from open_deep_research.tasks.domain_approvals import (
+            get_domain_approval_registry,
+        )
+
+        get_domain_approval_registry().record_decision(record.run_id, domain, allow)
+        await record.control_queue.put({
+            "type": "domain_decision",
+            "domain": domain.lower(),
+            "allow": allow,
+        })
 
     if record.status == TaskStatus.WAITING_FOR_CONFIRMATION:
         registry.update_status(task_id, TaskStatus.RUNNING)
     record.pending_domain = None
     record.pending_domain_tool = None
-
-    # Informational control-queue marker (the existing executor drain discards
-    # non-"update" messages; the future above is the actual resume signal).
-    await record.control_queue.put({
-        "type": "domain_decision",
-        "domain": domain.lower(),
-        "allow": allow,
-    })
 
     if event_writer is not None:
         event_writer.write(ResearchEvent(
@@ -625,7 +699,6 @@ async def handle_approve_research_domain(
             data={"domain": domain.lower(), "allow": allow},
         ))
 
-    configurable = Configuration.from_runnable_config(config)
     store = state_store or get_task_state_store(configurable)
     snapshot = await store.update_from_record(record)
     await _publish_snapshot_update(

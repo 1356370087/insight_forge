@@ -1,0 +1,407 @@
+"""Run-scoped persistent in-process teammate pool driven by file mailboxes."""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Coroutine
+
+import portalocker
+from langchain_core.runnables import RunnableConfig
+from pydantic import BaseModel, Field
+
+from open_deep_research.configuration import Configuration
+from open_deep_research.tasks.coordination import FileDomainDecisionStore, get_mailbox
+from open_deep_research.tasks.lease import LeaderLeaseManager
+from open_deep_research.tasks.mailbox import (
+    MailboxMessage,
+    atomic_write_json,
+    read_json_file,
+)
+from open_deep_research.tasks.registry import TaskRecord, TaskRegistry, TaskStatus
+from open_deep_research.tasks.state import get_task_state_store
+
+ExecuteResearchFn = Callable[
+    [dict[str, Any], RunnableConfig],
+    Coroutine[Any, Any, dict[str, Any]],
+]
+
+
+class TeammateDescriptor(BaseModel):
+    """Durable public state for one persistent teammate."""
+
+    teammate_id: str
+    status: str = "idle"
+    current_task_id: str | None = None
+    created_at: float = Field(default_factory=time.time)
+    updated_at: float = Field(default_factory=time.time)
+    tasks_completed: int = 0
+
+
+class TeamFile(BaseModel):
+    """Run-scoped persistent teammate directory."""
+
+    schema_version: int = 1
+    run_id: str
+    lead_agent_id: str = "lead"
+    next_teammate_number: int = 1
+    members: list[TeammateDescriptor] = Field(default_factory=list)
+
+
+@dataclass
+class _RuntimeTeammate:
+    descriptor: TeammateDescriptor
+    loop_task: asyncio.Task[None]
+
+
+class TeammatePool:
+    """Create teammates on demand and reuse them across clean-context tasks."""
+
+    def __init__(
+        self,
+        *,
+        config: RunnableConfig,
+        registry: TaskRegistry,
+        execute_research: ExecuteResearchFn,
+    ) -> None:
+        """Initialize a pool owned by one run and one Lead process."""
+        self.config = config
+        self.configurable = Configuration.from_runnable_config(config)
+        self.run_id = str(config.get("metadata", {}).get("run_id", "default"))
+        self.registry = registry
+        self.execute_research = execute_research
+        self.mailbox = get_mailbox(self.configurable, self.run_id)
+        self.store = get_task_state_store(self.configurable)
+        self.lease = LeaderLeaseManager(
+            runs_dir=self.configurable.runs_dir,
+            run_id=self.run_id,
+            lease_seconds=self.configurable.leader_lease_seconds,
+            lock_timeout=self.configurable.mailbox_lock_timeout_seconds,
+        )
+        self.root = Path(self.configurable.runs_dir).resolve() / self.run_id / "coordination"
+        self.team_path = self.root / "team.json"
+        self.team_lock_path = self.root / "team.lock"
+        self.consumer_prefix = f"pool-{os.getpid()}"
+        self._runtimes: dict[str, _RuntimeTeammate] = {}
+        self._dispatch_lock = asyncio.Lock()
+        self._heartbeat_task: asyncio.Task[None] | None = None
+        self._started = False
+        self._stopping = False
+
+    def _load_team_locked(self) -> TeamFile:
+        if not self.team_path.exists():
+            return TeamFile(run_id=self.run_id)
+        return TeamFile.model_validate(read_json_file(self.team_path))
+
+    def _update_team_sync(self, operation):
+        self.root.mkdir(parents=True, exist_ok=True)
+        with portalocker.Lock(
+            str(self.team_lock_path), mode="a+b", timeout=self.configurable.mailbox_lock_timeout_seconds
+        ):
+            team = self._load_team_locked()
+            result = operation(team)
+            atomic_write_json(self.team_path, team.model_dump(mode="json"))
+            return result
+
+    async def _write_descriptor(self, descriptor: TeammateDescriptor) -> None:
+        def operation(team: TeamFile) -> None:
+            for index, member in enumerate(team.members):
+                if member.teammate_id == descriptor.teammate_id:
+                    team.members[index] = descriptor
+                    break
+            else:
+                team.members.append(descriptor)
+
+        await asyncio.to_thread(self._update_team_sync, operation)
+
+    async def start(self) -> None:
+        """Acquire run ownership and start the lease heartbeat."""
+        if self._started:
+            return
+        await self.lease.acquire()
+        self._started = True
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        await self._restore_pending_tasks()
+
+    async def _heartbeat_loop(self) -> None:
+        while not self._stopping:
+            await asyncio.sleep(self.configurable.leader_heartbeat_seconds)
+            try:
+                await self.lease.renew()
+            except Exception:
+                self._stopping = True
+                for record in self.registry.list(run_id=self.run_id):
+                    if record.status in {
+                        TaskStatus.PENDING,
+                        TaskStatus.RUNNING,
+                        TaskStatus.WAITING_FOR_CONFIRMATION,
+                    }:
+                        record.cancelled.set()
+                for runtime in self._runtimes.values():
+                    runtime.loop_task.cancel()
+                raise
+
+    async def _new_teammate(self) -> _RuntimeTeammate:
+        def allocate(team: TeamFile) -> TeammateDescriptor:
+            teammate = TeammateDescriptor(teammate_id=f"teammate-{team.next_teammate_number}")
+            team.next_teammate_number += 1
+            team.members.append(teammate)
+            return teammate
+
+        descriptor = await asyncio.to_thread(self._update_team_sync, allocate)
+        loop_task = asyncio.create_task(self._worker_loop(descriptor))
+        runtime = _RuntimeTeammate(descriptor=descriptor, loop_task=loop_task)
+        self._runtimes[descriptor.teammate_id] = runtime
+        return runtime
+
+    async def submit(self, record: TaskRecord) -> str | None:
+        """Persist a pending task and dispatch it to an idle/new teammate."""
+        await self.start()
+        await self.store.update_from_record(record)
+        await self._dispatch_pending()
+        return record.assigned_teammate_id
+
+    async def _restore_pending_tasks(self) -> None:
+        snapshots = await self.store.list(run_id=self.run_id)
+        for snapshot in snapshots:
+            if self.registry.get(snapshot.task_id) is None and snapshot.status in {
+                TaskStatus.PENDING,
+                TaskStatus.RUNNING,
+                TaskStatus.WAITING_FOR_CONFIRMATION,
+            }:
+                self.registry.restore(TaskRecord(
+                    task_id=snapshot.task_id,
+                    research_topic=snapshot.research_topic,
+                    run_id=snapshot.run_id,
+                    user_id=snapshot.user_id,
+                    status=TaskStatus.PENDING,
+                    memory_context=None,
+                ))
+        await self._dispatch_pending()
+
+    async def _dispatch_pending(self) -> None:
+        async with self._dispatch_lock:
+            if self._stopping:
+                return
+            pending = [
+                record
+                for record in self.registry.list(status_filter=TaskStatus.PENDING, run_id=self.run_id)
+                if record.assigned_teammate_id is None
+            ]
+            for record in pending:
+                idle = next(
+                    (runtime for runtime in self._runtimes.values() if runtime.descriptor.status == "idle"),
+                    None,
+                )
+                if idle is None and len(self._runtimes) < self.configurable.max_persistent_teammates:
+                    idle = await self._new_teammate()
+                if idle is None:
+                    return
+                record.assigned_teammate_id = idle.descriptor.teammate_id
+                idle.descriptor.status = "reserved"
+                idle.descriptor.current_task_id = record.task_id
+                idle.descriptor.updated_at = time.time()
+                await self._write_descriptor(idle.descriptor)
+                await self.store.update_from_record(record)
+                await self.mailbox.send(
+                    recipient=idle.descriptor.teammate_id,
+                    sender="lead",
+                    message_type="task_assignment",
+                    priority=20,
+                    dedupe_key=f"{record.task_id}:assignment:1",
+                    payload={"task_id": record.task_id},
+                )
+
+    async def send_control(
+        self,
+        *,
+        task_id: str,
+        message_type: str,
+        payload: dict[str, Any],
+        priority: int,
+    ) -> None:
+        """Send a durable control message to the task's assigned teammate."""
+        record = self.registry.get(task_id)
+        if record is None or not record.assigned_teammate_id:
+            raise ValueError(f"Task {task_id} has no assigned teammate")
+        await self.mailbox.send(
+            recipient=record.assigned_teammate_id,
+            sender="lead",
+            message_type=message_type,
+            payload={"task_id": task_id, **payload},
+            priority=priority,
+            dedupe_key=f"{task_id}:{message_type}:{payload.get('request_id', time.time_ns())}",
+        )
+
+    async def _handle_control(self, descriptor: TeammateDescriptor, message: MailboxMessage) -> bool:
+        task_id = str(message.payload.get("task_id", ""))
+        record = self.registry.get(task_id) if task_id else None
+        if message.type == "task_update" and record is not None:
+            await record.control_queue.put({"type": "update", "instruction": message.payload["instruction"]})
+        elif message.type == "cancel_request" and record is not None:
+            record.cancelled.set()
+        elif message.type == "domain_decision" and record is not None:
+            domain = str(message.payload["domain"])
+            allowed = bool(message.payload["allow"])
+            await FileDomainDecisionStore(self.configurable, self.run_id).record(domain, allowed)
+            from open_deep_research.tasks.domain_approvals import (
+                get_domain_approval_registry,
+            )
+
+            get_domain_approval_registry().record_decision(self.run_id, domain, allowed)
+        elif message.type == "shutdown_request":
+            if record is not None:
+                record.cancelled.set()
+            await self.mailbox.send(
+                recipient="lead",
+                sender=descriptor.teammate_id,
+                message_type="shutdown_ack",
+                priority=0,
+                dedupe_key=f"{descriptor.teammate_id}:shutdown_ack",
+                payload={"teammate_id": descriptor.teammate_id},
+            )
+            return True
+        return False
+
+    async def _worker_loop(self, descriptor: TeammateDescriptor) -> None:
+        consumer_id = f"{self.consumer_prefix}-{descriptor.teammate_id}"
+        active: asyncio.Task[None] | None = None
+        while not self._stopping:
+            messages = await self.mailbox.claim(agent_id=descriptor.teammate_id, consumer_id=consumer_id)
+            ack_ids: list[str] = []
+            for message in messages:
+                if message.type == "task_assignment" and active is None:
+                    task_id = str(message.payload["task_id"])
+                    record = self.registry.get(task_id)
+                    if record is not None:
+                        descriptor.status = "busy"
+                        descriptor.current_task_id = task_id
+                        descriptor.updated_at = time.time()
+                        await self._write_descriptor(descriptor)
+                        active = asyncio.create_task(self._execute_task(record))
+                elif await self._handle_control(descriptor, message):
+                    ack_ids.append(message.message_id)
+                    await self.mailbox.ack(
+                        agent_id=descriptor.teammate_id,
+                        consumer_id=consumer_id,
+                        message_ids=ack_ids,
+                    )
+                    if active is not None and not active.done():
+                        active.cancel()
+                        await asyncio.gather(active, return_exceptions=True)
+                    return
+                ack_ids.append(message.message_id)
+            if ack_ids:
+                await self.mailbox.ack(
+                    agent_id=descriptor.teammate_id,
+                    consumer_id=consumer_id,
+                    message_ids=ack_ids,
+                )
+            if active is not None and active.done():
+                try:
+                    await active
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                active = None
+                descriptor.status = "idle"
+                descriptor.current_task_id = None
+                descriptor.tasks_completed += 1
+                descriptor.updated_at = time.time()
+                await self._write_descriptor(descriptor)
+                await self.mailbox.send(
+                    recipient="lead",
+                    sender=descriptor.teammate_id,
+                    message_type="idle_notification",
+                    priority=50,
+                    dedupe_key=f"{descriptor.teammate_id}:idle:{descriptor.tasks_completed}",
+                    payload={"teammate_id": descriptor.teammate_id},
+                )
+                await self._dispatch_pending()
+            await asyncio.sleep(self.configurable.mailbox_poll_interval_ms / 1000)
+
+    async def _execute_task(self, record: TaskRecord) -> None:
+        from open_deep_research.tasks.executor import run_task_with_control
+        from open_deep_research.tasks.recovery import CheckpointManager
+
+        await run_task_with_control(
+            record,
+            self.config,
+            self.registry,
+            self.execute_research,
+            checkpoint_manager=CheckpointManager(runs_dir=self.configurable.runs_dir, run_id=self.run_id),
+            runs_dir=self.configurable.runs_dir,
+            run_id=self.run_id,
+            event_log_enabled=self.configurable.event_log_enabled,
+        )
+
+    async def shutdown(self, timeout_seconds: float = 10) -> None:
+        """Request graceful teammate shutdown, then cancel stragglers."""
+        for teammate_id in self._runtimes:
+            await self.mailbox.send(
+                recipient=teammate_id,
+                sender="lead",
+                message_type="shutdown_request",
+                priority=0,
+                dedupe_key=f"{teammate_id}:shutdown",
+                payload={"teammate_id": teammate_id},
+            )
+        tasks = [runtime.loop_task for runtime in self._runtimes.values()]
+        if tasks:
+            done, pending = await asyncio.wait(tasks, timeout=timeout_seconds)
+            del done
+            self._stopping = True
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        else:
+            self._stopping = True
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+        await self.lease.release()
+
+
+_POOLS: dict[tuple[str, str], TeammatePool] = {}
+
+
+def get_active_teammate_pool(run_id: str) -> TeammatePool:
+    """Return the unique active pool for *run_id*."""
+    matches = [pool for (_runs_dir, rid), pool in _POOLS.items() if rid == run_id]
+    if len(matches) != 1:
+        raise RuntimeError(f"Expected one active teammate pool for run {run_id}, found {len(matches)}")
+    return matches[0]
+
+
+def find_active_teammate_pool(run_id: str) -> TeammatePool | None:
+    """Return an active pool when the run is owned by this process."""
+    matches = [pool for (_runs_dir, rid), pool in _POOLS.items() if rid == run_id]
+    return matches[0] if len(matches) == 1 else None
+
+
+def get_teammate_pool(
+    config: RunnableConfig,
+    registry: TaskRegistry,
+    execute_research: ExecuteResearchFn,
+) -> TeammatePool:
+    """Return the run-scoped teammate pool singleton."""
+    configurable = Configuration.from_runnable_config(config)
+    run_id = str(config.get("metadata", {}).get("run_id", "default"))
+    key = (str(Path(configurable.runs_dir).resolve()), run_id)
+    if key not in _POOLS:
+        _POOLS[key] = TeammatePool(config=config, registry=registry, execute_research=execute_research)
+    return _POOLS[key]
+
+
+async def shutdown_teammate_pool(config: RunnableConfig) -> None:
+    """Shutdown and remove one run's pool."""
+    configurable = Configuration.from_runnable_config(config)
+    run_id = str(config.get("metadata", {}).get("run_id", "default"))
+    key = (str(Path(configurable.runs_dir).resolve()), run_id)
+    pool = _POOLS.pop(key, None)
+    if pool is not None:
+        await pool.shutdown()

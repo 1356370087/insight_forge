@@ -73,7 +73,7 @@ class TestWaitingForConfirmation:
         assert snapshot.status == TaskStatus.WAITING_FOR_CONFIRMATION
         assert snapshot.pending_domain == "untrusted.example.com"
         assert snapshot.pending_domain_tool == "fetch_webpage"
-        # round-trips through JSON (proves serializable for redis/postgres)
+        # Round-trips through JSON for the file-backed task snapshot.
         dumped = snapshot.model_dump_json()
         assert "untrusted.example.com" in dumped
 
@@ -378,84 +378,6 @@ class TestMemoryTaskStateStore:
 
         completed = await store.collect_completed(run_id="run-1")
         assert [s.task_id for s in completed] == ["a"]
-
-
-class TestTaskNotifications:
-    """Tests for lightweight Redis notification payloads."""
-
-    def test_notification_payload_excludes_full_result(self):
-        from open_deep_research.tasks.events import EventType
-        from open_deep_research.tasks.notifications import notification_from_snapshot
-
-        snapshot = TaskSnapshot(
-            task_id="t",
-            run_id="r",
-            status=TaskStatus.COMPLETED,
-            phase=TaskPhase.COMPLETED,
-            research_topic="topic",
-            result={"compressed_research": "large result"},
-            version=7,
-        )
-
-        payload = notification_from_snapshot(snapshot, EventType.TASK_COMPLETED)
-        dumped = payload.model_dump()
-
-        assert dumped == {
-            "run_id": "r",
-            "task_id": "t",
-            "event_type": "task.completed",
-            "status": "completed",
-            "phase": "completed",
-            "version": 7,
-            "updated_at": payload.updated_at,
-        }
-        assert "compressed_research" not in payload.model_dump_json()
-
-
-class TestOrchestratorTaskUpdates:
-    """Tests for converting notifications into lead-agent context."""
-
-    @pytest.mark.asyncio
-    async def test_collect_task_update_context_reads_full_snapshot(self, monkeypatch):
-        from open_deep_research.configuration import Configuration
-        from open_deep_research.agents.deep_researcher import _collect_task_update_context
-        from open_deep_research.tasks.notifications import TaskNotification
-        from open_deep_research.tasks.state import get_task_state_store
-
-        configurable = Configuration(task_notification_wait_seconds=0.01)
-        store = get_task_state_store(configurable)
-        snapshot = TaskSnapshot(
-            task_id="task-1",
-            run_id="run-1",
-            status=TaskStatus.COMPLETED,
-            phase=TaskPhase.COMPLETED,
-            research_topic="topic",
-            result={"compressed_research": "findings", "raw_notes": []},
-            version=3,
-        )
-        await store.upsert(snapshot)
-
-        async def fake_wait(*args, **kwargs):
-            return [
-                TaskNotification(
-                    run_id="run-1",
-                    task_id="task-1",
-                    event_type="task.completed",
-                    status="completed",
-                    phase="completed",
-                    version=3,
-                )
-            ]
-
-        monkeypatch.setattr(
-            "open_deep_research.agents.deep_researcher.wait_for_task_notifications",
-            fake_wait,
-        )
-
-        content = await _collect_task_update_context(configurable, "run-1")
-        assert "Task state updates received" in content
-        assert "COMPLETED" in content
-        assert "findings" in content
 
 
 # ---------------------------------------------------------------------------

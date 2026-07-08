@@ -58,7 +58,7 @@ def get_token_store() -> TokenStore:
     """Return the configured token store.
 
     The first LangGraph-free implementation is in-memory. The interface is kept
-    deliberately small so Redis/Postgres stores can be added without changing
+    deliberately small so alternative durable stores can be added without changing
     OAuth call sites.
     """
     return _DEFAULT_TOKEN_STORE

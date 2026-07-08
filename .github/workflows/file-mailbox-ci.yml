@@ -1,0 +1,40 @@
+name: File Mailbox CI
+
+on:
+  push:
+    paths:
+      - "src/open_deep_research/tasks/**"
+      - "tests/test_file_mailbox.py"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/file-mailbox-ci.yml"
+  pull_request:
+    paths:
+      - "src/open_deep_research/tasks/**"
+      - "tests/test_file_mailbox.py"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/file-mailbox-ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  mailbox:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install locked dependencies
+        run: uv sync --frozen
+      - name: Run file Mailbox reliability tests
+        run: uv run pytest tests/test_file_mailbox.py -q

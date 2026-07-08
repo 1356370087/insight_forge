@@ -771,73 +771,29 @@ class Configuration(BaseModel):
             }
         }
     )
-    task_state_backend: Literal["memory", "redis", "postgres"] = Field(
-        default="memory",
+    task_state_backend: Literal["file", "memory"] = Field(
+        default="file",
         metadata={
             "x_oap_ui_config": {
                 "type": "select",
-                "default": "memory",
-                "description": "Shared latest-state backend for async research tasks.",
+                "default": "file",
+                "description": "File-backed production state or test-only process memory.",
                 "options": [
+                    {"label": "File Mailbox", "value": "file"},
                     {"label": "Memory", "value": "memory"},
-                    {"label": "Redis", "value": "redis"},
-                    {"label": "Postgres", "value": "postgres"},
                 ],
             }
         },
     )
-    redis_url: Optional[str] = Field(
-        default=None,
-        metadata={
-            "x_oap_ui_config": {
-                "type": "text",
-                "default": "",
-                "description": "Redis URL for task state or Pub/Sub notifications. Falls back to REDIS_URL.",
-            }
-        },
-    )
-    task_state_postgres_uri: Optional[str] = Field(
-        default=None,
-        metadata={
-            "x_oap_ui_config": {
-                "type": "text",
-                "default": "",
-                "description": "Postgres URI for async task latest-state storage. Falls back to TASK_STATE_POSTGRES_URI, LANGGRAPH_POSTGRES_URI, POSTGRES_URI, or DATABASE_URL.",
-            }
-        },
-    )
-    task_notification_enabled: bool = Field(
-        default=True,
-        metadata={
-            "x_oap_ui_config": {
-                "type": "boolean",
-                "default": True,
-                "description": "Publish and listen for Redis Pub/Sub notifications when async task state changes.",
-            }
-        },
-    )
-    task_notification_wait_seconds: float = Field(
-        default=5,
-        metadata={
-            "x_oap_ui_config": {
-                "type": "number",
-                "default": 5,
-                "min": 0,
-                "max": 60,
-                "description": "Seconds the orchestrator waits for task state notifications after async tool handling.",
-            }
-        },
-    )
-    task_state_ttl_seconds: Optional[int] = Field(
-        default=86400,
-        metadata={
-            "x_oap_ui_config": {
-                "type": "number",
-                "default": 86400,
-                "description": "Optional TTL for Redis-backed task state snapshots, in seconds.",
-            }
-        },
-    )
+    max_persistent_teammates: int = Field(default=5, ge=1, le=50)
+    mailbox_poll_interval_ms: int = Field(default=500, ge=50, le=10000)
+    mailbox_lock_timeout_seconds: float = Field(default=5, gt=0, le=60)
+    mailbox_claim_lease_seconds: float = Field(default=30, gt=0, le=3600)
+    mailbox_max_delivery_attempts: int = Field(default=5, ge=1, le=100)
+    mailbox_acked_retention_seconds: int = Field(default=86400, ge=0)
+    mailbox_compaction_threshold: int = Field(default=1000, ge=10)
+    leader_heartbeat_seconds: float = Field(default=5, gt=0, le=300)
+    leader_lease_seconds: float = Field(default=15, gt=1, le=3600)
     # Main Graph Message Summarization
     enable_message_summarization: bool = Field(
         default=False,
@@ -889,6 +845,61 @@ class Configuration(BaseModel):
             }
         }
     )
+    # Runtime quality gates
+    quality_evaluation_enabled: bool = Field(
+        default=False,
+        description="Evaluate researcher tool results and subagent handoffs at runtime.",
+    )
+    quality_evaluation_model: str = Field(
+        default="openai:qwen3.7-plus",
+        description="OpenAI-compatible Qwen model used by the runtime quality gates.",
+    )
+    quality_evaluation_model_max_tokens: int = Field(default=2048, ge=256)
+    quality_evaluation_base_url: Optional[str] = Field(
+        default="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        description="OpenAI-compatible DashScope endpoint for the quality model.",
+    )
+    quality_evaluation_fail_open: bool = Field(
+        default=True,
+        description="Allow research to continue if the quality evaluator is unavailable.",
+    )
+    quality_evaluation_min_score: int = Field(default=3, ge=1, le=5)
+    quality_evaluation_min_sources: int = Field(default=2, ge=0, le=20)
+    quality_evaluation_max_input_chars: int = Field(default=30000, ge=1000)
+    # File-backed Query session context
+    query_session_persistence_enabled: bool = Field(
+        default=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": True,
+                "description": "Persist run-scoped Query state and authoritative context artifacts under runs_dir.",
+            }
+        },
+    )
+    query_context_compaction_enabled: Optional[bool] = Field(
+        default=None,
+        optional=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": True,
+                "description": "Compact Lead and Supervisor histories into a durable summary plus recent raw window.",
+            }
+        },
+    )
+    query_context_trigger_ratio: float = Field(
+        default=0.75,
+        ge=0.1,
+        le=0.95,
+    )
+    query_context_recent_window_ratio: float = Field(
+        default=0.25,
+        ge=0.05,
+        le=0.75,
+    )
+    query_context_summary_max_tokens: int = Field(default=8000, ge=128)
+    query_journal_inline_content_max_chars: int = Field(default=32768, ge=1024)
     # Docker Sandbox Configuration
     enable_docker_sandbox: bool = Field(
         default=False,

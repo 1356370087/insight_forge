@@ -55,7 +55,8 @@ from open_deep_research.tools.token_store import get_token_store
 ##########################
 TAVILY_SEARCH_DESCRIPTION = (
     "A search engine optimized for comprehensive, accurate, and trusted results. "
-    "Useful for when you need to answer questions about current events."
+    "Useful for when you need to answer questions about current events. Start with "
+    "short, broad queries, then narrow subsequent queries based on evidence and gaps."
 )
 @tool(description=TAVILY_SEARCH_DESCRIPTION)
 async def tavily_search(
@@ -67,7 +68,8 @@ async def tavily_search(
     """Fetch and summarize search results from Tavily search API.
 
     Args:
-        queries: List of search queries to execute
+        queries: Short, search-engine-ready queries. Begin broad on the first call; on
+            later calls, narrow each query only as needed to address evidence-backed gaps.
         max_results: Maximum number of results to return per query
         topic: Topic filter for search results (general, news, or finance)
         config: Runtime configuration for API keys and model settings

@@ -16,6 +16,11 @@ from pydantic import BaseModel, Field
 from open_deep_research.agents.query_engine import QueryEngine
 from open_deep_research.configuration import Configuration
 from open_deep_research.observability import SQLiteTraceStore
+from open_deep_research.run_context import (
+    JournalCorruptedError,
+    RunContextError,
+    RunContextStore,
+)
 from security.auth import apply_user_to_config, get_current_user
 
 
@@ -23,6 +28,13 @@ class RunRequest(BaseModel):
     """HTTP request body for a research run."""
 
     messages: list[dict[str, Any]]
+    configurable: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ResumeRunRequest(BaseModel):
+    """Runtime overrides and credentials for explicitly resuming a run."""
+
     configurable: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -146,6 +158,23 @@ async def _run_background(record: RunRecord, request: RunRequest, config: dict[s
         record.status = "failed"
 
 
+async def _run_resumed_background(record: RunRecord) -> None:
+    """Continue a persisted Query run in the background."""
+    record.status = "running"
+    try:
+        async for event in record.engine.stream_resume():
+            record.events.append(event)
+            status = event.get("data", {}).get("status")
+            if status in {"running", "completed", "failed", "cancelled"}:
+                record.status = status
+        record.result = record.engine.final_state
+        record.status = "cancelled" if record.engine.status == "cancelled" else record.engine.status
+    except Exception as exc:  # noqa: BLE001 - surface through run state
+        record.events.append({"event": "run.failed", "data": {"run_id": record.run_id, "error": str(exc)}})
+        record.result = {"result": {"status": "error", "error": str(exc)}}
+        record.status = "failed"
+
+
 @app.post("/runs/stream")
 async def stream_run(
     request: RunRequest,
@@ -179,12 +208,32 @@ async def create_run(
 @app.get("/runs/{run_id}")
 async def get_run(
     run_id: str,
-    _user: dict[str, Any] = Depends(get_current_user),
+    user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Return the latest status/result for a run."""
     record = _runs.get(run_id)
     if record is None:
-        raise HTTPException(status_code=404, detail="Run not found")
+        configurable = Configuration.from_runnable_config(None)
+        try:
+            store = RunContextStore(run_id, runs_dir=configurable.runs_dir)
+            manifest = store.load_manifest()
+        except (ValueError, JournalCorruptedError, OSError):
+            raise HTTPException(status_code=404, detail="Run not found") from None
+        if manifest.owner_id and manifest.owner_id != user.get("identity"):
+            raise HTTPException(status_code=404, detail="Run not found")
+        result = manifest.result
+        if manifest.status == "completed":
+            report_path = store.context_dir / "final_report.md"
+            if report_path.exists():
+                result = {"status": "success", "result": report_path.read_text(encoding="utf-8")}
+        return {
+            "run_id": run_id,
+            "status": manifest.status,
+            "pending_human_action": None,
+            "result": result,
+            "event_count": manifest.last_journal_seq,
+            "persistence_degraded": manifest.persistence_degraded,
+        }
     return {
         "run_id": run_id,
         "status": record.status,
@@ -192,6 +241,50 @@ async def get_run(
         "result": record.result,
         "event_count": len(record.events),
     }
+
+
+@app.post("/runs/{run_id}/resume", status_code=202)
+async def resume_run(
+    run_id: str,
+    request: ResumeRunRequest,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, str]:
+    """Explicitly resume an interrupted file-backed Query run."""
+    active = _runs.get(run_id)
+    if active is not None:
+        if active.status == "completed":
+            raise HTTPException(status_code=409, detail="run_already_completed")
+        if active.status == "cancelled":
+            raise HTTPException(status_code=409, detail="run_not_recoverable")
+        if active.status not in {"failed", "cancelled"}:
+            raise HTTPException(status_code=409, detail="run_already_active")
+
+    config = apply_user_to_config(
+        {
+            "configurable": dict(request.configurable),
+            "metadata": {**request.metadata, "run_id": run_id},
+        },
+        user,
+    )
+    runs_dir = str(request.configurable.get("runs_dir") or Configuration.from_runnable_config(None).runs_dir)
+    try:
+        engine = QueryEngine.load(run_id, runs_dir=runs_dir, config=config)
+        if engine.context_store is None:
+            raise JournalCorruptedError("run_not_recoverable")
+        replay = engine.context_store.replay()
+    except (ValueError, RunContextError, OSError):
+        raise HTTPException(status_code=409, detail="run_not_recoverable") from None
+    if replay.manifest.owner_id and replay.manifest.owner_id != user.get("identity"):
+        raise HTTPException(status_code=404, detail="Run not found")
+    if replay.manifest.status == "completed":
+        raise HTTPException(status_code=409, detail="run_already_completed")
+    if replay.manifest.status == "cancelled" or replay.manifest.next_stage == "cancelled":
+        raise HTTPException(status_code=409, detail="run_not_recoverable")
+
+    record = RunRecord(run_id=run_id, engine=engine, status="running")
+    record.task = asyncio.create_task(_run_resumed_background(record))
+    _runs[run_id] = record
+    return {"run_id": run_id, "status": "running"}
 
 
 @app.post("/runs/{run_id}/human-actions/{action_id}")

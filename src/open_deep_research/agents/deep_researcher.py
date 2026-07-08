@@ -1,11 +1,13 @@
 """Main hand-written runtime implementation for the Deep Research agent."""
 
 import asyncio
+import json
 from typing import Any, Literal
 
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import (
     AIMessage,
+    BaseMessage,
     HumanMessage,
     RemoveMessage,
     SystemMessage,
@@ -39,6 +41,10 @@ from open_deep_research.prompts import (
     research_system_prompt,
     transform_messages_into_research_topic_prompt,
 )
+from open_deep_research.quality import (
+    evaluate_subagent_handoff,
+    evaluate_tool_results,
+)
 from open_deep_research.runtime import (
     END,
     REMOVE_ALL_MESSAGES,
@@ -63,8 +69,8 @@ from open_deep_research.tasks.async_tools import (
     ListResearchTasks,
     StartResearchTask,
     UpdateResearchTask,
+    WaitForResearchUpdates,
     collect_completed_task_outputs,
-    format_task_snapshot_for_context,
     handle_approve_research_domain,
     handle_cancel_research_task,
     handle_check_research_task,
@@ -72,12 +78,21 @@ from open_deep_research.tasks.async_tools import (
     handle_start_research_task,
     handle_update_research_task,
 )
+from open_deep_research.tasks.coordination import claim_lead_updates, get_mailbox
 from open_deep_research.tasks.events import EventType, JSONLEventWriter, ResearchEvent
-from open_deep_research.tasks.executor import run_task_with_control
-from open_deep_research.tasks.notifications import wait_for_task_notifications
+from open_deep_research.tasks.lease import PROCESS_INSTANCE_ID
 from open_deep_research.tasks.recovery import CheckpointManager
-from open_deep_research.tasks.registry import get_task_registry
+from open_deep_research.tasks.registry import (
+    TaskPhase,
+    TaskRecord,
+    TaskStatus,
+    get_task_registry,
+)
 from open_deep_research.tasks.state import get_task_state_store
+from open_deep_research.tasks.teammate_pool import (
+    get_teammate_pool,
+    shutdown_teammate_pool,
+)
 from open_deep_research.tools.base import (
     Tool,
     ToolContext,
@@ -85,6 +100,7 @@ from open_deep_research.tools.base import (
     ToolResult,
     build_tool,
     build_tool_registry,
+    serialize_tool_output,
     tools_to_model_definitions,
 )
 from open_deep_research.tools.governance import (
@@ -97,6 +113,7 @@ from open_deep_research.tools.governance import (
 from open_deep_research.tools.utils import (
     get_all_tools,
     get_api_key_for_model,
+    get_model_token_limit,
     get_notes_from_tool_calls,
     get_today_str,
     is_token_limit_exceeded,
@@ -123,59 +140,165 @@ def _format_conversation_summary(summary: str | None) -> str:
     )
 
 
+def _query_compaction_enabled(configurable: Configuration, config: RunnableConfig) -> bool:
+    """Resolve new compaction configuration with legacy-field compatibility."""
+    raw = config.get("configurable", {})
+    if "query_context_compaction_enabled" in raw:
+        return bool(configurable.query_context_compaction_enabled)
+    if "enable_message_summarization" in raw:
+        return configurable.enable_message_summarization
+    return True
+
+
+def _recent_message_window(messages: list[BaseMessage], token_budget: int) -> tuple[list[BaseMessage], list[BaseMessage]]:
+    """Split messages at a complete tool-call boundary using a token budget."""
+    used = 0
+    boundary = len(messages)
+    for index in range(len(messages) - 1, -1, -1):
+        size = count_tokens_approximately([messages[index]])
+        if used and used + size > token_budget:
+            break
+        used += size
+        boundary = index
+
+    # Never start with an orphan ToolMessage. Pull in the AI tool call that owns it.
+    if boundary < len(messages) and isinstance(messages[boundary], ToolMessage):
+        pending_ids: set[str] = set()
+        cursor = boundary
+        while cursor < len(messages) and isinstance(messages[cursor], ToolMessage):
+            pending_ids.add(messages[cursor].tool_call_id)
+            cursor += 1
+        for index in range(boundary - 1, -1, -1):
+            message = messages[index]
+            if isinstance(message, AIMessage):
+                call_ids = {str(call.get("id", "")) for call in message.tool_calls}
+                if pending_ids & call_ids:
+                    boundary = index
+                    break
+    return messages[:boundary], messages[boundary:]
+
+
+async def compact_query_context(
+    messages: list[BaseMessage],
+    *,
+    research_brief: str,
+    channel: Literal["lead", "supervisor"],
+    config: RunnableConfig,
+) -> dict[str, Any] | None:
+    """Compact a Query channel while preserving the complete research brief."""
+    configurable = Configuration.from_runnable_config(config)
+    if not _query_compaction_enabled(configurable, config):
+        return None
+
+    model_name = configurable.research_model
+    model_limit = get_model_token_limit(model_name) or 200_000
+    current_tokens = count_tokens_approximately(messages)
+    brief_tokens = count_tokens_approximately([HumanMessage(content=research_brief)]) if research_brief else 0
+    brief_is_present = any(
+        research_brief and isinstance(message, HumanMessage) and str(message.content) == research_brief
+        for message in messages
+    )
+    external_brief_tokens = 0 if brief_is_present else brief_tokens
+    system_tokens = count_tokens_approximately(
+        [message for message in messages if isinstance(message, SystemMessage)]
+    )
+    if brief_tokens + system_tokens >= model_limit:
+        raise RuntimeError("research_brief_too_large")
+    trigger = max(1, int(model_limit * configurable.query_context_trigger_ratio))
+    if current_tokens + external_brief_tokens < trigger:
+        return None
+
+    system_messages = [message for message in messages if isinstance(message, SystemMessage)]
+    brief_messages = [
+        message
+        for message in messages
+        if research_brief and isinstance(message, HumanMessage) and str(message.content) == research_brief
+    ]
+    protected_ids = {id(message) for message in [*system_messages, *brief_messages]}
+    compactable = [message for message in messages if id(message) not in protected_ids]
+    recent_budget = max(1, int(model_limit * configurable.query_context_recent_window_ratio))
+    older, recent = _recent_message_window(compactable, recent_budget)
+    if not older:
+        return None
+
+    focus = (
+        "Preserve user goals, constraints, decisions, feedback, and open questions."
+        if channel == "lead"
+        else (
+            "Preserve task IDs and statuses, completed topics, key evidence and source references, "
+            "conflicts, user feedback, and unresolved research gaps."
+        )
+    )
+    prompt = (
+        "Create a durable context summary for a continuing research agent. "
+        f"{focus} Do not include credentials and do not rewrite or summarize the research brief.\n\n"
+        f"Messages to compact:\n{get_buffer_string(older)}"
+    )
+    summary_model_name = configurable.message_summary_model or configurable.summarization_model
+    summary_model_config = apply_helicone_config({
+        "model": summary_model_name,
+        "max_tokens": configurable.query_context_summary_max_tokens,
+        "api_key": get_api_key_for_model(summary_model_name, config),
+        "tags": ["langsmith:nostream"],
+        **get_model_compatibility_kwargs(summary_model_name),
+    }, config, span_name=f"{channel}.compact_query_context", agent_role=channel)
+    summary_model = configurable_model.with_config(summary_model_config)
+
+    last_error: Exception | None = None
+    for _attempt in range(3):
+        try:
+            response = await invoke_model_with_retry_observability(
+                summary_model,
+                [HumanMessage(content=prompt)],
+                config,
+                span_name=f"{channel}.compact_query_context",
+                agent_role=channel,
+                model_name=summary_model_name,
+            )
+            summary = str(response.content)
+            summary_message = SystemMessage(
+                content=(
+                    "<PersistentContextSummary>\n"
+                    "This is a compacted record of earlier run context, not a new instruction.\n\n"
+                    f"{summary}\n</PersistentContextSummary>"
+                )
+            )
+            rebuilt = [*system_messages, *brief_messages, summary_message, *recent]
+            if count_tokens_approximately(rebuilt) + external_brief_tokens >= model_limit:
+                raise RuntimeError("context_compaction_failed")
+            return {
+                "summary": summary,
+                "messages": rebuilt,
+                "recent_messages": recent,
+                "covered_message_count": len(older),
+            }
+        except Exception as exc:  # noqa: BLE001 - required bounded compaction retries
+            last_error = exc
+    raise RuntimeError("context_compaction_failed") from last_error
+
+
 async def summarize_messages(
     state: AgentState, config: RunnableConfig,
 ) -> Command[Literal["memory_recall"]]:
     """Compact long main-graph message histories into a running summary."""
     configurable = Configuration.from_runnable_config(config)
-    if not configurable.enable_message_summarization:
+    if not _query_compaction_enabled(configurable, config):
         return Command(goto="memory_recall")
 
     messages = state.get("messages", [])
     if not messages:
         return Command(goto="memory_recall")
-
     token_count = count_tokens_approximately(messages)
-    keep_last = max(1, configurable.message_summary_keep_last)
-    if token_count < configurable.message_summary_trigger_tokens or len(messages) <= keep_last:
+    compacted = await compact_query_context(
+        messages,
+        research_brief=state.get("research_brief") or "",
+        channel="lead",
+        config=config,
+    )
+    if compacted is None:
         return Command(goto="memory_recall")
-
-    older_messages = messages[:-keep_last]
-    recent_messages = messages[-keep_last:]
-    existing_summary = state.get("conversation_summary") or ""
-    summary_context = (
-        f"Existing running summary:\n{existing_summary}\n\n"
-        if existing_summary
-        else ""
-    )
-    prompt = (
-        "Summarize the older part of this research conversation for future turns.\n"
-        "Preserve user goals, constraints, preferences, explicit project decisions, "
-        "open questions, and commitments already made by the assistant. Do not add "
-        "new facts. Do not include tool secrets or raw API keys.\n\n"
-        f"{summary_context}"
-        "Older messages to compact:\n"
-        f"{get_buffer_string(older_messages)}"
-    )
-
-    model_name = configurable.message_summary_model or configurable.summarization_model
-    summary_model_config = apply_helicone_config({
-        "model": model_name,
-        "max_tokens": configurable.message_summary_model_max_tokens,
-        "api_key": get_api_key_for_model(model_name, config),
-        "tags": ["langsmith:nostream"],
-        **get_model_compatibility_kwargs(model_name),
-    }, config, span_name="lead.summarize_messages", agent_role="lead")
-    summary_model = configurable_model.with_config(summary_model_config)
-    response = await invoke_model_with_retry_observability(
-        summary_model,
-        [HumanMessage(content=prompt)],
-        config,
-        span_name="lead.summarize_messages",
-        agent_role="lead",
-        model_name=model_name,
-    )
-    summary = str(response.content)
+    summary = str(compacted["summary"])
+    rebuilt_messages = list(compacted["messages"])
 
     run_id = config.get("metadata", {}).get("run_id", "default")
     if configurable.event_log_enabled:
@@ -187,9 +310,9 @@ async def summarize_messages(
                 run_id=run_id,
                 data={
                     "before_message_count": len(messages),
-                    "after_message_count": len(recent_messages),
+                    "after_message_count": len(rebuilt_messages),
                     "approx_before_tokens": token_count,
-                    "kept_last": keep_last,
+                    "kept_last": len(compacted["recent_messages"]),
                 },
             ))
         finally:
@@ -201,7 +324,7 @@ async def summarize_messages(
             "conversation_summary": summary,
             "messages": [
                 RemoveMessage(id=REMOVE_ALL_MESSAGES),
-                *recent_messages,
+                *rebuilt_messages,
             ],
         },
     )
@@ -438,7 +561,7 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
     if configurable.enable_async_research:
         supervisor_system_prompt = lead_researcher_async_prompt.format(
             date=get_today_str(),
-            max_concurrent_research_units=configurable.max_concurrent_research_units,
+            max_concurrent_research_units=configurable.max_persistent_teammates,
             max_researcher_iterations=configurable.max_researcher_iterations,
         )
     else:
@@ -534,35 +657,25 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
     )
 
 
-async def _collect_task_update_context(configurable: Configuration, run_id: str) -> str:
-    """Wait briefly for task notifications, then read full snapshots."""
-    try:
-        notifications = await wait_for_task_notifications(
-            configurable,
-            run_id=run_id,
-            timeout_seconds=configurable.task_notification_wait_seconds,
-        )
-    except Exception:
-        return ""
-    if not notifications:
-        return ""
+async def _collect_task_update_context(
+    configurable: Configuration,
+    run_id: str,
+    processed_message_ids: set[str],
+) -> tuple[str, list[str], str]:
+    """Claim Lead mailbox updates for durable injection into Supervisor state."""
+    from open_deep_research.tasks.teammate_pool import find_active_teammate_pool
 
-    latest_by_task = {}
-    for notification in notifications:
-        current = latest_by_task.get(notification.task_id)
-        if current is None or notification.version >= current.version:
-            latest_by_task[notification.task_id] = notification
-
-    store = get_task_state_store(configurable)
-    parts = []
-    for notification in latest_by_task.values():
-        snapshot = await store.get(notification.task_id)
-        if snapshot is not None:
-            parts.append(format_task_snapshot_for_context(snapshot))
-
-    if not parts:
-        return ""
-    return "Task state updates received:\n\n" + "\n---\n".join(parts)
+    pool = find_active_teammate_pool(run_id)
+    if pool is not None and not await pool.lease.is_owner():
+        raise RuntimeError(f"This process does not own the Lead lease for run {run_id}")
+    consumer_id = f"{PROCESS_INSTANCE_ID}-lead"
+    messages, context = await claim_lead_updates(
+        configurable,
+        run_id=run_id,
+        consumer_id=consumer_id,
+        processed_message_ids=processed_message_ids,
+    )
+    return context, [message.message_id for message in messages], consumer_id
 
 
 def _merge_task_update_context(
@@ -653,26 +766,13 @@ def build_supervisor_tools(state: SupervisorState) -> list[Tool]:
         registry = get_task_registry()
         run_id = context.config.get("metadata", {}).get("run_id", "default")
         writer = _event_writer(configurable, run_id)
-        checkpoint = (
-            CheckpointManager(runs_dir=configurable.runs_dir, run_id=run_id)
-            if configurable.task_checkpoint_enabled
-            else None
-        )
+        pool = get_teammate_pool(context.config, registry, researcher_runtime.ainvoke)
         try:
             message = await handle_start_research_task(
                 _tool_call_payload("StartResearchTask", input, context),
                 context.config,
                 registry,
-                launch_task=lambda record, cfg: run_task_with_control(
-                    record,
-                    cfg,
-                    registry,
-                    researcher_runtime.ainvoke,
-                    checkpoint_manager=checkpoint,
-                    runs_dir=configurable.runs_dir,
-                    run_id=run_id,
-                    event_log_enabled=configurable.event_log_enabled,
-                ),
+                launch_task=lambda record, _cfg: pool.submit(record),
                 event_writer=writer,
                 memory_context=state.get("memory_context"),
             )
@@ -763,6 +863,24 @@ def build_supervisor_tools(state: SupervisorState) -> list[Tool]:
             if writer is not None:
                 writer.close()
 
+    async def wait_call(input, context, on_progress=None):
+        del on_progress
+        configurable = Configuration.from_runnable_config(context.config)
+        run_id = context.config.get("metadata", {}).get("run_id", "default")
+        from open_deep_research.tasks.teammate_pool import find_active_teammate_pool
+
+        pool = find_active_teammate_pool(run_id)
+        if pool is not None and not await pool.lease.is_owner():
+            raise RuntimeError(f"This process does not own the Lead lease for run {run_id}")
+        mailbox = get_mailbox(configurable, run_id)
+        deadline = asyncio.get_running_loop().time() + input.timeout_seconds
+        while asyncio.get_running_loop().time() < deadline:
+            stats = await mailbox.stats("lead")
+            if stats["available"]:
+                return ToolResult(output=f"{stats['available']} mailbox update(s) are ready.")
+            await asyncio.sleep(configurable.mailbox_poll_interval_ms / 1000)
+        return ToolResult(output="No new research updates before the timeout.")
+
     definitions = [
         (StartResearchTask, start_call),
         (CheckResearchTask, check_call),
@@ -770,6 +888,7 @@ def build_supervisor_tools(state: SupervisorState) -> list[Tool]:
         (UpdateResearchTask, update_call),
         (CancelResearchTask, cancel_call),
         (ApproveResearchDomain, approve_call),
+        (WaitForResearchUpdates, wait_call),
     ]
     tools = [
         build_tool(
@@ -865,7 +984,51 @@ async def _execute_supervisor_tools(
             outcomes.append(await execute_one(tool_call))
         outcomes.extend(await asyncio.gather(*(execute_one(call) for call in conduct)))
 
-    tool_messages = [outcome.message for outcome in outcomes]
+    outcomes_by_id = {
+        outcome.message.tool_call_id: outcome
+        for outcome in outcomes
+    }
+
+    # Supervisor handoff gate: assess each completed synchronous subagent before
+    # its notes are admitted into the shared supervisor state. Rejected handoffs
+    # are returned to the Supervisor with concrete gaps/follow-up tasks so it can
+    # delegate a narrower replacement task.
+    handoff_assessments: dict[str, Any] = {}
+    if configurable.quality_evaluation_enabled:
+        assessable_calls = [
+            call
+            for call in conduct_calls
+            if call["id"] in outcomes_by_id
+            and outcomes_by_id[call["id"]].result is not None
+            and isinstance(outcomes_by_id[call["id"]].result.output, dict)
+        ]
+
+        async def assess_handoff(call: dict[str, Any]):
+            observation = outcomes_by_id[call["id"]].result.output
+            topic = str(call.get("args", {}).get("research_topic", ""))
+            return call["id"], await evaluate_subagent_handoff(topic, observation, config)
+
+        assessed = await asyncio.gather(*(assess_handoff(call) for call in assessable_calls))
+        handoff_assessments = {call_id: assessment for call_id, assessment in assessed}
+
+    tool_messages: list[ToolMessage] = []
+    for call in ordinary_calls:
+        outcome = outcomes_by_id[call["id"]]
+        assessment = handoff_assessments.get(call["id"])
+        if assessment is not None and not assessment.accepted:
+            tool_messages.append(
+                ToolMessage(
+                    content=serialize_tool_output({
+                        "status": "rejected_by_supervisor_quality_gate",
+                        "research_topic": call.get("args", {}).get("research_topic", ""),
+                        "assessment": assessment.model_dump(),
+                    }),
+                    name="ConductResearch",
+                    tool_call_id=call["id"],
+                )
+            )
+        else:
+            tool_messages.append(outcome.message)
     for overflow in overflow_conduct:
         tool_messages.append(
             ToolMessage(
@@ -879,15 +1042,43 @@ async def _execute_supervisor_tools(
             )
         )
 
-    outcomes_by_id = {
-        outcome.message.tool_call_id: outcome
-        for outcome in outcomes
-    }
     successful_complete = any(
         call["name"] == "ResearchComplete"
         and outcomes_by_id[call["id"]].error is None
         for call in ordinary_calls
     )
+    if successful_complete and state.get("enable_async_research", False):
+        snapshots = await get_task_state_store(configurable).list(
+            run_id=config.get("metadata", {}).get("run_id", "default")
+        )
+        unfinished = [
+            snapshot
+            for snapshot in snapshots
+            if snapshot.status not in {
+                TaskStatus.COMPLETED,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+                TaskStatus.TIMED_OUT,
+            }
+        ]
+        if unfinished:
+            successful_complete = False
+            complete_ids = {
+                call["id"] for call in ordinary_calls if call["name"] == "ResearchComplete"
+            }
+            tool_messages = [
+                ToolMessage(
+                    content=(
+                        "ResearchComplete rejected: async tasks are still pending or active: "
+                        + ", ".join(snapshot.task_id for snapshot in unfinished)
+                        + ". Use WaitForResearchUpdates or CheckResearchTask."
+                    ),
+                    name=message.name,
+                    tool_call_id=message.tool_call_id,
+                )
+                if message.tool_call_id in complete_ids else message
+                for message in tool_messages
+            ]
     if successful_complete:
         update: dict[str, Any] = {
             "notes": get_notes_from_tool_calls(supervisor_messages),
@@ -895,11 +1086,31 @@ async def _execute_supervisor_tools(
         }
         if state.get("enable_async_research", False):
             run_id = config.get("metadata", {}).get("run_id", "default")
-            update["completed_task_outputs"] = await collect_completed_task_outputs(
+            outputs = await collect_completed_task_outputs(
                 get_task_registry(),
                 run_id=run_id,
                 state_store=get_task_state_store(configurable),
             )
+            accepted_outputs: list[dict[str, Any]] = []
+            state_store = get_task_state_store(configurable)
+            for output in outputs:
+                snapshot = await state_store.get(str(output["task_id"]))
+                if configurable.quality_evaluation_enabled:
+                    assessment = await evaluate_subagent_handoff(
+                        str(output.get("research_topic", "")), output, config
+                    )
+                    if snapshot is not None:
+                        snapshot.admission_status = "accepted" if assessment.accepted else "rejected"
+                        await state_store.upsert(snapshot)
+                    if not assessment.accepted:
+                        continue
+                    output["handoff_assessment"] = assessment.model_dump()
+                elif snapshot is not None:
+                    snapshot.admission_status = "accepted"
+                    await state_store.upsert(snapshot)
+                accepted_outputs.append(output)
+            update["completed_task_outputs"] = accepted_outputs
+            await shutdown_teammate_pool(config)
         return Command(goto=END, update=update)
 
     raw_notes: list[str] = []
@@ -907,24 +1118,52 @@ async def _execute_supervisor_tools(
         outcome = outcomes_by_id[call["id"]]
         if call["name"] != "ConductResearch" or outcome.result is None:
             continue
+        assessment = handoff_assessments.get(call["id"])
+        if assessment is not None and not assessment.accepted:
+            continue
         observation = outcome.result.output
         if isinstance(observation, dict):
             notes = observation.get("raw_notes", [])
             if notes:
                 raw_notes.extend(str(note) for note in notes)
 
+    pending_mailbox_acks: list[dict[str, Any]] = []
     if state.get("enable_async_research", False) and tool_messages:
         run_id = config.get("metadata", {}).get("run_id", "default")
-        update_context = await _collect_task_update_context(configurable, run_id)
+        processed_ids = set(state.get("processed_mailbox_message_ids", []))
+        update_context, message_ids, consumer_id = await _collect_task_update_context(
+            configurable, run_id, processed_ids
+        )
         tool_messages = _merge_task_update_context(
             tool_messages,
             update_context,
             tool_calls[0],
         )
+        if message_ids:
+            pending_mailbox_acks.append({
+                "run_id": run_id,
+                "consumer_id": consumer_id,
+                "message_ids": message_ids,
+            })
+            update_payload_ids = sorted(processed_ids.union(message_ids))
 
     update_payload: dict[str, Any] = {"supervisor_messages": tool_messages}
     if raw_notes:
         update_payload["raw_notes"] = ["\n".join(raw_notes)]
+    if handoff_assessments:
+        update_payload["handoff_assessments"] = [
+            {
+                "tool_call_id": call_id,
+                **assessment.model_dump(),
+            }
+            for call_id, assessment in handoff_assessments.items()
+        ]
+    if pending_mailbox_acks:
+        update_payload["pending_mailbox_acks"] = pending_mailbox_acks
+        update_payload["processed_mailbox_message_ids"] = {
+            "type": "override",
+            "value": update_payload_ids,
+        }
     return Command(goto="supervisor", update=update_payload)
 
 
@@ -1019,7 +1258,7 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
     )
 
 
-async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Command[Literal["researcher", "compress_research"]]:
+async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Command[Literal["researcher", "assess_research_results", "compress_research"]]:
     """Execute tools called by the researcher, including search tools and strategic thinking.
     
     This function handles various types of researcher tool calls:
@@ -1084,6 +1323,14 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
     ]
     tool_outcomes = await asyncio.gather(*tool_execution_tasks)
     tool_outputs = [outcome.message for outcome in tool_outcomes]
+    pending_tool_results = [
+        {
+            "name": output.name or call.get("name", ""),
+            "content": str(output.content),
+            "error": outcome.error is not None,
+        }
+        for call, output, outcome in zip(tool_calls, tool_outputs, tool_outcomes)
+    ]
 
     # Step 3: Check late exit conditions (after processing tools)
     exceeded_iterations = state.get("tool_call_iterations", 0) >= configurable.max_react_tool_calls
@@ -1091,6 +1338,16 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
         tool_call["name"] == "ResearchComplete"
         for tool_call in most_recent_message.tool_calls
     )
+
+    if configurable.quality_evaluation_enabled:
+        return Command(
+            goto="assess_research_results",
+            update={
+                "researcher_messages": tool_outputs,
+                "pending_tool_results": pending_tool_results,
+                "research_complete_requested": research_complete_called,
+            },
+        )
 
     if exceeded_iterations or research_complete_called:
         # End research and proceed to compression
@@ -1104,6 +1361,63 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
         goto="researcher",
         update={"researcher_messages": tool_outputs}
     )
+
+
+async def assess_research_results(
+    state: ResearcherState,
+    config: RunnableConfig,
+) -> Command[Literal["researcher", "compress_research"]]:
+    """Force a Qwen JSON quality decision between tool execution and routing."""
+    configurable = Configuration.from_runnable_config(config)
+    pending = list(state.get("pending_tool_results", []))
+    complete_requested = state.get("research_complete_requested", False)
+    exceeded_iterations = state.get("tool_call_iterations", 0) >= configurable.max_react_tool_calls
+
+    # Reflection and completion tools contain no evidence of their own. A plain
+    # reflection continues immediately; a completion request is assessed against
+    # all evidence accumulated in this researcher's clean context.
+    evidence_pending = [
+        item for item in pending if item.get("name") not in {"think_tool", "ResearchComplete"}
+    ]
+    if complete_requested and not evidence_pending:
+        evidence_pending = [
+            {
+                "name": message.name or "tool",
+                "content": str(message.content),
+                "error": '"error_type"' in str(message.content).lower(),
+            }
+            for message in state.get("researcher_messages", [])
+            if isinstance(message, ToolMessage)
+            and message.name not in {"think_tool", "ResearchComplete"}
+        ]
+    if not evidence_pending and not complete_requested:
+        return Command(
+            goto="researcher",
+            update={"pending_tool_results": [], "research_complete_requested": False},
+        )
+
+    assessment = await evaluate_tool_results(
+        state.get("research_topic", ""),
+        evidence_pending,
+        config,
+    )
+    assessment_json = assessment.model_dump_json()
+    update = {
+        "researcher_messages": [HumanMessage(
+            content=(
+                "Runtime quality assessment JSON from the evaluation model. "
+                "Use its gaps and suggested queries to choose the next action:\n"
+                f"{assessment_json}"
+            )
+        )],
+        "result_assessment": assessment.model_dump(),
+        "pending_tool_results": [],
+        "research_complete_requested": False,
+    }
+
+    if exceeded_iterations or assessment.decision == "complete":
+        return Command(goto="compress_research", update=update)
+    return Command(goto="researcher", update=update)
 
 async def compress_research(state: ResearcherState, config: RunnableConfig):
     """Compress and synthesize research findings into a concise, structured summary.
@@ -1343,6 +1657,67 @@ async def memory_extract_and_write(
             "value": [c.model_dump() for c in candidates],
         }},
     )
+
+
+async def restore_async_research_tasks(config: RunnableConfig) -> None:
+    """Recreate async task records from checkpoints and completed task artifacts."""
+    from open_deep_research.run_context import RunContextStore
+
+    configurable = Configuration.from_runnable_config(config)
+    if not configurable.enable_async_research:
+        return
+    run_id = config.get("metadata", {}).get("run_id", "default")
+    registry = get_task_registry()
+    checkpoint_manager = CheckpointManager(runs_dir=configurable.runs_dir, run_id=run_id)
+
+    # Completed task artifacts survive successful checkpoint deletion.
+    context_store = RunContextStore(
+        run_id,
+        runs_dir=configurable.runs_dir,
+        inline_content_max_chars=configurable.query_journal_inline_content_max_chars,
+    )
+    task_artifact_dir = context_store.context_dir / "artifacts" / "research_tasks"
+    if task_artifact_dir.exists():
+        for artifact in task_artifact_dir.glob("*.json"):
+            task_id = artifact.stem
+            if registry.get(task_id) is not None:
+                continue
+            try:
+                result = json.loads(artifact.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            record = TaskRecord(
+                task_id=task_id,
+                research_topic=str(result.get("research_topic", "")),
+                run_id=run_id,
+                status=TaskStatus.COMPLETED,
+                phase=TaskPhase.COMPLETED,
+                result=result,
+            )
+            registry.restore(record)
+            await get_task_state_store(configurable).update_from_record(record)
+
+    for checkpoint in checkpoint_manager.list_checkpoints():
+        if checkpoint.run_id and checkpoint.run_id != run_id:
+            continue
+        if registry.get(checkpoint.task_id) is not None:
+            continue
+        record = TaskRecord(
+            task_id=checkpoint.task_id,
+            research_topic=checkpoint.research_topic,
+            run_id=run_id,
+            user_id=checkpoint.user_id,
+            status=TaskStatus.PENDING,
+            phase=(
+                TaskPhase.COMPRESSING
+                if checkpoint.phase == TaskPhase.COMPRESSING.value
+                else TaskPhase.RESEARCHING
+            ),
+            memory_context=checkpoint.memory_context,
+        )
+        registry.restore(record)
+
+    await get_teammate_pool(config, registry, researcher_runtime.ainvoke).start()
 
 
 researcher_runtime = ResearcherQueryEngine()

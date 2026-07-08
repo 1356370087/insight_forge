@@ -879,6 +879,12 @@ async def check_egress_domain(
     task_id = config.get("metadata", {}).get("task_id")
     approvals = get_domain_approval_registry()
     decision = approvals.is_allowed(run_id, host)
+    if decision is None:
+        from open_deep_research.tasks.coordination import FileDomainDecisionStore
+
+        decision = await FileDomainDecisionStore(configurable, run_id).get(host)
+        if decision is not None:
+            approvals.record_decision(run_id, host, decision)
     if decision is True:
         return None
     if decision is False:

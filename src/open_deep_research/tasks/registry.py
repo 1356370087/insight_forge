@@ -66,6 +66,10 @@ class TaskRecord:
 
     # Output
     result: Optional[dict[str, Any]] = None  # {"compressed_research": ..., "raw_notes": [...]}
+    assigned_teammate_id: Optional[str] = None
+    admission_status: str = "pending"
+    result_artifact_path: Optional[str] = None
+    result_artifact_sha256: Optional[str] = None
     memory_context: Optional[str] = None
     error_message: Optional[str] = None
 
@@ -116,6 +120,7 @@ class TaskRegistry:
     """
 
     def __init__(self) -> None:
+        """Initialize an empty task registry."""
         self._tasks: dict[str, TaskRecord] = {}
 
     # ------------------------------------------------------------------
@@ -141,6 +146,11 @@ class TaskRegistry:
     def get(self, task_id: str) -> Optional[TaskRecord]:
         """Return the record for *task_id*, or ``None``."""
         return self._tasks.get(task_id)
+
+    def restore(self, record: TaskRecord) -> TaskRecord:
+        """Register a record reconstructed from durable run state."""
+        self._tasks[record.task_id] = record
+        return record
 
     def list(
         self,
@@ -178,7 +188,7 @@ class TaskRegistry:
         return all(t.status in terminal for t in records)
 
     def count_running(self, run_id: Optional[str] = None) -> int:
-        """Number of tasks currently RUNNING, optionally scoped to *run_id*."""
+        """Count tasks currently RUNNING, optionally scoped to *run_id*."""
         records = self.list(run_id=run_id) if run_id is not None else self._tasks.values()
         return sum(1 for t in records if t.status == TaskStatus.RUNNING)
 
@@ -193,6 +203,7 @@ class TaskRegistry:
         return sum(1 for t in records if t.status in active)
 
     def __len__(self) -> int:
+        """Return the number of registered tasks."""
         return len(self._tasks)
 
 

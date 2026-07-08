@@ -29,6 +29,10 @@ class ResearcherCheckpoint:
     completed_queries: list[str] = field(default_factory=list)
     fetched_sources: list[str] = field(default_factory=list)
     compressed_research: Optional[str] = None
+    research_topic: str = ""
+    run_id: str = ""
+    user_id: Optional[str] = None
+    memory_context: Optional[str] = None
     timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
@@ -41,11 +45,15 @@ class ResearcherCheckpoint:
             "completed_queries": self.completed_queries,
             "fetched_sources": self.fetched_sources,
             "compressed_research": self.compressed_research,
+            "research_topic": self.research_topic,
+            "run_id": self.run_id,
+            "user_id": self.user_id,
+            "memory_context": self.memory_context,
             "timestamp": self.timestamp,
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "ResearcherCheckpoint":
+    def from_dict(cls, data: dict[str, Any]) -> ResearcherCheckpoint:
         """Deserialize from a dictionary."""
         return cls(
             task_id=data.get("task_id", ""),
@@ -55,6 +63,10 @@ class ResearcherCheckpoint:
             completed_queries=data.get("completed_queries", []),
             fetched_sources=data.get("fetched_sources", []),
             compressed_research=data.get("compressed_research"),
+            research_topic=data.get("research_topic", ""),
+            run_id=data.get("run_id", ""),
+            user_id=data.get("user_id"),
+            memory_context=data.get("memory_context"),
             timestamp=data.get("timestamp", time.time()),
         )
 
@@ -67,6 +79,7 @@ class CheckpointManager:
     """
 
     def __init__(self, runs_dir: str, run_id: str) -> None:
+        """Initialize the run-scoped checkpoint directory."""
         self._dir = os.path.join(runs_dir, run_id, "checkpoints")
         os.makedirs(self._dir, exist_ok=True)
 
@@ -93,7 +106,7 @@ class CheckpointManager:
         if not os.path.isfile(path):
             return None
         try:
-            with open(path, "r", encoding="utf-8") as fh:
+            with open(path, encoding="utf-8") as fh:
                 return ResearcherCheckpoint.from_dict(json.load(fh))
         except (json.JSONDecodeError, KeyError):
             return None
@@ -103,3 +116,16 @@ class CheckpointManager:
         path = self._path(task_id)
         if os.path.isfile(path):
             os.remove(path)
+
+    def list_checkpoints(self) -> list[ResearcherCheckpoint]:
+        """Load every valid checkpoint for this run."""
+        checkpoints: list[ResearcherCheckpoint] = []
+        if not os.path.isdir(self._dir):
+            return checkpoints
+        for name in os.listdir(self._dir):
+            if not name.endswith(".json"):
+                continue
+            checkpoint = self.load(name[:-5])
+            if checkpoint is not None:
+                checkpoints.append(checkpoint)
+        return checkpoints
