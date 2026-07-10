@@ -9,7 +9,7 @@ byte-for-byte.
 Contract preserved for backward compatibility:
 
 * ``final_report`` is always a markdown string.
-* ``messages`` carries the writer AIMessage (or an error AIMessage on failure).
+* ``messages`` carries the writer AIMessage; terminal writer failures propagate.
 * ``notes`` and ``completed_task_outputs`` are cleared via the override reducer,
   exactly as before.
 * For the default profile (markdown, one-shot) no extra state/SSE keys are
@@ -18,12 +18,14 @@ Contract preserved for backward compatibility:
 
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 
 from open_deep_research.configuration import Configuration
+from open_deep_research.observability import get_trace_recorder
 
 from .assembly import ReportContext, assemble
 from .profiles import (
@@ -119,6 +121,12 @@ async def build_report(state: dict, config: RunnableConfig) -> dict:
     # Render every artifact from the same canonical markdown exposed through
     # ``final_report`` so reference rewriting cannot create divergent payloads.
     result.body_markdown = markdown
+    metric_sources = result.sources or parse_sources_from_text(markdown + "\n" + ctx.findings)
+    active_span = get_trace_recorder(config).active_span()
+    active_span.score("report.source_count", len(metric_sources))
+    active_span.score("report.citation_marker_count", len(re.findall(r"\[\d+\]", markdown)))
+    active_span.score("report.character_count", len(markdown))
+    active_span.score("report.section_count", len(result.sections))
     artifacts = render_artifacts(result, fmt, ctx)
 
     update: dict = {

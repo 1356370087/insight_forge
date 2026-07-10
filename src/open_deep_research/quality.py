@@ -13,7 +13,10 @@ from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
 from open_deep_research.configuration import Configuration
-from open_deep_research.observability import invoke_model_with_retry_observability
+from open_deep_research.observability import (
+    get_trace_recorder,
+    invoke_model_with_retry_observability,
+)
 
 _URL_RE = re.compile(r"https?://[^\s\]\[()<>\"']+", re.IGNORECASE)
 _ERROR_MARKERS = ('"error_type"', '"error":', "error:", "tool execution failed")
@@ -62,6 +65,33 @@ independent sources, expose conflicts, and identify the most useful next search.
 for failed, irrelevant, or weak results; continue when useful evidence exists but important gaps
 remain; complete only when the topic can be answered with adequate corroborated evidence.
 """
+
+
+def _record_quality_scores(prefix: str, result: BaseModel, config: RunnableConfig) -> None:
+    """Attach bounded quality scores to the active research/supervisor span."""
+    span = get_trace_recorder(config).active_span()
+    payload = result.model_dump()
+    comment = str(payload.get("reason") or "")[:500] or None
+    for key in (
+        "relevance",
+        "source_quality",
+        "evidence_coverage",
+        "corroboration",
+        "groundedness",
+        "accepted",
+    ):
+        value = payload.get(key)
+        if isinstance(value, int | float | bool):
+            span.score(f"{prefix}.{key}", value, comment)
+    decision = payload.get("decision")
+    if isinstance(decision, str):
+        span.score(f"{prefix}.decision", decision, comment)
+    checks = payload.get("deterministic_checks") or {}
+    if isinstance(checks, dict):
+        for key in ("source_count", "error_count", "evidence_result_count", "passed"):
+            value = checks.get(key)
+            if isinstance(value, int | float | bool):
+                span.score(f"{prefix}.{key}", value, comment)
 
 
 HANDOFF_EVALUATION_PROMPT = """You are the Supervisor's research handoff quality gate.
@@ -214,6 +244,7 @@ async def evaluate_tool_results(
     scores = (result.relevance, result.source_quality, result.evidence_coverage, result.corroboration)
     if not checks["passed"] or min(scores) < configurable.quality_evaluation_min_score:
         result.decision = "retry"
+    _record_quality_scores("tool_result", result, config)
     return result
 
 
@@ -260,4 +291,5 @@ async def evaluate_subagent_handoff(
     scores = (result.relevance, result.source_quality, result.evidence_coverage, result.groundedness)
     if not checks["passed"] or min(scores) < configurable.quality_evaluation_min_score:
         result.accepted = False
+    _record_quality_scores("handoff", result, config)
     return result

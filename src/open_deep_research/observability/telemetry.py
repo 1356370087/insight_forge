@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from contextlib import ExitStack
 from typing import Any
 
-from prometheus_client import Counter, Histogram
+from prometheus_client import Counter, Gauge, Histogram
 
 from open_deep_research.configuration import Configuration
 
@@ -55,10 +55,22 @@ class PrometheusMetrics:
             ["provider", "model", "agent_role", "operation"],
             namespace=namespace,
         )
+        self.llm_output_throughput = Histogram(
+            "llm_output_tokens_per_second",
+            "Completed output tokens divided by request duration.",
+            ["provider", "model", "agent_role", "operation"],
+            namespace=namespace,
+        )
         self.llm_tokens = Counter(
             "llm_tokens_total",
             "LLM tokens reported by providers.",
             ["provider", "model", "agent_role", "direction"],
+            namespace=namespace,
+        )
+        self.llm_cost = Counter(
+            "llm_estimated_cost_usd_total",
+            "Estimated LLM cost in USD from configured model prices.",
+            ["provider", "model", "agent_role"],
             namespace=namespace,
         )
         self.tool_calls = Counter(
@@ -73,6 +85,30 @@ class PrometheusMetrics:
             ["tool_name", "agent_role"],
             namespace=namespace,
         )
+        self.tool_result_size = Histogram(
+            "tool_result_characters",
+            "Serialized tool result size in characters.",
+            ["tool_name", "agent_role"],
+            namespace=namespace,
+        )
+        self.search_sources = Histogram(
+            "search_unique_sources",
+            "Unique URLs returned by one search tool call.",
+            ["tool_name"],
+            namespace=namespace,
+        )
+        self.agent_steps = Counter(
+            "agent_steps_total",
+            "Completed agent/runtime stages.",
+            ["agent_role", "operation", "status"],
+            namespace=namespace,
+        )
+        self.agent_duration = Histogram(
+            "agent_step_duration_seconds",
+            "Agent/runtime stage duration, including wait states.",
+            ["agent_role", "operation"],
+            namespace=namespace,
+        )
         self.retries = Counter(
             "retries_total",
             "Retry attempts by operation and error class.",
@@ -85,22 +121,92 @@ class PrometheusMetrics:
             ["kind", "provider", "model", "agent_role"],
             namespace=namespace,
         )
+        self.terminal_rate_limits = Counter(
+            "terminal_rate_limits_total",
+            "LLM/tool calls that terminated with a rate-limit error.",
+            ["kind", "provider", "model", "agent_role"],
+            namespace=namespace,
+        )
+        self.export_errors = Counter(
+            "observability_export_errors_total",
+            "Failed writes to an observability backend.",
+            ["component", "operation"],
+            namespace=namespace,
+        )
+        self.quality_scores = Histogram(
+            "quality_score",
+            "Runtime quality and evidence scores.",
+            ["score_name", "agent_role"],
+            buckets=(0, 1, 2, 3, 4, 5),
+            namespace=namespace,
+        )
+        self.task_events = Counter(
+            "research_tasks_total",
+            "Research task lifecycle transitions.",
+            ["event"],
+            namespace=namespace,
+        )
+        self.task_queue_wait = Histogram(
+            "research_task_queue_wait_seconds",
+            "Time from task creation until execution starts.",
+            namespace=namespace,
+        )
+        self.task_duration = Histogram(
+            "research_task_duration_seconds",
+            "End-to-end research task duration by terminal outcome.",
+            ["outcome"],
+            namespace=namespace,
+        )
+        self.pending_tasks = Gauge(
+            "research_tasks_pending",
+            "Tasks waiting for a teammate.",
+            namespace=namespace,
+        )
+        self.active_tasks = Gauge(
+            "research_tasks_active",
+            "Tasks currently executing or waiting for approval.",
+            namespace=namespace,
+        )
 
     def observe_span(self, span: Any, status: str, duration_seconds: float) -> None:
         """Publish one completed LLM/tool span."""
         role = span.agent_role or "unknown"
         provider = span.provider or "unknown"
         model = span.model or "unknown"
+        if span.error_type == "rate_limited":
+            self.terminal_rate_limits.labels(span.kind, provider, model, role).inc()
         if span.kind == "llm":
             operation = _operation(span.name)
             self.llm_requests.labels(provider, model, role, operation, status).inc()
             self.llm_duration.labels(provider, model, role, operation).observe(duration_seconds)
+            if duration_seconds > 0 and span.usage.output_tokens > 0:
+                self.llm_output_throughput.labels(provider, model, role, operation).observe(
+                    span.usage.output_tokens / duration_seconds
+                )
             self.llm_tokens.labels(provider, model, role, "input").inc(span.usage.input_tokens)
             self.llm_tokens.labels(provider, model, role, "output").inc(span.usage.output_tokens)
+            self.llm_tokens.labels(provider, model, role, "cached_input").inc(
+                span.usage.cached_input_tokens
+            )
+            self.llm_tokens.labels(provider, model, role, "reasoning").inc(
+                span.usage.reasoning_tokens
+            )
+            self.llm_cost.labels(provider, model, role).inc(span.usage.estimated_cost_usd)
         elif span.kind == "tool":
             tool_name = span.attributes.get("tool_name") or span.name.removeprefix("tool.")
             self.tool_calls.labels(str(tool_name), role, status).inc()
             self.tool_duration.labels(str(tool_name), role).observe(duration_seconds)
+            self.tool_result_size.labels(str(tool_name), role).observe(
+                float(span.attributes.get("result_chars", 0))
+            )
+            if "search" in str(tool_name).lower():
+                self.search_sources.labels(str(tool_name)).observe(
+                    float(span.attributes.get("source_count", 0))
+                )
+        elif span.kind == "agent":
+            operation = _operation(span.name)
+            self.agent_steps.labels(role, operation, status).inc()
+            self.agent_duration.labels(role, operation).observe(duration_seconds)
 
     def observe_retry(self, span: Any, error_type: str) -> None:
         """Publish one retry without run/trace identifiers as labels."""
@@ -118,6 +224,32 @@ class PrometheusMetrics:
         """Publish one completed top-level run."""
         self.runs.labels(status).inc()
         self.run_duration.labels(status).observe(duration_seconds)
+
+    def observe_export_error(self, component: str, operation: str) -> None:
+        """Count a fail-open backend write failure."""
+        self.export_errors.labels(component, operation).inc()
+
+    def observe_score(self, name: str, value: Any, agent_role: str) -> None:
+        """Publish numeric runtime quality scores."""
+        if isinstance(value, int | float | bool):
+            self.quality_scores.labels(name, agent_role).observe(float(value))
+
+    def observe_task_transition(self, record: Any, event: str) -> None:
+        """Publish queue and lifecycle metrics for one research task transition."""
+        event_name = str(getattr(event, "value", event))
+        self.task_events.labels(event_name).inc()
+        if event_name == "task.started":
+            if record.started_at is not None:
+                self.task_queue_wait.observe(max(0.0, record.started_at - record.created_at))
+        elif event_name in {"task.completed", "task.failed", "task.timed_out", "task.cancelled"}:
+            self.task_duration.labels(event_name.removeprefix("task.")).observe(
+                max(0.0, record.elapsed_seconds)
+            )
+
+    def set_task_counts(self, pending: int, active: int) -> None:
+        """Set queue gauges from the authoritative task-state store."""
+        self.pending_tasks.set(max(0, pending))
+        self.active_tasks.set(max(0, active))
 
 
 _prometheus_metrics: dict[str, PrometheusMetrics] = {}
@@ -166,16 +298,26 @@ class LangfuseSpanBridge:
         }
         if as_type == "generation":
             kwargs["model"] = self.span.model
-        if self.span.parent_span_id is None:
-            kwargs["trace_context"] = {
-                "trace_id": self.sink.client.create_trace_id(seed=self.span.run_id),
-            }
+        trace_context = {
+            "trace_id": self.sink.client.create_trace_id(seed=self.span.run_id),
+        }
+        langfuse_parent_span_id = getattr(
+            self.span, "langfuse_parent_span_id", None
+        )
+        if langfuse_parent_span_id is not None:
+            trace_context["parent_span_id"] = langfuse_parent_span_id
+        kwargs["trace_context"] = trace_context
 
         stack = ExitStack()
         try:
             self.observation = stack.enter_context(
                 self.sink.client.start_as_current_observation(**kwargs)
             )
+            observation_id_getter = getattr(
+                self.sink.client, "get_current_observation_id", None
+            )
+            if observation_id_getter is not None:
+                self.span.langfuse_observation_id = observation_id_getter()
             if self.span.kind == "run":
                 stack.enter_context(
                     self.sink.propagate_attributes(
@@ -197,20 +339,41 @@ class LangfuseSpanBridge:
                 update: dict[str, Any] = {
                     "output": self.span.output_preview,
                     "metadata": {
+                        **self.span.attributes,
                         "retry_count": self.span.retry_count,
                         "error_type": self.span.error_type,
                         "http_status": self.span.http_status,
+                        "status": getattr(self.span, "final_status", None),
                     },
                 }
                 if self.span.kind == "llm":
-                    update["usage_details"] = {
+                    usage_details = {
                         "input": self.span.usage.input_tokens,
                         "output": self.span.usage.output_tokens,
                         "total": self.span.usage.total_tokens,
                     }
+                    if self.span.usage.cached_input_tokens:
+                        usage_details["cached_input"] = self.span.usage.cached_input_tokens
+                    if self.span.usage.cache_creation_input_tokens:
+                        usage_details["cache_creation_input"] = (
+                            self.span.usage.cache_creation_input_tokens
+                        )
+                    if self.span.usage.reasoning_tokens:
+                        usage_details["reasoning"] = self.span.usage.reasoning_tokens
+                    update["usage_details"] = usage_details
+                    if self.span.usage.estimated_cost_usd > 0:
+                        update["cost_details"] = {
+                            "total": self.span.usage.estimated_cost_usd,
+                        }
                 if exc or self.span.error_type:
                     update["level"] = "ERROR"
-                    update["status_message"] = str(exc or self.span.error_type)
+                    update["status_message"] = (
+                        getattr(self.span, "error_message", None)
+                        or str(self.span.error_type)
+                    )
+                elif getattr(self.span, "final_status", None) == "cancelled":
+                    update["level"] = "WARNING"
+                    update["status_message"] = "cancelled"
                 self.observation.update(**update)
         finally:
             if self.stack is not None:
@@ -248,6 +411,27 @@ class LangfuseSink:
         from langfuse.langchain import CallbackHandler
 
         return CallbackHandler()
+
+    def score(
+        self,
+        span: Any,
+        name: str,
+        value: float | str | bool,
+        comment: str | None = None,
+    ) -> None:
+        """Attach a score to the exact mirrored observation."""
+        data_type = "BOOLEAN" if isinstance(value, bool) else (
+            "NUMERIC" if isinstance(value, int | float) else "CATEGORICAL"
+        )
+        normalized: float | str = float(value) if isinstance(value, bool) else value
+        self.client.create_score(
+            name=name,
+            value=normalized,
+            trace_id=self.client.create_trace_id(seed=span.run_id),
+            observation_id=span.langfuse_observation_id,
+            data_type=data_type,
+            comment=comment,
+        )
 
     def flush(self) -> None:
         """Flush queued observations for short-lived processes."""

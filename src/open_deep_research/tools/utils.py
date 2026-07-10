@@ -25,7 +25,6 @@ from langchain_core.tools import (
     ToolException,
     tool,
 )
-from langchain_mcp_adapters.client import MultiServerMCPClient
 from mcp import McpError
 from openai import AsyncOpenAI
 from tavily import AsyncTavilyClient
@@ -572,6 +571,8 @@ async def load_mcp_tools(
     
     # Step 4: Load tools from MCP server
     try:
+        from langchain_mcp_adapters.client import MultiServerMCPClient
+
         client = MultiServerMCPClient(mcp_server_config)
         available_mcp_tools = await client.get_tools()
     except Exception:
@@ -650,6 +651,8 @@ async def load_browser_mcp_tools(
         return []
 
     try:
+        from langchain_mcp_adapters.client import MultiServerMCPClient
+
         client = MultiServerMCPClient({"browser": connection})
         available_browser_tools = await client.get_tools()
     except Exception:
@@ -744,11 +747,45 @@ def _sdk_usage(response: Any) -> TokenUsage:
         if output_tokens:
             break
     total_tokens = _to_int(getattr(usage_obj, "total_tokens", None)) or (input_tokens + output_tokens)
+    input_details = getattr(usage_obj, "input_tokens_details", None) or getattr(
+        usage_obj, "prompt_tokens_details", None
+    )
+    output_details = getattr(usage_obj, "output_tokens_details", None) or getattr(
+        usage_obj, "completion_tokens_details", None
+    )
+    cached_detail = (
+        input_details.get("cached_tokens")
+        if isinstance(input_details, dict)
+        else getattr(input_details, "cached_tokens", None)
+    )
+    reasoning_detail = (
+        output_details.get("reasoning_tokens")
+        if isinstance(output_details, dict)
+        else getattr(output_details, "reasoning_tokens", None)
+    )
+    cached_input_tokens = _to_int(
+        getattr(usage_obj, "cache_read_input_tokens", None)
+        or cached_detail
+    )
+    cache_creation_input_tokens = _to_int(
+        getattr(usage_obj, "cache_creation_input_tokens", None)
+    )
+    reasoning_tokens = _to_int(reasoning_detail)
     return TokenUsage(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         total_tokens=total_tokens,
-        raw_usage={"input_tokens": input_tokens, "output_tokens": output_tokens, "total_tokens": total_tokens},
+        cached_input_tokens=cached_input_tokens,
+        cache_creation_input_tokens=cache_creation_input_tokens,
+        reasoning_tokens=reasoning_tokens,
+        raw_usage={
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "cached_input_tokens": cached_input_tokens,
+            "cache_creation_input_tokens": cache_creation_input_tokens,
+            "reasoning_tokens": reasoning_tokens,
+        },
     )
 
 
@@ -822,8 +859,7 @@ async def _sdk_call_with_observability(
                 span.add_usage(usage, provider, str(model))
             if getattr(recorder.configuration, "trace_payload_mode", "preview") != "none":
                 preview_text = _sdk_response_text(response)
-                limit = None if recorder.configuration.trace_payload_mode == "full" else recorder.configuration.trace_preview_chars
-                span.output_preview = preview_text[:limit] if (limit and preview_text) else preview_text
+                span.set_output(preview_text)
             return response
 
 

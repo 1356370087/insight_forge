@@ -6,7 +6,7 @@ from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
 
 from langchain_core.runnables import RunnableConfig
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class SearchAPI(Enum):
@@ -165,6 +165,17 @@ class Configuration(BaseModel):
                 "description": "Maximum characters stored for trace payload previews.",
             }
         },
+    )
+    trace_redaction_enabled: bool = Field(
+        default=True,
+        description="Redact common credentials and bearer tokens from trace payloads.",
+    )
+    model_costs_per_million: Dict[str, Dict[str, float]] = Field(
+        default_factory=dict,
+        description=(
+            "Optional per-model USD rates per million tokens. Supported keys are "
+            "input, output, cached_input, cache_creation_input, and reasoning."
+        ),
     )
     langfuse_enabled: bool = Field(
         default=False,
@@ -1184,6 +1195,16 @@ class Configuration(BaseModel):
                 return parsed
             return [item.strip() for item in value.split(",") if item.strip()]
         return value
+
+    @model_validator(mode="after")
+    def validate_leader_lease_timing(self) -> "Configuration":
+        """Ensure a live leader renews well before its lease can expire."""
+        if self.leader_heartbeat_seconds * 3 > self.leader_lease_seconds:
+            raise ValueError(
+                "leader_heartbeat_seconds must be no more than one third of "
+                "leader_lease_seconds"
+            )
+        return self
 
     @classmethod
     def from_runnable_config(

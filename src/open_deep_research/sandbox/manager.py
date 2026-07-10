@@ -296,6 +296,8 @@ class DockerSandboxManager:
                 "run_id": task_record.run_id,
                 "user_id": task_record.user_id,
                 "task_id": task_record.task_id,
+                "trace_parent_span_id": task_record.trace_parent_span_id,
+                "langfuse_parent_span_id": task_record.langfuse_parent_span_id,
             },
         }
 

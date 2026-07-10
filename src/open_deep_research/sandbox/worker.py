@@ -61,10 +61,22 @@ async def _run() -> int:
 
         logging.info("Starting sandbox worker for task_id=%s", task_id)
         from open_deep_research.agents.deep_researcher import researcher_runtime
+        from open_deep_research.observability import bind_span_context
 
-        result = await researcher_runtime.ainvoke(state, config)
+        with bind_span_context(
+            str(config["metadata"].get("run_id") or "default"),
+            config["metadata"].get("trace_parent_span_id"),
+            config["metadata"].get("langfuse_parent_span_id"),
+        ):
+            result = await researcher_runtime.ainvoke(state, config)
         raw_notes = result.get("raw_notes", [])
         compressed_research = result.get("compressed_research", "")
+        result_metrics = dict(result.get("metrics", {}))
+        result_metrics.setdefault("sources_read", 0)
+        result_metrics.setdefault(
+            "tool_calls", int(result.get("tool_call_iterations", 0) or 0)
+        )
+        result_metrics["failures"] = 0
 
         _write_json(
             result_path,
@@ -73,11 +85,7 @@ async def _run() -> int:
                 "status": "completed",
                 "compressed_research": compressed_research,
                 "raw_notes": raw_notes,
-                "metrics": {
-                    "sources_read": 0,
-                    "tool_calls": int(state.get("tool_call_iterations", 0) or 0),
-                    "failures": 0,
-                },
+                "metrics": result_metrics,
             },
         )
         logging.info("Sandbox worker completed task_id=%s", task_id)
