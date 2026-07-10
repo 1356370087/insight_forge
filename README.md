@@ -81,7 +81,7 @@ See the fields in the [configuration.py](https://github.com/langchain-ai/open_de
 
 #### Observability
 
-The handwritten runtime uses `TraceRecorder` as its primary instrumentation boundary. It can keep the local SQLite trace store while also mirroring detailed runs, agent/tool spans, prompts, outputs, token usage, and inferred model cost to Langfuse. Low-cardinality counters and histograms are exposed for Prometheus/Grafana.
+The handwritten runtime uses `TraceRecorder` as its primary instrumentation boundary. It can keep the local SQLite trace store while also mirroring detailed runs, agent/tool spans, redacted prompt/output previews, token usage, runtime quality scores, and model cost to Langfuse. Cost is taken from provider usage when available, or estimated from the optional `model_costs_per_million` configurable map. Low-cardinality counters, gauges, and histograms are exposed for Prometheus/Grafana.
 
 ```env
 LANGFUSE_ENABLED=true
@@ -94,7 +94,7 @@ PROMETHEUS_ENABLED=true
 PROMETHEUS_METRICS_PATH=/metrics
 ```
 
-Prometheus should scrape `GET /metrics`. The exported series cover run and LLM/tool latency, request counts, input/output tokens, retries, and rate limits. Run IDs, trace IDs, and user IDs remain in Langfuse and are deliberately not used as Prometheus labels. Set `LANGFUSE_LANGCHAIN_CALLBACK_ENABLED=true` only when additional LangChain callback-level detail is needed; direct `TraceRecorder` instrumentation remains authoritative.
+Prometheus should scrape `GET /metrics`. The exported series cover run/agent/LLM/tool latency, request counts, detailed tokens, throughput, estimated cost, retries, rate-limited calls, research-task queue health, source counts, runtime quality scores, and observability export failures. Run IDs, trace IDs, task IDs, and user IDs are deliberately not used as Prometheus labels. Trace payload redaction is enabled by default. When `LANGFUSE_LANGCHAIN_CALLBACK_ENABLED=true`, callback tracing owns the Langfuse generation while `TraceRecorder` remains authoritative for SQLite and Prometheus, avoiding duplicate Langfuse generations.
 
 ### 📊 Evaluation
 
