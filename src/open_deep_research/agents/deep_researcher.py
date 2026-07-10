@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 from typing import Any, Literal
 
 from langchain.chat_models import init_chat_model
@@ -29,6 +30,7 @@ from open_deep_research.memory.store import (
 )
 from open_deep_research.observability import (
     apply_helicone_config,
+    get_trace_recorder,
     invoke_model_with_retry_observability,
     observe_tool_call,
 )
@@ -398,6 +400,7 @@ async def memory_recall(
         )
     except Exception:
         results = []
+        get_trace_recorder(config).active_span().score("memory.recall_failed", True)
         if event_writer is not None:
             event_writer.write(ResearchEvent(
                 event_type=EventType.MEMORY_FAILED,
@@ -410,9 +413,11 @@ async def memory_recall(
             event_writer.close()
 
     if not results:
+        get_trace_recorder(config).active_span().score("memory.recall_count", 0)
         return Command(goto="clarify_with_user")
 
     memory_context = _format_memory_context(results)
+    get_trace_recorder(config).active_span().score("memory.recall_count", len(results))
 
     # Log recall event (summary only)
     if configurable.event_log_enabled:
@@ -793,6 +798,7 @@ def build_supervisor_tools(state: SupervisorState) -> list[Tool]:
                 registry,
                 writer,
                 get_task_state_store(configurable),
+                run_id=run_id,
             )
             return ToolResult(output=message.content)
         finally:
@@ -821,6 +827,8 @@ def build_supervisor_tools(state: SupervisorState) -> list[Tool]:
                 _tool_call_payload("UpdateResearchTask", input, context),
                 get_task_registry(),
                 writer,
+                get_task_state_store(configurable),
+                run_id=run_id,
             )
             return ToolResult(output=message.content)
         finally:
@@ -839,6 +847,7 @@ def build_supervisor_tools(state: SupervisorState) -> list[Tool]:
                 writer,
                 get_task_state_store(configurable),
                 configurable,
+                run_id=run_id,
             )
             return ToolResult(output=message.content)
         finally:
@@ -923,6 +932,21 @@ async def _execute_supervisor_tools(
         > configurable.max_researcher_iterations
         or not tool_calls
     ):
+        if state.get("enable_async_research", False):
+            run_id = str(config.get("metadata", {}).get("run_id", "default"))
+            snapshots = await get_task_state_store(configurable).list(run_id=run_id)
+            terminal = {
+                TaskStatus.COMPLETED,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+                TaskStatus.TIMED_OUT,
+            }
+            unfinished = [snapshot.task_id for snapshot in snapshots if snapshot.status not in terminal]
+            if unfinished:
+                raise RuntimeError(
+                    "Supervisor attempted to exit while async research tasks remain active: "
+                    + ", ".join(unfinished)
+                )
         return Command(
             goto=END,
             update={
@@ -1094,7 +1118,9 @@ async def _execute_supervisor_tools(
             accepted_outputs: list[dict[str, Any]] = []
             state_store = get_task_state_store(configurable)
             for output in outputs:
-                snapshot = await state_store.get(str(output["task_id"]))
+                snapshot = await state_store.get(
+                    str(output["task_id"]), run_id=run_id
+                )
                 if configurable.quality_evaluation_enabled:
                     assessment = await evaluate_subagent_handoff(
                         str(output.get("research_topic", "")), output, config
@@ -1453,6 +1479,7 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
     # Step 3: Attempt compression with retry logic for token limit issues
     synthesis_attempts = 0
     max_attempts = 3
+    last_error: Exception | None = None
     
     while synthesis_attempts < max_attempts:
         try:
@@ -1477,32 +1504,71 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
             ])
             
             # Return successful compression result
+            tool_messages = [
+                message
+                for message in researcher_messages
+                if isinstance(message, ToolMessage)
+            ]
+            source_urls = set(
+                re.findall(
+                    r"https?://[^\s\]\)>'\"}]+",
+                    "\n".join(str(message.content) for message in tool_messages),
+                )
+            )
+            metrics = {
+                "tool_calls": len(tool_messages),
+                "query_count": sum(
+                    "search" in str(message.name or "").lower()
+                    for message in tool_messages
+                ),
+                "sources_read": len(source_urls),
+                "citation_count": len(source_urls),
+            }
+            task_id = str(config.get("metadata", {}).get("task_id", ""))
+            if task_id:
+                record = get_task_registry().get(task_id)
+                expected_run_id = str(config.get("metadata", {}).get("run_id", "default"))
+                if record is not None and record.run_id == expected_run_id:
+                    metrics.update({
+                        "query_count": record.query_count,
+                        "sources_read": record.source_count,
+                        "citation_count": record.citation_count,
+                        "retry_count": record.retry_count,
+                    })
             return {
                 "compressed_research": str(response.content),
-                "raw_notes": [raw_notes_content]
+                "raw_notes": [raw_notes_content],
+                "metrics": metrics,
             }
             
         except Exception as e:
+            last_error = e
             synthesis_attempts += 1
+            outer_error_type = (
+                "context_length_exceeded"
+                if is_token_limit_exceeded(e, configurable.compression_model)
+                else "compression_attempt_failed"
+            )
+            active_span = get_trace_recorder(config).active_span()
+            if synthesis_attempts < max_attempts:
+                active_span.record_retry(
+                    attempt=synthesis_attempts,
+                    error_type=outer_error_type,
+                    retryable=True,
+                    message=str(e),
+                )
+            else:
+                active_span.record_outcome(error_type=outer_error_type)
             
             # Handle token limit exceeded by removing older messages
-            if is_token_limit_exceeded(e, configurable.research_model):
+            if is_token_limit_exceeded(e, configurable.compression_model):
                 researcher_messages = remove_up_to_last_ai_message(researcher_messages)
                 continue
             
             # For other errors, continue retrying
             continue
     
-    # Step 4: Return error result if all attempts failed
-    raw_notes_content = "\n".join([
-        str(message.content) 
-        for message in filter_messages(researcher_messages, include_types=["tool", "ai"])
-    ])
-    
-    return {
-        "compressed_research": "Error synthesizing research report: Maximum retries exceeded",
-        "raw_notes": [raw_notes_content]
-    }
+    raise RuntimeError("research_compression_failed_after_retries") from last_error
 
 async def final_report_generation(state: AgentState, config: RunnableConfig):
     """Generate the final research report.
@@ -1510,24 +1576,13 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
     Delegates to the registry-based report product system
     (``open_deep_research.report.build_report``). The ``default`` report type
     reproduces the original single-call synthesis byte-for-byte; other report
-    types and output formats are opt-in via ``Configuration``. On failure,
-    returns an error string in ``final_report`` rather than raising, preserving
-    the original error contract.
+    types and output formats are opt-in via ``Configuration``. Terminal writer
+    failures propagate so the outer run is recorded as failed rather than as a
+    successful run containing an error string.
     """
     from open_deep_research.report import build_report
 
-    try:
-        return await build_report(state, config)
-    except Exception as e:
-        cleared_state = {
-            "notes": {"type": "override", "value": []},
-            "completed_task_outputs": {"type": "override", "value": []},
-        }
-        return {
-            "final_report": f"Error generating final report: {e}",
-            "messages": [AIMessage(content="Report generation failed due to an error")],
-            **cleared_state,
-        }
+    return await build_report(state, config)
 
 
 async def memory_extract_and_write(
@@ -1579,6 +1634,7 @@ async def memory_extract_and_write(
             config=config,
         )
     except Exception:
+        get_trace_recorder(config).active_span().score("memory.extract_failed", True)
         if configurable.event_log_enabled:
             writer = JSONLEventWriter(run_id=run_id, runs_dir=configurable.runs_dir)
             writer.write(ResearchEvent(
@@ -1622,6 +1678,11 @@ async def memory_extract_and_write(
                     raise
     else:
         skipped_count = len(candidates)
+
+    active_span = get_trace_recorder(config).active_span()
+    active_span.score("memory.candidate_count", len(candidates))
+    active_span.score("memory.written_count", written_count)
+    active_span.score("memory.skipped_count", skipped_count)
 
     # Emit events (summary only)
     if configurable.event_log_enabled:
@@ -1680,7 +1741,8 @@ async def restore_async_research_tasks(config: RunnableConfig) -> None:
     if task_artifact_dir.exists():
         for artifact in task_artifact_dir.glob("*.json"):
             task_id = artifact.stem
-            if registry.get(task_id) is not None:
+            existing = registry.get(task_id)
+            if existing is not None and existing.run_id == run_id:
                 continue
             try:
                 result = json.loads(artifact.read_text(encoding="utf-8"))
@@ -1700,7 +1762,8 @@ async def restore_async_research_tasks(config: RunnableConfig) -> None:
     for checkpoint in checkpoint_manager.list_checkpoints():
         if checkpoint.run_id and checkpoint.run_id != run_id:
             continue
-        if registry.get(checkpoint.task_id) is not None:
+        existing = registry.get(checkpoint.task_id)
+        if existing is not None and existing.run_id == run_id:
             continue
         record = TaskRecord(
             task_id=checkpoint.task_id,

@@ -13,13 +13,17 @@ from dataclasses import dataclass, field
 from typing import Any, List, Optional, Protocol
 
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import AIMessage, HumanMessage, get_buffer_string
+from langchain_core.messages import HumanMessage, get_buffer_string
 from langchain_core.runnables import RunnableConfig
 
 from open_deep_research import prompts as _prompts
-from open_deep_research.configuration import Configuration, get_model_compatibility_kwargs
+from open_deep_research.configuration import (
+    Configuration,
+    get_model_compatibility_kwargs,
+)
 from open_deep_research.observability import (
     apply_helicone_config,
+    get_trace_recorder,
     invoke_model_with_retry_observability,
 )
 from open_deep_research.prompts import (
@@ -231,6 +235,18 @@ class OneShotStrategy:
                 # Handle token limit exceeded errors with progressive truncation
                 if is_token_limit_exceeded(e, configurable.final_report_model):
                     current_retry += 1
+                    active_span = get_trace_recorder(ctx.config).active_span()
+                    if current_retry <= max_retries:
+                        active_span.record_retry(
+                            attempt=current_retry,
+                            error_type="context_length_exceeded",
+                            retryable=True,
+                            message=str(e),
+                        )
+                    else:
+                        active_span.record_outcome(
+                            error_type="context_length_exceeded"
+                        )
 
                     if current_retry == 1:
                         # First retry: determine initial truncation limit
@@ -238,17 +254,9 @@ class OneShotStrategy:
                             configurable.final_report_model
                         )
                         if not model_token_limit:
-                            return AssemblyResult(
-                                body_markdown=(
-                                    "Error generating final report: Token limit exceeded, "
-                                    "however, we could not determine the model's maximum context "
-                                    "length. Please update the model map in deep_researcher/utils.py "
-                                    f"with this information. {e}"
-                                ),
-                                message=AIMessage(
-                                    content="Report generation failed due to token limits"
-                                ),
-                            )
+                            raise RuntimeError(
+                                "final_report_model_token_limit_unknown"
+                            ) from e
                         # Use 4x token limit as character approximation for truncation
                         findings_token_limit = model_token_limit * 4
                     else:
@@ -260,21 +268,10 @@ class OneShotStrategy:
                     findings = findings[:findings_token_limit]
                     continue
                 else:
-                    # Non-token-limit error: return error immediately
-                    return AssemblyResult(
-                        body_markdown=f"Error generating final report: {e}",
-                        message=AIMessage(
-                            content="Report generation failed due to an error"
-                        ),
-                    )
+                    raise
 
         # All retries exhausted
-        return AssemblyResult(
-            body_markdown="Error generating final report: Maximum retries exceeded",
-            message=AIMessage(
-                content="Report generation failed after maximum retries"
-            ),
-        )
+        raise RuntimeError("final_report_generation_failed_after_retries")
 
 
 def _skeleton_text(skeleton) -> str:

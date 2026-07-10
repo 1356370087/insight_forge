@@ -361,7 +361,11 @@ class QueryEngine:
         except Exception:  # noqa: BLE001 - task registry is optional for sync research paths
             return
         record = get_task_registry().get(str(task_id))
-        if record is None or record.status != TaskStatus.RUNNING:
+        if (
+            record is None
+            or record.run_id != self.run_id
+            or record.status != TaskStatus.RUNNING
+        ):
             return
         await record.control_queue.put({"type": "update", "instruction": self._format_feedback_instruction(entry)})
         entry["queued_to_task"] = True
@@ -486,17 +490,26 @@ class QueryEngine:
             self.status = "running"
 
     def _cancelled_state(self, state: dict[str, Any]) -> dict[str, Any]:
-        result = {"status": "cancelled", "permission_denials": self.permission_denials}
+        result = {
+            "status": "cancelled",
+            "usage": self._usage_subset(self.total_usage),
+            "metrics": self._metrics_subset(self.total_usage),
+            "permission_denials": self.permission_denials,
+        }
         self.final_state = {**state, "result": result}
         return self.final_state
 
     @staticmethod
-    def _usage_subset(total: dict[str, Any]) -> dict[str, int]:
+    def _usage_subset(total: dict[str, Any]) -> dict[str, Any]:
         """Token-only view of a finish_run summary (backward-compatible usage payload)."""
         return {
             "input_tokens": total.get("input_tokens", 0),
             "output_tokens": total.get("output_tokens", 0),
             "total_tokens": total.get("total_tokens", 0),
+            "cached_input_tokens": total.get("cached_input_tokens", 0),
+            "cache_creation_input_tokens": total.get("cache_creation_input_tokens", 0),
+            "reasoning_tokens": total.get("reasoning_tokens", 0),
+            "estimated_cost_usd": total.get("estimated_cost_usd", 0.0),
         }
 
     @staticmethod
@@ -504,9 +517,12 @@ class QueryEngine:
         """Retry/429 view of a finish_run summary (the new metrics payload)."""
         return {
             "retry_count": total.get("retry_count", 0),
+            "rate_limit_events": total.get("rate_limit_events", 0),
             "rate_limited_count": total.get("rate_limited_count", 0),
+            "terminal_rate_limited_count": total.get("terminal_rate_limited_count", 0),
             "rate_429": total.get("rate_429", 0.0),
             "total_llm_tool_calls": total.get("total_llm_tool_calls", 0),
+            "attempt_count": total.get("attempt_count", 0),
         }
 
     async def stream_message(
@@ -606,6 +622,7 @@ class QueryEngine:
             name="lead.run",
             user_id=_config_user_id(self.config),
             metadata=run_metadata,
+            input_payload=state.get("messages", []),
         ):
             event_name = "run.resumed" if recovered else "run.started"
             yield self._event(event_name, {"run_id": self.run_id, "recovered": recovered})
@@ -658,11 +675,26 @@ class QueryEngine:
                     state["research_brief"] = self.context_store.load_research_brief()
 
                 if stage == "plan_approval":
-                    async for hitl_event in self._maybe_await_plan_approval(state):
-                        yield hitl_event
+                    with recorder.start_span(
+                        name="node.plan_approval",
+                        kind="agent",
+                        agent_role="lead",
+                        attributes={"hitl_enabled": self._hitl_enabled()},
+                    ):
+                        async for hitl_event in self._maybe_await_plan_approval(state):
+                            yield hitl_event
                     if self.cancelled:
                         await self._persist_checkpoint("cancelled", "cancelled", status="cancelled")
+                        self.total_usage = recorder.finish_run(self.run_id, "cancelled")
                         self._cancelled_state(state)
+                        yield self._event(
+                            "run.cancelled",
+                            {
+                                "run_id": self.run_id,
+                                "usage": self._usage_subset(self.total_usage),
+                                "metrics": self._metrics_subset(self.total_usage),
+                            },
+                        )
                         return
                     approved_plan = str(state.get("approved_research_plan") or "")
                     await self._write_optional_text_artifact(
@@ -704,11 +736,26 @@ class QueryEngine:
                     stage = "outline_approval"
 
                 if stage == "outline_approval":
-                    async for hitl_event in self._maybe_await_outline_approval(state):
-                        yield hitl_event
+                    with recorder.start_span(
+                        name="node.outline_approval",
+                        kind="agent",
+                        agent_role="lead",
+                        attributes={"hitl_enabled": self._hitl_enabled()},
+                    ):
+                        async for hitl_event in self._maybe_await_outline_approval(state):
+                            yield hitl_event
                     if self.cancelled:
                         await self._persist_checkpoint("cancelled", "cancelled", status="cancelled")
+                        self.total_usage = recorder.finish_run(self.run_id, "cancelled")
                         self._cancelled_state(state)
+                        yield self._event(
+                            "run.cancelled",
+                            {
+                                "run_id": self.run_id,
+                                "usage": self._usage_subset(self.total_usage),
+                                "metrics": self._metrics_subset(self.total_usage),
+                            },
+                        )
                         return
                     outline = str(state.get("report_outline") or "")
                     await self._write_optional_text_artifact(
@@ -766,6 +813,20 @@ class QueryEngine:
                     await shutdown_teammate_pool(self.config)
                 except Exception:
                     pass
+                if self.cancelled:
+                    self.status = "cancelled"
+                    await self._persist_checkpoint("cancelled", "cancelled", status="cancelled")
+                    self.total_usage = recorder.finish_run(self.run_id, "cancelled")
+                    self._cancelled_state(state)
+                    yield self._event(
+                        "run.cancelled",
+                        {
+                            "run_id": self.run_id,
+                            "usage": self._usage_subset(self.total_usage),
+                            "metrics": self._metrics_subset(self.total_usage),
+                        },
+                    )
+                    return
                 self.status = "failed"
                 if self.context_store is not None:
                     try:
@@ -814,6 +875,7 @@ class QueryEngine:
         from open_deep_research.tasks.teammate_pool import shutdown_teammate_pool
 
         await shutdown_teammate_pool(self.config)
+        recorder.active_span().set_output(result_text)
         self.total_usage = recorder.finish_run(self.run_id, "success")
         result = {
             "status": "success",
@@ -1099,7 +1161,8 @@ class ResearcherQueryEngine:
                     from open_deep_research.tasks.registry import get_task_registry
 
                     task_record = get_task_registry().get(task_id)
-                    if task_record is not None:
+                    expected_run_id = str(cfg.get("metadata", {}).get("run_id", "default"))
+                    if task_record is not None and task_record.run_id == expected_run_id:
                         if task_record.cancelled.is_set():
                             return {
                                 **researcher_state,
