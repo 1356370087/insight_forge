@@ -831,7 +831,7 @@ def _find_task_for_run(
     """
     if task_id:
         rec = registry.get(task_id)
-        if rec is not None and rec.status in (
+        if rec is not None and rec.run_id == run_id and rec.status in (
             TaskStatus.RUNNING,
             TaskStatus.WAITING_FOR_CONFIRMATION,
         ):
@@ -1004,42 +1004,51 @@ async def execute_governed_tool_call(
     tool_call_id = tool_call["id"]
     args = tool_call.get("args", {}) or {}
 
+    def observed_error(error: ToolError) -> GovernedToolCallResult:
+        get_trace_recorder(config).active_span().record_outcome(
+            error_type=error.error_type.value,
+            http_status=error.detail.get("status") if isinstance(error.detail, dict) else None,
+        )
+        return _error_result(error, tool_call_id)
+
     # tool_not_found
     tool = tools_by_name.get(name)
     if tool is None:
-        return _error_result(ToolError(
+        return observed_error(ToolError(
             error_type=ToolErrorType.tool_not_found,
             tool_name=name,
             message=f"No tool named '{name}' is registered for the {role.value}.",
             detail={"role": role.value},
-        ), tool_call_id)
+        ))
 
     # Permission gate.
     perm_err = check_permission(name, tool, role, allowed_tools, config)
     if perm_err is not None:
-        return _error_result(perm_err, tool_call_id)
+        return observed_error(perm_err)
 
     # Parameter validation (with per-tool configured constraints).
     val_err = validate_tool_args(tool, args, config)
     if val_err is not None:
-        return _error_result(val_err, tool_call_id)
+        return observed_error(val_err)
     try:
         validated_input = tool.input_schema.model_validate(args)
     except ValidationError as exc:
-        return _error_result(
+        return observed_error(
             ToolError(
                 error_type=ToolErrorType.validation_error,
                 tool_name=name,
                 message="Input failed Pydantic validation.",
                 detail={"errors": exc.errors(include_url=False)},
             ),
-            tool_call_id,
         )
 
     # Egress domain allowlist for URL-bearing tools (MCP + fetch_webpage). May
     # block inline (in-process) until a supervisor decision arrives.
     egress_err = await check_egress_domain(tool_call, tool, args, config)
     if egress_err is not None:
+        get_trace_recorder(config).active_span().record_outcome(
+            error_type=ToolErrorType.egress_domain_denied.value,
+        )
         return GovernedToolCallResult(message=egress_err)
 
     context = ToolContext(
