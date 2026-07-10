@@ -99,6 +99,20 @@ def _observability_store() -> SQLiteTraceStore:
     return SQLiteTraceStore(configurable.trace_store_path)
 
 
+def _user_identity(user: dict[str, Any]) -> str | None:
+    """Return the normalized authenticated identity used by run ownership checks."""
+    value = user.get("identity") or user.get("id")
+    return str(value) if value else None
+
+
+def _require_record_owner(record: RunRecord, user: dict[str, Any]) -> None:
+    """Hide in-memory runs from users other than their owner."""
+    metadata = record.engine.config.get("metadata", {})
+    owner = metadata.get("owner") or metadata.get("user_id")
+    if owner and str(owner) != _user_identity(user):
+        raise HTTPException(status_code=404, detail="Run not found")
+
+
 def _span_tree_rows(spans: list[dict[str, Any]]) -> str:
     children: dict[str | None, list[dict[str, Any]]] = {}
     for span in spans:
@@ -234,6 +248,7 @@ async def get_run(
             "event_count": manifest.last_journal_seq,
             "persistence_degraded": manifest.persistence_degraded,
         }
+    _require_record_owner(record, user)
     return {
         "run_id": run_id,
         "status": record.status,
@@ -252,6 +267,7 @@ async def resume_run(
     """Explicitly resume an interrupted file-backed Query run."""
     active = _runs.get(run_id)
     if active is not None:
+        _require_record_owner(active, user)
         if active.status == "completed":
             raise HTTPException(status_code=409, detail="run_already_completed")
         if active.status == "cancelled":
@@ -292,12 +308,13 @@ async def submit_human_action(
     run_id: str,
     action_id: str,
     request: HumanActionRequest,
-    _user: dict[str, Any] = Depends(get_current_user),
+    user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Resolve a pending human approval, revision, or cancellation action."""
     record = _runs.get(run_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Run not found")
+    _require_record_owner(record, user)
     try:
         result = record.engine.handle_human_action(action_id, request.action, request.message or "")
     except ValueError as exc:
@@ -311,12 +328,13 @@ async def submit_human_action(
 async def submit_feedback(
     run_id: str,
     request: HumanFeedbackRequest,
-    _user: dict[str, Any] = Depends(get_current_user),
+    user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Accept mid-run human direction or evidence questions."""
     record = _runs.get(run_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Run not found")
+    _require_record_owner(record, user)
     try:
         result = await record.engine.submit_feedback(request.model_dump(exclude_none=True))
     except ValueError as exc:
@@ -329,12 +347,13 @@ async def submit_feedback(
 @app.get("/runs/{run_id}/events")
 async def stream_run_events(
     run_id: str,
-    _user: dict[str, Any] = Depends(get_current_user),
+    user: dict[str, Any] = Depends(get_current_user),
 ) -> StreamingResponse:
     """Subscribe to stored and future events for a background run."""
     record = _runs.get(run_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Run not found")
+    _require_record_owner(record, user)
 
     async def iterator():
         index = 0
@@ -352,21 +371,21 @@ async def stream_run_events(
 @app.get("/observability/runs")
 async def list_observed_runs(
     limit: int = 100,
-    _user: dict[str, Any] = Depends(get_current_user),
+    user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Return persisted observed run summaries."""
     store = _observability_store()
-    return {"runs": store.list_runs(limit=limit)}
+    return {"runs": store.list_runs(limit=limit, user_id=_user_identity(user))}
 
 
 @app.get("/observability/runs/{run_id}")
 async def get_observed_run(
     run_id: str,
-    _user: dict[str, Any] = Depends(get_current_user),
+    user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Return one persisted observed run summary."""
     store = _observability_store()
-    run = store.get_run(run_id)
+    run = store.get_run(run_id, user_id=_user_identity(user))
     if run is None:
         raise HTTPException(status_code=404, detail="Observed run not found")
     return {"run": run}
@@ -375,11 +394,11 @@ async def get_observed_run(
 @app.get("/observability/runs/{run_id}/spans")
 async def get_observed_run_spans(
     run_id: str,
-    _user: dict[str, Any] = Depends(get_current_user),
+    user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Return ordered spans for a persisted observed run."""
     store = _observability_store()
-    if store.get_run(run_id) is None:
+    if store.get_run(run_id, user_id=_user_identity(user)) is None:
         raise HTTPException(status_code=404, detail="Observed run not found")
     return {"run_id": run_id, "spans": store.list_spans(run_id)}
 
@@ -387,11 +406,11 @@ async def get_observed_run_spans(
 @app.get("/observability/runs/{run_id}/usage")
 async def get_observed_run_usage(
     run_id: str,
-    _user: dict[str, Any] = Depends(get_current_user),
+    user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Return token usage aggregate for a persisted observed run."""
     store = _observability_store()
-    if store.get_run(run_id) is None:
+    if store.get_run(run_id, user_id=_user_identity(user)) is None:
         raise HTTPException(status_code=404, detail="Observed run not found")
     return {"run_id": run_id, "usage": store.get_usage(run_id)}
 
@@ -399,11 +418,11 @@ async def get_observed_run_usage(
 @app.get("/observability/runs/{run_id}/metrics")
 async def get_observed_run_metrics(
     run_id: str,
-    _user: dict[str, Any] = Depends(get_current_user),
+    user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Return token usage, retry counts, and 429 rate for a persisted observed run."""
     store = _observability_store()
-    if store.get_run(run_id) is None:
+    if store.get_run(run_id, user_id=_user_identity(user)) is None:
         raise HTTPException(status_code=404, detail="Observed run not found")
     return {"run_id": run_id, "metrics": store.get_metrics(run_id)}
 
@@ -411,13 +430,16 @@ async def get_observed_run_metrics(
 @app.get("/observability/ui", response_class=HTMLResponse)
 async def observability_ui(
     run_id: str | None = None,
-    _user: dict[str, Any] = Depends(get_current_user),
+    user: dict[str, Any] = Depends(get_current_user),
 ) -> HTMLResponse:
     """Render a small server-side observability page."""
     store = _observability_store()
-    runs = store.list_runs(limit=50)
+    identity = _user_identity(user)
+    runs = store.list_runs(limit=50, user_id=identity)
     selected = run_id or (runs[0]["run_id"] if runs else None)
-    selected_run = store.get_run(selected) if selected else None
+    selected_run = store.get_run(selected, user_id=identity) if selected else None
+    if selected and selected_run is None:
+        raise HTTPException(status_code=404, detail="Observed run not found")
     spans = store.list_spans(selected) if selected else []
     run_links = "".join(
         "<li><a href='/observability/ui?run_id="
@@ -472,8 +494,12 @@ async def observability_ui(
           <div class='metric'>input: {usage['input_tokens']}</div>
           <div class='metric'>output: {usage['output_tokens']}</div>
           <div class='metric'>total: {usage['total_tokens']}</div>
+          <div class='metric'>cached input: {usage.get('cached_input_tokens', 0)}</div>
+          <div class='metric'>reasoning: {usage.get('reasoning_tokens', 0)}</div>
+          <div class='metric'>estimated cost: ${usage.get('estimated_cost_usd', 0):.6f}</div>
+          <div class='metric'>attempts: {metrics.get('attempt_count', 0)}</div>
           <div class='metric'>retries: {metrics.get('retry_count', 0)}</div>
-          <div class='metric'>429 rate: {rate_pct} ({metrics.get('rate_limited_count', 0)}/{metrics.get('total_llm_tool_calls', 0)})</div>
+          <div class='metric'>429 call rate: {rate_pct} ({metrics.get('rate_limited_count', 0)}/{metrics.get('total_llm_tool_calls', 0)} calls; {metrics.get('rate_limit_events', 0)} events)</div>
           <table>
             <thead><tr><th>Span</th><th>Kind</th><th>Status</th><th>Duration ms</th><th>Tokens</th><th>Retries</th><th>Error type</th><th>Error</th></tr></thead>
             <tbody>{rows}</tbody>
@@ -489,12 +515,13 @@ async def observability_ui(
 @app.post("/runs/{run_id}/cancel")
 async def cancel_run(
     run_id: str,
-    _user: dict[str, Any] = Depends(get_current_user),
+    user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, str]:
     """Cancel a background run."""
     record = _runs.get(run_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Run not found")
+    _require_record_owner(record, user)
     record.engine.interrupt()
     if record.task and not record.task.done():
         record.task.cancel()
