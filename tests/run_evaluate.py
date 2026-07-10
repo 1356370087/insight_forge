@@ -1,26 +1,34 @@
 import asyncio
 import uuid
 
-from dotenv import load_dotenv
 from langsmith import Client
 
 from open_deep_research.agents.query_engine import QueryEngine
 from tests.evaluators import (
+    eval_citation_accuracy,
     eval_completeness,
     eval_correctness,
     eval_groundedness,
     eval_overall_quality,
     eval_relevance,
     eval_structure,
+    eval_tool_efficiency,
 )
-
-load_dotenv("../.env")
 
 client = Client()
 
 # NOTE: Configure the right dataset and evaluators
 dataset_name = "Deep Research Bench"
-evaluators = [eval_overall_quality, eval_relevance, eval_structure, eval_correctness, eval_groundedness, eval_completeness]
+evaluators = [
+    eval_overall_quality,
+    eval_relevance,
+    eval_structure,
+    eval_correctness,
+    eval_groundedness,
+    eval_citation_accuracy,
+    eval_completeness,
+    eval_tool_efficiency,
+]
 # NOTE: Configure the right parameters for the experiment, these will be logged in the metadata
 max_structured_output_retries = 3
 allow_clarification = False
@@ -61,10 +69,17 @@ async def target(
     config["configurable"]["final_report_model"] = final_report_model
     config["configurable"]["final_report_model_max_tokens"] = final_report_model_max_tokens
     # NOTE: We do not use MCP tools to stay consistent
-    final_state = await QueryEngine(config).submit_message(
+    engine = QueryEngine(config)
+    final_state = await engine.submit_message(
         [{"role": "user", "content": inputs["messages"][0]["content"]}],
         config,
     )
+    final_state["evaluation_metadata"] = {
+        "search_api": search_api,
+        "max_concurrent_research_units": max_concurrent_research_units,
+        "max_researcher_iterations": max_researcher_iterations,
+        "max_react_tool_calls": max_react_tool_calls,
+    }
     return final_state
 
 async def main():

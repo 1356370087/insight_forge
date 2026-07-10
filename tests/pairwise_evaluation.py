@@ -121,8 +121,9 @@ multi_agent_workflow = "DR MAW - Tavily #-c6818a83"
 #     randomize_order=True,
 # )
 
-evaluate_comparative(
-    (single_agent, multi_agent_supervisor_v2),  # Replace with the names/IDs of your experiments
-    evaluators=[head_to_head_evaluator],
-    randomize_order=True,
-)
+if __name__ == "__main__":
+    evaluate_comparative(
+        (single_agent, multi_agent_supervisor_v2),
+        evaluators=[head_to_head_evaluator],
+        randomize_order=True,
+    )

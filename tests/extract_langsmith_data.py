@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """Extract data from LangSmith and save to JSONL file with configurable dataset."""
 
-import os
-import json
 import argparse
-from langsmith import Client
+import json
+import os
+
 from dotenv import load_dotenv
+from langsmith import Client
 
 load_dotenv()
 
 
 def extract_langsmith_data(project_name, model_name, dataset_name, api_key):
     """Extract data from LangSmith and save to JSONL file."""
-    print(f"Extracting data from LangSmith project: {project_name}")
-    print(f"Using dataset: {dataset_name}")
+    print(f"Extracting data from LangSmith project: {project_name}")  # noqa: T201
+    print(f"Using dataset: {dataset_name}")  # noqa: T201
     
     client = Client(api_key=api_key)
     
@@ -38,13 +39,18 @@ def extract_langsmith_data(project_name, model_name, dataset_name, api_key):
         if run.outputs is not None and run.outputs.get("final_report") is not None:
             runs.append(run)
     
-    output_jsonl = [
-        {
-            "id": examples_dict[run.reference_example_id].metadata["id"],
-            "prompt": run.inputs["inputs"]["messages"][0]["content"],
+    output_jsonl = []
+    for run in runs:
+        run_inputs = run.inputs.get("inputs", run.inputs)
+        messages = run_inputs.get("messages", [])
+        example = examples_dict.get(run.reference_example_id)
+        if not messages or example is None:
+            continue
+        output_jsonl.append({
+            "id": example.metadata["id"],
+            "prompt": messages[0]["content"],
             "article": run.outputs["final_report"],
-        } for run in runs
-    ]
+        })
     
     # Write output_jsonl to JSONL file in tests/expt_results directory
     output_file_path = f"tests/expt_results/{dataset_name}_{model_name}.jsonl"
@@ -53,8 +59,8 @@ def extract_langsmith_data(project_name, model_name, dataset_name, api_key):
         for item in output_jsonl:
             f.write(json.dumps(item, ensure_ascii=False) + '\n')
     
-    print(f"Data written to {output_file_path}")
-    print(f"Total records: {len(output_jsonl)}")
+    print(f"Data written to {output_file_path}")  # noqa: T201
+    print(f"Total records: {len(output_jsonl)}")  # noqa: T201
     return output_file_path
 
 

@@ -12,9 +12,29 @@ def right_parallelism_evaluator(
     outputs: dict,
     reference_outputs: dict,
 ) -> dict:
+    state = outputs.get("output", outputs)
+    actual_parallelism = 0
+    for message in state.get("supervisor_messages", []):
+        tool_calls = (
+            message.get("tool_calls", [])
+            if isinstance(message, dict)
+            else getattr(message, "tool_calls", [])
+        )
+        research_calls = [
+            call
+            for call in tool_calls or []
+            if call.get("name") in {"ConductResearch", "StartResearchTask"}
+        ]
+        if research_calls:
+            actual_parallelism = len(research_calls)
+            break
     return {
-        "key": "right_parallelism", 
-        "score": len(outputs["output"]["supervisor_messages"][-1].tool_calls) == reference_outputs["parallel"]
+        "key": "right_parallelism",
+        "score": actual_parallelism == reference_outputs["parallel"],
+        "comment": (
+            f"Expected {reference_outputs['parallel']} first-wave research calls; "
+            f"observed {actual_parallelism}."
+        ),
     }
 
 async def target(inputs: dict):

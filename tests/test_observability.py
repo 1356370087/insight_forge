@@ -12,15 +12,19 @@ from open_deep_research.agents.query import QueryParams, query
 from open_deep_research.observability import (
     SQLiteTraceStore,
     TokenUsage,
+    bind_span_context,
     get_trace_recorder,
     invoke_model_with_observability,
     invoke_model_with_retry_observability,
+    observe_tool_call,
 )
 from open_deep_research.observability.telemetry import LangfuseSpanBridge
 from open_deep_research.server import app
 from open_deep_research.tools.governance import (
+    AgentRole,
     ToolErrorType,
     classify_llm_retryable_error,
+    execute_governed_tool_call,
     invoke_tool_with_retry,
 )
 from security.auth import get_current_user
@@ -77,6 +81,27 @@ def test_token_usage_extracts_provider_metadata_fallbacks():
     assert usage.total_tokens == 18
 
 
+def test_token_usage_skips_empty_candidate_and_extracts_details():
+    response = SimpleNamespace(
+        usage_metadata={},
+        response_metadata={
+            "token_usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+                "prompt_tokens_details": {"cached_tokens": 40},
+                "completion_tokens_details": {"reasoning_tokens": 20},
+            }
+        },
+    )
+
+    usage = TokenUsage.from_response(response)
+
+    assert usage.input_tokens == 100
+    assert usage.output_tokens == 50
+    assert usage.cached_input_tokens == 40
+    assert usage.reasoning_tokens == 20
+
+
 @pytest.mark.asyncio
 async def test_model_wrapper_persists_span_and_usage(tmp_path):
     trace_path = tmp_path / "trace.sqlite3"
@@ -110,6 +135,133 @@ async def test_model_wrapper_persists_span_and_usage(tmp_path):
     assert usage["rate_429"] == 0.0
     assert any(span["name"] == "test.model" and span["total_tokens"] == 6 for span in spans)
     assert store.get_run("obs-run")["total_tokens"] == 6
+
+
+@pytest.mark.asyncio
+async def test_cost_breakdown_and_redaction_are_persisted(tmp_path):
+    trace_path = tmp_path / "cost.sqlite3"
+    config = _config(trace_path, run_id="cost-run")
+    config["configurable"]["model_costs_per_million"] = {
+        "openai:gpt-test": {
+            "input": 1.0,
+            "cached_input": 0.5,
+            "output": 2.0,
+            "reasoning": 4.0,
+        }
+    }
+    response = AIMessage(
+        content="answer with api_key=sk-super-secret-value",
+        usage_metadata={
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "total_tokens": 150,
+            "input_token_details": {"cache_read": 40},
+            "output_token_details": {"reasoning": 20},
+        },
+    )
+    recorder = get_trace_recorder(config)
+
+    with recorder.start_run("cost-run", user_id="user-1"):
+        await invoke_model_with_observability(
+            FakeModel(response),
+            [HumanMessage(content="Authorization: Bearer secret-token")],
+            config,
+            span_name="cost.model",
+            agent_role="lead",
+            model_name="openai:gpt-test",
+        )
+        recorder.finish_run("cost-run", "success")
+
+    store = SQLiteTraceStore(str(trace_path))
+    usage = store.get_usage("cost-run")
+    span = next(item for item in store.list_spans("cost-run") if item["name"] == "cost.model")
+    assert usage["cached_input_tokens"] == 40
+    assert usage["reasoning_tokens"] == 20
+    assert usage["estimated_cost_usd"] == pytest.approx(0.00022)
+    assert "secret-token" not in span["input_preview"]
+    assert "sk-super-secret-value" not in span["output_preview"]
+
+
+def test_rate_429_counts_distinct_calls_not_retry_events(tmp_path):
+    store = SQLiteTraceStore(str(tmp_path / "rate.sqlite3"))
+    store.start_run("rate-run", "user-1", {})
+    for span_id in ("limited", "ok"):
+        store.start_span(
+            span_id=span_id,
+            run_id="rate-run",
+            parent_span_id=None,
+            name=f"tool.{span_id}",
+            kind="tool",
+            agent_role="researcher",
+            attributes={},
+            input_preview=None,
+            provider=None,
+            model=None,
+        )
+        store.finish_span(span_id=span_id, status="success")
+    for attempt in (1, 2, 3):
+        store.record_retry_event(
+            run_id="rate-run",
+            span_id="limited",
+            attempt=attempt,
+            error_type="rate_limited",
+        )
+    store.finish_run("rate-run", "success")
+
+    metrics = store.get_metrics("rate-run")
+
+    assert metrics["rate_limit_events"] == 3
+    assert metrics["rate_limited_count"] == 1
+    assert metrics["rate_429"] == 0.5
+
+
+def test_explicit_background_context_preserves_parent(tmp_path):
+    trace_path = tmp_path / "parent.sqlite3"
+    config = _config(trace_path, run_id="parent-run")
+    recorder = get_trace_recorder(config)
+    with recorder.start_run("parent-run", user_id="user-1") as root:
+        root_id = root.span_id
+    with bind_span_context("parent-run", root_id):
+        with recorder.start_span(name="researcher.topic", kind="agent"):
+            pass
+    recorder.finish_run("parent-run", "success")
+
+    child = next(
+        item
+        for item in SQLiteTraceStore(str(trace_path)).list_spans("parent-run")
+        if item["name"] == "researcher.topic"
+    )
+    assert child["parent_span_id"] == root_id
+
+
+@pytest.mark.asyncio
+async def test_governance_rejection_marks_tool_span_as_error(tmp_path):
+    trace_path = tmp_path / "governance.sqlite3"
+    config = _config(trace_path, run_id="governance-run")
+    recorder = get_trace_recorder(config)
+    tool_call = {"id": "missing-1", "name": "missing_tool", "args": {}}
+    with recorder.start_run("governance-run", user_id="user-1"):
+        outcome = await observe_tool_call(
+            tool_call,
+            AgentRole.RESEARCHER.value,
+            config,
+            lambda: execute_governed_tool_call(
+                tool_call,
+                {},
+                AgentRole.RESEARCHER,
+                config,
+            ),
+        )
+        recorder.finish_run("governance-run", "success")
+
+    span = next(
+        item
+        for item in SQLiteTraceStore(str(trace_path)).list_spans("governance-run")
+        if item["name"] == "tool.missing_tool"
+    )
+    assert outcome.error.error_type is ToolErrorType.tool_not_found
+    assert span["status"] == "error"
+    assert span["error_type"] == "tool_not_found"
 
 
 @pytest.mark.asyncio
@@ -175,6 +327,27 @@ def test_observability_endpoints_return_persisted_trace(tmp_path, monkeypatch):
     assert spans_resp.json()["spans"][0]["name"] == "lead.run"
     assert ui_resp.status_code == 200
     assert "Open Deep Research Observability" in ui_resp.text
+
+
+def test_observability_endpoints_are_scoped_to_authenticated_owner(tmp_path, monkeypatch):
+    trace_path = tmp_path / "owner.sqlite3"
+    monkeypatch.setenv("TRACE_STORE_PATH", str(trace_path))
+    store = SQLiteTraceStore(str(trace_path))
+    for run_id, owner in (("mine", "user-1"), ("theirs", "user-2")):
+        store.start_run(run_id, owner, {})
+        store.finish_run(run_id, "success")
+
+    app.dependency_overrides[get_current_user] = lambda: {"identity": "user-1"}
+    try:
+        client = TestClient(app)
+        listed = client.get("/observability/runs")
+        hidden = client.get("/observability/runs/theirs")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert listed.status_code == 200
+    assert [run["run_id"] for run in listed.json()["runs"]] == ["mine"]
+    assert hidden.status_code == 404
 
 
 def test_metrics_endpoint_returns_aggregated_metrics(tmp_path, monkeypatch):
@@ -592,6 +765,73 @@ def test_langfuse_bridge_maps_generation_usage_and_trace_id():
         "output": 4,
         "total": 6,
     }
+
+
+def test_langfuse_bridge_uses_captured_external_parent_id():
+    class FakeObservation:
+        def update(self, **_kwargs):
+            return None
+
+    class FakeContext:
+        def __enter__(self):
+            return FakeObservation()
+
+        def __exit__(self, *_args):
+            return None
+
+    class FakeClient:
+        def __init__(self):
+            self.started = []
+
+        @staticmethod
+        def create_trace_id(*, seed):
+            assert seed == "run-parent"
+            return "a" * 32
+
+        def start_as_current_observation(self, **kwargs):
+            self.started.append(kwargs)
+            return FakeContext()
+
+        @staticmethod
+        def get_current_observation_id():
+            return "c" * 16
+
+    sink = SimpleNamespace(
+        client=FakeClient(),
+        user_id="user-1",
+        session_id="session-1",
+        propagate_attributes=lambda **_kwargs: FakeContext(),
+    )
+    span = SimpleNamespace(
+        kind="agent",
+        name="researcher.topic",
+        input_preview=None,
+        output_preview=None,
+        attributes={},
+        run_id="run-parent",
+        parent_span_id="local-parent",
+        langfuse_parent_span_id="b" * 16,
+        langfuse_observation_id=None,
+        agent_role="researcher",
+        provider=None,
+        model=None,
+        usage=TokenUsage(),
+        retry_count=0,
+        error_type=None,
+        http_status=None,
+        final_status=None,
+        error_message=None,
+    )
+
+    bridge = LangfuseSpanBridge(sink, span)
+    bridge.enter()
+    bridge.exit(None, None, None)
+
+    assert sink.client.started[0]["trace_context"] == {
+        "trace_id": "a" * 32,
+        "parent_span_id": "b" * 16,
+    }
+    assert span.langfuse_observation_id == "c" * 16
 
 
 @pytest.mark.asyncio

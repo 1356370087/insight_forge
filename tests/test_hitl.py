@@ -9,6 +9,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from open_deep_research.agents.query_engine import QueryEngine
 from open_deep_research.configuration import Configuration
+from open_deep_research.observability import SQLiteTraceStore
 from open_deep_research.runtime import RuntimeCommand
 
 
@@ -150,6 +151,39 @@ async def test_hitl_plan_revision_regenerates_plan_before_approval(monkeypatch):
     engine.handle_human_action(second["data"]["pending_human_action"]["action_id"], "approve")
     await asyncio.wait_for(task, 2)
     assert any(item["type"] == "plan_revision" for item in engine.final_state["human_feedback"])
+
+
+@pytest.mark.asyncio
+async def test_hitl_cancellation_finalizes_observability_run(monkeypatch, tmp_path):
+    await _install_basic_graph(monkeypatch)
+    trace_path = tmp_path / "cancel.sqlite3"
+    engine = QueryEngine(
+        _config(
+            enable_human_in_loop=True,
+            hitl_require_outline_approval=False,
+            trace_store_path=str(trace_path),
+        )
+    )
+    queue: asyncio.Queue = asyncio.Queue()
+    events: list[dict[str, Any]] = []
+
+    async def run():
+        async for event in engine.stream_message([HumanMessage(content="research HITL")]):
+            events.append(event)
+            await queue.put(event)
+
+    task = asyncio.create_task(run())
+    pending = await asyncio.wait_for(_collect_until([], "hitl.plan_pending", queue), 2)
+    engine.handle_human_action(
+        pending["data"]["pending_human_action"]["action_id"], "cancel"
+    )
+    await asyncio.wait_for(task, 2)
+
+    observed = SQLiteTraceStore(str(trace_path)).get_run("hitl-test")
+    assert observed is not None
+    assert observed["status"] == "cancelled"
+    assert engine.final_state["result"]["status"] == "cancelled"
+    assert any(event["event"] == "run.cancelled" for event in events)
 
 
 @pytest.mark.asyncio

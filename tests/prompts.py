@@ -9,7 +9,11 @@ Evaluation Criteria:
    - Background context provided
 
 2. Source Quality and Methodology
-   - Use of authoritative sources (webpages)
+   - Prefer primary and first-party sources (original research papers, official
+     documentation, government data, standards, court filings, and direct
+     company disclosures) over summaries, aggregators, and SEO-driven pages
+   - Use authoritative secondary sources only when a primary source is not
+     reasonably available or when synthesis is itself valuable
    - Diversity of source webpage types (e.g. news articles, papers, etc.)
    - Citation quality and integration
    - Transparency of research methodology
@@ -101,6 +105,20 @@ We expect the report to contain more information that is not in the answer, that
 They likely won't be perfectly the same, but they should have the same themes and ideas to get a high score.
 
 Use your best judgement when comparing the answer to the report!
+
+<user_question>
+{user_question}
+</user_question>
+
+<authority_answer>
+{answer}
+</authority_answer>
+
+<report>
+{report}
+</report>
+
+Today is {today}.
 """
 
 RELEVANCE_PROMPT = """You are evaluating the relevance of a response to a user's input question. Please assess the answer against the following criteria, being especially strict about section relevance.
@@ -209,6 +227,60 @@ Use the following format for your evaluation:
    ]
 }}
 </Output Format>
+"""
+
+
+CITATION_ACCURACY_PROMPT = """You are evaluating citation accuracy in a research report.
+
+For every explicit inline citation or source link in the report:
+1. Identify the specific factual claim the citation is attached to.
+2. Locate the cited source material in the retrieved context.
+3. Mark supported=true only when that source directly supports the claim at the
+   stated level of specificity. Mere topical similarity is not enough.
+4. Mark unsupported citations, citations that support only part of a compound
+   claim, and citations whose source is absent from the context as false.
+
+Do not evaluate whether uncited claims are complete; this metric measures the
+precision of citations that are present.
+
+<user_question>
+{user_question}
+</user_question>
+
+<retrieved_context>
+{context}
+</retrieved_context>
+
+<report>
+{report}
+</report>
+
+Today is {today}.
+"""
+
+
+TOOL_EFFICIENCY_PROMPT = """You are evaluating the observable tool efficiency of a deep-research agent.
+
+Give two integer scores from 1 to 5:
+- tool_selection_score: whether the visible tools and delegated research topics
+  were appropriate for the user's request.
+- call_efficiency_score: whether the number of calls was proportionate to task
+  complexity, avoided redundant delegation, respected configured limits, and
+  stopped once adequate evidence was available.
+
+Do not infer hidden Researcher-level tool calls. The trace explicitly states
+its visibility limits; judge only the supplied evidence and mention any
+material uncertainty in the reasoning.
+
+<user_question>
+{user_question}
+</user_question>
+
+<observable_tool_trace>
+{tool_trace}
+</observable_tool_trace>
+
+Today is {today}.
 """
 
 

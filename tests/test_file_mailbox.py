@@ -30,6 +30,11 @@ from open_deep_research.tasks.state import FileTaskStateStore, TaskSnapshot
 from open_deep_research.tasks.teammate_pool import TeammatePool
 
 
+def test_rejects_heartbeat_that_can_outlive_leader_lease() -> None:
+    with pytest.raises(ValueError, match="leader_heartbeat_seconds"):
+        Configuration(leader_heartbeat_seconds=10, leader_lease_seconds=20)
+
+
 def _send_messages(runs_dir: str, worker: int, count: int) -> None:
     async def send_all() -> None:
         mailbox = FileMailbox(runs_dir=runs_dir, run_id="concurrent")
@@ -132,6 +137,17 @@ async def test_file_task_store_versions_snapshots(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_file_task_store_scopes_reads_to_requested_run(tmp_path: Path) -> None:
+    store = FileTaskStateStore(str(tmp_path))
+    await store.upsert(TaskSnapshot(task_id="shared", run_id="run-a", research_topic="SECRET-A"))
+    await store.upsert(TaskSnapshot(task_id="shared", run_id="run-b", research_topic="PUBLIC-B"))
+
+    restored = await store.get("shared", run_id="run-b")
+    assert restored is not None
+    assert restored.research_topic == "PUBLIC-B"
+
+
+@pytest.mark.asyncio
 async def test_lead_verifies_completed_artifact_before_ack(tmp_path: Path) -> None:
     configurable = Configuration(runs_dir=str(tmp_path), task_state_backend="file")
     store = FileTaskStateStore(str(tmp_path))
@@ -211,6 +227,7 @@ async def test_persistent_teammate_reuses_identity_with_clean_task_state(tmp_pat
             "event_log_enabled": False,
             "query_session_persistence_enabled": False,
             "leader_heartbeat_seconds": 60,
+            "leader_lease_seconds": 180,
         },
         "metadata": {"run_id": "pool-run"},
     }

@@ -1,174 +1,360 @@
-from typing import cast
-from pydantic import BaseModel, Field
-from langchain_openai import ChatOpenAI
-from langchain_anthropic import ChatAnthropic
-from open_deep_research.tools.utils import get_today_str
-from tests.prompts import RELEVANCE_PROMPT, STRUCTURE_PROMPT, GROUNDEDNESS_PROMPT, OVERALL_QUALITY_PROMPT, CORRECTNESS_PROMPT, COMPLETENESS_PROMPT
+"""LangSmith evaluators for the current QueryEngine state contract."""
 
-eval_model = ChatOpenAI(
-    model="gpt-4.1",
+from __future__ import annotations
+
+import json
+from datetime import date
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, cast
+
+from dotenv import load_dotenv
+from langchain_anthropic import ChatAnthropic
+from langchain_openai import ChatOpenAI
+from pydantic import BaseModel, Field
+
+from tests.prompts import (
+    CITATION_ACCURACY_PROMPT,
+    COMPLETENESS_PROMPT,
+    CORRECTNESS_PROMPT,
+    GROUNDEDNESS_PROMPT,
+    OVERALL_QUALITY_PROMPT,
+    RELEVANCE_PROMPT,
+    STRUCTURE_PROMPT,
+    TOOL_EFFICIENCY_PROMPT,
 )
 
-def _format_input_query(inputs: dict) -> str:
-    messages = inputs["messages"]
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+
+
+@lru_cache(maxsize=1)
+def _get_eval_model() -> ChatOpenAI:
+    """Build the judge lazily so importing tests does not require credentials."""
+    return ChatOpenAI(model="gpt-4.1")
+
+
+def _today() -> str:
+    return date.today().isoformat()
+
+
+def _format_input_query(inputs: dict[str, Any]) -> str:
+    messages = inputs.get("messages", [])
     if len(messages) == 1:
-        return messages[0]["content"]
+        return str(messages[0].get("content", ""))
 
-    role_to_string_format_map = {
-        "user": "<user_input>\n{content}\n</user_input>",
-        "assistant": "<assistant_follow_up>\n{content}\n</assistant_follow_up>",
+    role_tags = {
+        "user": "user_input",
+        "assistant": "assistant_follow_up",
     }
+    formatted = []
+    for message in messages:
+        role = str(message.get("role", "user"))
+        tag = role_tags.get(role, role)
+        formatted.append(f"<{tag}>\n{message.get('content', '')}\n</{tag}>")
+    return "\n\n".join(formatted)
 
-    return "\n\n".join([role_to_string_format_map[message["role"]].format(content=message["content"]) for message in messages])
+
+def _failure_reason(outputs: dict[str, Any]) -> str | None:
+    result = outputs.get("result")
+    if isinstance(result, dict) and result.get("status") in {"error", "cancelled"}:
+        return str(result.get("error") or f"run status: {result.get('status')}")
+    report = outputs.get("final_report")
+    if not isinstance(report, str) or not report.strip():
+        return "run produced no final_report"
+    if report.startswith("Error generating final report:"):
+        return report
+    return None
+
+
+def _zero(key: str, reason: str) -> dict[str, Any]:
+    return {"key": key, "score": 0.0, "comment": f"Not scored: {reason}"}
+
+
+def _judge_input(content: str) -> str | list[dict[str, Any]]:
+    model = _get_eval_model()
+    if isinstance(model, ChatAnthropic):
+        return [{"type": "text", "text": content, "cache_control": {"type": "ephemeral", "ttl": "1h"}}]
+    return content
 
 
 class OverallQualityScore(BaseModel):
-    """Score the overall quality of the report against specific criteria."""
-    research_depth: int = Field(description="Integer score 1-5 showing whether the report meets the provided criteria (1 = doesn't meet at all, 5 = meets all criteria).")
-    source_quality: int = Field(description="Integer score 1-5 showing whether the report meets the provided criteria (1 = doesn't meet at all, 5 = meets all criteria).")
-    analytical_rigor: int = Field(description="Integer score 1-5 showing whether the report meets the provided criteria (1 = doesn't meet at all, 5 = meets all criteria).")
-    practical_value: int = Field(description="Integer score 1-5 showing whether the report meets the provided criteria (1 = doesn't meet at all, 5 = meets all criteria).")
-    balance_and_objectivity: int = Field(description="Integer score 1-5 showing whether the report meets the provided criteria (1 = doesn't meet at all, 5 = meets all criteria).")
-    writing_quality: int = Field(description="Integer score 1-5 showing whether the report meets the provided criteria (1 = doesn't meet at all, 5 = meets all criteria).")
+    research_depth: int = Field(ge=1, le=5)
+    source_quality: int = Field(ge=1, le=5)
+    analytical_rigor: int = Field(ge=1, le=5)
+    practical_value: int = Field(ge=1, le=5)
+    balance_and_objectivity: int = Field(ge=1, le=5)
+    writing_quality: int = Field(ge=1, le=5)
 
-def eval_overall_quality(inputs: dict, outputs: dict):
-    query = _format_input_query(inputs)
-    final_report = outputs["final_report"]
-    user_input_content = f"""User input: {query}\n\nReport: \n\n{final_report}\n\nEvaluate whether the report meets the criteria and provide detailed justification for your evaluation."""
-    if isinstance(eval_model, ChatAnthropic):
-        user_input_content = [{
-            "type": "text",
-            "text": user_input_content,
-            "cache_control": {"type": "ephemeral", "ttl": "1h"}
-        }]
-    eval_result = cast(OverallQualityScore, eval_model.with_structured_output(OverallQualityScore).invoke([
-        {"role": "system", "content": OVERALL_QUALITY_PROMPT.format(today=get_today_str())},
-        {"role": "user", "content": user_input_content}
-    ]))
-    return [
-        {"key": "research_depth_score", "score": eval_result.research_depth / 5},
-        {"key": "source_quality_score", "score": eval_result.source_quality / 5},
-        {"key": "analytical_rigor_score", "score": eval_result.analytical_rigor / 5},
-        {"key": "practical_value_score", "score": eval_result.practical_value / 5},
-        {"key": "balance_and_objectivity_score", "score": eval_result.balance_and_objectivity / 5},
-        {"key": "writing_quality_score", "score": eval_result.writing_quality / 5},
+
+def eval_overall_quality(inputs: dict, outputs: dict) -> list[dict[str, Any]]:
+    keys = [
+        "research_depth_score",
+        "source_quality_score",
+        "analytical_rigor_score",
+        "practical_value_score",
+        "balance_and_objectivity_score",
+        "writing_quality_score",
     ]
+    if reason := _failure_reason(outputs):
+        return [_zero(key, reason) for key in keys]
+
+    content = (
+        f"User input: {_format_input_query(inputs)}\n\n"
+        f"Report:\n\n{outputs['final_report']}\n\n"
+        "Evaluate whether the report meets the criteria."
+    )
+    model = _get_eval_model()
+    result = cast(
+        OverallQualityScore,
+        model.with_structured_output(OverallQualityScore).invoke(
+            [
+                {"role": "system", "content": OVERALL_QUALITY_PROMPT.format(today=_today())},
+                {"role": "user", "content": _judge_input(content)},
+            ]
+        ),
+    )
+    values = [
+        result.research_depth,
+        result.source_quality,
+        result.analytical_rigor,
+        result.practical_value,
+        result.balance_and_objectivity,
+        result.writing_quality,
+    ]
+    return [{"key": key, "score": value / 5} for key, value in zip(keys, values, strict=True)]
 
 
 class RelevanceScore(BaseModel):
-    """Score the report relevance against specific criteria."""
-    reasoning: str = Field(description="The reason for the score, including specific examples from the report.")
-    score: int = Field(description="Integer score 1-5 showing whether the report meets the provided criteria for relevance (1 = doesn't meet at all, 5 = meets all criteria).")
+    reasoning: str
+    score: int = Field(ge=1, le=5)
 
-def eval_relevance(inputs: dict, outputs: dict):
-    query = _format_input_query(inputs)
-    final_report = outputs["final_report"]
-    user_input_content = f"""User input: {query}\n\nReport: \n\n{final_report}\n\nEvaluate whether the report meets the criteria and provide detailed justification for your evaluation."""
-    if isinstance(eval_model, ChatAnthropic):
-        user_input_content = [{
-            "type": "text",
-            "text": user_input_content,
-            "cache_control": {"type": "ephemeral", "ttl": "1h"}
-        }]
 
-    eval_result = cast(RelevanceScore, eval_model.with_structured_output(RelevanceScore).invoke([
-        {"role": "system", "content": RELEVANCE_PROMPT.format(today=get_today_str())},
-        {"role": "user", "content": user_input_content}
-    ]))
-    return {"key": "relevance_score", "score": eval_result.score / 5, "comment": eval_result.reasoning}
+def eval_relevance(inputs: dict, outputs: dict) -> dict[str, Any]:
+    if reason := _failure_reason(outputs):
+        return _zero("relevance_score", reason)
+    content = f"User input: {_format_input_query(inputs)}\n\nReport:\n\n{outputs['final_report']}"
+    model = _get_eval_model()
+    result = cast(
+        RelevanceScore,
+        model.with_structured_output(RelevanceScore).invoke(
+            [
+                {"role": "system", "content": RELEVANCE_PROMPT.format(today=_today())},
+                {"role": "user", "content": _judge_input(content)},
+            ]
+        ),
+    )
+    return {"key": "relevance_score", "score": result.score / 5, "comment": result.reasoning}
 
 
 class StructureScore(BaseModel):
-    """Score the report structure against specific criteria."""
-    reasoning: str = Field(description="The reason for the score, including specific examples from the report.")
-    score: int = Field(description="Integer score 1-5 showing whether the report meets the provided criteria for structure and flow (1 = doesn't meet at all, 5 = meets all criteria).")
+    reasoning: str
+    score: int = Field(ge=1, le=5)
 
-def eval_structure(inputs: dict, outputs: dict):
-    query = _format_input_query(inputs)
-    final_report = outputs["final_report"]
-    user_input_content = STRUCTURE_PROMPT.format(user_question=query, report=final_report, today=get_today_str())
-    if isinstance(eval_model, ChatAnthropic):
-        user_input_content = [{
-            "type": "text",
-            "text": user_input_content,
-            "cache_control": {"type": "ephemeral", "ttl": "1h"}
-        }]
 
-    eval_result = cast(StructureScore, eval_model.with_structured_output(StructureScore).invoke([
-        {"role": "user", "content": user_input_content}
-    ]))
-    return {"key": "structure_and_cohesiveness_score", "score": eval_result.score / 5, "comment": eval_result.reasoning}
+def eval_structure(inputs: dict, outputs: dict) -> dict[str, Any]:
+    if reason := _failure_reason(outputs):
+        return _zero("structure_and_cohesiveness_score", reason)
+    content = STRUCTURE_PROMPT.format(
+        user_question=_format_input_query(inputs),
+        report=outputs["final_report"],
+        today=_today(),
+    )
+    result = cast(
+        StructureScore,
+        _get_eval_model().with_structured_output(StructureScore).invoke(
+            [{"role": "user", "content": _judge_input(content)}]
+        ),
+    )
+    return {
+        "key": "structure_and_cohesiveness_score",
+        "score": result.score / 5,
+        "comment": result.reasoning,
+    }
 
 
 class CorrectnessScore(BaseModel):
-    """Score the report correctness against specific criteria."""
-    reasoning: str = Field(description="The reason for the score, including specific examples from the report.")
-    score: int = Field(description="Integer score 1-5 showing whether the report meets the provided criteria for correctness (1 = doesn't meet at all, 5 = meets all criteria).")
+    reasoning: str
+    score: int = Field(ge=1, le=5)
 
-def eval_correctness(inputs: dict, outputs: dict, reference_outputs: dict):
-    query = _format_input_query(inputs)
-    final_report = outputs["final_report"]
-    answer = reference_outputs["answer"]
-    user_input_content = CORRECTNESS_PROMPT.format(user_question=query, report=final_report, answer=answer, today=get_today_str())
-    if isinstance(eval_model, ChatAnthropic):
-        user_input_content = [{
-            "type": "text",
-            "text": user_input_content,
-            "cache_control": {"type": "ephemeral", "ttl": "1h"}
-        }]
 
-    eval_result = cast(CorrectnessScore, eval_model.with_structured_output(CorrectnessScore).invoke([
-        {"role": "user", "content": user_input_content}
-    ]))
-    return {"key": "correctness_score", "score": eval_result.score / 5, "comment": eval_result.reasoning}
+def eval_correctness(inputs: dict, outputs: dict, reference_outputs: dict) -> dict[str, Any]:
+    if reason := _failure_reason(outputs):
+        return _zero("correctness_score", reason)
+    answer = reference_outputs.get("answer")
+    if not answer:
+        return _zero("correctness_score", "reference output has no answer")
+    content = CORRECTNESS_PROMPT.format(
+        user_question=_format_input_query(inputs),
+        report=outputs["final_report"],
+        answer=answer,
+        today=_today(),
+    )
+    result = cast(
+        CorrectnessScore,
+        _get_eval_model().with_structured_output(CorrectnessScore).invoke(
+            [{"role": "user", "content": _judge_input(content)}]
+        ),
+    )
+    return {"key": "correctness_score", "score": result.score / 5, "comment": result.reasoning}
+
 
 class GroundednessClaim(BaseModel):
-    """A claim from the report, and whether or not it is grounded in the context"""
-    claim: str = Field(description="The claim extracted from the report.")
-    grounded: bool = Field(description="Whether the claim is grounded in the context.")
+    claim: str
+    grounded: bool
+
 
 class GroundednessScore(BaseModel):
-    """Extract the claims and whether they are grounded in the context"""
-    claims: list[GroundednessClaim] = Field(description="All claims extracted from the report, and whether or not they are grounded in the context.")
+    claims: list[GroundednessClaim]
 
-def eval_groundedness(inputs: dict, outputs: dict):
-    final_report = outputs["final_report"]
-    context = str(outputs["raw_notes"])
 
-    user_input_content = GROUNDEDNESS_PROMPT.format(context=context, report=final_report, today=get_today_str())
-    if isinstance(eval_model, ChatAnthropic):
-        user_input_content = [{
-            "type": "text",
-            "text": user_input_content,
-            "cache_control": {"type": "ephemeral", "ttl": "1h"}
-        }]
-
-    eval_result = cast(GroundednessScore, eval_model.with_structured_output(GroundednessScore).with_retry(stop_after_attempt=3).invoke([
-        {"role": "user", "content": user_input_content},
-    ]))
-    # normalize to 0-1
-    grounded_claims = [claim for claim in eval_result.claims if claim.grounded]
-    return {"key": "groundedness_score", "score": len(grounded_claims) / len(eval_result.claims), "comment": str(eval_result.claims)}
+def eval_groundedness(inputs: dict, outputs: dict) -> list[dict[str, Any]]:
+    del inputs
+    keys = ["groundedness_score", "factual_accuracy_score"]
+    if reason := _failure_reason(outputs):
+        return [_zero(key, reason) for key in keys]
+    context = "\n\n".join(str(note) for note in outputs.get("raw_notes", []))
+    if not context.strip():
+        return [_zero(key, "run produced no retrieved evidence") for key in keys]
+    content = GROUNDEDNESS_PROMPT.format(
+        context=context,
+        report=outputs["final_report"],
+        today=_today(),
+    )
+    result = cast(
+        GroundednessScore,
+        _get_eval_model()
+        .with_structured_output(GroundednessScore)
+        .with_retry(stop_after_attempt=3)
+        .invoke([{"role": "user", "content": _judge_input(content)}]),
+    )
+    score = sum(claim.grounded for claim in result.claims) / len(result.claims) if result.claims else 0.0
+    comment = json.dumps([claim.model_dump() for claim in result.claims], ensure_ascii=False)
+    return [{"key": key, "score": score, "comment": comment} for key in keys]
 
 
 class CompletenessScore(BaseModel):
-    """Score the report completeness against specific criteria."""
-    reasoning: str = Field(description="The reason for the score, including specific examples from the report.")
-    score: int = Field(description="Integer score 1-5 showing whether the report meets the provided criteria for completeness (1 = doesn't meet at all, 5 = meets all criteria).")
+    reasoning: str
+    score: int = Field(ge=1, le=5)
 
-def eval_completeness(inputs: dict, outputs: dict):
-    query = _format_input_query(inputs)
-    final_report = outputs["final_report"]
-    research_brief = outputs["research_brief"]
-    user_input_content = COMPLETENESS_PROMPT.format(user_question=query, research_brief=research_brief, report=final_report, today=get_today_str())
-    if isinstance(eval_model, ChatAnthropic):
-        user_input_content = [{
-            "type": "text",
-            "text": user_input_content,
-            "cache_control": {"type": "ephemeral", "ttl": "1h"}
-        }]
 
-    eval_result = cast(CompletenessScore, eval_model.with_structured_output(CompletenessScore).invoke([
-        {"role": "user", "content": user_input_content}
-    ]))
-    return {"key": "completeness_score", "score": eval_result.score / 5, "comment": eval_result.reasoning}
+def eval_completeness(inputs: dict, outputs: dict) -> dict[str, Any]:
+    if reason := _failure_reason(outputs):
+        return _zero("completeness_score", reason)
+    brief = outputs.get("research_brief")
+    if not brief:
+        return _zero("completeness_score", "run produced no research_brief")
+    content = COMPLETENESS_PROMPT.format(
+        user_question=_format_input_query(inputs),
+        research_brief=brief,
+        report=outputs["final_report"],
+        today=_today(),
+    )
+    result = cast(
+        CompletenessScore,
+        _get_eval_model().with_structured_output(CompletenessScore).invoke(
+            [{"role": "user", "content": _judge_input(content)}]
+        ),
+    )
+    return {"key": "completeness_score", "score": result.score / 5, "comment": result.reasoning}
+
+
+class CitationAssessment(BaseModel):
+    claim: str
+    citation: str
+    supported: bool
+
+
+class CitationAccuracyScore(BaseModel):
+    citations: list[CitationAssessment]
+    reasoning: str
+
+
+def eval_citation_accuracy(inputs: dict, outputs: dict) -> dict[str, Any]:
+    if reason := _failure_reason(outputs):
+        return _zero("citation_accuracy_score", reason)
+    context = "\n\n".join(str(note) for note in outputs.get("raw_notes", []))
+    if not context.strip():
+        return _zero("citation_accuracy_score", "run produced no retrieved evidence")
+    content = CITATION_ACCURACY_PROMPT.format(
+        user_question=_format_input_query(inputs),
+        context=context,
+        report=outputs["final_report"],
+        today=_today(),
+    )
+    result = cast(
+        CitationAccuracyScore,
+        _get_eval_model()
+        .with_structured_output(CitationAccuracyScore)
+        .with_retry(stop_after_attempt=3)
+        .invoke([{"role": "user", "content": _judge_input(content)}]),
+    )
+    score = sum(item.supported for item in result.citations) / len(result.citations) if result.citations else 0.0
+    details = json.dumps([item.model_dump() for item in result.citations], ensure_ascii=False)
+    return {
+        "key": "citation_accuracy_score",
+        "score": score,
+        "comment": f"{result.reasoning}\n{details}",
+    }
+
+
+class ToolEfficiencyScore(BaseModel):
+    tool_selection_score: int = Field(ge=1, le=5)
+    call_efficiency_score: int = Field(ge=1, le=5)
+    reasoning: str
+
+
+def _extract_tool_trace(outputs: dict[str, Any]) -> dict[str, Any]:
+    calls: list[dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
+    for message in outputs.get("supervisor_messages", []):
+        tool_calls = message.get("tool_calls", []) if isinstance(message, dict) else getattr(message, "tool_calls", [])
+        for call in tool_calls or []:
+            calls.append({
+                "name": call.get("name"),
+                "args": call.get("args", {}),
+                "id": call.get("id"),
+            })
+        message_type = message.get("type") if isinstance(message, dict) else getattr(message, "type", None)
+        if message_type == "tool":
+            results.append({
+                "name": message.get("name") if isinstance(message, dict) else getattr(message, "name", None),
+                "content": str(message.get("content", "") if isinstance(message, dict) else getattr(message, "content", ""))[:1000],
+            })
+    result = outputs.get("result", {})
+    return {
+        "supervisor_tool_calls": calls,
+        "supervisor_tool_results": results,
+        "completed_task_metrics": [
+            {
+                key: task.get(key)
+                for key in ("research_topic", "query_count", "source_count", "citation_count", "elapsed_seconds")
+            }
+            for task in outputs.get("completed_task_outputs", [])
+            if isinstance(task, dict)
+        ],
+        "run_metrics": result.get("metrics", {}) if isinstance(result, dict) else {},
+        "limits": outputs.get("evaluation_metadata", {}),
+        "scope_note": "Researcher-level tool names are not retained in the final state; score only observable evidence.",
+    }
+
+
+def eval_tool_efficiency(inputs: dict, outputs: dict) -> dict[str, Any]:
+    if reason := _failure_reason(outputs):
+        return _zero("tool_efficiency_score", reason)
+    trace = _extract_tool_trace(outputs)
+    content = TOOL_EFFICIENCY_PROMPT.format(
+        user_question=_format_input_query(inputs),
+        tool_trace=json.dumps(trace, ensure_ascii=False, default=str),
+        today=_today(),
+    )
+    result = cast(
+        ToolEfficiencyScore,
+        _get_eval_model().with_structured_output(ToolEfficiencyScore).invoke(
+            [{"role": "user", "content": _judge_input(content)}]
+        ),
+    )
+    return {
+        "key": "tool_efficiency_score",
+        "score": (result.tool_selection_score + result.call_efficiency_score) / 10,
+        "comment": result.reasoning,
+    }

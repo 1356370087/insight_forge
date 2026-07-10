@@ -450,7 +450,10 @@ class TestHandleStartResearchTask:
             registry.update_status(record.task_id, TaskStatus.COMPLETED)
 
         result = await handle_start_research_task(
-            tool_call, {"configurable": {}}, registry, fake_launch,
+            tool_call,
+            {"configurable": {"task_state_backend": "memory"}},
+            registry,
+            fake_launch,
         )
         assert "task_id" in result.content
         assert len(registry) == 1
@@ -482,6 +485,61 @@ class TestHandleStartResearchTask:
         )
         assert "Cannot start" in result.content
 
+    @pytest.mark.asyncio
+    async def test_pending_task_holds_an_admission_slot(self):
+        from open_deep_research.tasks.async_tools import handle_start_research_task
+
+        registry = TaskRegistry()
+
+        async def fake_launch(record, cfg):
+            del record, cfg
+
+        config = {
+            "configurable": {
+                "task_state_backend": "memory",
+                "max_in_flight_tasks": 1,
+            },
+            "metadata": {"run_id": "admission-run"},
+        }
+        first = await handle_start_research_task(
+            {"id": "first", "args": {"research_topic": "first"}},
+            config,
+            registry,
+            fake_launch,
+        )
+        second = await handle_start_research_task(
+            {"id": "second", "args": {"research_topic": "second"}},
+            config,
+            registry,
+            fake_launch,
+        )
+
+        assert "task_id" in first.content
+        assert "Cannot start" in second.content
+        assert len(registry.list(run_id="admission-run")) == 1
+
+    @pytest.mark.asyncio
+    async def test_launch_failure_persists_terminal_state(self):
+        from open_deep_research.tasks.async_tools import handle_start_research_task
+
+        registry = TaskRegistry()
+
+        async def fail_launch(record, cfg):
+            del record, cfg
+            raise RuntimeError("pool unavailable")
+
+        with pytest.raises(RuntimeError, match="pool unavailable"):
+            await handle_start_research_task(
+                {"id": "failed", "args": {"research_topic": "topic"}},
+                {"configurable": {"task_state_backend": "memory"}},
+                registry,
+                fail_launch,
+            )
+
+        [record] = registry.list(run_id="default")
+        assert record.status == TaskStatus.FAILED
+        assert record.error_message == "Unable to launch task: pool unavailable"
+
 
 class TestHandleCheckResearchTask:
     """Tests for handle_check_research_task."""
@@ -495,6 +553,21 @@ class TestHandleCheckResearchTask:
         tool_call = {"id": "c", "name": "CheckResearchTask", "args": {"task_ids": ["no-such"]}}
         result = await handle_check_research_task(tool_call, registry)
         assert "UNKNOWN" in result.content
+
+    @pytest.mark.asyncio
+    async def test_rejects_task_from_another_run(self):
+        from open_deep_research.tasks.async_tools import handle_check_research_task
+
+        registry = TaskRegistry()
+        record = registry.create("secret topic", run_id="other-run")
+        registry.update_status(record.task_id, TaskStatus.COMPLETED)
+        result = await handle_check_research_task(
+            {"id": "c", "name": "CheckResearchTask", "args": {"task_ids": [record.task_id]}},
+            registry,
+            run_id="current-run",
+        )
+        assert "UNKNOWN" in result.content
+        assert "secret topic" not in result.content
 
     @pytest.mark.asyncio
     async def test_completed_task_returns_results(self):
@@ -632,7 +705,7 @@ class TestHandleCancelResearchTask:
         assert "already cancelled" in result.content
 
     @pytest.mark.asyncio
-    async def test_cancel_waiting_task_clears_approvals(self):
+    async def test_cancel_waiting_task_preserves_sibling_approvals(self):
         from open_deep_research.tasks.async_tools import handle_cancel_research_task
         from open_deep_research.tasks.registry import TaskRegistry, TaskStatus
         from open_deep_research.tasks.domain_approvals import (
@@ -644,6 +717,8 @@ class TestHandleCancelResearchTask:
         registry = TaskRegistry()
         r = registry.create("topic", run_id="run-x")
         registry.update_status(r.task_id, TaskStatus.WAITING_FOR_CONFIRMATION)
+        sibling = registry.create("sibling", run_id="run-x")
+        registry.update_status(sibling.task_id, TaskStatus.RUNNING)
         approvals = get_domain_approval_registry()
         req = approvals.request_decision("run-x", "pending.example", "fetch_webpage")
         req.future = asyncio.get_running_loop().create_future()
@@ -654,8 +729,8 @@ class TestHandleCancelResearchTask:
         }
         await handle_cancel_research_task(tool_call, registry)
         assert r.status == TaskStatus.CANCELLED
-        # pending future was cancelled by clear_run
-        assert req.future.cancelled()
+        # A single task cancellation must not cancel other tasks in the run.
+        assert not req.future.cancelled()
         reset_domain_approval_registry()
 
 
@@ -702,10 +777,9 @@ class TestHandleApproveResearchDomain:
         assert req.future.result() is True
         # decision cached for the run
         assert approvals.is_allowed("run-x", "untrusted.example") is True
-        # control queue got the domain_decision marker
-        marker = r.control_queue.get_nowait()
-        assert marker["type"] == "domain_decision"
-        assert marker["allow"] is True
+        # The approval Future is the single wake-up path; no duplicate control
+        # marker should remain to race with later supervisor updates.
+        assert r.control_queue.empty()
 
     @pytest.mark.asyncio
     async def test_deny_waiting_task(self):
@@ -899,3 +973,132 @@ class TestCheckpointManager:
             mgr = CheckpointManager(runs_dir=tmpdir, run_id="run-4")
             # Should not raise
             mgr.delete("no-such-file")
+
+    def test_rejects_path_traversal_identifiers(self, tmp_path: Path):
+        from open_deep_research.tasks.recovery import CheckpointManager
+
+        with pytest.raises(ValueError):
+            CheckpointManager(runs_dir=str(tmp_path), run_id="../outside")
+
+
+class TestControlledExecutor:
+    """Regression tests for live update/cancel handling."""
+
+    @pytest.mark.asyncio
+    async def test_update_interrupts_and_restarts_research(self, monkeypatch):
+        from open_deep_research.tasks import executor
+
+        async def no_publish(*args, **kwargs):
+            del args, kwargs
+
+        class FakeContextStore:
+            def __init__(self, *args, **kwargs):
+                del args, kwargs
+
+            def persist_task_result(self, *args, **kwargs):
+                del args, kwargs
+                return "0" * 64
+
+        monkeypatch.setattr(executor, "publish_task_update", no_publish)
+        monkeypatch.setattr(executor, "RunContextStore", FakeContextStore)
+        registry = TaskRegistry()
+        record = registry.restore(TaskRecord(task_id="update-task", run_id="update-run", research_topic="topic"))
+        started = asyncio.Event()
+        calls: list[list[str]] = []
+
+        async def research(state, _config):
+            calls.append([str(message.content) for message in state["researcher_messages"]])
+            if len(calls) == 1:
+                started.set()
+                await asyncio.Event().wait()
+            return {"compressed_research": "done", "raw_notes": [], "metrics": {}}
+
+        config = {
+            "configurable": {
+                "task_state_backend": "memory",
+                "task_checkpoint_enabled": False,
+                "event_log_enabled": False,
+                "task_timeout_seconds": 60,
+            },
+            "metadata": {"run_id": "update-run"},
+        }
+        task = asyncio.create_task(
+            executor.run_task_with_control(
+                record, config, registry, research, run_id="update-run", event_log_enabled=False
+            )
+        )
+        await started.wait()
+        await record.control_queue.put({"type": "update", "instruction": "use official sources"})
+        await asyncio.wait_for(task, timeout=2)
+
+        assert len(calls) == 2
+        assert "[Supervisor Instruction] use official sources" in calls[1]
+        assert record.status == TaskStatus.COMPLETED
+
+    @pytest.mark.asyncio
+    async def test_mailbox_publish_failure_does_not_fail_research(self, monkeypatch):
+        from open_deep_research.tasks import executor
+
+        async def fail_publish(*args, **kwargs):
+            del args, kwargs
+            raise OSError("mailbox unavailable")
+
+        class FakeContextStore:
+            def __init__(self, *args, **kwargs):
+                del args, kwargs
+
+            def persist_task_result(self, *args, **kwargs):
+                del args, kwargs
+                return "0" * 64
+
+        monkeypatch.setattr(executor, "publish_task_update", fail_publish)
+        monkeypatch.setattr(executor, "RunContextStore", FakeContextStore)
+        registry = TaskRegistry()
+        record = registry.restore(TaskRecord(task_id="failed-start", run_id="run", research_topic="topic"))
+
+        async def research(state, _config):
+            del state, _config
+            return {"compressed_research": "done", "raw_notes": [], "metrics": {}}
+
+        await executor.run_task_with_control(
+            record,
+            {"configurable": {"task_state_backend": "memory", "event_log_enabled": False}},
+            registry,
+            research,
+            run_id="run",
+            event_log_enabled=False,
+        )
+        assert record.status == TaskStatus.COMPLETED
+
+
+class TestAsyncSupervisorTermination:
+    """Async supervisors must not silently finish with active tasks."""
+
+    @pytest.mark.asyncio
+    async def test_rejects_empty_tool_turn_while_task_is_active(self):
+        from langchain_core.messages import AIMessage
+
+        from open_deep_research.agents.deep_researcher import _execute_supervisor_tools
+        from open_deep_research.configuration import Configuration
+        from open_deep_research.tasks.state import get_task_state_store
+
+        config = {
+            "configurable": {
+                "enable_async_research": True,
+                "task_state_backend": "memory",
+            },
+            "metadata": {"run_id": "supervisor-run"},
+        }
+        record = TaskRecord(task_id="active-task", run_id="supervisor-run", research_topic="topic")
+        configurable = Configuration.from_runnable_config(config)
+        await get_task_state_store(configurable).update_from_record(record)
+
+        with pytest.raises(RuntimeError, match="remain active"):
+            await _execute_supervisor_tools(
+                {
+                    "enable_async_research": True,
+                    "research_iterations": 0,
+                    "supervisor_messages": [AIMessage(content="", tool_calls=[])],
+                },
+                config,
+            )
