@@ -70,7 +70,11 @@ class TaskRecord:
     admission_status: str = "pending"
     result_artifact_path: Optional[str] = None
     result_artifact_sha256: Optional[str] = None
+    trace_parent_span_id: Optional[str] = None
+    langfuse_parent_span_id: Optional[str] = None
     memory_context: Optional[str] = None
+    assignment_attempt: int = 0
+    pending_update_instructions: list[str] = field(default_factory=list)
     error_message: Optional[str] = None
 
     # Pending domain-confirmation (set while WAITING_FOR_CONFIRMATION).
@@ -99,6 +103,7 @@ class TaskRecord:
     source_count: int = 0
     citation_count: int = 0
     retry_count: int = 0
+    source_urls: set[str] = field(default_factory=set, repr=False)
 
     @property
     def elapsed_seconds(self) -> float:
@@ -193,13 +198,17 @@ class TaskRegistry:
         return sum(1 for t in records if t.status == TaskStatus.RUNNING)
 
     def count_active(self, run_id: Optional[str] = None) -> int:
-        """Count tasks RUNNING or WAITING_FOR_CONFIRMATION (holding a slot).
+        """Count admitted tasks that hold a run concurrency slot.
 
         Paused-for-confirmation tasks still occupy resources, so this is the
         concurrency check used against ``max_in_flight_tasks``.
         """
         records = self.list(run_id=run_id) if run_id is not None else self._tasks.values()
-        active = {TaskStatus.RUNNING, TaskStatus.WAITING_FOR_CONFIRMATION}
+        active = {
+            TaskStatus.PENDING,
+            TaskStatus.RUNNING,
+            TaskStatus.WAITING_FOR_CONFIRMATION,
+        }
         return sum(1 for t in records if t.status in active)
 
     def __len__(self) -> int:

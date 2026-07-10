@@ -7,11 +7,16 @@ rather than starting from scratch.
 
 from __future__ import annotations
 
-import json
-import os
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
+
+from open_deep_research.tasks.mailbox import (
+    atomic_write_json,
+    read_json_file,
+    validate_component,
+)
 
 
 @dataclass
@@ -80,15 +85,18 @@ class CheckpointManager:
 
     def __init__(self, runs_dir: str, run_id: str) -> None:
         """Initialize the run-scoped checkpoint directory."""
-        self._dir = os.path.join(runs_dir, run_id, "checkpoints")
-        os.makedirs(self._dir, exist_ok=True)
+        root = Path(runs_dir).resolve()
+        safe_run_id = validate_component(run_id, "run_id")
+        self._dir = root / safe_run_id / "checkpoints"
+        self._dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
     # Path helpers
     # ------------------------------------------------------------------
 
-    def _path(self, task_id: str) -> str:
-        return os.path.join(self._dir, f"{task_id}.json")
+    def _path(self, task_id: str) -> Path:
+        safe_task_id = validate_component(task_id, "task_id")
+        return self._dir / f"{safe_task_id}.json"
 
     # ------------------------------------------------------------------
     # CRUD
@@ -97,35 +105,30 @@ class CheckpointManager:
     def save(self, checkpoint: ResearcherCheckpoint) -> None:
         """Write (or overwrite) a checkpoint for the given task."""
         checkpoint.timestamp = time.time()
-        with open(self._path(checkpoint.task_id), "w", encoding="utf-8") as fh:
-            json.dump(checkpoint.to_dict(), fh, ensure_ascii=False, indent=2)
+        atomic_write_json(self._path(checkpoint.task_id), checkpoint.to_dict())
 
     def load(self, task_id: str) -> Optional[ResearcherCheckpoint]:
         """Load the checkpoint for *task_id*, or ``None`` if it doesn't exist."""
         path = self._path(task_id)
-        if not os.path.isfile(path):
+        if not path.is_file():
             return None
-        try:
-            with open(path, encoding="utf-8") as fh:
-                return ResearcherCheckpoint.from_dict(json.load(fh))
-        except (json.JSONDecodeError, KeyError):
-            return None
+        return ResearcherCheckpoint.from_dict(read_json_file(path))
 
     def delete(self, task_id: str) -> None:
         """Remove the checkpoint file for *task_id* (e.g. after successful completion)."""
         path = self._path(task_id)
-        if os.path.isfile(path):
-            os.remove(path)
+        if path.is_file():
+            path.unlink()
 
     def list_checkpoints(self) -> list[ResearcherCheckpoint]:
         """Load every valid checkpoint for this run."""
         checkpoints: list[ResearcherCheckpoint] = []
-        if not os.path.isdir(self._dir):
+        if not self._dir.is_dir():
             return checkpoints
-        for name in os.listdir(self._dir):
-            if not name.endswith(".json"):
+        for path in self._dir.iterdir():
+            if path.suffix != ".json":
                 continue
-            checkpoint = self.load(name[:-5])
+            checkpoint = self.load(path.stem)
             if checkpoint is not None:
                 checkpoints.append(checkpoint)
         return checkpoints

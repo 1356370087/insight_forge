@@ -178,7 +178,16 @@ class FileMailbox:
             if not isinstance(payload, list):
                 raise CoordinationCorruptedError(f"Invalid dead-letter file: {path}")
             existing = payload
-        existing.extend(message.model_dump(mode="json") for message in messages)
+        existing_ids = {
+            str(message.get("message_id", ""))
+            for message in existing
+            if isinstance(message, dict)
+        }
+        existing.extend(
+            message.model_dump(mode="json")
+            for message in messages
+            if message.message_id not in existing_ids
+        )
         atomic_write_json(path, existing)
 
     async def send(

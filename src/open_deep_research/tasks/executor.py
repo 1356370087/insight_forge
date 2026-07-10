@@ -14,6 +14,7 @@ from langchain_core.messages import HumanMessage, message_to_dict
 from langchain_core.runnables import RunnableConfig
 
 from open_deep_research.configuration import Configuration
+from open_deep_research.observability.telemetry import get_prometheus_metrics
 from open_deep_research.run_context import RunContextStore
 from open_deep_research.sandbox.manager import DockerSandboxManager
 from open_deep_research.tasks.coordination import publish_task_update
@@ -83,8 +84,14 @@ async def _emit_state_change(
     _emit_event(event, runs_dir=runs_dir, run_id=run_id, enabled=event_log_enabled)
 
     configurable = Configuration.from_runnable_config(config)
+    metrics = get_prometheus_metrics(configurable)
+    if metrics is not None:
+        metrics.observe_task_transition(task_record, event_type)
     store = get_task_state_store(configurable)
     snapshot = await store.update_from_record(task_record)
+    if metrics is not None:
+        pending = await store.list(status_filter=TaskStatus.PENDING, run_id=run_id)
+        metrics.set_task_counts(len(pending), await store.count_active(run_id=run_id))
     if not notify:
         return
     try:
@@ -102,7 +109,8 @@ async def _emit_state_change(
             run_id=run_id,
             enabled=event_log_enabled,
         )
-        raise
+        # The task snapshot is authoritative. A transient notification failure
+        # must not roll back or strand the task lifecycle.
 
 
 async def emit_task_state_change(
@@ -147,6 +155,12 @@ def _config_with_task_id(config: RunnableConfig, task_id: str) -> RunnableConfig
     return new_config
 
 
+def _clear_run_approvals_if_idle(registry: TaskRegistry, run_id: str) -> None:
+    """Release run-scoped approval state only after its last active task ends."""
+    if registry.count_active(run_id=run_id) == 0:
+        get_domain_approval_registry().clear_run(run_id)
+
+
 # ---------------------------------------------------------------------------
 # Simple executor (no control queue, no checkpoints)
 # ---------------------------------------------------------------------------
@@ -171,15 +185,30 @@ async def run_task(
         started_at=time.time(),
     )
 
-    await _emit_state_change(
-        task_record,
-        config,
-        event_type=EventType.TASK_STARTED,
-        runs_dir=runs_dir,
-        run_id=run_id,
-        event_log_enabled=event_log_enabled,
-        data={"research_topic": task_record.research_topic},
-    )
+    try:
+        await _emit_state_change(
+            task_record,
+            config,
+            event_type=EventType.TASK_STARTED,
+            runs_dir=runs_dir,
+            run_id=run_id,
+            event_log_enabled=event_log_enabled,
+            data={"research_topic": task_record.research_topic},
+        )
+    except Exception as exc:  # noqa: BLE001 - state must not remain RUNNING
+        registry.update_status(
+            task_record.task_id,
+            TaskStatus.FAILED,
+            error_message=f"Unable to publish task start: {exc}",
+            completed_at=time.time(),
+        )
+        try:
+            configurable = Configuration.from_runnable_config(config)
+            snapshot = await get_task_state_store(configurable).update_from_record(task_record)
+            await publish_task_update(configurable, snapshot, EventType.TASK_FAILED)
+        except Exception:
+            pass
+        return
 
     try:
         if task_record.cancelled.is_set():
@@ -233,13 +262,14 @@ async def run_task(
                 "compressed_length": len(result.get("compressed_research", "")),
             },
         )
-        get_domain_approval_registry().clear_run(run_id)
+        _clear_run_approvals_if_idle(registry, run_id)
 
     except asyncio.TimeoutError:
         registry.update_status(
             task_record.task_id,
             TaskStatus.TIMED_OUT,
             error_message=f"Task exceeded {timeout}s timeout.",
+            completed_at=time.time(),
         )
         await _emit_state_change(
             task_record,
@@ -250,13 +280,14 @@ async def run_task(
             event_log_enabled=event_log_enabled,
             data={"timeout_seconds": timeout},
         )
-        get_domain_approval_registry().clear_run(run_id)
+        _clear_run_approvals_if_idle(registry, run_id)
 
     except Exception as exc:
         registry.update_status(
             task_record.task_id,
             TaskStatus.FAILED,
             error_message=str(exc),
+            completed_at=time.time(),
         )
         await _emit_state_change(
             task_record,
@@ -267,7 +298,7 @@ async def run_task(
             event_log_enabled=event_log_enabled,
             data={"error": str(exc)},
         )
-        get_domain_approval_registry().clear_run(run_id)
+        _clear_run_approvals_if_idle(registry, run_id)
 
 
 # ---------------------------------------------------------------------------
@@ -295,15 +326,29 @@ async def run_task_with_control(
         started_at=time.time(),
     )
 
-    await _emit_state_change(
-        task_record,
-        config,
-        event_type=EventType.TASK_STARTED,
-        runs_dir=runs_dir,
-        run_id=run_id,
-        event_log_enabled=event_log_enabled,
-        data={"research_topic": task_record.research_topic},
-    )
+    try:
+        await _emit_state_change(
+            task_record,
+            config,
+            event_type=EventType.TASK_STARTED,
+            runs_dir=runs_dir,
+            run_id=run_id,
+            event_log_enabled=event_log_enabled,
+            data={"research_topic": task_record.research_topic},
+        )
+    except Exception as exc:  # noqa: BLE001 - state must not remain RUNNING
+        registry.update_status(
+            task_record.task_id,
+            TaskStatus.FAILED,
+            error_message=f"Unable to publish task start: {exc}",
+            completed_at=time.time(),
+        )
+        try:
+            snapshot = await get_task_state_store(configurable).update_from_record(task_record)
+            await publish_task_update(configurable, snapshot, EventType.TASK_FAILED)
+        except Exception:
+            pass
+        return
 
     # --- Resume from checkpoint if available ---------------------------------
     existing_checkpoint = None
@@ -329,7 +374,7 @@ async def run_task_with_control(
             "researcher_messages": messages_from_dict(existing_checkpoint.messages_snapshot),
             "research_topic": task_record.research_topic,
             "tool_call_iterations": existing_checkpoint.tool_call_iterations,
-            "memory_context": task_record.memory_context,
+            "memory_context": existing_checkpoint.memory_context or task_record.memory_context,
         }
         task_record.phase = (
             TaskPhase.COMPRESSING
@@ -385,11 +430,12 @@ async def run_task_with_control(
                 return
 
             # Drain any pending update instructions
-            instructions: list[str] = []
+            instructions = list(task_record.pending_update_instructions)
+            task_record.pending_update_instructions.clear()
             while not task_record.control_queue.empty():
                 try:
                     msg = task_record.control_queue.get_nowait()
-                    if msg.get("type") == "update":
+                    if msg.get("type") == "update" and msg["instruction"] not in instructions:
                         instructions.append(msg["instruction"])
                 except asyncio.QueueEmpty:
                     break
@@ -398,6 +444,10 @@ async def run_task_with_control(
                 researcher_state["researcher_messages"].append(
                     HumanMessage(content=f"[Supervisor Instruction] {instr}")
                 )
+
+            await _save_checkpoint()
+
+            for instr in instructions:
                 await _emit_state_change(
                     task_record,
                     config,
@@ -409,23 +459,82 @@ async def run_task_with_control(
                     notify=False,
                 )
 
-            await _save_checkpoint()
-
-            if configurable.enable_docker_sandbox:
-                sandbox_result = await DockerSandboxManager().run_researcher_task(
-                    task_record,
-                    config,
-                    researcher_state,
-                    runs_dir=runs_dir,
-                    run_id=run_id,
-                    event_log_enabled=event_log_enabled,
-                )
-                result = sandbox_result.result
-            else:
-                result = await asyncio.wait_for(
-                    execute_research(researcher_state, _config_with_task_id(config, task_record.task_id)),
+            async def invoke_researcher() -> dict[str, Any]:
+                if configurable.enable_docker_sandbox:
+                    sandbox_result = await DockerSandboxManager().run_researcher_task(
+                        task_record,
+                        config,
+                        researcher_state,
+                        runs_dir=runs_dir,
+                        run_id=run_id,
+                        event_log_enabled=event_log_enabled,
+                    )
+                    return sandbox_result.result
+                return await asyncio.wait_for(
+                    execute_research(
+                        researcher_state,
+                        _config_with_task_id(config, task_record.task_id),
+                    ),
                     timeout=timeout,
                 )
+
+            research_task = asyncio.create_task(invoke_researcher())
+            cancellation_wait = asyncio.create_task(task_record.cancelled.wait())
+            control_wait = asyncio.create_task(task_record.control_queue.get())
+            done, pending = await asyncio.wait(
+                {research_task, cancellation_wait, control_wait},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if cancellation_wait in done:
+                research_task.cancel()
+                await asyncio.gather(research_task, return_exceptions=True)
+                control_wait.cancel()
+                await asyncio.gather(control_wait, return_exceptions=True)
+                await _save_checkpoint()
+                return
+
+            if control_wait in done:
+                control = control_wait.result()
+                cancellation_wait.cancel()
+                await asyncio.gather(cancellation_wait, return_exceptions=True)
+                if control.get("type") == "update":
+                    research_task.cancel()
+                    await asyncio.gather(research_task, return_exceptions=True)
+                    instruction = str(control["instruction"])
+                    try:
+                        task_record.pending_update_instructions.remove(instruction)
+                    except ValueError:
+                        pass
+                    researcher_state["researcher_messages"].append(
+                        HumanMessage(content=f"[Supervisor Instruction] {instruction}")
+                    )
+                    await _save_checkpoint()
+                    await _emit_state_change(
+                        task_record,
+                        config,
+                        event_type=EventType.TASK_UPDATED,
+                        runs_dir=runs_dir,
+                        run_id=run_id,
+                        event_log_enabled=event_log_enabled,
+                        data={"instruction": instruction},
+                        notify=False,
+                    )
+                    continue
+                # Domain-decision markers are informational; the governance
+                # future has already resumed the active researcher.
+                control_wait = None
+                result = await research_task
+            else:
+                result = await research_task
+
+            for task in pending:
+                if task is not research_task:
+                    task.cancel()
+            await asyncio.gather(
+                *(task for task in pending if task is not research_task),
+                return_exceptions=True,
+            )
 
             if task_record.cancelled.is_set():
                 await _save_checkpoint()
@@ -477,14 +586,19 @@ async def run_task_with_control(
                     "iterations": iteration + 1,
                 },
             )
-            get_domain_approval_registry().clear_run(run_id)
+            _clear_run_approvals_if_idle(registry, run_id)
             return
+
+        raise RuntimeError(
+            f"Task exceeded {max_iterations} supervisor-update restarts"
+        )
 
     except asyncio.TimeoutError:
         registry.update_status(
             task_record.task_id,
             TaskStatus.TIMED_OUT,
             error_message=f"Task exceeded {timeout}s timeout.",
+            completed_at=time.time(),
         )
         await _save_checkpoint()
         await _emit_state_change(
@@ -496,13 +610,14 @@ async def run_task_with_control(
             event_log_enabled=event_log_enabled,
             data={"timeout_seconds": timeout},
         )
-        get_domain_approval_registry().clear_run(run_id)
+        _clear_run_approvals_if_idle(registry, run_id)
 
     except Exception as exc:
         registry.update_status(
             task_record.task_id,
             TaskStatus.FAILED,
             error_message=str(exc),
+            completed_at=time.time(),
         )
         await _save_checkpoint()
         await _emit_state_change(
@@ -514,4 +629,4 @@ async def run_task_with_control(
             event_log_enabled=event_log_enabled,
             data={"error": str(exc)},
         )
-        get_domain_approval_registry().clear_run(run_id)
+        _clear_run_approvals_if_idle(registry, run_id)

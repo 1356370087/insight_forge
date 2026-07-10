@@ -14,7 +14,13 @@ from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
 from open_deep_research.configuration import Configuration
-from open_deep_research.tasks.coordination import FileDomainDecisionStore, get_mailbox
+from open_deep_research.tasks.coordination import (
+    FileDomainDecisionStore,
+    get_mailbox,
+    publish_task_update,
+)
+from open_deep_research.tasks.domain_approvals import get_domain_approval_registry
+from open_deep_research.tasks.events import EventType
 from open_deep_research.tasks.lease import LeaderLeaseManager
 from open_deep_research.tasks.mailbox import (
     MailboxMessage,
@@ -124,14 +130,31 @@ class TeammatePool:
         await self.lease.acquire()
         self._started = True
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        await self._restore_teammates()
         await self._restore_pending_tasks()
+
+    async def _restore_teammates(self) -> None:
+        """Restart durable teammate inbox consumers after a Lead takeover."""
+        team = await asyncio.to_thread(self._load_team_locked)
+        for descriptor in team.members:
+            if descriptor.teammate_id in self._runtimes:
+                continue
+            descriptor.status = "idle"
+            descriptor.current_task_id = None
+            descriptor.updated_at = time.time()
+            await self._write_descriptor(descriptor)
+            loop_task = asyncio.create_task(self._worker_loop(descriptor))
+            self._runtimes[descriptor.teammate_id] = _RuntimeTeammate(
+                descriptor=descriptor,
+                loop_task=loop_task,
+            )
 
     async def _heartbeat_loop(self) -> None:
         while not self._stopping:
             await asyncio.sleep(self.configurable.leader_heartbeat_seconds)
             try:
                 await self.lease.renew()
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 - lease loss is terminal for this owner
                 self._stopping = True
                 for record in self.registry.list(run_id=self.run_id):
                     if record.status in {
@@ -140,9 +163,28 @@ class TeammatePool:
                         TaskStatus.WAITING_FOR_CONFIRMATION,
                     }:
                         record.cancelled.set()
+                        self.registry.update_status(
+                            record.task_id,
+                            TaskStatus.FAILED,
+                            error_message=f"Lead lease lost: {exc}",
+                        )
+                        try:
+                            snapshot = await self.store.update_from_record(record)
+                            await publish_task_update(
+                                self.configurable,
+                                snapshot,
+                                EventType.TASK_FAILED,
+                            )
+                        except Exception:
+                            pass
                 for runtime in self._runtimes.values():
                     runtime.loop_task.cancel()
-                raise
+                self._started = False
+                _POOLS.pop(
+                    (str(Path(self.configurable.runs_dir).resolve()), self.run_id),
+                    None,
+                )
+                return
 
     async def _new_teammate(self) -> _RuntimeTeammate:
         def allocate(team: TeamFile) -> TeammateDescriptor:
@@ -178,7 +220,14 @@ class TeammatePool:
                     run_id=snapshot.run_id,
                     user_id=snapshot.user_id,
                     status=TaskStatus.PENDING,
-                    memory_context=None,
+                    memory_context=snapshot.memory_context,
+                    assignment_attempt=max(
+                        snapshot.assignment_attempt,
+                        1 if snapshot.assigned_teammate_id else 0,
+                    ),
+                    pending_update_instructions=list(snapshot.pending_update_instructions),
+                    trace_parent_span_id=snapshot.trace_parent_span_id,
+                    langfuse_parent_span_id=snapshot.langfuse_parent_span_id,
                 ))
         await self._dispatch_pending()
 
@@ -201,6 +250,7 @@ class TeammatePool:
                 if idle is None:
                     return
                 record.assigned_teammate_id = idle.descriptor.teammate_id
+                record.assignment_attempt += 1
                 idle.descriptor.status = "reserved"
                 idle.descriptor.current_task_id = record.task_id
                 idle.descriptor.updated_at = time.time()
@@ -211,7 +261,7 @@ class TeammatePool:
                     sender="lead",
                     message_type="task_assignment",
                     priority=20,
-                    dedupe_key=f"{record.task_id}:assignment:1",
+                    dedupe_key=f"{record.task_id}:assignment:{record.assignment_attempt}",
                     payload={"task_id": record.task_id},
                 )
 
@@ -225,7 +275,11 @@ class TeammatePool:
     ) -> None:
         """Send a durable control message to the task's assigned teammate."""
         record = self.registry.get(task_id)
-        if record is None or not record.assigned_teammate_id:
+        if (
+            record is None
+            or record.run_id != self.run_id
+            or not record.assigned_teammate_id
+        ):
             raise ValueError(f"Task {task_id} has no assigned teammate")
         await self.mailbox.send(
             recipient=record.assigned_teammate_id,
@@ -239,8 +293,14 @@ class TeammatePool:
     async def _handle_control(self, descriptor: TeammateDescriptor, message: MailboxMessage) -> bool:
         task_id = str(message.payload.get("task_id", ""))
         record = self.registry.get(task_id) if task_id else None
+        if record is not None and record.run_id != self.run_id:
+            record = None
         if message.type == "task_update" and record is not None:
-            await record.control_queue.put({"type": "update", "instruction": message.payload["instruction"]})
+            instruction = str(message.payload["instruction"])
+            if instruction not in record.pending_update_instructions:
+                record.pending_update_instructions.append(instruction)
+                await self.store.update_from_record(record)
+            await record.control_queue.put({"type": "update", "instruction": instruction})
         elif message.type == "cancel_request" and record is not None:
             record.cancelled.set()
         elif message.type == "domain_decision" and record is not None:
@@ -276,7 +336,11 @@ class TeammatePool:
                 if message.type == "task_assignment" and active is None:
                     task_id = str(message.payload["task_id"])
                     record = self.registry.get(task_id)
-                    if record is not None:
+                    if (
+                        record is not None
+                        and record.run_id == self.run_id
+                        and record.status == TaskStatus.PENDING
+                    ):
                         descriptor.status = "busy"
                         descriptor.current_task_id = task_id
                         descriptor.updated_at = time.time()
@@ -325,19 +389,25 @@ class TeammatePool:
             await asyncio.sleep(self.configurable.mailbox_poll_interval_ms / 1000)
 
     async def _execute_task(self, record: TaskRecord) -> None:
+        from open_deep_research.observability import bind_span_context
         from open_deep_research.tasks.executor import run_task_with_control
         from open_deep_research.tasks.recovery import CheckpointManager
 
-        await run_task_with_control(
-            record,
-            self.config,
-            self.registry,
-            self.execute_research,
-            checkpoint_manager=CheckpointManager(runs_dir=self.configurable.runs_dir, run_id=self.run_id),
-            runs_dir=self.configurable.runs_dir,
-            run_id=self.run_id,
-            event_log_enabled=self.configurable.event_log_enabled,
-        )
+        with bind_span_context(
+            record.run_id,
+            record.trace_parent_span_id,
+            record.langfuse_parent_span_id,
+        ):
+            await run_task_with_control(
+                record,
+                self.config,
+                self.registry,
+                self.execute_research,
+                checkpoint_manager=CheckpointManager(runs_dir=self.configurable.runs_dir, run_id=self.run_id),
+                runs_dir=self.configurable.runs_dir,
+                run_id=self.run_id,
+                event_log_enabled=self.configurable.event_log_enabled,
+            )
 
     async def shutdown(self, timeout_seconds: float = 10) -> None:
         """Request graceful teammate shutdown, then cancel stragglers."""
@@ -364,6 +434,7 @@ class TeammatePool:
         if self._heartbeat_task is not None:
             self._heartbeat_task.cancel()
         await self.lease.release()
+        get_domain_approval_registry().clear_run(self.run_id)
 
 
 _POOLS: dict[tuple[str, str], TeammatePool] = {}

@@ -8,6 +8,7 @@ with handlers backed by the persistent teammate pool and file Mailbox.
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any, Callable, Coroutine, Optional
 
 from langchain_core.messages import ToolMessage
@@ -15,6 +16,8 @@ from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
 from open_deep_research.configuration import Configuration
+from open_deep_research.observability import current_span_ids, get_trace_recorder
+from open_deep_research.observability.telemetry import get_prometheus_metrics
 from open_deep_research.sandbox.manager import stop_sandbox_container
 from open_deep_research.tasks.coordination import (
     FileDomainDecisionStore,
@@ -189,15 +192,19 @@ async def _get_snapshot_with_registry_fallback(
     store: TaskStateStore,
     registry: TaskRegistry,
     task_id: str,
+    *,
+    run_id: str = "",
 ) -> Optional[TaskSnapshot]:
     record = registry.get(task_id)
+    if record is not None and run_id and record.run_id not in {"", run_id}:
+        return None
     if record is not None and not record.run_id:
         return _record_to_snapshot(record)
-    snapshot = await store.get(task_id)
+    snapshot = await store.get(task_id, run_id=run_id or None)
     if snapshot is not None:
         return snapshot
     record = registry.get(task_id)
-    if record is None:
+    if record is None or (run_id and record.run_id not in {"", run_id}):
         return None
     snapshot = _record_to_snapshot(record)
     await store.upsert(snapshot)
@@ -307,7 +314,8 @@ async def _publish_snapshot_update(
                 phase=snapshot.phase.value,
                 data={"error": str(exc)},
             ))
-        raise
+        # The durable snapshot remains authoritative and can be fetched with
+        # CheckResearchTask even if the push notification is unavailable.
 
 
 async def handle_start_research_task(
@@ -337,6 +345,9 @@ async def handle_start_research_task(
         await state_store.count_active(run_id=run_id),
     )
     if active_count >= configurable.max_in_flight_tasks:
+        get_trace_recorder(config).active_span().record_outcome(
+            error_type="task_capacity_exceeded",
+        )
         return ToolMessage(
             content=(
                 f"Cannot start new task: already at maximum in-flight tasks "
@@ -349,6 +360,13 @@ async def handle_start_research_task(
 
     research_topic = tool_call["args"]["research_topic"]
     record = registry.create(research_topic=research_topic, run_id=run_id, user_id=user_id)
+    _trace_run_id, trace_parent_span_id = current_span_ids()
+    record.trace_parent_span_id = trace_parent_span_id
+    record.langfuse_parent_span_id = getattr(
+        get_trace_recorder(config).active_span(),
+        "langfuse_observation_id",
+        None,
+    )
     if memory_context:
         record.memory_context = memory_context
     if configurable.enable_docker_sandbox:
@@ -364,12 +382,31 @@ async def handle_start_research_task(
             data={"research_topic": research_topic},
         ))
     snapshot = await state_store.update_from_record(record)
+    metrics = get_prometheus_metrics(configurable)
+    if metrics is not None:
+        metrics.observe_task_transition(record, EventType.TASK_CREATED)
+        pending = await state_store.list(status_filter=TaskStatus.PENDING, run_id=run_id)
+        metrics.set_task_counts(len(pending), await state_store.count_active(run_id=run_id))
     await _publish_snapshot_update(
         configurable, snapshot, EventType.TASK_CREATED, event_writer
     )
 
     # Submit to the persistent pool. Assignment is durable before this returns.
-    await launch_task(record, config)
+    # If pool admission itself fails, persist a terminal state so a task created
+    # moments earlier cannot remain PENDING forever.
+    try:
+        await launch_task(record, config)
+    except Exception as exc:
+        registry.update_status(
+            record.task_id,
+            TaskStatus.FAILED,
+            error_message=f"Unable to launch task: {exc}",
+        )
+        snapshot = await state_store.update_from_record(record)
+        await _publish_snapshot_update(
+            configurable, snapshot, EventType.TASK_FAILED, event_writer
+        )
+        raise
 
     return ToolMessage(
         content=(
@@ -390,6 +427,8 @@ async def handle_check_research_task(
     registry: TaskRegistry,
     event_writer: Optional[JSONLEventWriter] = None,
     state_store: Optional[TaskStateStore] = None,
+    *,
+    run_id: str = "",
 ) -> ToolMessage:
     """Poll one or more tasks and return their status / results."""
     store = state_store or get_task_state_store(Configuration.from_runnable_config(None))
@@ -397,7 +436,9 @@ async def handle_check_research_task(
     parts: list[str] = []
 
     for task_id in task_ids:
-        snapshot = await _get_snapshot_with_registry_fallback(store, registry, task_id)
+        snapshot = await _get_snapshot_with_registry_fallback(
+            store, registry, task_id, run_id=run_id
+        )
         if snapshot is None:
             parts.append(f"### {task_id}\nStatus: **UNKNOWN** — no such task.\n")
             continue
@@ -472,13 +513,16 @@ async def handle_update_research_task(
     tool_call: dict[str, Any],
     registry: TaskRegistry,
     event_writer: Optional[JSONLEventWriter] = None,
+    state_store: Optional[TaskStateStore] = None,
+    *,
+    run_id: str = "",
 ) -> ToolMessage:
     """Queue an update instruction on the task's control queue."""
     task_id: str = tool_call["args"]["task_id"]
     instruction: str = tool_call["args"]["instruction"]
 
     record = registry.get(task_id)
-    if record is None:
+    if record is None or (run_id and record.run_id not in {"", run_id}):
         return ToolMessage(
             content=f"Task {task_id} not found.",
             name="UpdateResearchTask",
@@ -507,6 +551,10 @@ async def handle_update_research_task(
                 priority=10,
             )
         else:
+            if instruction not in record.pending_update_instructions:
+                record.pending_update_instructions.append(instruction)
+                if state_store is not None:
+                    await state_store.update_from_record(record)
             await record.control_queue.put({"type": "update", "instruction": instruction})
     else:
         await record.control_queue.put({"type": "update", "instruction": instruction})
@@ -537,6 +585,8 @@ async def handle_cancel_research_task(
     event_writer: Optional[JSONLEventWriter] = None,
     state_store: Optional[TaskStateStore] = None,
     configurable: Optional[Configuration] = None,
+    *,
+    run_id: str = "",
 ) -> ToolMessage:
     """Signal cancellation for one or more tasks."""
     effective_config = configurable or Configuration.from_runnable_config(None)
@@ -547,11 +597,15 @@ async def handle_cancel_research_task(
 
     for task_id in task_ids:
         record = registry.get(task_id)
-        if record is None:
+        if record is None or (run_id and record.run_id not in {"", run_id}):
             results.append(f"- {task_id}: not found")
             continue
 
-        if record.status not in (TaskStatus.RUNNING, TaskStatus.WAITING_FOR_CONFIRMATION):
+        if record.status not in (
+            TaskStatus.PENDING,
+            TaskStatus.RUNNING,
+            TaskStatus.WAITING_FOR_CONFIRMATION,
+        ):
             results.append(f"- {task_id}: already {record.status.value}")
             continue
 
@@ -568,19 +622,9 @@ async def handle_cancel_research_task(
                 )
             else:
                 record.cancelled.set()
-                from open_deep_research.tasks.domain_approvals import (
-                    get_domain_approval_registry,
-                )
-
-                get_domain_approval_registry().clear_run(record.run_id)
         else:
             record.cancelled.set()
-            from open_deep_research.tasks.domain_approvals import (
-                get_domain_approval_registry,
-            )
-
-            get_domain_approval_registry().clear_run(record.run_id)
-        registry.update_status(task_id, TaskStatus.CANCELLED)
+        registry.update_status(task_id, TaskStatus.CANCELLED, completed_at=time.time())
         stop_error = None
         if record.container_id:
             try:
@@ -597,9 +641,26 @@ async def handle_cancel_research_task(
                 data={"reason": reason, "sandbox_stop_error": stop_error},
             ))
         snapshot = await store.update_from_record(record)
+        metrics = get_prometheus_metrics(effective_config)
+        if metrics is not None:
+            metrics.observe_task_transition(record, EventType.TASK_CANCELLED)
+            pending = await store.list(
+                status_filter=TaskStatus.PENDING,
+                run_id=record.run_id or None,
+            )
+            metrics.set_task_counts(
+                len(pending),
+                await store.count_active(run_id=record.run_id or None),
+            )
         await _publish_snapshot_update(
             effective_config, snapshot, EventType.TASK_CANCELLED, event_writer
         )
+        if record.run_id and registry.count_active(run_id=record.run_id) == 0:
+            from open_deep_research.tasks.domain_approvals import (
+                get_domain_approval_registry,
+            )
+
+            get_domain_approval_registry().clear_run(record.run_id)
 
         if stop_error:
             results.append(f"- {task_id}: cancelled; sandbox stop failed: {stop_error}")
@@ -631,8 +692,9 @@ async def handle_approve_research_domain(
     domain: str = tool_call["args"]["domain"]
     allow: bool = tool_call["args"]["allow"]
 
+    current_run_id = str(config.get("metadata", {}).get("run_id", "default"))
     record = registry.get(task_id)
-    if record is None:
+    if record is None or record.run_id not in {"", current_run_id}:
         return ToolMessage(
             content=f"Task {task_id} not found.",
             name="ApproveResearchDomain",
@@ -668,22 +730,12 @@ async def handle_approve_research_domain(
             )
 
             get_domain_approval_registry().record_decision(record.run_id, domain, allow)
-            await record.control_queue.put({
-                "type": "domain_decision",
-                "domain": domain.lower(),
-                "allow": allow,
-            })
     else:
         from open_deep_research.tasks.domain_approvals import (
             get_domain_approval_registry,
         )
 
         get_domain_approval_registry().record_decision(record.run_id, domain, allow)
-        await record.control_queue.put({
-            "type": "domain_decision",
-            "domain": domain.lower(),
-            "allow": allow,
-        })
 
     if record.status == TaskStatus.WAITING_FOR_CONFIRMATION:
         registry.update_status(task_id, TaskStatus.RUNNING)

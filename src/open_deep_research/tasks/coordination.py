@@ -132,7 +132,7 @@ async def claim_lead_updates(
         if message.message_id in processed:
             continue
         task_id = str(message.payload.get("task_id", ""))
-        snapshot = await store.get(task_id) if task_id else None
+        snapshot = await store.get(task_id, run_id=run_id) if task_id else None
         if snapshot is None:
             parts.append(f"{message.type}: task={task_id or '(none)'}")
             continue

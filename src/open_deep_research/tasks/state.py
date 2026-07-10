@@ -25,6 +25,7 @@ class TaskSnapshot(BaseModel):
     task_id: str
     run_id: str = ""
     user_id: Optional[str] = None
+    memory_context: Optional[str] = None
     status: TaskStatus = TaskStatus.PENDING
     phase: TaskPhase = TaskPhase.RESEARCHING
     research_topic: str = ""
@@ -38,9 +39,13 @@ class TaskSnapshot(BaseModel):
     pending_domain: Optional[str] = None
     pending_domain_tool: Optional[str] = None
     assigned_teammate_id: Optional[str] = None
+    assignment_attempt: int = 0
+    pending_update_instructions: list[str] = Field(default_factory=list)
     admission_status: str = "pending"
     result_artifact_path: Optional[str] = None
     result_artifact_sha256: Optional[str] = None
+    trace_parent_span_id: Optional[str] = None
+    langfuse_parent_span_id: Optional[str] = None
     metrics: dict[str, int] = Field(default_factory=dict)
     sandbox: dict[str, Any] = Field(default_factory=dict)
 
@@ -62,6 +67,7 @@ class TaskSnapshot(BaseModel):
             task_id=record.task_id,
             run_id=record.run_id or "default",
             user_id=record.user_id,
+            memory_context=record.memory_context,
             status=record.status,
             phase=record.phase,
             research_topic=record.research_topic,
@@ -75,9 +81,13 @@ class TaskSnapshot(BaseModel):
             pending_domain=record.pending_domain,
             pending_domain_tool=record.pending_domain_tool,
             assigned_teammate_id=record.assigned_teammate_id,
+            assignment_attempt=record.assignment_attempt,
+            pending_update_instructions=list(record.pending_update_instructions),
             admission_status=record.admission_status,
             result_artifact_path=record.result_artifact_path,
             result_artifact_sha256=record.result_artifact_sha256,
+            trace_parent_span_id=record.trace_parent_span_id,
+            langfuse_parent_span_id=record.langfuse_parent_span_id,
             metrics={
                 "query_count": record.query_count,
                 "source_count": record.source_count,
@@ -104,12 +114,14 @@ class TaskStateStore(ABC):
 
     async def update_from_record(self, record: TaskRecord) -> TaskSnapshot:
         """Persist a runtime record with a monotonic version."""
-        current = await self.get(record.task_id)
+        current = await self.get(record.task_id, run_id=record.run_id or "default")
         snapshot = TaskSnapshot.from_record(record, version=(current.version + 1) if current else 1)
         return await self.upsert(snapshot)
 
     @abstractmethod
-    async def get(self, task_id: str) -> Optional[TaskSnapshot]:
+    async def get(
+        self, task_id: str, *, run_id: Optional[str] = None
+    ) -> Optional[TaskSnapshot]:
         """Return one task snapshot."""
 
     @abstractmethod
@@ -126,10 +138,11 @@ class TaskStateStore(ABC):
         return len(await self.list(status_filter=TaskStatus.RUNNING, run_id=run_id))
 
     async def count_active(self, *, run_id: Optional[str] = None) -> int:
-        """Count running and approval-blocked tasks."""
+        """Count admitted tasks that hold a run concurrency slot."""
+        pending = await self.list(status_filter=TaskStatus.PENDING, run_id=run_id)
         running = await self.list(status_filter=TaskStatus.RUNNING, run_id=run_id)
         waiting = await self.list(status_filter=TaskStatus.WAITING_FOR_CONFIRMATION, run_id=run_id)
-        return len(running) + len(waiting)
+        return len(pending) + len(running) + len(waiting)
 
     async def collect_completed(self, *, run_id: Optional[str] = None) -> List[TaskSnapshot]:
         """Return completed tasks."""
@@ -148,9 +161,14 @@ class MemoryTaskStateStore(TaskStateStore):
         self._snapshots[snapshot.task_id] = snapshot
         return snapshot
 
-    async def get(self, task_id: str) -> Optional[TaskSnapshot]:
+    async def get(
+        self, task_id: str, *, run_id: Optional[str] = None
+    ) -> Optional[TaskSnapshot]:
         """Return one process-local snapshot."""
-        return self._snapshots.get(task_id)
+        snapshot = self._snapshots.get(task_id)
+        if snapshot is None or (run_id and snapshot.run_id != run_id):
+            return None
+        return snapshot
 
     async def list(
         self,
@@ -208,9 +226,16 @@ class FileTaskStateStore(TaskStateStore):
         """Atomically write one versioned task snapshot."""
         return await asyncio.to_thread(self._upsert_sync, snapshot)
 
-    async def get(self, task_id: str) -> Optional[TaskSnapshot]:
-        """Find a task snapshot by its globally unique identifier."""
+    async def get(
+        self, task_id: str, *, run_id: Optional[str] = None
+    ) -> Optional[TaskSnapshot]:
+        """Find a task snapshot, scoped to a run when supplied."""
         task = validate_component(task_id, "task_id")
+        if run_id:
+            path, _ = self._paths(run_id, task)
+            if not path.exists():
+                return None
+            return TaskSnapshot.model_validate(await asyncio.to_thread(read_json_file, path))
         for path in self.runs_dir.glob(f"*/coordination/tasks/{task}.json"):
             return TaskSnapshot.model_validate(await asyncio.to_thread(read_json_file, path))
         return None
