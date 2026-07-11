@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 from typing import List, Sequence
+from urllib.parse import urlparse
 
 from .models import SourceRef
 from .profiles import ReferenceStyle
@@ -29,6 +30,22 @@ _SOURCE_BLOCK_RE = re.compile(
     re.IGNORECASE,
 )
 _BARE_URL_RE = re.compile(r"https?://[^\s\)\]\.]+(?:\.[^\s\)\]\.]+)*")
+_HTML_TAG_RE = re.compile(r"<[^>]*>")
+
+
+def _safe_reference_url(value: str) -> str:
+    candidate = (value or "").strip().rstrip(".,;)")
+    try:
+        parsed = urlparse(candidate)
+    except ValueError:
+        return ""
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        return ""
+    return candidate
+
+
+def _safe_reference_title(value: str) -> str:
+    return _HTML_TAG_RE.sub("", value or "").replace("\n", " ").strip()[:300]
 
 
 def parse_sources_from_text(text: str) -> List[SourceRef]:
@@ -42,9 +59,9 @@ def parse_sources_from_text(text: str) -> List[SourceRef]:
     seen: dict[str, SourceRef] = {}
 
     def _add(title: str, url: str) -> None:
-        url = (url or "").strip().rstrip(".")
+        url = _safe_reference_url(url)
         if url and url not in seen:
-            seen[url] = SourceRef(title=(title or "").strip(), url=url)
+            seen[url] = SourceRef(title=_safe_reference_title(title), url=url)
 
     for m in _SOURCE_BLOCK_RE.finditer(text):
         _add(m.group("title"), m.group("url"))
@@ -62,11 +79,17 @@ def dedupe_sources(sources: Sequence) -> List[SourceRef]:
     seen: dict[str, SourceRef] = {}
     for s in sources or []:
         if isinstance(s, SourceRef):
-            ref = s
+            ref = SourceRef(
+                title=_safe_reference_title(s.title),
+                url=_safe_reference_url(s.url),
+            )
         elif isinstance(s, dict):
-            ref = SourceRef(title=s.get("title", "") or "", url=s.get("url", "") or "")
+            ref = SourceRef(
+                title=_safe_reference_title(s.get("title", "") or ""),
+                url=_safe_reference_url(s.get("url", "") or ""),
+            )
         else:
-            ref = SourceRef(url=str(s))
+            ref = SourceRef(url=_safe_reference_url(str(s)))
         if ref.url and ref.url not in seen:
             seen[ref.url] = ref
     return list(seen.values())

@@ -50,6 +50,8 @@ async def test_supervisor_compaction_preserves_brief_and_tool_pair(monkeypatch) 
     assert sum(message.content == brief for message in rebuilt) == 1
     summary = next(message for message in rebuilt if "PersistentContextSummary" in str(message.content))
     assert "durable summary" in summary.content
+    assert isinstance(summary, HumanMessage)
+    assert not isinstance(summary, SystemMessage)
     recent = compacted["recent_messages"]
     assert isinstance(recent[0], AIMessage)
     assert isinstance(recent[1], ToolMessage)
@@ -66,4 +68,3 @@ async def test_compaction_disabled_keeps_context_untouched() -> None:
     )
 
     assert result is None
-

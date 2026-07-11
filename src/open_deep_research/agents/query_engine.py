@@ -31,6 +31,7 @@ from open_deep_research.runtime import (
     coerce_command,
     normalize_messages,
 )
+from open_deep_research.security.inputs import validate_client_messages
 
 
 def _ensure_config(config: RunnableConfig | None, fallback: RunnableConfig | None = None) -> RunnableConfig:
@@ -70,6 +71,10 @@ class QueryEngine:
             "rate_limited_count": 0,
             "rate_429": 0.0,
             "total_llm_tool_calls": 0,
+            "cache_hit_rate": 0.0,
+            "cache_input_ratio": 0.0,
+            "llm_output_tokens_per_second": 0.0,
+            "tool_success_rate": 0.0,
         }
         self.permission_denials: list[dict[str, Any]] = []
         self.cancelled = False
@@ -523,6 +528,23 @@ class QueryEngine:
             "rate_429": total.get("rate_429", 0.0),
             "total_llm_tool_calls": total.get("total_llm_tool_calls", 0),
             "attempt_count": total.get("attempt_count", 0),
+            "llm_call_count": total.get("llm_call_count", 0),
+            "cache_eligible_count": total.get("cache_eligible_count", 0),
+            "cache_hit_count": total.get("cache_hit_count", 0),
+            "cache_hit_rate": total.get("cache_hit_rate", 0.0),
+            "cache_input_ratio": total.get("cache_input_ratio", 0.0),
+            "llm_output_input_ratio": total.get("llm_output_input_ratio", 0.0),
+            "llm_reasoning_output_ratio": total.get(
+                "llm_reasoning_output_ratio", 0.0
+            ),
+            "llm_output_tokens_per_second": total.get(
+                "llm_output_tokens_per_second", 0.0
+            ),
+            "tool_call_count": total.get("tool_call_count", 0),
+            "tool_success_count": total.get("tool_success_count", 0),
+            "tool_success_rate": total.get("tool_success_rate", 0.0),
+            "empty_tool_result_count": total.get("empty_tool_result_count", 0),
+            "zero_source_search_count": total.get("zero_source_search_count", 0),
         }
 
     async def stream_message(
@@ -531,6 +553,7 @@ class QueryEngine:
         config: RunnableConfig | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Stream protocol events for a complete research request."""
+        validate_client_messages(messages)
         self.config = _ensure_config(config, self.config)
         self.run_id = self.config["metadata"]["run_id"]
         self._configure_context_store()

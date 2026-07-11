@@ -14,12 +14,13 @@ from typing import Any
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field
 
+from open_deep_research.configuration import get_model_compatibility_kwargs
 from open_deep_research.memory.store import MemoryCandidate, MemoryCategory
 from open_deep_research.observability import (
     apply_helicone_config,
     invoke_model_with_retry_observability,
 )
-from open_deep_research.configuration import get_model_compatibility_kwargs
+from open_deep_research.security.content import inspect_untrusted_content
 from open_deep_research.tools.utils import get_api_key_for_model, get_today_str
 
 # ---------------------------------------------------------------------------
@@ -169,6 +170,12 @@ def filter_candidates(
 
         # 4. Forbidden pattern check
         if any(p.search(content) for p in FORBIDDEN_PATTERNS):
+            continue
+
+        # Reject instruction-shaped preferences even when they avoid the small
+        # keyword/prefix blocklist above. Memory is durable across runs, so this
+        # boundary intentionally fails closed.
+        if inspect_untrusted_content(content):
             continue
 
         # 5. Validate category

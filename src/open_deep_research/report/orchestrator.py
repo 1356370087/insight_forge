@@ -26,6 +26,7 @@ from langchain_core.runnables import RunnableConfig
 
 from open_deep_research.configuration import Configuration
 from open_deep_research.observability import get_trace_recorder
+from open_deep_research.security.content import sanitize_report_markdown
 
 from .assembly import ReportContext, assemble
 from .profiles import (
@@ -109,7 +110,7 @@ async def build_report(state: dict, config: RunnableConfig) -> dict:
     if needs_sources and not result.sources:
         result.sources = parse_sources_from_text(result.body_markdown + "\n" + ctx.findings)
 
-    markdown = result.body_markdown
+    markdown = sanitize_report_markdown(result.body_markdown)
     if result.sources and (is_sectioned or ref_style == ReferenceStyle.BIBTEX_LIKE):
         # Sectioned bodies have no Sources section -> append one in the resolved
         # style. One-shot bibtex -> replace the model-emitted Sources section.
@@ -117,22 +118,35 @@ async def build_report(state: dict, config: RunnableConfig) -> dict:
         markdown = replace_sources_section(
             markdown, render_references(result.sources, ref_style)
         )
+    markdown = sanitize_report_markdown(markdown)
 
     # Render every artifact from the same canonical markdown exposed through
     # ``final_report`` so reference rewriting cannot create divergent payloads.
     result.body_markdown = markdown
     metric_sources = result.sources or parse_sources_from_text(markdown + "\n" + ctx.findings)
+    citation_markers = re.findall(r"\[(\d+)\]", markdown)
+    unique_citation_markers = set(citation_markers)
+    citation_density = len(citation_markers) * 1000 / len(markdown) if markdown else 0.0
+    cited_source_ratio = (
+        min(1.0, len(unique_citation_markers) / len(metric_sources))
+        if metric_sources
+        else 0.0
+    )
     active_span = get_trace_recorder(config).active_span()
     active_span.score("report.source_count", len(metric_sources))
-    active_span.score("report.citation_marker_count", len(re.findall(r"\[\d+\]", markdown)))
+    active_span.score("report.citation_marker_count", len(citation_markers))
     active_span.score("report.character_count", len(markdown))
     active_span.score("report.section_count", len(result.sections))
+    active_span.score("report.citation_density_per_1k_chars", citation_density)
+    active_span.score("report.cited_source_ratio", cited_source_ratio)
     artifacts = render_artifacts(result, fmt, ctx)
 
     update: dict = {
         "final_report": markdown,
         "messages": (
-            [result.message] if result.message is not None else [AIMessage(content=markdown)]
+            [result.message]
+            if result.message is not None and str(result.message.content) == markdown
+            else [AIMessage(content=markdown)]
         ),
         **_cleared_state(),
     }

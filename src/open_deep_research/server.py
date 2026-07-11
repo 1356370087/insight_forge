@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -20,6 +21,10 @@ from open_deep_research.run_context import (
     JournalCorruptedError,
     RunContextError,
     RunContextStore,
+)
+from open_deep_research.security.inputs import (
+    validate_http_configurable,
+    validate_http_metadata,
 )
 from security.auth import apply_user_to_config, get_current_user
 
@@ -69,6 +74,7 @@ class RunRecord:
 
 
 app = FastAPI(title="Open Deep Research", version="0.1.0")
+logger = logging.getLogger(__name__)
 _runs: dict[str, RunRecord] = {}
 _metrics_path = Configuration.from_runnable_config(None).prometheus_metrics_path
 
@@ -87,9 +93,15 @@ def _sse(event: dict[str, Any]) -> str:
 
 
 def _config_from_request(request: RunRequest, user: dict[str, Any]) -> dict[str, Any]:
+    try:
+        validate_http_configurable(request.configurable)
+        validate_http_metadata(request.metadata)
+    except ValueError as exc:
+        logger.warning("security.unsafe_config_rejected: %s", exc)
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     config = {
         "configurable": dict(request.configurable),
-        "metadata": dict(request.metadata),
+        "metadata": {**request.metadata, "deployment_surface": "http"},
     }
     return apply_user_to_config(config, user)
 
@@ -107,7 +119,7 @@ def _user_identity(user: dict[str, Any]) -> str | None:
 
 def _require_record_owner(record: RunRecord, user: dict[str, Any]) -> None:
     """Hide in-memory runs from users other than their owner."""
-    metadata = record.engine.config.get("metadata", {})
+    metadata = getattr(record.engine, "config", {}).get("metadata", {})
     owner = metadata.get("owner") or metadata.get("user_id")
     if owner and str(owner) != _user_identity(user):
         raise HTTPException(status_code=404, detail="Run not found")
@@ -275,10 +287,20 @@ async def resume_run(
         if active.status not in {"failed", "cancelled"}:
             raise HTTPException(status_code=409, detail="run_already_active")
 
+    try:
+        validate_http_configurable(request.configurable)
+        validate_http_metadata(request.metadata)
+    except ValueError as exc:
+        logger.warning("security.unsafe_config_rejected: %s", exc)
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     config = apply_user_to_config(
         {
             "configurable": dict(request.configurable),
-            "metadata": {**request.metadata, "run_id": run_id},
+            "metadata": {
+                **request.metadata,
+                "run_id": run_id,
+                "deployment_surface": "http",
+            },
         },
         user,
     )
@@ -455,12 +477,20 @@ async def observability_ui(
     )
     usage = store.get_usage(selected) if selected else {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     metrics = store.get_metrics(selected) if selected else {
-        "retry_count": 0, "rate_limited_count": 0, "rate_429": 0.0, "total_llm_tool_calls": 0,
+        "retry_count": 0,
+        "rate_limited_count": 0,
+        "rate_429": 0.0,
+        "total_llm_tool_calls": 0,
+        "cache_hit_rate": 0.0,
+        "tool_success_rate": 0.0,
     }
     run_title = html.escape(str(selected or "No observed runs"))
     run_status = html.escape(str((selected_run or {}).get("status") or ""))
     rows = _span_tree_rows(spans)
     rate_pct = f"{(metrics.get('rate_429') or 0) * 100:.1f}%"
+    cache_hit_pct = f"{(metrics.get('cache_hit_rate') or 0) * 100:.1f}%"
+    cache_input_pct = f"{(metrics.get('cache_input_ratio') or 0) * 100:.1f}%"
+    tool_success_pct = f"{(metrics.get('tool_success_rate') or 0) * 100:.1f}%"
     body = f"""
     <!doctype html>
     <html>
@@ -500,6 +530,12 @@ async def observability_ui(
           <div class='metric'>attempts: {metrics.get('attempt_count', 0)}</div>
           <div class='metric'>retries: {metrics.get('retry_count', 0)}</div>
           <div class='metric'>429 call rate: {rate_pct} ({metrics.get('rate_limited_count', 0)}/{metrics.get('total_llm_tool_calls', 0)} calls; {metrics.get('rate_limit_events', 0)} events)</div>
+          <div class='metric'>cache hit: {cache_hit_pct} ({metrics.get('cache_hit_count', 0)}/{metrics.get('cache_eligible_count', 0)} calls)</div>
+          <div class='metric'>cached input ratio: {cache_input_pct}</div>
+          <div class='metric'>output throughput: {metrics.get('llm_output_tokens_per_second', 0):.1f} token/s</div>
+          <div class='metric'>tool success: {tool_success_pct} ({metrics.get('tool_success_count', 0)}/{metrics.get('tool_call_count', 0)})</div>
+          <div class='metric'>empty tool results: {metrics.get('empty_tool_result_count', 0)}</div>
+          <div class='metric'>zero-source searches: {metrics.get('zero_source_search_count', 0)}</div>
           <table>
             <thead><tr><th>Span</th><th>Kind</th><th>Status</th><th>Duration ms</th><th>Tokens</th><th>Retries</th><th>Error type</th><th>Error</th></tr></thead>
             <tbody>{rows}</tbody>
