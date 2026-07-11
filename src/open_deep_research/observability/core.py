@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import hashlib
 import json
 import logging
 import random
@@ -636,7 +637,10 @@ class SQLiteTraceStore:
             ).fetchone()
             span_rows = conn.execute(
                 """
-                SELECT span_id, name, kind, retry_count, error_type, http_status
+                SELECT span_id, name, kind, status, duration_ms,
+                       input_tokens, output_tokens, cached_input_tokens,
+                       reasoning_tokens, retry_count, error_type, http_status,
+                       attributes_json
                 FROM spans
                 WHERE run_id = ? AND kind IN ('llm', 'tool')
                 ORDER BY started_at ASC
@@ -667,6 +671,32 @@ class SQLiteTraceStore:
         terminal_rate_limited = int(
             terminal_rate_limited_row["c"] if terminal_rate_limited_row else 0
         )
+        llm_rows = [row for row in span_rows if row["kind"] == "llm"]
+        tool_rows = [row for row in span_rows if row["kind"] == "tool"]
+        cache_eligible_rows = [row for row in llm_rows if int(row["input_tokens"] or 0) > 0]
+        cache_hit_count = sum(
+            1 for row in cache_eligible_rows if int(row["cached_input_tokens"] or 0) > 0
+        )
+        llm_input_tokens = sum(int(row["input_tokens"] or 0) for row in llm_rows)
+        llm_output_tokens = sum(int(row["output_tokens"] or 0) for row in llm_rows)
+        llm_reasoning_tokens = sum(int(row["reasoning_tokens"] or 0) for row in llm_rows)
+        llm_duration_seconds = sum(float(row["duration_ms"] or 0) for row in llm_rows) / 1000
+        successful_tools = sum(1 for row in tool_rows if row["status"] == "success")
+        empty_tool_result_count = 0
+        zero_source_search_count = 0
+        for row in tool_rows:
+            if row["status"] != "success":
+                continue
+            try:
+                attributes = json.loads(row["attributes_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                attributes = {}
+            if not attributes.get("result_chars", 0):
+                empty_tool_result_count += 1
+            if "search" in str(row["name"]).lower() and not attributes.get(
+                "source_count", 0
+            ):
+                zero_source_search_count += 1
         run = self.get_run(run_id) or {}
         return {
             "run_id": run_id,
@@ -684,12 +714,36 @@ class SQLiteTraceStore:
             "terminal_rate_limited_count": terminal_rate_limited,
             "total_llm_tool_calls": total_calls,
             "rate_429": (rate_limited_calls / total_calls) if total_calls else 0.0,
+            "llm_call_count": len(llm_rows),
+            "cache_eligible_count": len(cache_eligible_rows),
+            "cache_hit_count": cache_hit_count,
+            "cache_hit_rate": (
+                cache_hit_count / len(cache_eligible_rows) if cache_eligible_rows else 0.0
+            ),
+            "cache_input_ratio": (
+                usage["cached_input_tokens"] / llm_input_tokens if llm_input_tokens else 0.0
+            ),
+            "llm_output_input_ratio": (
+                llm_output_tokens / llm_input_tokens if llm_input_tokens else 0.0
+            ),
+            "llm_reasoning_output_ratio": (
+                llm_reasoning_tokens / llm_output_tokens if llm_output_tokens else 0.0
+            ),
+            "llm_output_tokens_per_second": (
+                llm_output_tokens / llm_duration_seconds if llm_duration_seconds else 0.0
+            ),
+            "tool_call_count": len(tool_rows),
+            "tool_success_count": successful_tools,
+            "tool_success_rate": successful_tools / len(tool_rows) if tool_rows else 0.0,
+            "empty_tool_result_count": empty_tool_result_count,
+            "zero_source_search_count": zero_source_search_count,
             "by_error_type": retry["by_error_type"],
             "by_span": [
                 {
                     "span_id": row["span_id"],
                     "name": row["name"],
                     "kind": row["kind"],
+                    "status": row["status"],
                     "retry_count": int(row["retry_count"] or 0),
                     "error_type": row["error_type"],
                     "http_status": row["http_status"],
@@ -1165,6 +1219,19 @@ class TraceRecorder:
             "rate_429": 0.0,
             "total_llm_tool_calls": 0,
             "attempt_count": 0,
+            "llm_call_count": 0,
+            "cache_eligible_count": 0,
+            "cache_hit_count": 0,
+            "cache_hit_rate": 0.0,
+            "cache_input_ratio": 0.0,
+            "llm_output_input_ratio": 0.0,
+            "llm_reasoning_output_ratio": 0.0,
+            "llm_output_tokens_per_second": 0.0,
+            "tool_call_count": 0,
+            "tool_success_count": 0,
+            "tool_success_rate": 0.0,
+            "empty_tool_result_count": 0,
+            "zero_source_search_count": 0,
         }
         if not self.enabled:
             return empty
@@ -1205,6 +1272,23 @@ class TraceRecorder:
             "rate_429": metrics.get("rate_429", 0.0),
             "total_llm_tool_calls": metrics.get("total_llm_tool_calls", 0),
             "attempt_count": metrics.get("attempt_count", 0),
+            "llm_call_count": metrics.get("llm_call_count", 0),
+            "cache_eligible_count": metrics.get("cache_eligible_count", 0),
+            "cache_hit_count": metrics.get("cache_hit_count", 0),
+            "cache_hit_rate": metrics.get("cache_hit_rate", 0.0),
+            "cache_input_ratio": metrics.get("cache_input_ratio", 0.0),
+            "llm_output_input_ratio": metrics.get("llm_output_input_ratio", 0.0),
+            "llm_reasoning_output_ratio": metrics.get(
+                "llm_reasoning_output_ratio", 0.0
+            ),
+            "llm_output_tokens_per_second": metrics.get(
+                "llm_output_tokens_per_second", 0.0
+            ),
+            "tool_call_count": metrics.get("tool_call_count", 0),
+            "tool_success_count": metrics.get("tool_success_count", 0),
+            "tool_success_rate": metrics.get("tool_success_rate", 0.0),
+            "empty_tool_result_count": metrics.get("empty_tool_result_count", 0),
+            "zero_source_search_count": metrics.get("zero_source_search_count", 0),
         }
 
     def start_span(
@@ -1507,11 +1591,32 @@ async def observe_tool_call(
             except Exception as exc:  # noqa: BLE001 - metrics must stay fail-open
                 logger.debug("Unable to update task research metrics: %s", exc)
         if getattr(recorder.configuration, "trace_payload_mode", "preview") != "none":
-            span.output_preview = _message_preview(
-                result,
-                None if recorder.configuration.trace_payload_mode == "full" else recorder.configuration.trace_preview_chars,
-                redact=recorder.configuration.trace_redaction_enabled,
-            )
+            if (
+                role == "researcher"
+                and getattr(
+                    recorder.configuration,
+                    "prompt_injection_protection_enabled",
+                    True,
+                )
+            ):
+                span.output_preview = json.dumps(
+                    {
+                        "content_hash": hashlib.sha256(
+                            result_text.encode("utf-8", errors="replace")
+                        ).hexdigest(),
+                        "result_chars": len(result_text),
+                        "source_count": len(result_urls),
+                    },
+                    sort_keys=True,
+                )
+            else:
+                span.output_preview = _message_preview(
+                    result,
+                    None
+                    if recorder.configuration.trace_payload_mode == "full"
+                    else recorder.configuration.trace_preview_chars,
+                    redact=recorder.configuration.trace_redaction_enabled,
+                )
         return result
 
 

@@ -18,7 +18,10 @@ from open_deep_research.observability import (
     invoke_model_with_retry_observability,
     observe_tool_call,
 )
-from open_deep_research.observability.telemetry import LangfuseSpanBridge
+from open_deep_research.observability.telemetry import (
+    LangfuseSpanBridge,
+    PrometheusMetrics,
+)
 from open_deep_research.server import app
 from open_deep_research.tools.governance import (
     AgentRole,
@@ -657,6 +660,122 @@ def test_get_metrics_empty_run(tmp_path):
     assert metrics["rate_429"] == 0.0
     assert metrics["total_llm_tool_calls"] == 0
     assert metrics["by_span"] == []
+
+
+def test_get_metrics_summarizes_cache_and_tool_efficiency(tmp_path):
+    store = SQLiteTraceStore(str(tmp_path / "efficiency.sqlite3"))
+    store.start_run("efficiency-run", "user-1", {})
+    usages = (
+        TokenUsage(
+            input_tokens=100,
+            output_tokens=50,
+            total_tokens=150,
+            cached_input_tokens=40,
+            reasoning_tokens=10,
+        ),
+        TokenUsage(input_tokens=100, output_tokens=50, total_tokens=150),
+    )
+    for index, usage in enumerate(usages):
+        span_id = f"llm-{index}"
+        store.start_span(
+            span_id=span_id,
+            run_id="efficiency-run",
+            parent_span_id=None,
+            name="researcher.model",
+            kind="llm",
+            agent_role="researcher",
+            attributes={},
+            input_preview=None,
+            provider="openai",
+            model="gpt-test",
+        )
+        store.finish_span(span_id=span_id, status="success", usage=usage)
+        store.add_usage("efficiency-run", span_id, "openai", "gpt-test", usage)
+
+    for span_id, name, status, attributes in (
+        ("search-empty", "tool.tavily_search", "success", {"result_chars": 0, "source_count": 0}),
+        ("tool-error", "tool.fetch", "error", {"result_chars": 0}),
+    ):
+        store.start_span(
+            span_id=span_id,
+            run_id="efficiency-run",
+            parent_span_id=None,
+            name=name,
+            kind="tool",
+            agent_role="researcher",
+            attributes={},
+            input_preview=None,
+            provider=None,
+            model=None,
+        )
+        store.finish_span(span_id=span_id, status=status, attributes=attributes)
+
+    metrics = store.get_metrics("efficiency-run")
+
+    assert metrics["cache_hit_count"] == 1
+    assert metrics["cache_hit_rate"] == 0.5
+    assert metrics["cache_input_ratio"] == 0.2
+    assert metrics["llm_output_input_ratio"] == 0.5
+    assert metrics["llm_reasoning_output_ratio"] == 0.1
+    assert metrics["tool_success_rate"] == 0.5
+    assert metrics["empty_tool_result_count"] == 1
+    assert metrics["zero_source_search_count"] == 1
+
+
+def test_prometheus_routes_quality_counts_and_report_metrics_separately():
+    metrics = PrometheusMetrics("odr_supplemental_metrics_test")
+
+    metrics.observe_score("handoff.groundedness", 4, "researcher")
+    metrics.observe_score("handoff.source_count", 12, "researcher")
+    metrics.observe_score("report.character_count", 8000, "lead")
+    metrics.observe_score("report.citation_density_per_1k_chars", 2.5, "lead")
+    llm_span = SimpleNamespace(
+        kind="llm",
+        error_type=None,
+        agent_role="researcher",
+        provider="openai",
+        model="gpt-test",
+        name="researcher.model",
+        attributes={},
+        usage=TokenUsage(
+            input_tokens=100,
+            output_tokens=50,
+            cached_input_tokens=40,
+            reasoning_tokens=10,
+        ),
+    )
+    metrics.observe_span(llm_span, "success", 2.0)
+    tool_span = SimpleNamespace(
+        kind="tool",
+        error_type=None,
+        agent_role="researcher",
+        provider=None,
+        model=None,
+        name="tool.tavily_search",
+        attributes={"tool_name": "tavily_search", "result_chars": 0, "source_count": 0},
+        usage=TokenUsage(),
+    )
+    metrics.observe_span(tool_span, "success", 0.5)
+    task = SimpleNamespace(
+        assignment_attempt=2,
+        created_at=10.0,
+        started_at=12.0,
+        elapsed_seconds=8.0,
+    )
+    metrics.observe_task_transition(task, "task.started")
+    metrics.observe_task_transition(task, "task.completed")
+
+    exposition = generate_latest().decode()
+    assert 'odr_supplemental_metrics_test_quality_score_count{agent_role="researcher",score_name="handoff.groundedness"} 1.0' in exposition
+    assert 'odr_supplemental_metrics_test_evidence_items_count{agent_role="researcher",metric="source_count"} 1.0' in exposition
+    assert "odr_supplemental_metrics_test_report_characters_count 1.0" in exposition
+    assert "odr_supplemental_metrics_test_report_citations_per_1000_characters_sum 2.5" in exposition
+    assert 'odr_supplemental_metrics_test_research_task_starts_total{attempt_type="reassigned"} 1.0' in exposition
+    assert 'odr_supplemental_metrics_test_research_task_assignment_attempts_sum{outcome="completed"} 2.0' in exposition
+    assert 'odr_supplemental_metrics_test_llm_cache_requests_total{agent_role="researcher",cache_status="hit"' in exposition
+    assert 'odr_supplemental_metrics_test_llm_cache_input_ratio_sum{agent_role="researcher"' in exposition
+    assert 'odr_supplemental_metrics_test_tool_empty_results_total{agent_role="researcher",tool_name="tavily_search"} 1.0' in exposition
+    assert 'odr_supplemental_metrics_test_search_zero_source_calls_total{agent_role="researcher",tool_name="tavily_search"} 1.0' in exposition
 
 
 @pytest.mark.asyncio

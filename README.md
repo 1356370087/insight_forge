@@ -94,7 +94,7 @@ PROMETHEUS_ENABLED=true
 PROMETHEUS_METRICS_PATH=/metrics
 ```
 
-Prometheus should scrape `GET /metrics`. The exported series cover run/agent/LLM/tool latency, request counts, detailed tokens, throughput, estimated cost, retries, rate-limited calls, research-task queue health, source counts, runtime quality scores, and observability export failures. Run IDs, trace IDs, task IDs, and user IDs are deliberately not used as Prometheus labels. Trace payload redaction is enabled by default. When `LANGFUSE_LANGCHAIN_CALLBACK_ENABLED=true`, callback tracing owns the Langfuse generation while `TraceRecorder` remains authoritative for SQLite and Prometheus, avoiding duplicate Langfuse generations.
+Prometheus should scrape `GET /metrics`. The exported series cover run/agent/LLM/tool latency, request counts, detailed tokens, cache hit and cached-input ratios, output/reasoning efficiency, throughput, estimated cost, retries, rate-limited calls, tool empty-result and search zero-source counts, research-task queue/reassignment health, evidence counts, report size/citation density/source coverage, runtime quality scores, and observability export failures. Quality scores, evidence counts, and report-size distributions use separate histogram families so their units and buckets remain meaningful. Run IDs, trace IDs, task IDs, and user IDs are deliberately not used as Prometheus labels. Trace payload redaction is enabled by default. When `LANGFUSE_LANGCHAIN_CALLBACK_ENABLED=true`, callback tracing owns the Langfuse generation while `TraceRecorder` remains authoritative for SQLite and Prometheus, avoiding duplicate Langfuse generations.
 
 ### 📊 Evaluation
 

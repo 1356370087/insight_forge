@@ -73,6 +73,33 @@ class PrometheusMetrics:
             ["provider", "model", "agent_role"],
             namespace=namespace,
         )
+        self.llm_cache_requests = Counter(
+            "llm_cache_requests_total",
+            "LLM requests with input usage, split by prompt-cache outcome.",
+            ["provider", "model", "agent_role", "operation", "cache_status"],
+            namespace=namespace,
+        )
+        self.llm_cache_input_ratio = Histogram(
+            "llm_cache_input_ratio",
+            "Cached input tokens divided by total input tokens.",
+            ["provider", "model", "agent_role", "operation"],
+            buckets=(0, 0.01, 0.1, 0.25, 0.5, 0.75, 0.9, 1),
+            namespace=namespace,
+        )
+        self.llm_output_input_ratio = Histogram(
+            "llm_output_input_token_ratio",
+            "Output tokens divided by input tokens for completed LLM requests.",
+            ["provider", "model", "agent_role", "operation"],
+            buckets=(0, 0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8),
+            namespace=namespace,
+        )
+        self.llm_reasoning_output_ratio = Histogram(
+            "llm_reasoning_output_token_ratio",
+            "Reasoning tokens divided by output tokens when reported.",
+            ["provider", "model", "agent_role", "operation"],
+            buckets=(0, 0.01, 0.1, 0.25, 0.5, 0.75, 0.9, 1),
+            namespace=namespace,
+        )
         self.tool_calls = Counter(
             "tool_calls_total",
             "Completed tool calls.",
@@ -95,6 +122,18 @@ class PrometheusMetrics:
             "search_unique_sources",
             "Unique URLs returned by one search tool call.",
             ["tool_name"],
+            namespace=namespace,
+        )
+        self.tool_empty_results = Counter(
+            "tool_empty_results_total",
+            "Successful tool calls that returned an empty serialized result.",
+            ["tool_name", "agent_role"],
+            namespace=namespace,
+        )
+        self.search_zero_source_calls = Counter(
+            "search_zero_source_calls_total",
+            "Successful search calls that returned no unique source URL.",
+            ["tool_name", "agent_role"],
             namespace=namespace,
         )
         self.agent_steps = Counter(
@@ -140,6 +179,49 @@ class PrometheusMetrics:
             buckets=(0, 1, 2, 3, 4, 5),
             namespace=namespace,
         )
+        self.evidence_counts = Histogram(
+            "evidence_items",
+            "Evidence, source, and validation item counts observed by quality gates.",
+            ["metric", "agent_role"],
+            buckets=(0, 1, 2, 3, 5, 10, 20, 50, 100),
+            namespace=namespace,
+        )
+        self.report_sources = Histogram(
+            "report_sources",
+            "Unique sources included in a generated report.",
+            buckets=(0, 1, 2, 3, 5, 10, 20, 50, 100),
+            namespace=namespace,
+        )
+        self.report_citations = Histogram(
+            "report_citation_markers",
+            "Citation markers included in a generated report.",
+            buckets=(0, 1, 2, 3, 5, 10, 20, 50, 100, 200),
+            namespace=namespace,
+        )
+        self.report_characters = Histogram(
+            "report_characters",
+            "Generated report length in characters.",
+            buckets=(0, 1000, 2500, 5000, 10000, 20000, 50000, 100000),
+            namespace=namespace,
+        )
+        self.report_sections = Histogram(
+            "report_sections",
+            "Sections included in a generated report.",
+            buckets=(0, 1, 2, 3, 5, 8, 10, 15, 20, 30),
+            namespace=namespace,
+        )
+        self.report_citation_density = Histogram(
+            "report_citations_per_1000_characters",
+            "Citation markers per 1000 report characters.",
+            buckets=(0, 0.25, 0.5, 1, 2, 3, 5, 10, 20),
+            namespace=namespace,
+        )
+        self.report_source_coverage = Histogram(
+            "report_cited_source_ratio",
+            "Unique numeric citation markers divided by available report sources.",
+            buckets=(0, 0.1, 0.25, 0.5, 0.75, 0.9, 1),
+            namespace=namespace,
+        )
         self.task_events = Counter(
             "research_tasks_total",
             "Research task lifecycle transitions.",
@@ -155,6 +237,19 @@ class PrometheusMetrics:
             "research_task_duration_seconds",
             "End-to-end research task duration by terminal outcome.",
             ["outcome"],
+            namespace=namespace,
+        )
+        self.task_starts = Counter(
+            "research_task_starts_total",
+            "Research task execution starts split by initial or reassigned attempt.",
+            ["attempt_type"],
+            namespace=namespace,
+        )
+        self.task_assignment_attempts = Histogram(
+            "research_task_assignment_attempts",
+            "Assignment attempts consumed by a terminal research task.",
+            ["outcome"],
+            buckets=(1, 2, 3, 4, 5, 8, 10),
             namespace=namespace,
         )
         self.pending_tasks = Gauge(
@@ -192,6 +287,20 @@ class PrometheusMetrics:
                 span.usage.reasoning_tokens
             )
             self.llm_cost.labels(provider, model, role).inc(span.usage.estimated_cost_usd)
+            if span.usage.input_tokens > 0:
+                cache_status = "hit" if span.usage.cached_input_tokens > 0 else "miss"
+                cache_labels = (provider, model, role, operation)
+                self.llm_cache_requests.labels(*cache_labels, cache_status).inc()
+                self.llm_cache_input_ratio.labels(*cache_labels).observe(
+                    min(1.0, span.usage.cached_input_tokens / span.usage.input_tokens)
+                )
+                self.llm_output_input_ratio.labels(*cache_labels).observe(
+                    span.usage.output_tokens / span.usage.input_tokens
+                )
+            if span.usage.output_tokens > 0 and span.usage.reasoning_tokens > 0:
+                self.llm_reasoning_output_ratio.labels(
+                    provider, model, role, operation
+                ).observe(min(1.0, span.usage.reasoning_tokens / span.usage.output_tokens))
         elif span.kind == "tool":
             tool_name = span.attributes.get("tool_name") or span.name.removeprefix("tool.")
             self.tool_calls.labels(str(tool_name), role, status).inc()
@@ -199,10 +308,14 @@ class PrometheusMetrics:
             self.tool_result_size.labels(str(tool_name), role).observe(
                 float(span.attributes.get("result_chars", 0))
             )
+            if status == "success" and not span.attributes.get("result_chars", 0):
+                self.tool_empty_results.labels(str(tool_name), role).inc()
             if "search" in str(tool_name).lower():
                 self.search_sources.labels(str(tool_name)).observe(
                     float(span.attributes.get("source_count", 0))
                 )
+                if status == "success" and not span.attributes.get("source_count", 0):
+                    self.search_zero_source_calls.labels(str(tool_name), role).inc()
         elif span.kind == "agent":
             operation = _operation(span.name)
             self.agent_steps.labels(role, operation, status).inc()
@@ -231,19 +344,51 @@ class PrometheusMetrics:
 
     def observe_score(self, name: str, value: Any, agent_role: str) -> None:
         """Publish numeric runtime quality scores."""
-        if isinstance(value, int | float | bool):
-            self.quality_scores.labels(name, agent_role).observe(float(value))
+        if not isinstance(value, int | float | bool):
+            return
+        numeric = float(value)
+        report_collectors = {
+            "report.source_count": self.report_sources,
+            "report.citation_marker_count": self.report_citations,
+            "report.character_count": self.report_characters,
+            "report.section_count": self.report_sections,
+            "report.citation_density_per_1k_chars": self.report_citation_density,
+            "report.cited_source_ratio": self.report_source_coverage,
+        }
+        report_collector = report_collectors.get(name)
+        if report_collector is not None:
+            report_collector.observe(numeric)
+            return
+        metric = name.rsplit(".", 1)[-1]
+        if metric in {"source_count", "error_count", "evidence_result_count"}:
+            self.evidence_counts.labels(metric, agent_role).observe(numeric)
+            return
+        if metric in {
+            "accepted",
+            "passed",
+            "relevance",
+            "source_quality",
+            "evidence_coverage",
+            "corroboration",
+            "groundedness",
+        }:
+            self.quality_scores.labels(name, agent_role).observe(numeric)
 
     def observe_task_transition(self, record: Any, event: str) -> None:
         """Publish queue and lifecycle metrics for one research task transition."""
         event_name = str(getattr(event, "value", event))
         self.task_events.labels(event_name).inc()
         if event_name == "task.started":
+            assignment_attempt = max(1, int(getattr(record, "assignment_attempt", 0)))
+            attempt_type = "reassigned" if assignment_attempt > 1 else "initial"
+            self.task_starts.labels(attempt_type).inc()
             if record.started_at is not None:
                 self.task_queue_wait.observe(max(0.0, record.started_at - record.created_at))
         elif event_name in {"task.completed", "task.failed", "task.timed_out", "task.cancelled"}:
-            self.task_duration.labels(event_name.removeprefix("task.")).observe(
-                max(0.0, record.elapsed_seconds)
+            outcome = event_name.removeprefix("task.")
+            self.task_duration.labels(outcome).observe(max(0.0, record.elapsed_seconds))
+            self.task_assignment_attempts.labels(outcome).observe(
+                max(1, int(getattr(record, "assignment_attempt", 0)))
             )
 
     def set_task_counts(self, pending: int, active: int) -> None:
