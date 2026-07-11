@@ -7,13 +7,13 @@ import pytest
 from langchain_core.messages import HumanMessage
 
 from open_deep_research.configuration import Configuration, MCPConfig
-from open_deep_research.tasks.events import EventType
 from open_deep_research.sandbox.manager import DockerSandboxManager, SandboxWorkspace
 from open_deep_research.sandbox.policy import (
     allowed_domains,
     egress_host_from_url,
     is_enforced_mode,
 )
+from open_deep_research.tasks.events import EventType
 from open_deep_research.tasks.registry import TaskRecord
 
 
@@ -135,7 +135,7 @@ class TestEgressPolicy:
     def test_is_enforced_mode(self):
         assert is_enforced_mode(Configuration(sandbox_network_mode="allow-search-only"))
         assert is_enforced_mode(Configuration(sandbox_network_mode="allowlist-domain"))
-        assert not is_enforced_mode(Configuration(sandbox_network_mode="no-network"))
+        assert is_enforced_mode(Configuration(sandbox_network_mode="no-network"))
         assert not is_enforced_mode(Configuration(sandbox_network_mode="open-network"))
 
 

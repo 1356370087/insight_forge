@@ -13,10 +13,10 @@ from urllib.parse import urlparse
 from open_deep_research.configuration import Configuration, SearchAPI
 
 #: Network modes in which the tool-layer egress check actively enforces.
-ENFORCE_NETWORK_MODES = {"allow-search-only", "allowlist-domain"}
+ENFORCE_NETWORK_MODES = {"no-network", "allow-search-only", "allowlist-domain"}
 
 #: Network modes in which egress is unrestricted (or fully offline).
-PASS_THROUGH_NETWORK_MODES = {"no-network", "open-network"}
+PASS_THROUGH_NETWORK_MODES = {"open-network"}
 
 
 def allowed_domains(configurable: Configuration) -> list[str]:

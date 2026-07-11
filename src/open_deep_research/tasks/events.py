@@ -36,6 +36,13 @@ class EventType(str, Enum):
     CHECKPOINT_LOADED = "checkpoint.loaded"
     MESSAGES_SUMMARIZED = "messages.summarized"
 
+    # Prompt-injection and capability-boundary events. Payloads must contain
+    # hashes/rule identifiers only, never the untrusted source text.
+    PROMPT_INJECTION_DETECTED = "security.prompt_injection_detected"
+    EXTERNAL_CONTENT_QUARANTINED = "security.external_content_quarantined"
+    SENSITIVE_TOOL_BLOCKED = "security.sensitive_tool_blocked"
+    UNSAFE_CONFIG_REJECTED = "security.unsafe_config_rejected"
+
     # Mem0 long-term memory events (lead-agent only, privacy-preserving)
     MEMORY_RECALLED = "memory.recalled"
     MEMORY_CANDIDATE_EXTRACTED = "memory.candidate_extracted"

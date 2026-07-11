@@ -48,6 +48,14 @@ class MCPConfig(BaseModel):
         optional=True,
     )
     """Whether the MCP server requires authentication"""
+    tool_effects: Dict[str, Literal[
+        "read_only",
+        "sensitive_read",
+        "external_write",
+        "local_write",
+        "destructive",
+    ]] = Field(default_factory=dict)
+    """Explicit side-effect classification for every exposed MCP tool."""
 
 
 class BrowserMCPConfig(BaseModel):
@@ -82,7 +90,15 @@ class BrowserMCPConfig(BaseModel):
         default=None,
         optional=True,
     )
-    """Optional browser tool allowlist. None exposes all tools returned by the server."""
+    """Required browser tool allowlist. None exposes no browser tools."""
+    tool_effects: Dict[str, Literal[
+        "read_only",
+        "sensitive_read",
+        "external_write",
+        "local_write",
+        "destructive",
+    ]] = Field(default_factory=dict)
+    """Explicit side-effect classification for every exposed browser tool."""
 
 class Configuration(BaseModel):
     """Main configuration class for the Deep Research agent."""
@@ -911,6 +927,17 @@ class Configuration(BaseModel):
     )
     query_context_summary_max_tokens: int = Field(default=8000, ge=128)
     query_journal_inline_content_max_chars: int = Field(default=32768, ge=1024)
+    # Prompt-injection and external-content protection. These are administrator
+    # settings on the HTTP surface and are rejected when supplied by a run.
+    prompt_injection_protection_enabled: bool = Field(default=True)
+    external_content_fail_closed: bool = Field(default=True)
+    allow_http_stdio_mcp: bool = Field(default=False)
+    require_sensitive_tool_approval: bool = Field(default=True)
+    max_external_content_bytes: int = Field(default=1_000_000, ge=1024)
+    max_mcp_description_chars: int = Field(default=2_000, ge=64)
+    max_mcp_output_chars: int = Field(default=30_000, ge=256)
+    allowed_mcp_servers: list[str] = Field(default_factory=list)
+    allowed_model_endpoints: list[str] = Field(default_factory=list)
     # Docker Sandbox Configuration
     enable_docker_sandbox: bool = Field(
         default=False,
@@ -1178,6 +1205,32 @@ class Configuration(BaseModel):
         if value is None or value == "":
             return []
         if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
+
+    @field_validator("mcp_config", "browser_mcp_config", mode="before")
+    @classmethod
+    def parse_mcp_config_json(cls, value: Any) -> Any:
+        """Allow administrator-owned MCP configuration to come from JSON env vars."""
+        if isinstance(value, str):
+            parsed = json.loads(value)
+            if not isinstance(parsed, dict):
+                raise ValueError("MCP configuration JSON must be an object")
+            return parsed
+        return value
+
+    @field_validator("allowed_mcp_servers", "allowed_model_endpoints", mode="before")
+    @classmethod
+    def parse_security_allowlists(cls, value: Any) -> list[str]:
+        """Accept JSON arrays or comma-separated administrator allowlists."""
+        if value is None or value == "":
+            return []
+        if isinstance(value, str):
+            if value.lstrip().startswith("["):
+                parsed = json.loads(value)
+                if not isinstance(parsed, list):
+                    raise ValueError("security allowlist JSON value must be an array")
+                return [str(item).strip() for item in parsed if str(item).strip()]
             return [item.strip() for item in value.split(",") if item.strip()]
         return value
 

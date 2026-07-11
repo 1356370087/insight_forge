@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from open_deep_research.tools.base import (
     ProgressCallback,
     ToolContext,
+    ToolEffect,
     ToolOrigin,
     ToolResult,
 )
@@ -22,6 +23,7 @@ class LangChainToolAdapter:
 
     adapted: BaseTool
     origin: ToolOrigin
+    effect: ToolEffect = ToolEffect.READ_ONLY
     retryable: bool = False
     auth_satisfied: bool = False
 
@@ -59,6 +61,7 @@ def adapt_langchain_tool(
     tool: BaseTool,
     *,
     origin: ToolOrigin,
+    effect: ToolEffect = ToolEffect.READ_ONLY,
     retryable: bool = False,
     auth_satisfied: bool = False,
 ) -> LangChainToolAdapter:
@@ -66,6 +69,7 @@ def adapt_langchain_tool(
     return LangChainToolAdapter(
         adapted=tool,
         origin=origin,
+        effect=effect,
         retryable=retryable,
         auth_satisfied=auth_satisfied,
     )

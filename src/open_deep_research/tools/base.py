@@ -37,6 +37,16 @@ class ToolOrigin(str, Enum):
     SKILL = "skill"
 
 
+class ToolEffect(str, Enum):
+    """Externally visible effect a tool invocation may have."""
+
+    READ_ONLY = "read_only"
+    SENSITIVE_READ = "sensitive_read"
+    EXTERNAL_WRITE = "external_write"
+    LOCAL_WRITE = "local_write"
+    DESTRUCTIVE = "destructive"
+
+
 @dataclass(frozen=True, slots=True)
 class ToolContext:
     """Runtime facts shared with every tool invocation."""
@@ -100,6 +110,7 @@ class BuiltTool(Generic[InputT, OutputT, ProgressT]):
     name: str
     input_schema: type[InputT]
     origin: ToolOrigin
+    effect: ToolEffect
     retryable: bool
     _description: Callable[[Optional[InputT]], Union[str, Awaitable[str]]]
     _call: Callable[
@@ -142,6 +153,7 @@ def build_tool(
         Union[ToolResult[OutputT], Awaitable[ToolResult[OutputT]]],
     ],
     origin: ToolOrigin,
+    effect: ToolEffect = ToolEffect.READ_ONLY,
     retryable: bool = False,
 ) -> Tool[InputT, OutputT, ProgressT]:
     """Build a tool with conservative defaults and eager contract checks."""
@@ -166,6 +178,7 @@ def build_tool(
         name=name.strip(),
         input_schema=input_schema,
         origin=origin,
+        effect=effect,
         retryable=bool(retryable),
         _description=description_fn,
         _call=call,
@@ -193,20 +206,29 @@ def serialize_tool_output(output: Any) -> str:
 
 async def tool_to_model_definition(
     tool: Tool[Any, Any, Any],
+    *,
+    max_description_chars: int = 2_000,
 ) -> dict[str, Any]:
     """Project a Tool into the schema-only shape accepted by bind_tools()."""
+    description = (await tool.description(None)).strip()
+    description = description[:max_description_chars]
     return {
         "name": tool.name,
-        "description": await tool.description(None),
+        "description": description,
         "parameters": tool.input_schema.model_json_schema(),
     }
 
 
 async def tools_to_model_definitions(
     tools: list[Tool[Any, Any, Any]],
+    *,
+    max_description_chars: int = 2_000,
 ) -> list[dict[str, Any]]:
     """Project tools for model binding without exposing an execution bypass."""
-    return [await tool_to_model_definition(tool) for tool in tools]
+    return [
+        await tool_to_model_definition(tool, max_description_chars=max_description_chars)
+        for tool in tools
+    ]
 
 
 def build_tool_registry(
