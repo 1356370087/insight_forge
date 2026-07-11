@@ -42,7 +42,7 @@ from open_deep_research.sandbox.policy import (
     is_enforced_mode,
 )
 from open_deep_research.tasks.domain_approvals import get_domain_approval_registry
-from open_deep_research.tasks.events import EventType
+from open_deep_research.tasks.events import EventType, JSONLEventWriter, ResearchEvent
 from open_deep_research.tasks.executor import emit_task_state_change
 from open_deep_research.tasks.registry import (
     TaskRecord,
@@ -52,6 +52,7 @@ from open_deep_research.tasks.registry import (
 from open_deep_research.tools.base import (
     Tool,
     ToolContext,
+    ToolEffect,
     ToolOrigin,
     ToolResult,
     serialize_tool_output,
@@ -96,6 +97,7 @@ class ToolErrorType(str, Enum):
     tool_not_found = "tool_not_found"
     egress_domain_denied = "egress_domain_denied"
     egress_domain_pending = "egress_domain_pending"
+    sensitive_tool_approval_required = "sensitive_tool_approval_required"
     unknown = "unknown"
 
 
@@ -111,6 +113,16 @@ def get_tool_retryable(tool: Tool) -> bool:
 def get_tool_origin(tool: Tool) -> ToolOrigin:
     """Return origin declared directly by the Tool Interface."""
     return tool.origin
+
+
+def get_tool_effect(tool: Tool) -> ToolEffect:
+    """Return the tool effect, failing closed for undeclared MCP tools."""
+    effect = getattr(tool, "effect", None)
+    if isinstance(effect, ToolEffect):
+        return effect
+    if get_tool_origin(tool) is ToolOrigin.MCP:
+        return ToolEffect.DESTRUCTIVE
+    return ToolEffect.READ_ONLY
 
 
 ##########################
@@ -872,6 +884,13 @@ async def check_egress_domain(
     host = _egress_host_for_tool(tool, args, configurable)
     if host is None:
         return None
+    if configurable.sandbox_network_mode == "no-network":
+        return ToolError(
+            error_type=ToolErrorType.egress_domain_denied,
+            tool_name=getattr(tool, "name", "unknown"),
+            message="Network access is disabled for this run.",
+            detail={"domain": host, "network_mode": "no-network"},
+        ).to_tool_message(tool_call_id)
     if host in set(allowed_domains(configurable)):
         return None
 
@@ -1040,6 +1059,52 @@ async def execute_governed_tool_call(
                 message="Input failed Pydantic validation.",
                 detail={"errors": exc.errors(include_url=False)},
             ),
+        )
+
+    # Capability policy. Researchers may autonomously use only read-only
+    # tools. A host integration can approve an exact generated call id through
+    # trusted metadata; HTTP clients cannot set this administrator-owned state.
+    configurable = Configuration.from_runnable_config(config)
+    effect = get_tool_effect(tool)
+    approved_call_ids = {
+        str(value)
+        for value in config.get("metadata", {}).get("approved_sensitive_tool_call_ids", [])
+    }
+    if (
+        role is AgentRole.RESEARCHER
+        and configurable.require_sensitive_tool_approval
+        and effect is not ToolEffect.READ_ONLY
+        and tool_call_id not in approved_call_ids
+    ):
+        get_trace_recorder(config).active_span().score(
+            "security.sensitive_tool_blocked", True, effect.value
+        )
+        if configurable.event_log_enabled:
+            run_id = str(config.get("metadata", {}).get("run_id", "default"))
+            writer = JSONLEventWriter(run_id=run_id, runs_dir=configurable.runs_dir)
+            try:
+                writer.write(ResearchEvent(
+                    event_type=EventType.SENSITIVE_TOOL_BLOCKED,
+                    task_id=str(config.get("metadata", {}).get("task_id", "researcher")),
+                    run_id=run_id,
+                    data={
+                        "tool": name,
+                        "effect": effect.value,
+                        "tool_call_id": tool_call_id,
+                    },
+                ))
+            finally:
+                writer.close()
+        return observed_error(
+            ToolError(
+                error_type=ToolErrorType.sensitive_tool_approval_required,
+                tool_name=name,
+                message=(
+                    f"Tool '{name}' has effect '{effect.value}' and requires "
+                    "explicit approval for this exact tool call."
+                ),
+                detail={"effect": effect.value, "tool_call_id": tool_call_id},
+            )
         )
 
     # Egress domain allowlist for URL-bearing tools (MCP + fetch_webpage). May

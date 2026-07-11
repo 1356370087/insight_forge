@@ -27,21 +27,27 @@ from langchain_core.tools import tool as lc_tool
 from open_deep_research.state import ConductResearch, ResearchComplete
 from open_deep_research.tasks.registry import TaskStatus
 from open_deep_research.tools.adapters import adapt_langchain_tool
-from open_deep_research.tools.base import Tool, ToolContext, ToolOrigin, ToolResult
+from open_deep_research.tools.base import Tool, ToolContext, ToolOrigin
 from open_deep_research.tools.governance import (
     AgentRole,
     ToolErrorType,
     ToolExecutionFailure,
-    check_permission as _check_permission,
     classify_retryable_error,
-    execute_governed_tool_call as _execute_governed_tool_call,
     filter_tools_by_permission,
     get_tool_origin,
     get_tool_retryable,
     get_user_permissions,
-    invoke_tool_with_retry as _invoke_tool_with_retry,
     resolve_allowed_tools,
     validate_tool_args,
+)
+from open_deep_research.tools.governance import (
+    check_permission as _check_permission,
+)
+from open_deep_research.tools.governance import (
+    execute_governed_tool_call as _execute_governed_tool_call,
+)
+from open_deep_research.tools.governance import (
+    invoke_tool_with_retry as _invoke_tool_with_retry,
 )
 from open_deep_research.tools.utils import tavily_search, think_tool
 
@@ -1061,14 +1067,13 @@ async def _ok_fetch_fn(url: str) -> str:
 def egress_env(monkeypatch):
     """Ensure in-process mode (no SANDBOX_NETWORK_MODE) and fresh registries."""
     monkeypatch.delenv("SANDBOX_NETWORK_MODE", raising=False)
-    from open_deep_research.tasks.registry import get_task_registry
+    # Reset the registry singleton so prior tests' tasks don't leak in.
+    import open_deep_research.tasks.registry as registry_mod
     from open_deep_research.tasks.domain_approvals import (
         get_domain_approval_registry,
         reset_domain_approval_registry,
     )
-
-    # Reset the registry singleton so prior tests' tasks don't leak in.
-    import open_deep_research.tasks.registry as registry_mod
+    from open_deep_research.tasks.registry import get_task_registry
 
     registry_mod._registry = None
     reset_domain_approval_registry()
@@ -1124,7 +1129,7 @@ class TestEgressAllowlist:
         )
         assert msg.content == "fetched:https://example.com/x"
 
-    def test_no_network_mode_skips_egress(self, egress_env):
+    def test_no_network_mode_denies_egress(self, egress_env):
         registry, _ = egress_env
         tool = _fetch_tool()
         cfg = _egress_config(sandbox_network_mode="no-network")
@@ -1139,8 +1144,9 @@ class TestEgressAllowlist:
                 apply_retry=False,
             )
         )
-        # no-network -> egress check skipped -> tool runs
-        assert msg.content == "fetched:https://untrusted.example/x"
+        payload = json.loads(msg.content)
+        assert payload["error_type"] == "egress_domain_denied"
+        assert payload["detail"]["network_mode"] == "no-network"
 
     def test_open_network_mode_skips_egress(self, egress_env):
         registry, _ = egress_env

@@ -7,6 +7,7 @@ import random
 import warnings
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Awaitable, Callable, Dict, List, Literal, Optional
+from urllib.parse import urljoin
 
 import aiohttp
 from anthropic import AsyncAnthropic
@@ -25,6 +26,7 @@ from langchain_core.tools import (
     ToolException,
     tool,
 )
+from langchain_mcp_adapters.client import MultiServerMCPClient
 from mcp import McpError
 from openai import AsyncOpenAI
 from tavily import AsyncTavilyClient
@@ -41,9 +43,16 @@ from open_deep_research.observability import (
     invoke_model_with_retry_observability,
 )
 from open_deep_research.prompts import summarize_webpage_prompt
+from open_deep_research.security.content import inspect_untrusted_content
+from open_deep_research.security.network import validate_public_http_url
 from open_deep_research.state import ResearchComplete, Summary
 from open_deep_research.tools.adapters import adapt_langchain_tool
-from open_deep_research.tools.base import Tool, ToolOrigin, build_tool_registry
+from open_deep_research.tools.base import (
+    Tool,
+    ToolEffect,
+    ToolOrigin,
+    build_tool_registry,
+)
 from open_deep_research.tools.governance import (
     classify_llm_retryable_error,
 )
@@ -239,13 +248,12 @@ async def summarize_webpage(
         return formatted_summary
         
     except asyncio.TimeoutError:
-        # Timeout during summarization - return original content
-        logging.warning("Summarization timed out after 60 seconds, returning original content")
-        return webpage_content
+        # Never fail open by returning attacker-controlled raw content.
+        logging.warning("Summarization timed out after 120 seconds; content quarantined")
+        return "<external_content_quarantined reason=\"summarization_timeout\"/>"
     except Exception as e:
-        # Other errors during summarization - log and return original content
-        logging.warning(f"Summarization failed with error: {str(e)}, returning original content")
-        return webpage_content
+        logging.warning("Summarization failed; external content quarantined: %s", str(e)[:200])
+        return "<external_content_quarantined reason=\"summarization_failed\"/>"
 
 
 ##########################
@@ -280,21 +288,63 @@ async def fetch_webpage(
     Raises:
         ToolException: On HTTP errors or non-2xx responses (handled by governance retry).
     """
+    configurable = Configuration.from_runnable_config(config)
+    max_bytes = configurable.max_external_content_bytes
+    requested_chars = max(1, min(int(max_chars), max_bytes))
     timeout = aiohttp.ClientTimeout(total=30)
+    current_url = url
+    raw = ""
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url, ssl=False) as response:
-            if response.status >= 400:
-                raise ToolException(
-                    f"fetch_webpage got HTTP {response.status} for {url}"
-                )
-            raw = await response.text(errors="replace")
+        for redirect_count in range(6):
+            try:
+                await validate_public_http_url(current_url)
+            except ValueError as exc:
+                raise ToolException(f"Unsafe webpage URL rejected: {exc}") from exc
+            async with session.get(current_url, allow_redirects=False) as response:
+                if response.status in {301, 302, 303, 307, 308}:
+                    location = getattr(response, "headers", {}).get("Location")
+                    if not location or redirect_count >= 5:
+                        raise ToolException("fetch_webpage redirect limit exceeded")
+                    current_url = urljoin(current_url, location)
+                    continue
+                if response.status >= 400:
+                    raise ToolException(
+                        f"fetch_webpage got HTTP {response.status} for {current_url}"
+                    )
+                content_type = str(
+                    getattr(response, "headers", {}).get("Content-Type", "")
+                ).lower()
+                if content_type and not any(
+                    allowed in content_type
+                    for allowed in ("text/", "application/json", "application/xml", "application/xhtml+xml")
+                ):
+                    raise ToolException(f"Unsupported webpage content type: {content_type[:80]}")
+                body = getattr(response, "content", None)
+                if body is not None and hasattr(body, "iter_chunked"):
+                    chunks: list[bytes] = []
+                    size = 0
+                    async for chunk in body.iter_chunked(16_384):
+                        size += len(chunk)
+                        if size > max_bytes:
+                            raise ToolException("Webpage response exceeds configured byte limit")
+                        chunks.append(chunk)
+                    raw = b"".join(chunks).decode(
+                        getattr(response, "charset", None) or "utf-8",
+                        errors="replace",
+                    )
+                else:
+                    raw = await response.text(errors="replace")
+                    if len(raw.encode("utf-8", errors="replace")) > max_bytes:
+                        raise ToolException("Webpage response exceeds configured byte limit")
+                break
+        else:  # pragma: no cover - loop exits through break or redirect error
+            raise ToolException("fetch_webpage redirect limit exceeded")
 
-    raw = raw[:max_chars]
+    raw = raw[:requested_chars]
 
     if not summarize:
-        return f"<url>{url}</url>\n<content>\n{raw}\n</content>"
+        return f"<url>{current_url}</url>\n<content>\n{raw}\n</content>"
 
-    configurable = Configuration.from_runnable_config(config)
     model_api_key = get_api_key_for_model(configurable.summarization_model, config)
     summarization_model = init_chat_model(
         model=configurable.summarization_model,
@@ -303,8 +353,13 @@ async def fetch_webpage(
         tags=["langsmith:nostream"],
         **get_model_compatibility_kwargs(configurable.summarization_model),
     ).with_structured_output(Summary, method="function_calling")
-    summary = await summarize_webpage(summarization_model, raw)
-    return f"<url>{url}</url>\n{summary}"
+    summary = await summarize_webpage(
+        summarization_model,
+        raw,
+        config=config,
+        model_name=configurable.summarization_model,
+    )
+    return f"<url>{current_url}</url>\n{summary}"
 
 
 ##########################
@@ -534,7 +589,26 @@ async def load_mcp_tools(
         List of configured MCP tools ready for use
     """
     configurable = Configuration.from_runnable_config(config)
-    
+    is_http_surface = config.get("metadata", {}).get("deployment_surface") == "http"
+
+    # Validate every administrator-controlled boundary before authentication or
+    # capability discovery performs network I/O.
+    if not (
+        configurable.mcp_config
+        and configurable.mcp_config.url
+        and configurable.mcp_config.tools
+    ):
+        return []
+    configured_names = set(configurable.mcp_config.tools)
+    if not configured_names.issubset(configurable.mcp_config.tool_effects):
+        logging.warning("Blocked MCP discovery because one or more tool effects are undeclared")
+        return []
+    if is_http_surface:
+        allowed_servers = {value.rstrip("/") for value in configurable.allowed_mcp_servers}
+        if configurable.mcp_config.url.rstrip("/") not in allowed_servers:
+            logging.warning("Blocked non-allowlisted MCP server on HTTP surface")
+            return []
+
     # Step 1: Handle authentication if required
     if configurable.mcp_config and configurable.mcp_config.auth_required:
         mcp_tokens = await fetch_tokens(config)
@@ -542,16 +616,11 @@ async def load_mcp_tools(
         mcp_tokens = None
     
     # Step 2: Validate configuration requirements
-    config_valid = (
-        configurable.mcp_config and 
-        configurable.mcp_config.url and 
-        configurable.mcp_config.tools and 
-        (mcp_tokens or not configurable.mcp_config.auth_required)
-    )
+    config_valid = mcp_tokens or not configurable.mcp_config.auth_required
     
     if not config_valid:
         return []
-    
+
     # Step 3: Set up MCP server connection
     server_url = configurable.mcp_config.url.rstrip("/") + "/mcp"
     
@@ -571,8 +640,6 @@ async def load_mcp_tools(
     
     # Step 4: Load tools from MCP server
     try:
-        from langchain_mcp_adapters.client import MultiServerMCPClient
-
         client = MultiServerMCPClient(mcp_server_config)
         available_mcp_tools = await client.get_tools()
     except Exception:
@@ -592,6 +659,18 @@ async def load_mcp_tools(
         # Only include tools specified in configuration
         if mcp_tool.name not in set(configurable.mcp_config.tools):
             continue
+        effect_value = configurable.mcp_config.tool_effects.get(mcp_tool.name)
+        if effect_value is None:
+            warnings.warn(
+                f"MCP tool '{mcp_tool.name}' has no explicit tool_effects entry - skipping"
+            )
+            continue
+        description = str(getattr(mcp_tool, "description", "") or "")
+        if inspect_untrusted_content(description[: configurable.max_mcp_description_chars]):
+            warnings.warn(
+                f"MCP tool '{mcp_tool.name}' has an instruction-shaped description - skipping"
+            )
+            continue
         
         # Wrap the external implementation and place it behind the project Tool seam.
         enhanced_tool = wrap_mcp_authenticate_tool(mcp_tool)
@@ -599,6 +678,7 @@ async def load_mcp_tools(
             adapt_langchain_tool(
                 enhanced_tool,
                 origin=ToolOrigin.MCP,
+                effect=ToolEffect(effect_value),
                 retryable=True,
                 auth_satisfied=bool(
                     configurable.mcp_config
@@ -646,19 +726,31 @@ async def load_browser_mcp_tools(
         return []
 
     browser_config = configurable.browser_mcp_config or BrowserMCPConfig()
+    allowed_browser_tools = set(browser_config.tools or [])
+    if not allowed_browser_tools:
+        return []
+    if not allowed_browser_tools.issubset(browser_config.tool_effects):
+        logging.warning("Blocked browser MCP discovery because one or more tool effects are undeclared")
+        return []
+    is_http_surface = config.get("metadata", {}).get("deployment_surface") == "http"
+    if is_http_surface and browser_config.transport == "stdio" and not configurable.allow_http_stdio_mcp:
+        logging.warning("Blocked browser stdio MCP on HTTP surface")
+        return []
+    if is_http_surface and browser_config.url:
+        allowed_servers = {value.rstrip("/") for value in configurable.allowed_mcp_servers}
+        if browser_config.url.rstrip("/") not in allowed_servers:
+            logging.warning("Blocked non-allowlisted browser MCP server on HTTP surface")
+            return []
     connection = _build_browser_mcp_connection(browser_config)
     if not connection:
         return []
 
     try:
-        from langchain_mcp_adapters.client import MultiServerMCPClient
-
         client = MultiServerMCPClient({"browser": connection})
         available_browser_tools = await client.get_tools()
     except Exception:
         return []
 
-    allowed_browser_tools = set(browser_config.tools or [])
     configured_tools: list[Tool] = []
     for browser_tool in available_browser_tools:
         if browser_tool.name in existing_tool_names:
@@ -666,7 +758,19 @@ async def load_browser_mcp_tools(
                 f"Browser MCP tool '{browser_tool.name}' conflicts with existing tool name - skipping"
             )
             continue
-        if allowed_browser_tools and browser_tool.name not in allowed_browser_tools:
+        if browser_tool.name not in allowed_browser_tools:
+            continue
+        effect_value = browser_config.tool_effects.get(browser_tool.name)
+        if effect_value is None:
+            warnings.warn(
+                f"Browser MCP tool '{browser_tool.name}' has no explicit tool_effects entry - skipping"
+            )
+            continue
+        description = str(getattr(browser_tool, "description", "") or "")
+        if inspect_untrusted_content(description[: configurable.max_mcp_description_chars]):
+            warnings.warn(
+                f"Browser MCP tool '{browser_tool.name}' has an instruction-shaped description - skipping"
+            )
             continue
 
         enhanced_tool = wrap_mcp_authenticate_tool(browser_tool)
@@ -674,6 +778,7 @@ async def load_browser_mcp_tools(
             adapt_langchain_tool(
                 enhanced_tool,
                 origin=ToolOrigin.MCP,
+                effect=ToolEffect(effect_value),
                 retryable=True,
             )
         )
@@ -1160,7 +1265,11 @@ async def get_all_tools(config: RunnableConfig) -> list[Tool]:
     # Add configured search tools
     configurable = Configuration.from_runnable_config(config)
     search_api = SearchAPI(get_config_value(configurable.search_api))
-    search_tools = await get_search_tool(search_api)
+    search_tools = (
+        []
+        if configurable.sandbox_network_mode == "no-network"
+        else await get_search_tool(search_api)
+    )
     tools.extend(search_tools)
 
     # Track existing tool names to prevent conflicts
@@ -1171,7 +1280,12 @@ async def get_all_tools(config: RunnableConfig) -> list[Tool]:
     mcp_tools = [
         t
         if isinstance(t, Tool)
-        else adapt_langchain_tool(t, origin=ToolOrigin.MCP, retryable=True)
+        else adapt_langchain_tool(
+            t,
+            origin=ToolOrigin.MCP,
+            effect=ToolEffect.DESTRUCTIVE,
+            retryable=True,
+        )
         for t in loaded_mcp_tools
     ]
     tools.extend(mcp_tools)
@@ -1183,7 +1297,12 @@ async def get_all_tools(config: RunnableConfig) -> list[Tool]:
     browser_mcp_tools = [
         t
         if isinstance(t, Tool)
-        else adapt_langchain_tool(t, origin=ToolOrigin.MCP, retryable=True)
+        else adapt_langchain_tool(
+            t,
+            origin=ToolOrigin.MCP,
+            effect=ToolEffect.DESTRUCTIVE,
+            retryable=True,
+        )
         for t in loaded_browser_tools
     ]
     tools.extend(browser_mcp_tools)
