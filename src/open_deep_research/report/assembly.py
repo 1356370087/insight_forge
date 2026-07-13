@@ -39,6 +39,7 @@ from open_deep_research.tools.utils import (
     is_token_limit_exceeded,
 )
 
+from .coverage import derive_coverage_checklist, render_coverage_checklist
 from .models import ReportOutline, SectionSpec, SourceRef, WrittenSection
 from .profiles import AssemblyMode, ReportProfile
 
@@ -119,13 +120,23 @@ class ReportContext:
     ) -> ReportContext:
         """Build report context from graph state and runnable configuration."""
         configurable = Configuration.from_runnable_config(config)
+        evidence_sources: list[SourceRef] = []
+        seen_urls: set[str] = set()
+        for record in state.get("evidence_registry", []):
+            url = str(record.get("source_url", ""))
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            evidence_sources.append(
+                SourceRef(title=str(record.get("source_title", "")), url=url)
+            )
         return cls(
             state=state,
             config=config,
             profile=profile,
             configurable=configurable,
             findings=_build_findings(state),
-            sources=list(sources or []),
+            sources=list(sources or evidence_sources),
         )
 
     @property
@@ -192,11 +203,16 @@ class ReportContext:
         return prompt
 
     def with_skill_report_context(self, prompt: str) -> str:
-        """Prepend enabled domain-skill guidance to a writer prompt."""
+        """Prepend deterministic coverage and enabled domain-skill guidance."""
+        coverage = render_coverage_checklist(
+            derive_coverage_checklist(str(self.state.get("research_brief", "")))
+        )
         skill_context = get_skill_report_context(self.configurable.skills)
-        if not skill_context:
+        contexts = [item for item in (coverage, skill_context) if item]
+        if not contexts:
             return prompt
-        return f"{skill_context}\n\n{prompt}"
+        context_block = "\n\n".join(contexts)
+        return f"{context_block}\n\n{prompt}"
 
 
 class OneShotStrategy:

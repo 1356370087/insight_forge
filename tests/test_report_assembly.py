@@ -10,13 +10,16 @@ from langchain_core.runnables import RunnableConfig
 
 from open_deep_research.report import assembly as assembly_module
 from open_deep_research.report import build_report
-from open_deep_research.report.assembly import SectionedStrategy
+from open_deep_research.report.assembly import AssemblyResult, SectionedStrategy
 from open_deep_research.report.models import ReportOutline, SectionSpec, WrittenSection
 from open_deep_research.report.profiles import AssemblyMode, get_profile
 
 
 def _config(**configurable: Any) -> RunnableConfig:
-    return {"configurable": configurable, "metadata": {"run_id": "assembly-test"}}
+    return {
+        "configurable": {"quality_evaluation_enabled": False, **configurable},
+        "metadata": {"run_id": "assembly-test"},
+    }
 
 
 class _FakeStructuredModel:
@@ -70,6 +73,7 @@ def test_literature_review_uses_bibtex_style():
 
 @pytest.mark.asyncio
 async def test_comparison_matrix_builds_multi_section_report(monkeypatch):
+    monkeypatch.setenv("QUALITY_EVALUATION_ENABLED", "false")
     outline = ReportOutline(
         title="A vs B",
         sections=[
@@ -112,6 +116,7 @@ async def test_comparison_matrix_builds_multi_section_report(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_sectioned_report_appends_sources_from_findings(monkeypatch):
+    monkeypatch.setenv("QUALITY_EVALUATION_ENABLED", "false")
     outline = ReportOutline(title="T", sections=[SectionSpec(name="Findings")])
 
     async def fake_invoke(model, messages, config, *, span_name, agent_role=None, model_name=None, **_kw):
@@ -137,3 +142,56 @@ async def test_sectioned_report_appends_sources_from_findings(monkeypatch):
     assert "### Sources" in update["final_report"]
     assert "https://x.io" in update["final_report"]
     assert update["sources"]["value"][0]["url"] == "https://x.io"
+
+
+@pytest.mark.asyncio
+async def test_quality_enabled_report_rejects_state_without_accepted_evidence(monkeypatch):
+    monkeypatch.setenv("QUALITY_EVALUATION_ENABLED", "true")
+    async def fake_assemble(_ctx):
+        return AssemblyResult(body_markdown="unsupported report")
+
+    monkeypatch.setattr("open_deep_research.report.orchestrator.assemble", fake_assemble)
+    state = {
+        "messages": [],
+        "research_brief": "research A",
+        "notes": ["rejected_by_supervisor_quality_gate"],
+        "raw_notes": [],
+        "completed_task_outputs": [],
+        "evidence_registry": [],
+    }
+
+    with pytest.raises(RuntimeError, match="accepted research evidence"):
+        await build_report(state, _config(quality_evaluation_enabled=True))
+
+
+@pytest.mark.asyncio
+async def test_quality_enabled_report_rewrites_sources_to_evidence_allowlist(monkeypatch):
+    monkeypatch.setenv("QUALITY_EVALUATION_ENABLED", "true")
+    async def fake_assemble(_ctx):
+        return AssemblyResult(
+            body_markdown=(
+                "Claim [1] [Allowed](https://allowed.example/paper) "
+                "[Fabricated](https://fabricated.example/post)\n\n"
+                "### Sources\n[1] Fabricated: https://fabricated.example/post"
+            )
+        )
+
+    monkeypatch.setattr("open_deep_research.report.orchestrator.assemble", fake_assemble)
+    state = {
+        "messages": [],
+        "research_brief": "research A",
+        "notes": ["supported finding"],
+        "raw_notes": ["supported finding https://allowed.example/paper"],
+        "evidence_registry": [
+            {
+                "source_title": "Allowed primary source",
+                "source_url": "https://allowed.example/paper",
+            }
+        ],
+    }
+
+    update = await build_report(state, _config(quality_evaluation_enabled=True))
+
+    assert "https://allowed.example/paper" in update["final_report"]
+    assert "https://fabricated.example/post" not in update["final_report"]
+    assert "[1] Allowed primary source" in update["final_report"]

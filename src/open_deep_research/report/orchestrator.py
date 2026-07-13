@@ -29,6 +29,7 @@ from open_deep_research.observability import get_trace_recorder
 from open_deep_research.security.content import sanitize_report_markdown
 
 from .assembly import ReportContext, assemble
+from .coverage import derive_coverage_checklist
 from .profiles import (
     AssemblyMode,
     OutputFormat,
@@ -74,6 +75,18 @@ def _resolve_reference_style(cfg: Configuration, profile: ReportProfile) -> Refe
     return profile.reference_style
 
 
+def _research_was_attempted(state: dict) -> bool:
+    """Return whether the state contains observable researcher tool activity."""
+    note_text = "\n".join(str(note) for note in state.get("notes", []))
+    if "rejected_by_supervisor_quality_gate" in note_text:
+        return True
+    for message in state.get("supervisor_messages", []):
+        name = message.get("name") if isinstance(message, dict) else getattr(message, "name", None)
+        if name == "ConductResearch":
+            return True
+    return False
+
+
 async def build_report(state: dict, config: RunnableConfig) -> dict:
     """Build the final report product from collected research state.
 
@@ -90,11 +103,30 @@ async def build_report(state: dict, config: RunnableConfig) -> dict:
         and ``sources`` only when non-default reference handling runs.
     """
     cfg = Configuration.from_runnable_config(config)
+    has_accepted_evidence = bool(
+        state.get("raw_notes")
+        or state.get("completed_task_outputs")
+        or state.get("evidence_registry")
+    )
+    if (
+        cfg.quality_evaluation_enabled
+        and _research_was_attempted(state)
+        and not has_accepted_evidence
+    ):
+        raise RuntimeError(
+            "Final report blocked: research completed without accepted research evidence."
+        )
     profile = get_profile(getattr(cfg, "report_type", None))
     fmt = _resolve_output_format(cfg, profile)
     ref_style = _resolve_reference_style(cfg, profile)
 
     ctx = ReportContext.from_state(state, config, profile)
+    coverage_checklist = derive_coverage_checklist(
+        str(state.get("research_brief", ""))
+    )
+    if cfg.quality_evaluation_enabled and not ctx.sources:
+        raw_evidence = "\n".join(str(note) for note in state.get("raw_notes", []))
+        ctx.sources = parse_sources_from_text(raw_evidence)
     result = await assemble(ctx)
 
     # Recover structured sources whenever a non-default output format, a
@@ -106,17 +138,50 @@ async def build_report(state: dict, config: RunnableConfig) -> dict:
         (fmt != OutputFormat.MARKDOWN)
         or (ref_style != ReferenceStyle.NUMBERED)
         or is_sectioned
+        or bool(ctx.sources)
     )
+    if ctx.sources:
+        result.sources = ctx.sources
     if needs_sources and not result.sources:
         result.sources = parse_sources_from_text(result.body_markdown + "\n" + ctx.findings)
 
     markdown = sanitize_report_markdown(result.body_markdown)
-    if result.sources and (is_sectioned or ref_style == ReferenceStyle.BIBTEX_LIKE):
+    if ctx.sources:
+        allowed_urls = {source.url for source in ctx.sources}
+
+        def keep_fetched_link(match: re.Match[str]) -> str:
+            label, url = match.group(1), match.group(2)
+            return match.group(0) if url in allowed_urls else label
+
+        markdown = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", keep_fetched_link, markdown)
+    if result.sources and (
+        is_sectioned
+        or ref_style == ReferenceStyle.BIBTEX_LIKE
+        or cfg.quality_evaluation_enabled
+    ):
         # Sectioned bodies have no Sources section -> append one in the resolved
         # style. One-shot bibtex -> replace the model-emitted Sources section.
         # One-shot numbered is left untouched (byte-identical to the original).
         markdown = replace_sources_section(
             markdown, render_references(result.sources, ref_style)
+        )
+    if cfg.quality_evaluation_enabled and result.sources:
+        allowed_urls = {source.url for source in result.sources}
+
+        def keep_eligible_url(match: re.Match[str]) -> str:
+            raw_url = match.group(0)
+            url = raw_url.rstrip(".,;:")
+            suffix = raw_url[len(url):]
+            return raw_url if url in allowed_urls else suffix
+
+        markdown = re.sub(r"https?://[^\s)\]}>]+", keep_eligible_url, markdown)
+        source_count = len(result.sources)
+        markdown = re.sub(
+            r"\[(\d+)\]",
+            lambda match: match.group(0)
+            if 1 <= int(match.group(1)) <= source_count
+            else "",
+            markdown,
         )
     markdown = sanitize_report_markdown(markdown)
 
@@ -139,6 +204,7 @@ async def build_report(state: dict, config: RunnableConfig) -> dict:
     active_span.score("report.section_count", len(result.sections))
     active_span.score("report.citation_density_per_1k_chars", citation_density)
     active_span.score("report.cited_source_ratio", cited_source_ratio)
+    active_span.score("report.coverage_requirement_count", len(coverage_checklist))
     artifacts = render_artifacts(result, fmt, ctx)
 
     update: dict = {
@@ -149,6 +215,10 @@ async def build_report(state: dict, config: RunnableConfig) -> dict:
             else [AIMessage(content=markdown)]
         ),
         **_cleared_state(),
+        "coverage_checklist": {
+            "type": "override",
+            "value": coverage_checklist,
+        },
     }
 
     if needs_sources and result.sources:
