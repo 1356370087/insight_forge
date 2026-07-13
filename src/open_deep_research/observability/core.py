@@ -1075,6 +1075,7 @@ class NoopSpanContext:
     run_id: str | None = None
 
     def __init__(self):
+        self.attributes: dict[str, Any] = {}
         self.output_preview: str | None = None
         self.usage = TokenUsage()
         self.retry_count = 0

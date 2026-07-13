@@ -17,6 +17,14 @@ from typing import Any
 from langchain_core.messages import BaseMessage, HumanMessage, get_buffer_string
 from langchain_core.runnables import RunnableConfig
 
+from open_deep_research.agents.query import (
+    BeforeTurnHookResult,
+    ContextPolicy,
+    QueryParams,
+    StopHookResult,
+    ToolResultsHookResult,
+    query,
+)
 from open_deep_research.configuration import Configuration
 from open_deep_research.observability import get_trace_recorder
 from open_deep_research.run_context import (
@@ -1038,68 +1046,26 @@ class QueryEngine:
                     "approved_research_plan": supervisor_state.get("approved_research_plan"),
                 },
             )
-        next_step = END if start_step == END else start_step
         recorder = get_trace_recorder(self.config)
-        while next_step != END:
-            if self.cancelled:
-                raise RuntimeError("Run cancelled")
-            with recorder.start_span(
-                name=f"supervisor.{next_step}",
-                kind="agent",
-                agent_role="supervisor",
-                attributes={"iteration": supervisor_state.get("research_iterations", 0)},
-            ):
-                if next_step == "supervisor":
-                    self._drain_human_feedback(supervisor_state)
-                    compacted = await graph.compact_query_context(
-                        list(supervisor_state.get("supervisor_messages", [])),
-                        research_brief=str(supervisor_state.get("research_brief", "")),
-                        channel="supervisor",
-                        config=self.config,
-                    )
-                    if compacted is not None:
-                        compact_update = {
-                            "supervisor_messages": {
-                                "type": "override",
-                                "value": compacted["messages"],
-                            }
-                        }
-                        apply_update_to_state(supervisor_state, compact_update)
-                        await self._persist_update(
-                            channel="supervisor",
-                            stage="supervisor_running",
-                            scope="supervisor",
-                            update=compact_update,
-                            record_type="context_compacted",
-                            extra={
-                                "summary": compacted["summary"],
-                                "recent_messages": compacted["recent_messages"],
-                            },
-                        )
-                    command = coerce_command(
-                        await graph.supervisor(supervisor_state, self.config),
-                        default_goto="supervisor_tools",
-                    )
-                elif next_step == "supervisor_tools":
-                    command = coerce_command(
-                        await graph.supervisor_tools(supervisor_state, self.config),
-                        default_goto="supervisor",
-                    )
-                else:
-                    raise RuntimeError(f"Unknown supervisor step: {next_step}")
-            apply_update_to_state(supervisor_state, command.update)
+        configurable = Configuration.from_runnable_config(self.config)
+
+        async def commit_supervisor_update(
+            update: dict[str, Any],
+            *,
+            step: str,
+            goto: str,
+        ) -> None:
+            apply_update_to_state(supervisor_state, update)
             await self._persist_update(
                 channel="supervisor",
                 stage="supervisor_running",
                 scope="supervisor",
-                update=command.update,
+                update=update,
             )
-            pending_acks = list(command.update.get("pending_mailbox_acks", []))
+            pending_acks = list(update.get("pending_mailbox_acks", []))
             if pending_acks:
-                from open_deep_research.configuration import Configuration
                 from open_deep_research.tasks.coordination import ack_lead_updates
 
-                configurable = Configuration.from_runnable_config(self.config)
                 for ack in pending_acks:
                     await ack_lead_updates(
                         configurable,
@@ -1108,14 +1074,225 @@ class QueryEngine:
                         message_ids=list(ack["message_ids"]),
                     )
                 supervisor_state["pending_mailbox_acks"] = []
-            self._record("supervisor", {"step": next_step, "goto": command.goto})
-            next_step = command.goto
+            self._record("supervisor", {"step": step, "goto": goto})
             await self._persist_checkpoint(
                 "supervisor_running",
-                f"supervisor.{next_step}",
+                f"supervisor.{goto}",
                 channel="supervisor",
-                payload={"supervisor_step": next_step},
+                payload={"supervisor_step": goto},
             )
+
+        async def execute_supervisor_tools(
+            messages: list[BaseMessage],
+            turn: int,
+        ) -> RuntimeCommand:
+            if self.cancelled:
+                raise RuntimeError("Run cancelled")
+            tool_state = {
+                **supervisor_state,
+                "supervisor_messages": list(messages),
+                "research_iterations": turn,
+            }
+            with recorder.start_span(
+                name="supervisor.tools",
+                kind="agent",
+                agent_role="supervisor",
+                attributes={"iteration": turn},
+            ):
+                return coerce_command(
+                    await graph._execute_supervisor_tools(tool_state, self.config),
+                    default_goto="supervisor",
+                )
+
+        next_step = END if start_step == END else start_step
+        if next_step == "supervisor_tools":
+            restored_messages = normalize_messages(
+                list(supervisor_state.get("supervisor_messages", []))
+            )
+            restored_turn = int(supervisor_state.get("research_iterations", 0) or 0)
+            command = await execute_supervisor_tools(restored_messages, restored_turn)
+            await commit_supervisor_update(
+                dict(command.update),
+                step="supervisor_tools",
+                goto=command.goto,
+            )
+            next_step = command.goto
+        elif next_step not in {"supervisor", END}:
+            raise RuntimeError(f"Unknown supervisor step: {next_step}")
+
+        if next_step != END:
+            model_tools = graph.filter_tools_by_permission(
+                list(graph.build_supervisor_tool_registry(supervisor_state).values()),
+                graph.AgentRole.SUPERVISOR,
+                self.config,
+            )
+            model_config = {
+                "model": configurable.research_model,
+                "max_tokens": configurable.research_model_max_tokens,
+                **graph.get_model_connection_kwargs(
+                    configurable.research_model,
+                    self.config,
+                ),
+                "tags": ["langsmith:nostream"],
+                **graph.get_model_compatibility_kwargs(configurable.research_model),
+            }
+
+            async def before_turn(
+                messages: list[BaseMessage],
+                _next_turn: int,
+                _config: RunnableConfig,
+            ) -> BeforeTurnHookResult | None:
+                if self.cancelled:
+                    raise RuntimeError("Run cancelled")
+                prepared_state = {
+                    **supervisor_state,
+                    "supervisor_messages": list(messages),
+                }
+                self._drain_human_feedback(prepared_state)
+                prepared_messages = normalize_messages(
+                    list(prepared_state.get("supervisor_messages", []))
+                )
+                feedback_changed = prepared_messages != messages
+                compacted = await graph.compact_query_context(
+                    prepared_messages,
+                    research_brief=str(supervisor_state.get("research_brief", "")),
+                    channel="supervisor",
+                    config=self.config,
+                )
+                if compacted is None and not feedback_changed:
+                    return None
+
+                replacement = (
+                    normalize_messages(compacted["messages"])
+                    if compacted is not None
+                    else prepared_messages
+                )
+                control_update: dict[str, Any] = {
+                    "supervisor_messages": {
+                        "type": "override",
+                        "value": replacement,
+                    },
+                    "human_feedback": {
+                        "type": "override",
+                        "value": list(self.human_feedback),
+                    },
+                }
+                apply_update_to_state(supervisor_state, control_update)
+                await self._persist_update(
+                    channel="supervisor",
+                    stage="supervisor_running",
+                    scope="supervisor",
+                    update=control_update,
+                    record_type=(
+                        "context_compacted" if compacted is not None else "state_delta"
+                    ),
+                    extra=(
+                        {
+                            "summary": compacted["summary"],
+                            "recent_messages": compacted["recent_messages"],
+                        }
+                        if compacted is not None
+                        else None
+                    ),
+                )
+                return BeforeTurnHookResult(replace_messages=replacement)
+
+            async def run_tool_batch(
+                messages: list[BaseMessage],
+                _tool_calls: list[dict[str, Any]],
+                _tools_by_name: dict[str, Any],
+                turn: int,
+                _config: RunnableConfig,
+            ) -> ToolResultsHookResult:
+                command = await execute_supervisor_tools(messages, turn)
+                update = dict(command.update)
+                tool_messages = normalize_messages(update.pop("supervisor_messages", []))
+                return ToolResultsHookResult(
+                    messages=tool_messages,
+                    updates=update,
+                    should_continue=command.goto != END,
+                )
+
+            async def handle_no_tool_stop(
+                messages: list[BaseMessage],
+                _config: RunnableConfig,
+            ) -> StopHookResult:
+                turn = int(supervisor_state.get("research_iterations", 0) or 0)
+                command = await execute_supervisor_tools(messages, turn)
+                update = dict(command.update)
+                tool_messages = normalize_messages(update.pop("supervisor_messages", []))
+                return StopHookResult(
+                    should_continue=command.goto != END,
+                    messages=tool_messages,
+                    updates=update,
+                    reason="completed" if command.goto == END else "stop_hook_blocked",
+                )
+
+            completed_messages = normalize_messages(
+                list(supervisor_state.get("supervisor_messages", []))
+            )
+            completed_turn = int(supervisor_state.get("research_iterations", 0) or 0)
+            terminal_tool_update_handled = False
+            async for event in query(QueryParams(
+                messages=completed_messages,
+                system_prompt=None,
+                model=graph.configurable_model,
+                config=self.config,
+                tools=model_tools,
+                role=graph.AgentRole.SUPERVISOR,
+                model_span_name="supervisor.model",
+                model_config=model_config,
+                initial_turn=completed_turn,
+                max_tool_description_chars=configurable.max_mcp_description_chars,
+                context_policy=ContextPolicy(
+                    max_tool_result_chars=configurable.max_mcp_output_chars,
+                ),
+                before_turn_hooks=[before_turn],
+                stop_hooks=[handle_no_tool_stop],
+                tool_batch_hook=run_tool_batch,
+            )):
+                if event.type == "query.model_event":
+                    completed_turn = int(event.data["turn"])
+                    terminal_tool_update_handled = False
+                    await commit_supervisor_update(
+                        {
+                            "supervisor_messages": [event.data["message"]],
+                            "research_iterations": completed_turn,
+                        },
+                        step="supervisor",
+                        goto="supervisor_tools",
+                    )
+                elif event.type == "query.tool_result":
+                    event_update = dict(event.data.get("updates", {}))
+                    tool_messages = [
+                        *event.data.get("messages", []),
+                        *event.data.get("additional_messages", []),
+                    ]
+                    if tool_messages:
+                        event_update["supervisor_messages"] = tool_messages
+                    should_continue = bool(event.data.get("should_continue", True))
+                    await commit_supervisor_update(
+                        event_update,
+                        step="supervisor_tools",
+                        goto="supervisor" if should_continue else END,
+                    )
+                    terminal_tool_update_handled = not should_continue
+                elif event.type == "query.completed":
+                    completed_messages = normalize_messages(
+                        list(event.data.get("messages", completed_messages))
+                    )
+                    completed_turn = int(
+                        event.data.get("transition", {}).get("turn", completed_turn)
+                    )
+                    if not terminal_tool_update_handled:
+                        await commit_supervisor_update(
+                            dict(event.data.get("updates", {})),
+                            step="supervisor_tools",
+                            goto=END,
+                        )
+
+            supervisor_state["supervisor_messages"] = completed_messages
+            supervisor_state["research_iterations"] = completed_turn
         return {
             "supervisor_messages": {"type": "override", "value": supervisor_state.get("supervisor_messages", [])},
             "notes": {"type": "override", "value": supervisor_state.get("notes", [])},
@@ -1182,10 +1359,11 @@ class ResearcherQueryEngine:
         state: dict[str, Any],
         config: RunnableConfig | None = None,
     ) -> dict[str, Any]:
-        """Invoke the researcher loop with an explicit researcher state."""
+        """Invoke one focused Researcher through the shared Query runtime."""
         from open_deep_research.agents import deep_researcher as graph
 
         cfg = _ensure_config(config, self.config)
+        configurable = Configuration.from_runnable_config(cfg)
         researcher_state = dict(state)
         researcher_state["researcher_messages"] = normalize_messages(
             researcher_state.get("researcher_messages", []),
@@ -1198,53 +1376,171 @@ class ResearcherQueryEngine:
             agent_role="researcher",
             attributes={"research_topic": topic[:500]},
         ):
-            next_step = "researcher"
-            while next_step != END:
+            tools = await graph.get_all_tools(cfg)
+            tools = graph.filter_tools_by_permission(
+                tools,
+                graph.AgentRole.RESEARCHER,
+                cfg,
+            )
+            if not tools:
+                raise ValueError(
+                    "No tools found to conduct research: Please configure either your "
+                    "search API or add MCP tools to your configuration, and ensure the "
+                    "researcher tool whitelist/origin filter does not exclude all tools."
+                )
+
+            memory_context = str(researcher_state.get("memory_context") or "")
+            runtime_messages: list[BaseMessage] = []
+            if memory_context:
+                runtime_messages.append(HumanMessage(content=memory_context))
+            memory_prefix_count = len(runtime_messages)
+            runtime_messages.extend(researcher_state["researcher_messages"])
+
+            async def before_turn(
+                _messages: list[BaseMessage],
+                _next_turn: int,
+                _config: RunnableConfig,
+            ) -> BeforeTurnHookResult | None:
                 task_id = str(cfg.get("metadata", {}).get("task_id", ""))
-                if task_id:
-                    from langchain_core.messages import HumanMessage
+                if not task_id:
+                    return None
+                from open_deep_research.tasks.registry import get_task_registry
 
-                    from open_deep_research.tasks.registry import get_task_registry
+                task_record = get_task_registry().get(task_id)
+                expected_run_id = str(cfg.get("metadata", {}).get("run_id", "default"))
+                if task_record is None or task_record.run_id != expected_run_id:
+                    return None
+                if task_record.cancelled.is_set():
+                    return BeforeTurnHookResult(
+                        updates={"cancelled": True},
+                        should_stop=True,
+                        reason="cancelled",
+                    )
+                instructions: list[BaseMessage] = []
+                while not task_record.control_queue.empty():
+                    control = task_record.control_queue.get_nowait()
+                    if control.get("type") == "update":
+                        instructions.append(HumanMessage(
+                            content=f"[Supervisor Instruction] {control['instruction']}"
+                        ))
+                if not instructions:
+                    return None
+                return BeforeTurnHookResult(messages=instructions)
 
-                    task_record = get_task_registry().get(task_id)
-                    expected_run_id = str(cfg.get("metadata", {}).get("run_id", "default"))
-                    if task_record is not None and task_record.run_id == expected_run_id:
-                        if task_record.cancelled.is_set():
-                            return {
-                                **researcher_state,
-                                "cancelled": True,
-                                "compressed_research": "",
-                                "raw_notes": [],
-                            }
-                        while not task_record.control_queue.empty():
-                            control = task_record.control_queue.get_nowait()
-                            if control.get("type") == "update":
-                                researcher_state.setdefault("researcher_messages", []).append(
-                                    HumanMessage(
-                                        content=f"[Supervisor Instruction] {control['instruction']}"
-                                    )
-                                )
-                if next_step == "researcher":
-                    command = coerce_command(
-                        await graph.researcher(researcher_state, cfg),
-                        default_goto="researcher_tools",
+            async def after_tools(
+                messages: list[BaseMessage],
+                tool_calls: list[dict[str, Any]],
+                outcomes: list[Any],
+                tools_by_name: dict[str, Any],
+                turn: int,
+                _config: RunnableConfig,
+            ) -> ToolResultsHookResult:
+                tool_outputs, batch_update = await graph.prepare_researcher_tool_outcomes(
+                    tool_calls,
+                    outcomes,
+                    tools_by_name,
+                    cfg,
+                )
+                domain_updates = {
+                    key: value
+                    for key, value in batch_update.items()
+                    if key not in {"pending_tool_results", "research_complete_requested"}
+                }
+                additional_messages: list[BaseMessage] = []
+                should_continue = not (
+                    turn >= configurable.max_react_tool_calls
+                    or batch_update["research_complete_requested"]
+                )
+
+                if configurable.quality_evaluation_enabled:
+                    assessment_state = {
+                        **researcher_state,
+                        "researcher_messages": [
+                            *messages[memory_prefix_count:],
+                            *tool_outputs,
+                        ],
+                        "tool_call_iterations": turn,
+                        "pending_tool_results": batch_update["pending_tool_results"],
+                        "research_complete_requested": batch_update[
+                            "research_complete_requested"
+                        ],
+                    }
+                    assessment = await graph.assess_research_results(
+                        assessment_state,
+                        cfg,
                     )
-                elif next_step == "researcher_tools":
-                    command = coerce_command(
-                        await graph.researcher_tools(researcher_state, cfg),
-                        default_goto="researcher",
+                    assessment_update = dict(assessment.update)
+                    additional_messages = list(
+                        assessment_update.pop("researcher_messages", [])
                     )
-                elif next_step == "assess_research_results":
-                    command = coerce_command(
-                        await graph.assess_research_results(researcher_state, cfg),
-                        default_goto="researcher",
+                    assessment_update.pop("pending_tool_results", None)
+                    assessment_update.pop("research_complete_requested", None)
+                    domain_updates.update(assessment_update)
+                    should_continue = assessment.goto == "researcher"
+
+                return ToolResultsHookResult(
+                    messages=tool_outputs,
+                    additional_messages=additional_messages,
+                    updates=domain_updates,
+                    should_continue=should_continue,
+                )
+
+            model_config = {
+                "model": configurable.research_model,
+                "max_tokens": configurable.research_model_max_tokens,
+                **graph.get_model_connection_kwargs(configurable.research_model, cfg),
+                "tags": ["langsmith:nostream"],
+                **graph.get_model_compatibility_kwargs(configurable.research_model),
+            }
+            completed_messages = runtime_messages
+            completed_turn = int(researcher_state.get("tool_call_iterations", 0) or 0)
+            async for event in query(QueryParams(
+                messages=runtime_messages,
+                system_prompt=graph.build_researcher_system_prompt(configurable),
+                model=graph.configurable_model,
+                config=cfg,
+                tools=tools,
+                role=graph.AgentRole.RESEARCHER,
+                model_span_name="researcher.model",
+                model_config=model_config,
+                max_turns=configurable.max_react_tool_calls,
+                initial_turn=completed_turn,
+                max_tool_description_chars=configurable.max_mcp_description_chars,
+                context_policy=ContextPolicy(
+                    max_tool_result_chars=configurable.max_mcp_output_chars,
+                ),
+                before_turn_hooks=[before_turn],
+                tool_results_hook=after_tools,
+            )):
+                updates = event.data.get("updates")
+                if updates:
+                    apply_update_to_state(researcher_state, updates)
+                if event.type == "query.completed":
+                    completed_messages = list(event.data.get("messages", runtime_messages))
+                    completed_turn = int(
+                        event.data.get("transition", {}).get("turn", completed_turn)
                     )
-                elif next_step == "compress_research":
-                    update = await graph.compress_research(researcher_state, cfg)
-                    apply_update_to_state(researcher_state, update)
-                    return researcher_state
-                else:
-                    raise RuntimeError(f"Unknown researcher step: {next_step}")
-                apply_update_to_state(researcher_state, command.update)
-                next_step = command.goto
+
+            # A control signal may arrive while the final model/tool call is in
+            # flight.  The legacy step loop observed it before entering the
+            # compression node, so preserve that terminal-boundary check here.
+            final_control = await before_turn(completed_messages, completed_turn + 1, cfg)
+            if final_control is not None:
+                completed_messages.extend(final_control.messages)
+                if final_control.updates:
+                    apply_update_to_state(researcher_state, final_control.updates)
+
+            researcher_state["researcher_messages"] = completed_messages[
+                memory_prefix_count:
+            ]
+            researcher_state["tool_call_iterations"] = completed_turn
+            if researcher_state.get("cancelled"):
+                return {
+                    **researcher_state,
+                    "compressed_research": "",
+                    "raw_notes": [],
+                }
+            update = await graph.compress_research(researcher_state, cfg)
+            apply_update_to_state(researcher_state, update)
+            return researcher_state
         return researcher_state

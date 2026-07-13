@@ -1319,6 +1319,21 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
     return await _execute_supervisor_tools(state, config)
 
 
+def build_researcher_system_prompt(configurable: Configuration) -> str:
+    """Build the role prompt shared by legacy and unified Researcher runtimes."""
+    tool_prompt_parts = [configurable.mcp_prompt or ""]
+    if configurable.browser_mcp_enabled and configurable.browser_mcp_prompt:
+        tool_prompt_parts.append(configurable.browser_mcp_prompt)
+    skill_researcher_context = get_skill_researcher_context(configurable.skills)
+    if skill_researcher_context:
+        tool_prompt_parts.append(skill_researcher_context)
+    tool_prompt = "\n\n".join(part for part in tool_prompt_parts if part)
+    return research_system_prompt.format(
+        mcp_prompt=tool_prompt,
+        date=get_today_str(),
+    )
+
+
 async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[Literal["researcher_tools"]]:
     """Individual researcher that conducts focused research on specific topics.
     
@@ -1361,19 +1376,7 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
     
     # Prepare system prompt with MCP context if available
     memory_context = state.get("memory_context") or ""
-    tool_prompt_parts = [configurable.mcp_prompt or ""]
-    if configurable.browser_mcp_enabled and configurable.browser_mcp_prompt:
-        tool_prompt_parts.append(configurable.browser_mcp_prompt)
-    skill_researcher_context = get_skill_researcher_context(configurable.skills)
-    if skill_researcher_context:
-        tool_prompt_parts.append(skill_researcher_context)
-    tool_prompt = "\n\n".join(part for part in tool_prompt_parts if part)
-
-    base_prompt = research_system_prompt.format(
-        mcp_prompt=tool_prompt,
-        date=get_today_str()
-    )
-    researcher_prompt = base_prompt
+    researcher_prompt = build_researcher_system_prompt(configurable)
     
     # Configure model with tools (retry is handled by the observability retry
     # wrapper at the call site).
@@ -1411,19 +1414,153 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
     )
 
 
+async def prepare_researcher_tool_outcomes(
+    tool_calls: list[dict[str, Any]],
+    tool_outcomes: list[GovernedToolCallResult],
+    tools_by_name: dict[str, Tool],
+    config: RunnableConfig,
+) -> tuple[list[ToolMessage], dict[str, Any]]:
+    """Apply Researcher security and evidence policies to a governed tool batch."""
+    configurable = Configuration.from_runnable_config(config)
+    tool_outputs: list[ToolMessage] = []
+    for call, outcome in zip(tool_calls, tool_outcomes):
+        output = outcome.message
+        tool = tools_by_name.get(str(call.get("name", "")))
+        is_external = (
+            tool is not None
+            and (
+                tool.origin in {ToolOrigin.SEARCH, ToolOrigin.MCP, ToolOrigin.BROWSER}
+                or tool.name == "fetch_webpage"
+            )
+            and outcome.error is None
+        )
+        if (
+            tool is not None
+            and is_external
+            and configurable.prompt_injection_protection_enabled
+        ):
+            source_type = (
+                "mcp"
+                if tool.origin in {ToolOrigin.MCP, ToolOrigin.BROWSER}
+                else "webpage"
+                if tool.name == "fetch_webpage"
+                else "search"
+            )
+            evidence = protect_tool_output(
+                str(output.content),
+                tool_name=tool.name,
+                source_type=source_type,
+                max_chars=configurable.max_mcp_output_chars,
+                fail_closed=configurable.external_content_fail_closed,
+            )
+            protected_content = render_evidence_for_model(evidence)
+            if tool.name in {"web_research", "fetch_url"}:
+                try:
+                    protected_content, structured_flags = _protect_web_pipeline_output(
+                        str(output.content),
+                        tool_name=tool.name,
+                        max_chars=configurable.max_mcp_output_chars,
+                        fail_closed=configurable.external_content_fail_closed,
+                    )
+                    evidence.injection_flags = sorted(
+                        set(evidence.injection_flags) | set(structured_flags)
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    pass
+            output = ToolMessage(
+                content=protected_content,
+                name=output.name,
+                tool_call_id=output.tool_call_id,
+            )
+            if evidence.injection_flags:
+                get_trace_recorder(config).active_span().score(
+                    "security.prompt_injection_detected",
+                    True,
+                    ",".join(evidence.injection_flags),
+                )
+                if configurable.event_log_enabled:
+                    run_id = str(config.get("metadata", {}).get("run_id", "default"))
+                    task_id = str(config.get("metadata", {}).get("task_id", "researcher"))
+                    writer = JSONLEventWriter(run_id=run_id, runs_dir=configurable.runs_dir)
+                    try:
+                        writer.write(ResearchEvent(
+                            event_type=(
+                                EventType.EXTERNAL_CONTENT_QUARANTINED
+                                if evidence.quarantined
+                                else EventType.PROMPT_INJECTION_DETECTED
+                            ),
+                            task_id=task_id,
+                            run_id=run_id,
+                            data={
+                                "source_type": evidence.source_type,
+                                "source_id": evidence.source_id,
+                                "content_hash": evidence.content_hash,
+                                "rules": evidence.injection_flags,
+                            },
+                        ))
+                    finally:
+                        writer.close()
+        tool_outputs.append(output)
+
+    pending_tool_results = [
+        {
+            "name": output.name or call.get("name", ""),
+            "content": str(output.content),
+            "error": outcome.error is not None,
+        }
+        for call, output, outcome in zip(tool_calls, tool_outputs, tool_outcomes)
+    ]
+    registry_update: dict[str, Any] = {}
+    candidate_registry: list[dict] = []
+    document_registry: list[dict] = []
+    evidence_registry: list[dict] = []
+    research_iterations: list[dict] = []
+    for output in tool_outputs:
+        if output.name not in {"web_research", "fetch_url"}:
+            continue
+        try:
+            payload = json.loads(str(output.content))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        candidate_registry.extend(payload.get("candidates", []))
+        document_registry.extend(payload.get("documents", []))
+        evidence_registry.extend(payload.get("evidence", []))
+        research_iterations.append({
+            "request": payload.get("request", {}),
+            "gap_analysis": payload.get("gap_analysis", {}),
+            "approval_batch": payload.get("approval_batch"),
+        })
+    if candidate_registry:
+        registry_update["candidate_registry"] = candidate_registry
+    if document_registry:
+        registry_update["document_registry"] = document_registry
+    if evidence_registry:
+        registry_update["evidence_registry"] = evidence_registry
+    if research_iterations:
+        registry_update["web_research_iterations"] = research_iterations
+
+    return tool_outputs, {
+        "pending_tool_results": pending_tool_results,
+        "research_complete_requested": any(
+            call.get("name") == "ResearchComplete" for call in tool_calls
+        ),
+        **registry_update,
+    }
+
+
 async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Command[Literal["researcher", "assess_research_results", "compress_research"]]:
     """Execute tools called by the researcher, including search tools and strategic thinking.
-    
+
     This function handles various types of researcher tool calls:
     1. think_tool - Strategic reflection that continues the research conversation
     2. Search tools (tavily_search, web_search) - Information gathering
     3. MCP tools - External tool integrations
     4. ResearchComplete - Signals completion of individual research task
-    
+
     Args:
         state: Current researcher state with messages and iteration count
         config: Runtime configuration with research limits and tool settings
-        
+
     Returns:
         Command to either continue research loop or proceed to compression
     """
@@ -1431,13 +1568,13 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
     configurable = Configuration.from_runnable_config(config)
     researcher_messages = state.get("researcher_messages", [])
     most_recent_message = researcher_messages[-1]
-    
+
     # Early exit if no tool calls were made. All search backends (Tavily, OpenAI,
     # Anthropic) are now explicit StructuredTools the model emits as tool_calls,
     # so the prior server-side-native-search detection is no longer needed.
     if not most_recent_message.tool_calls:
         return Command(goto="compress_research")
-    
+
     # Step 2: Handle other tool calls (search, MCP tools, etc.)
     # Tools are assembled with origin tags (see utils.get_all_tools); build the
     # name->tool map and a parallel origin index for provider-native search dicts.
@@ -1475,135 +1612,28 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
         for tool_call in tool_calls
     ]
     tool_outcomes = await asyncio.gather(*tool_execution_tasks)
-    tool_outputs: list[ToolMessage] = []
-    for call, outcome in zip(tool_calls, tool_outcomes):
-        output = outcome.message
-        tool = tools_by_name.get(str(call.get("name", "")))
-        is_external = (
-            tool is not None
-            and (
-                tool.origin in {ToolOrigin.SEARCH, ToolOrigin.MCP, ToolOrigin.BROWSER}
-                or tool.name == "fetch_webpage"
-            )
-            and outcome.error is None
-        )
-        if is_external and configurable.prompt_injection_protection_enabled:
-            source_type = (
-                "mcp"
-                if tool.origin in {ToolOrigin.MCP, ToolOrigin.BROWSER}
-                else "webpage"
-                if tool.name == "fetch_webpage"
-                else "search"
-            )
-            evidence = protect_tool_output(
-                str(output.content),
-                tool_name=tool.name,
-                source_type=source_type,
-                max_chars=configurable.max_mcp_output_chars,
-                fail_closed=configurable.external_content_fail_closed,
-            )
-            protected_content = render_evidence_for_model(evidence)
-            if tool.name in {"web_research", "fetch_url"}:
-                try:
-                    protected_content, structured_flags = _protect_web_pipeline_output(
-                        str(output.content),
-                        tool_name=tool.name,
-                        max_chars=configurable.max_mcp_output_chars,
-                        fail_closed=configurable.external_content_fail_closed,
-                    )
-                    evidence.injection_flags = sorted(
-                        set(evidence.injection_flags) | set(structured_flags)
-                    )
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    # Invalid structured output stays fail-closed and cannot be
-                    # mistaken for a registry-bearing Web result.
-                    pass
-            output = ToolMessage(
-                content=protected_content,
-                name=output.name,
-                tool_call_id=output.tool_call_id,
-            )
-            if evidence.injection_flags:
-                get_trace_recorder(config).active_span().score(
-                    "security.prompt_injection_detected",
-                    True,
-                    ",".join(evidence.injection_flags),
-                )
-                if configurable.event_log_enabled:
-                    run_id = str(config.get("metadata", {}).get("run_id", "default"))
-                    task_id = str(config.get("metadata", {}).get("task_id", "researcher"))
-                    writer = JSONLEventWriter(run_id=run_id, runs_dir=configurable.runs_dir)
-                    try:
-                        writer.write(ResearchEvent(
-                            event_type=(
-                                EventType.EXTERNAL_CONTENT_QUARANTINED
-                                if evidence.quarantined
-                                else EventType.PROMPT_INJECTION_DETECTED
-                            ),
-                            task_id=task_id,
-                            run_id=run_id,
-                            data={
-                                "source_type": evidence.source_type,
-                                "source_id": evidence.source_id,
-                                "content_hash": evidence.content_hash,
-                                "rules": evidence.injection_flags,
-                            },
-                        ))
-                    finally:
-                        writer.close()
-        tool_outputs.append(output)
-    pending_tool_results = [
-        {
-            "name": output.name or call.get("name", ""),
-            "content": str(output.content),
-            "error": outcome.error is not None,
-        }
-        for call, output, outcome in zip(tool_calls, tool_outputs, tool_outcomes)
-    ]
-    registry_update: dict[str, Any] = {}
-    candidate_registry: list[dict] = []
-    document_registry: list[dict] = []
-    evidence_registry: list[dict] = []
-    research_iterations: list[dict] = []
-    for output in tool_outputs:
-        if output.name not in {"web_research", "fetch_url"}:
-            continue
-        try:
-            payload = json.loads(str(output.content))
-        except (TypeError, json.JSONDecodeError):
-            continue
-        candidate_registry.extend(payload.get("candidates", []))
-        document_registry.extend(payload.get("documents", []))
-        evidence_registry.extend(payload.get("evidence", []))
-        research_iterations.append(
-            {
-                "request": payload.get("request", {}),
-                "gap_analysis": payload.get("gap_analysis", {}),
-                "approval_batch": payload.get("approval_batch"),
-            }
-        )
-    if candidate_registry:
-        registry_update["candidate_registry"] = candidate_registry
-    if document_registry:
-        registry_update["document_registry"] = document_registry
-    if evidence_registry:
-        registry_update["evidence_registry"] = evidence_registry
-    if research_iterations:
-        registry_update["web_research_iterations"] = research_iterations
+    tool_outputs, batch_update = await prepare_researcher_tool_outcomes(
+        tool_calls,
+        tool_outcomes,
+        tools_by_name,
+        config,
+    )
+    registry_update = {
+        key: value
+        for key, value in batch_update.items()
+        if key not in {"pending_tool_results", "research_complete_requested"}
+    }
 
     # Step 3: Check late exit conditions (after processing tools)
     exceeded_iterations = state.get("tool_call_iterations", 0) >= configurable.max_react_tool_calls
-    research_complete_called = any(
-        tool_call["name"] == "ResearchComplete"
-        for tool_call in most_recent_message.tool_calls
-    )
+    research_complete_called = bool(batch_update["research_complete_requested"])
 
     if configurable.quality_evaluation_enabled:
         return Command(
             goto="assess_research_results",
             update={
                 "researcher_messages": tool_outputs,
-                "pending_tool_results": pending_tool_results,
+                "pending_tool_results": batch_update["pending_tool_results"],
                 "research_complete_requested": research_complete_called,
                 **registry_update,
             },
