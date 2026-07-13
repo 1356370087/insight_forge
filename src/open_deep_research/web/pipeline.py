@@ -181,7 +181,8 @@ def _heuristic_authority(candidate: CandidateSource) -> float:
     domain = candidate.domain.lower()
     if domain.endswith((".gov", ".edu", ".ac.uk")):
         return 1.0
-    if any(token in domain for token in ("doi.org", "arxiv.org", "who.int", "un.org")):
+    trusted_hosts = ("doi.org", "arxiv.org", "who.int", "un.org", "europa.eu")
+    if any(domain == host or domain.endswith(f".{host}") for host in trusted_hosts):
         return 0.9
     return 0.55
 
@@ -208,9 +209,11 @@ async def rank_candidates(
     for position, candidate in enumerate(candidates):
         overlap = len(objective_terms & _terms(f"{candidate.title} {candidate.snippet}"))
         lexical = min(1.0, overlap / max(3, len(objective_terms) * 0.25))
-        relevance, authority, information_gain = semantic.get(
-            candidate.candidate_id,
-            (lexical, _heuristic_authority(candidate), min(1.0, len(candidate.snippet) / 500)),
+        semantic_scores = semantic.get(candidate.candidate_id)
+        relevance, authority, information_gain = semantic_scores or (
+            lexical,
+            _heuristic_authority(candidate),
+            min(1.0, len(candidate.snippet) / 500),
         )
         rank_score = max(0.0, 1.0 - (position / total))
         freshness = 0.5
@@ -226,6 +229,7 @@ async def rank_candidates(
                 candidate=candidate,
                 relevance=relevance,
                 authority=authority,
+                authority_method=("reranker" if semantic_scores is not None else "heuristic"),
                 information_gain=information_gain,
                 freshness=freshness,
                 provider_rank_score=rank_score,
@@ -271,8 +275,9 @@ async def _robots_allowed(
     if not settings.respect_robots_txt:
         return True
     parsed = urlsplit(url)
-    host = parsed.hostname or ""
-    key = (settings.cache_namespace, host)
+    # robots rules are path-sensitive; caching one boolean for an entire host
+    # can allow a disallowed path after an allowed path was visited.
+    key = (settings.cache_namespace, canonicalize_url(url))
     if key in _ROBOTS_CACHE:
         return _ROBOTS_CACHE[key]
     robots_url = urlunsplit((parsed.scheme, parsed.netloc, "/robots.txt", "", ""))
@@ -313,9 +318,9 @@ async def _fetch_local_once(
     result = FetchResult(candidate_id=candidate.candidate_id, requested_url=requested)
     try:
         async with aiohttp.ClientSession(timeout=timeout, headers=headers, auto_decompress=True) as session:
-            if not await _robots_allowed(session, current, settings):
-                raise PermissionError("robots_disallowed")
             for redirect_index in range(settings.max_redirects + 1):
+                if not await _robots_allowed(session, current, settings):
+                    raise PermissionError("robots_disallowed")
                 await validate_public_http_url(current)
                 async with session.get(current, allow_redirects=False) as response:
                     validate_response_peer(response)

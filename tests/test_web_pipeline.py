@@ -24,6 +24,7 @@ from open_deep_research.web.pipeline import (
     RawFetch,
     WebPipelineSettings,
     WebResearchPipeline,
+    _heuristic_authority,
     canonicalize_url,
     extract_document,
     fetch_local,
@@ -35,7 +36,7 @@ from open_deep_research.web.pipeline import (
 def candidate(url: str, rank: int = 1, snippet: str = "research evidence") -> CandidateSource:
     canonical = canonicalize_url(url)
     return CandidateSource(
-        candidate_id="placeholder",
+        candidate_id=hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16],
         provider="test",
         query_ids=["q1"],
         provider_rank=rank,
@@ -105,6 +106,74 @@ async def test_ranking_rejects_candidates_below_authority_threshold() -> None:
     assert next(
         item.reason for item in ranked if item.candidate.domain == "blog.example"
     ) == "below_authority_threshold"
+
+
+@pytest.mark.asyncio
+async def test_authority_fallback_uses_exact_trusted_domain_rules() -> None:
+    trusted = candidate("https://www.who.int/publication")
+    spoofed = candidate("https://who.int.attacker.example/payload")
+    europa = candidate("https://digital-strategy.ec.europa.eu/policy")
+
+    assert _heuristic_authority(trusted) == 0.9
+    assert _heuristic_authority(spoofed) == 0.55
+    assert _heuristic_authority(europa) == 0.9
+
+    async def failed_reranker(_objective, _items):
+        raise TimeoutError("reranker unavailable")
+
+    ranked = await rank_candidates(
+        "official policy",
+        [trusted, spoofed, europa],
+        reranker=failed_reranker,
+        top_k=3,
+        min_authority=0.65,
+    )
+
+    assert all(item.authority_method == "heuristic" for item in ranked)
+    assert next(item for item in ranked if item.candidate is spoofed).reason == (
+        "below_authority_threshold"
+    )
+
+
+@pytest.mark.asyncio
+async def test_allow_search_only_does_not_require_unreachable_sync_approval(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SANDBOX_NETWORK_MODE", "allow-search-only")
+    config = {
+        "configurable": {"sandbox_network_mode": "allow-search-only"},
+        "metadata": {"run_id": "sync-search"},
+    }
+
+    batch = await utils._approve_candidate_batch(
+        [candidate("https://example.org/research")],
+        1,
+        config,
+    )
+
+    assert batch.pending_domains == []
+    assert batch.denied_domains == []
+
+
+@pytest.mark.asyncio
+async def test_allowlist_domain_keeps_explicit_domain_approval(monkeypatch) -> None:
+    monkeypatch.setenv("SANDBOX_NETWORK_MODE", "allowlist-domain")
+    utils.get_domain_approval_registry().clear_run("approval-required")
+    config = {
+        "configurable": {
+            "sandbox_network_mode": "allowlist-domain",
+            "sandbox_allowed_domains": [],
+        },
+        "metadata": {"run_id": "approval-required"},
+    }
+
+    batch = await utils._approve_candidate_batch(
+        [candidate("https://example.org/research")],
+        1,
+        config,
+    )
+
+    assert batch.pending_domains == ["example.org"]
 
 
 def test_html_extraction_removes_navigation_and_preserves_metadata() -> None:

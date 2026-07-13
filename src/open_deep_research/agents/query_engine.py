@@ -101,6 +101,19 @@ class QueryEngine:
             inline_content_max_chars=configurable.query_journal_inline_content_max_chars,
         )
 
+    def _clear_run_resources(self) -> None:
+        """Best-effort cleanup of process-local resources owned by this run."""
+        try:
+            from open_deep_research.tasks.domain_approvals import (
+                get_domain_approval_registry,
+            )
+
+            get_domain_approval_registry().clear_run(self.run_id)
+        except Exception:
+            # Cleanup must never replace the terminal result of a completed or
+            # already-failed research run.
+            pass
+
     @classmethod
     def load(
         cls,
@@ -836,6 +849,7 @@ class QueryEngine:
                     await shutdown_teammate_pool(self.config)
                 except Exception:
                     pass
+                self._clear_run_resources()
                 if self.cancelled:
                     self.status = "cancelled"
                     await self._persist_checkpoint("cancelled", "cancelled", status="cancelled")
@@ -898,6 +912,7 @@ class QueryEngine:
         from open_deep_research.tasks.teammate_pool import shutdown_teammate_pool
 
         await shutdown_teammate_pool(self.config)
+        self._clear_run_resources()
         recorder.active_span().set_output(result_text)
         self.total_usage = recorder.finish_run(self.run_id, "success")
         result = {

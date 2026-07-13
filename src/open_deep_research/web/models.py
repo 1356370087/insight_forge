@@ -61,6 +61,7 @@ class RankedCandidate(BaseModel):
     candidate: CandidateSource
     relevance: float = Field(default=0.0, ge=0.0, le=1.0)
     authority: float = Field(default=0.0, ge=0.0, le=1.0)
+    authority_method: Literal["reranker", "heuristic"] = "heuristic"
     information_gain: float = Field(default=0.0, ge=0.0, le=1.0)
     freshness: float = Field(default=0.5, ge=0.0, le=1.0)
     provider_rank_score: float = Field(default=0.0, ge=0.0, le=1.0)
