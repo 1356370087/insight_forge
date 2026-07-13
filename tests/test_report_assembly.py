@@ -195,3 +195,80 @@ async def test_quality_enabled_report_rewrites_sources_to_evidence_allowlist(mon
     assert "https://allowed.example/paper" in update["final_report"]
     assert "https://fabricated.example/post" not in update["final_report"]
     assert "[1] Allowed primary source" in update["final_report"]
+
+
+@pytest.mark.asyncio
+async def test_enforced_report_uses_evidence_allowlist_when_quality_gate_is_disabled(
+    monkeypatch,
+):
+    monkeypatch.setenv("QUALITY_EVALUATION_ENABLED", "false")
+    monkeypatch.setenv("WEB_PIPELINE_MODE", "enforced")
+
+    async def fake_assemble(_ctx):
+        return AssemblyResult(
+            body_markdown=(
+                "[Allowed](https://allowed.example/paper) "
+                "[Fabricated](https://fabricated.example/post) "
+                "bare https://unknown.example/post [99]"
+            )
+        )
+
+    monkeypatch.setattr("open_deep_research.report.orchestrator.assemble", fake_assemble)
+    state = {
+        "messages": [],
+        "research_brief": "research A",
+        "notes": ["supported finding"],
+        "raw_notes": ["supported finding https://allowed.example/paper"],
+        "evidence_registry": [
+            {
+                "source_title": "Allowed primary source",
+                "source_url": "https://allowed.example/paper",
+            }
+        ],
+    }
+
+    update = await build_report(
+        state,
+        _config(
+            quality_evaluation_enabled=False,
+            web_pipeline_mode="enforced",
+        ),
+    )
+
+    assert "https://allowed.example/paper" in update["final_report"]
+    assert "https://fabricated.example/post" not in update["final_report"]
+    assert "https://unknown.example/post" not in update["final_report"]
+    assert "[99]" not in update["final_report"]
+
+
+@pytest.mark.asyncio
+async def test_enforced_report_removes_all_citations_without_accepted_evidence(
+    monkeypatch,
+):
+    monkeypatch.setenv("QUALITY_EVALUATION_ENABLED", "false")
+    monkeypatch.setenv("WEB_PIPELINE_MODE", "enforced")
+
+    async def fake_assemble(_ctx):
+        return AssemblyResult(
+            body_markdown=(
+                "Unsupported [source](https://unknown.example/post), "
+                "bare https://other.example/page and numeric [1]."
+            )
+        )
+
+    monkeypatch.setattr("open_deep_research.report.orchestrator.assemble", fake_assemble)
+    state = {
+        "messages": [],
+        "research_brief": "research A",
+        "notes": ["no accepted evidence"],
+        "raw_notes": [],
+        "evidence_registry": [],
+    }
+
+    update = await build_report(
+        state,
+        _config(quality_evaluation_enabled=False, web_pipeline_mode="enforced"),
+    )
+
+    assert "https://" not in update["final_report"]
+    assert "[1]" not in update["final_report"]

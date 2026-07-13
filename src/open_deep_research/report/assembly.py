@@ -33,13 +33,13 @@ from open_deep_research.prompts import (
 )
 from open_deep_research.skills import get_skill_report_context
 from open_deep_research.tools.utils import (
-    get_api_key_for_model,
+    get_model_connection_kwargs,
     get_model_token_limit,
     get_today_str,
     is_token_limit_exceeded,
 )
 
-from .coverage import derive_coverage_checklist, render_coverage_checklist
+from .coverage import derive_state_coverage_checklist, render_coverage_checklist
 from .models import ReportOutline, SectionSpec, SourceRef, WrittenSection
 from .profiles import AssemblyMode, ReportProfile
 
@@ -149,7 +149,10 @@ class ReportContext:
         writer_model_config = {
             "model": self.configurable.final_report_model,
             "max_tokens": self.configurable.final_report_model_max_tokens,
-            "api_key": get_api_key_for_model(self.configurable.final_report_model, self.config),
+            **get_model_connection_kwargs(
+                self.configurable.final_report_model,
+                self.config,
+            ),
             "tags": ["langsmith:nostream"],
             **get_model_compatibility_kwargs(self.configurable.final_report_model),
         }
@@ -171,7 +174,10 @@ class ReportContext:
         model = init_chat_model(
             model=self.configurable.final_report_model,
             max_tokens=self.configurable.final_report_model_max_tokens,
-            api_key=get_api_key_for_model(self.configurable.final_report_model, self.config),
+            **get_model_connection_kwargs(
+                self.configurable.final_report_model,
+                self.config,
+            ),
             tags=["langsmith:nostream"],
             **get_model_compatibility_kwargs(self.configurable.final_report_model),
         )
@@ -205,7 +211,7 @@ class ReportContext:
     def with_skill_report_context(self, prompt: str) -> str:
         """Prepend deterministic coverage and enabled domain-skill guidance."""
         coverage = render_coverage_checklist(
-            derive_coverage_checklist(str(self.state.get("research_brief", "")))
+            derive_state_coverage_checklist(self.state)
         )
         skill_context = get_skill_report_context(self.configurable.skills)
         contexts = [item for item in (coverage, skill_context) if item]

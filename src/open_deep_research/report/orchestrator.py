@@ -29,7 +29,7 @@ from open_deep_research.observability import get_trace_recorder
 from open_deep_research.security.content import sanitize_report_markdown
 
 from .assembly import ReportContext, assemble
-from .coverage import derive_coverage_checklist
+from .coverage import derive_state_coverage_checklist
 from .profiles import (
     AssemblyMode,
     OutputFormat,
@@ -121,9 +121,7 @@ async def build_report(state: dict, config: RunnableConfig) -> dict:
     ref_style = _resolve_reference_style(cfg, profile)
 
     ctx = ReportContext.from_state(state, config, profile)
-    coverage_checklist = derive_coverage_checklist(
-        str(state.get("research_brief", ""))
-    )
+    coverage_checklist = derive_state_coverage_checklist(state)
     if cfg.quality_evaluation_enabled and not ctx.sources:
         raw_evidence = "\n".join(str(note) for note in state.get("raw_notes", []))
         ctx.sources = parse_sources_from_text(raw_evidence)
@@ -140,7 +138,10 @@ async def build_report(state: dict, config: RunnableConfig) -> dict:
         or is_sectioned
         or bool(ctx.sources)
     )
-    if ctx.sources:
+    evidence_allowlist_enabled = (
+        cfg.quality_evaluation_enabled or cfg.web_pipeline_mode == "enforced"
+    )
+    if evidence_allowlist_enabled:
         result.sources = ctx.sources
     if needs_sources and not result.sources:
         result.sources = parse_sources_from_text(result.body_markdown + "\n" + ctx.findings)
@@ -165,7 +166,7 @@ async def build_report(state: dict, config: RunnableConfig) -> dict:
         markdown = replace_sources_section(
             markdown, render_references(result.sources, ref_style)
         )
-    if cfg.quality_evaluation_enabled and result.sources:
+    if evidence_allowlist_enabled:
         allowed_urls = {source.url for source in result.sources}
 
         def keep_eligible_url(match: re.Match[str]) -> str:

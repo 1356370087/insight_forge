@@ -36,13 +36,49 @@ def derive_coverage_checklist(text: str, *, max_items: int = 20) -> list[str]:
     for item in candidates:
         item = re.sub(r"^(?:以及|并且|同时|并|和|与)\s*", "", item).strip()
         key = re.sub(r"\W+", "", item).lower()
-        if len(key) < 4 or key in seen:
+        # Explicit list items such as "成本" and "安全性" are valid, compact
+        # requirements.  Reject only one-character fragments, which are much
+        # more likely to be punctuation/splitting noise.
+        if len(key) < 2 or key in seen:
             continue
         seen.add(key)
         checklist.append(item[:240])
         if len(checklist) >= max_items:
             break
     return checklist or [clean[:240]]
+
+
+def derive_state_coverage_checklist(
+    state: dict,
+    *,
+    max_items: int = 20,
+) -> list[str]:
+    """Derive requirements from original user messages before the model brief."""
+    source_texts: list[str] = []
+    for message in state.get("messages", []):
+        if isinstance(message, dict):
+            role = str(message.get("role") or message.get("type") or "")
+            content = message.get("content", "")
+        else:
+            role = str(getattr(message, "type", ""))
+            content = getattr(message, "content", "")
+        if role in {"user", "human"} and content:
+            source_texts.append(str(content))
+    if state.get("research_brief"):
+        source_texts.append(str(state["research_brief"]))
+
+    requirements: list[str] = []
+    seen: set[str] = set()
+    for text in source_texts:
+        for requirement in derive_coverage_checklist(text, max_items=max_items):
+            key = re.sub(r"\W+", "", requirement).lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            requirements.append(requirement)
+            if len(requirements) >= max_items:
+                return requirements
+    return requirements
 
 
 def render_coverage_checklist(items: list[str]) -> str:

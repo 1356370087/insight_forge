@@ -23,7 +23,11 @@ def _config(**configurable: Any) -> RunnableConfig:
 
 
 @pytest.mark.asyncio
-async def test_default_report_is_byte_identical_to_model_output(monkeypatch):
+async def test_legacy_report_is_byte_identical_to_model_output(monkeypatch):
+    # Other evaluation-test modules load the developer .env during collection;
+    # isolate this default-value assertion from that process-global side effect.
+    monkeypatch.delenv("FINAL_REPORT_MODEL", raising=False)
+    monkeypatch.setenv("WEB_PIPELINE_MODE", "legacy")
     fake_content = "# Report\n\nBody with [link](https://example.com)."
     captured: dict[str, Any] = {}
 
@@ -42,7 +46,7 @@ async def test_default_report_is_byte_identical_to_model_output(monkeypatch):
         "notes": ["finding one", "finding two"],
         "completed_task_outputs": [],
     }
-    update = await build_report(state, _config())
+    update = await build_report(state, _config(web_pipeline_mode="legacy"))
 
     # final_report is exactly the model output
     assert update["final_report"] == fake_content
