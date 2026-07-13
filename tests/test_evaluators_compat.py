@@ -52,7 +52,7 @@ class _StructuredRunner:
 
 
 class _FakeJudge:
-    def with_structured_output(self, schema: type) -> _StructuredRunner:
+    def with_structured_output(self, schema: type, **_kwargs: Any) -> _StructuredRunner:
         return _StructuredRunner(schema)
 
 
@@ -84,6 +84,16 @@ def _outputs() -> dict[str, Any]:
             "max_react_tool_calls": 10,
         },
     }
+
+
+def test_evidence_evaluators_accept_notes_fallback(monkeypatch) -> None:
+    monkeypatch.setattr(evaluators, "_get_eval_model", lambda: _FakeJudge())
+    inputs = {"messages": [{"role": "user", "content": "Research claim A"}]}
+    outputs = _outputs()
+    outputs["notes"] = outputs.pop("raw_notes")
+
+    assert evaluators.eval_groundedness(inputs, outputs)[0]["score"] == 1
+    assert evaluators.eval_citation_accuracy(inputs, outputs)["score"] == 1
 
 
 def test_required_quality_metrics_are_emitted(monkeypatch) -> None:
@@ -131,7 +141,7 @@ def test_empty_claim_and_citation_lists_do_not_divide_by_zero(monkeypatch) -> No
             return self.schema(citations=[], reasoning="no citations")
 
     class EmptyJudge:
-        def with_structured_output(self, schema: type) -> EmptyRunner:
+        def with_structured_output(self, schema: type, **_kwargs: Any) -> EmptyRunner:
             return EmptyRunner(schema)
 
     monkeypatch.setattr(evaluators, "_get_eval_model", lambda: EmptyJudge())

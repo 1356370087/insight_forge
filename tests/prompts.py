@@ -259,6 +259,43 @@ Today is {today}.
 """
 
 
+EVIDENCE_INTEGRITY_PROMPT = """You are the single evidence-integrity Judge for a deep-research report.
+
+Create one canonical inventory of the report's material, externally verifiable factual claims
+(maximum 60). Assess every inventoried claim exactly once against the retrieved evidence.
+This inventory is used to derive groundedness, factual accuracy, citation accuracy, and source
+authority; do not produce inconsistent verdicts for the same claim.
+
+For each claim return: claim, citation, has_citation, entailed_by_evidence, source_authority
+(primary, high_quality_secondary, low_quality, or unknown), and concise reasoning.
+
+Authority definitions:
+- primary: law/regulator/government data, standards body, peer-reviewed paper, official
+  benchmark/framework documentation, or first-party documentation about its own product
+- high_quality_secondary: reputable independent synthesis with transparent attribution
+- low_quality: personal/community post, SEO/content farm, unattributed aggregator, vendor
+  marketing used beyond claims about its own product, or social media
+- unknown: insufficient information to classify
+
+Rules:
+- A low-quality page repeating a statement does not make that statement independently established.
+- Do not use outside knowledge; judge entailment only from retrieved evidence.
+- An uncited claim may be evidence-grounded but cannot count as citation-accurate.
+- Return the complete canonical claim inventory plus one overall reasoning string.
+
+<user_question>
+{user_question}
+</user_question>
+<retrieved_evidence>
+{context}
+</retrieved_evidence>
+<report>
+{report}
+</report>
+Today is {today}.
+"""
+
+
 TOOL_EFFICIENCY_PROMPT = """You are evaluating the observable tool efficiency of a deep-research agent.
 
 Give two integer scores from 1 to 5:
@@ -301,10 +338,20 @@ An incomplete report:
 
 <Instruction>
 - Compare the output against the research brief and the user's question
+- Evaluate every supplied coverage-checklist item exactly once
 - Identify any points that are not covered by the report
 - Identify any points that are not covered by the research brief
 - Identify any points that are not covered by the user's question
 </Instruction>
+
+Return a checklist assessment for every item with status covered, partial, or missing and a
+short explanation. The overall score must agree with those item-level statuses: a report with
+any material missing item cannot receive 5/5, and one with multiple missing items cannot receive
+more than 3/5.
+
+<coverage_checklist>
+{coverage_checklist}
+</coverage_checklist>
 
 <Reminder>
 - Focus solely on completeness of the report

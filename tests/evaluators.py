@@ -3,20 +3,23 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import date
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from dotenv import load_dotenv
 from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
+from open_deep_research.report.coverage import derive_coverage_checklist
 from tests.prompts import (
     CITATION_ACCURACY_PROMPT,
     COMPLETENESS_PROMPT,
     CORRECTNESS_PROMPT,
+    EVIDENCE_INTEGRITY_PROMPT,
     GROUNDEDNESS_PROMPT,
     OVERALL_QUALITY_PROMPT,
     RELEVANCE_PROMPT,
@@ -30,7 +33,13 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 @lru_cache(maxsize=1)
 def _get_eval_model() -> ChatOpenAI:
     """Build the judge lazily so importing tests does not require credentials."""
-    return ChatOpenAI(model="gpt-4.1")
+    return ChatOpenAI(
+        model=os.getenv("EVALUATION_MODEL", "deepseek-v4-flash"),
+        api_key=os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENAI_API_KEY"),
+        base_url=os.getenv("EVALUATION_BASE_URL") or os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com"),
+        max_tokens=int(os.getenv("EVALUATION_MODEL_MAX_TOKENS", "8192")),
+        extra_body={"thinking": {"type": "disabled"}},
+    )
 
 
 def _today() -> str:
@@ -77,6 +86,26 @@ def _judge_input(content: str) -> str | list[dict[str, Any]]:
     return content
 
 
+def _structured_output(schema: type[BaseModel]):
+    """Use tool calling because DeepSeek does not accept OpenAI json_schema output."""
+    return _get_eval_model().with_structured_output(schema, method="function_calling")
+
+
+def _evidence_context(outputs: dict[str, Any]) -> str:
+    """Read evidence from current and legacy QueryEngine state shapes."""
+    notes = outputs.get("raw_notes") or outputs.get("notes") or []
+    if notes:
+        return "\n\n".join(str(note) for note in notes)
+    task_notes: list[str] = []
+    for task in outputs.get("completed_task_outputs", []):
+        if not isinstance(task, dict):
+            continue
+        task_notes.extend(str(note) for note in task.get("raw_notes", []))
+        if task.get("compressed_research"):
+            task_notes.append(str(task["compressed_research"]))
+    return "\n\n".join(task_notes)
+
+
 class OverallQualityScore(BaseModel):
     research_depth: int = Field(ge=1, le=5)
     source_quality: int = Field(ge=1, le=5)
@@ -103,10 +132,9 @@ def eval_overall_quality(inputs: dict, outputs: dict) -> list[dict[str, Any]]:
         f"Report:\n\n{outputs['final_report']}\n\n"
         "Evaluate whether the report meets the criteria."
     )
-    model = _get_eval_model()
     result = cast(
         OverallQualityScore,
-        model.with_structured_output(OverallQualityScore).invoke(
+        _structured_output(OverallQualityScore).invoke(
             [
                 {"role": "system", "content": OVERALL_QUALITY_PROMPT.format(today=_today())},
                 {"role": "user", "content": _judge_input(content)},
@@ -133,10 +161,9 @@ def eval_relevance(inputs: dict, outputs: dict) -> dict[str, Any]:
     if reason := _failure_reason(outputs):
         return _zero("relevance_score", reason)
     content = f"User input: {_format_input_query(inputs)}\n\nReport:\n\n{outputs['final_report']}"
-    model = _get_eval_model()
     result = cast(
         RelevanceScore,
-        model.with_structured_output(RelevanceScore).invoke(
+        _structured_output(RelevanceScore).invoke(
             [
                 {"role": "system", "content": RELEVANCE_PROMPT.format(today=_today())},
                 {"role": "user", "content": _judge_input(content)},
@@ -161,7 +188,7 @@ def eval_structure(inputs: dict, outputs: dict) -> dict[str, Any]:
     )
     result = cast(
         StructureScore,
-        _get_eval_model().with_structured_output(StructureScore).invoke(
+        _structured_output(StructureScore).invoke(
             [{"role": "user", "content": _judge_input(content)}]
         ),
     )
@@ -191,7 +218,7 @@ def eval_correctness(inputs: dict, outputs: dict, reference_outputs: dict) -> di
     )
     result = cast(
         CorrectnessScore,
-        _get_eval_model().with_structured_output(CorrectnessScore).invoke(
+        _structured_output(CorrectnessScore).invoke(
             [{"role": "user", "content": _judge_input(content)}]
         ),
     )
@@ -207,12 +234,95 @@ class GroundednessScore(BaseModel):
     claims: list[GroundednessClaim]
 
 
+class EvidenceIntegrityClaim(BaseModel):
+    """One canonical claim verdict shared by all evidence metrics."""
+
+    claim: str
+    citation: str = ""
+    has_citation: bool
+    entailed_by_evidence: bool
+    source_authority: Literal[
+        "primary", "high_quality_secondary", "low_quality", "unknown"
+    ]
+    reasoning: str
+
+
+class EvidenceIntegrityScore(BaseModel):
+    """One internally consistent claim inventory for evidence-related scores."""
+
+    claims: list[EvidenceIntegrityClaim]
+    reasoning: str
+
+
+def eval_evidence_integrity(inputs: dict, outputs: dict) -> list[dict[str, Any]]:
+    """Derive all evidence scores from one canonical Judge decision."""
+    keys = [
+        "groundedness_score",
+        "factual_accuracy_score",
+        "citation_accuracy_score",
+        "source_authority_score",
+    ]
+    if reason := _failure_reason(outputs):
+        return [_zero(key, reason) for key in keys]
+    context = _evidence_context(outputs)
+    if not context.strip():
+        return [_zero(key, "run produced no retrieved evidence") for key in keys]
+    content = EVIDENCE_INTEGRITY_PROMPT.format(
+        user_question=_format_input_query(inputs),
+        context=context,
+        report=outputs["final_report"],
+        today=_today(),
+    )
+    result = cast(
+        EvidenceIntegrityScore,
+        _structured_output(EvidenceIntegrityScore)
+        .with_retry(stop_after_attempt=3)
+        .invoke([{"role": "user", "content": _judge_input(content)}]),
+    )
+    claims = result.claims
+    grounded = (
+        sum(item.entailed_by_evidence for item in claims) / len(claims)
+        if claims
+        else 0.0
+    )
+    cited = [item for item in claims if item.has_citation]
+    citation_accuracy = (
+        sum(item.entailed_by_evidence for item in cited) / len(cited)
+        if cited
+        else 0.0
+    )
+    authority_weights = {
+        "primary": 1.0,
+        "high_quality_secondary": 0.75,
+        "low_quality": 0.25,
+        "unknown": 0.0,
+    }
+    authority = (
+        sum(authority_weights.get(item.source_authority, 0.0) for item in cited)
+        / len(cited)
+        if cited
+        else 0.0
+    )
+    details = json.dumps([item.model_dump() for item in claims], ensure_ascii=False)
+    comment = f"{result.reasoning}\nCanonical claim inventory:\n{details}"
+    return [
+        {"key": "groundedness_score", "score": grounded, "comment": comment},
+        {"key": "factual_accuracy_score", "score": grounded, "comment": comment},
+        {
+            "key": "citation_accuracy_score",
+            "score": citation_accuracy,
+            "comment": comment,
+        },
+        {"key": "source_authority_score", "score": authority, "comment": comment},
+    ]
+
+
 def eval_groundedness(inputs: dict, outputs: dict) -> list[dict[str, Any]]:
     del inputs
     keys = ["groundedness_score", "factual_accuracy_score"]
     if reason := _failure_reason(outputs):
         return [_zero(key, reason) for key in keys]
-    context = "\n\n".join(str(note) for note in outputs.get("raw_notes", []))
+    context = _evidence_context(outputs)
     if not context.strip():
         return [_zero(key, "run produced no retrieved evidence") for key in keys]
     content = GROUNDEDNESS_PROMPT.format(
@@ -222,8 +332,7 @@ def eval_groundedness(inputs: dict, outputs: dict) -> list[dict[str, Any]]:
     )
     result = cast(
         GroundednessScore,
-        _get_eval_model()
-        .with_structured_output(GroundednessScore)
+        _structured_output(GroundednessScore)
         .with_retry(stop_after_attempt=3)
         .invoke([{"role": "user", "content": _judge_input(content)}]),
     )
@@ -232,9 +341,16 @@ def eval_groundedness(inputs: dict, outputs: dict) -> list[dict[str, Any]]:
     return [{"key": key, "score": score, "comment": comment} for key in keys]
 
 
+class CoverageAssessment(BaseModel):
+    requirement: str
+    status: Literal["covered", "partial", "missing"]
+    explanation: str
+
+
 class CompletenessScore(BaseModel):
     reasoning: str
     score: int = Field(ge=1, le=5)
+    checklist: list[CoverageAssessment] = Field(default_factory=list)
 
 
 def eval_completeness(inputs: dict, outputs: dict) -> dict[str, Any]:
@@ -243,19 +359,49 @@ def eval_completeness(inputs: dict, outputs: dict) -> dict[str, Any]:
     brief = outputs.get("research_brief")
     if not brief:
         return _zero("completeness_score", "run produced no research_brief")
+    user_question = _format_input_query(inputs)
+    coverage_checklist = list(
+        dict.fromkeys(
+            [
+                *derive_coverage_checklist(user_question),
+                *[str(item) for item in outputs.get("coverage_checklist", [])],
+            ]
+        )
+    )[:20]
     content = COMPLETENESS_PROMPT.format(
-        user_question=_format_input_query(inputs),
+        user_question=user_question,
         research_brief=brief,
+        coverage_checklist=json.dumps(
+            coverage_checklist,
+            ensure_ascii=False,
+        ),
         report=outputs["final_report"],
         today=_today(),
     )
     result = cast(
         CompletenessScore,
-        _get_eval_model().with_structured_output(CompletenessScore).invoke(
+        _structured_output(CompletenessScore).invoke(
             [{"role": "user", "content": _judge_input(content)}]
         ),
     )
-    return {"key": "completeness_score", "score": result.score / 5, "comment": result.reasoning}
+    assessed = [item.model_dump() for item in result.checklist]
+    missing_assessments = max(0, len(coverage_checklist) - len(assessed))
+    missing = sum(item.status == "missing" for item in result.checklist) + missing_assessments
+    partial = sum(item.status == "partial" for item in result.checklist)
+    score = result.score / 5
+    if missing >= 2:
+        score = min(score, 0.6)
+    elif missing == 1 or partial:
+        score = min(score, 0.8)
+    checklist = json.dumps(assessed, ensure_ascii=False)
+    return {
+        "key": "completeness_score",
+        "score": score,
+        "comment": (
+            f"{result.reasoning}\nCoverage checklist ({len(assessed)}/{len(coverage_checklist)} "
+            f"assessed; {missing} missing; {partial} partial):\n{checklist}"
+        ),
+    }
 
 
 class CitationAssessment(BaseModel):
@@ -272,7 +418,7 @@ class CitationAccuracyScore(BaseModel):
 def eval_citation_accuracy(inputs: dict, outputs: dict) -> dict[str, Any]:
     if reason := _failure_reason(outputs):
         return _zero("citation_accuracy_score", reason)
-    context = "\n\n".join(str(note) for note in outputs.get("raw_notes", []))
+    context = _evidence_context(outputs)
     if not context.strip():
         return _zero("citation_accuracy_score", "run produced no retrieved evidence")
     content = CITATION_ACCURACY_PROMPT.format(
@@ -283,8 +429,7 @@ def eval_citation_accuracy(inputs: dict, outputs: dict) -> dict[str, Any]:
     )
     result = cast(
         CitationAccuracyScore,
-        _get_eval_model()
-        .with_structured_output(CitationAccuracyScore)
+        _structured_output(CitationAccuracyScore)
         .with_retry(stop_after_attempt=3)
         .invoke([{"role": "user", "content": _judge_input(content)}]),
     )
@@ -349,7 +494,7 @@ def eval_tool_efficiency(inputs: dict, outputs: dict) -> dict[str, Any]:
     )
     result = cast(
         ToolEfficiencyScore,
-        _get_eval_model().with_structured_output(ToolEfficiencyScore).invoke(
+        _structured_output(ToolEfficiencyScore).invoke(
             [{"role": "user", "content": _judge_input(content)}]
         ),
     )
