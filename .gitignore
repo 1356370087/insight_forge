@@ -72,3 +72,10 @@ temp/
 .langgraph_api
 
 uv.lock
+
+# .claude
+.claude/
+
+# Test scratch dirs and local evaluation output
+.codex-test-tmp/
+tests/local_eval_results/
