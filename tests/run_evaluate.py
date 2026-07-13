@@ -1,21 +1,20 @@
 import asyncio
 import uuid
+from pathlib import Path
 
+from dotenv import load_dotenv
 from langsmith import Client
 
 from open_deep_research.agents.query_engine import QueryEngine
 from tests.evaluators import (
-    eval_citation_accuracy,
     eval_completeness,
     eval_correctness,
-    eval_groundedness,
+    eval_evidence_integrity,
     eval_overall_quality,
     eval_relevance,
     eval_structure,
     eval_tool_efficiency,
 )
-
-client = Client()
 
 # NOTE: Configure the right dataset and evaluators
 dataset_name = "Deep Research Bench"
@@ -24,8 +23,9 @@ evaluators = [
     eval_relevance,
     eval_structure,
     eval_correctness,
-    eval_groundedness,
-    eval_citation_accuracy,
+    # One canonical claim inventory emits groundedness, factual accuracy,
+    # citation accuracy, and source authority without duplicate Judge calls.
+    eval_evidence_integrity,
     eval_completeness,
     eval_tool_efficiency,
 ]
@@ -83,6 +83,8 @@ async def target(
     return final_state
 
 async def main():
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+    client = Client()
     return await client.aevaluate(
         target,
         data=dataset_name,

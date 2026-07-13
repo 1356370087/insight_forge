@@ -31,6 +31,20 @@ class _StructuredRunner:
             "GroundednessScore": {
                 "claims": [{"claim": "Claim A", "grounded": True}],
             },
+            "EvidenceIntegrityScore": {
+                "claims": [
+                    {
+                        "claim": "Claim A",
+                        "citation": "https://primary.example/paper",
+                        "has_citation": True,
+                        "entailed_by_evidence": True,
+                        "cited_source_entails_claim": True,
+                        "source_authority": "primary",
+                        "reasoning": "supported by the retrieved primary source",
+                    }
+                ],
+                "reasoning": "canonical evidence assessment",
+            },
             "CompletenessScore": {"reasoning": "complete", "score": 4},
             "CitationAccuracyScore": {
                 "citations": [
@@ -96,6 +110,124 @@ def test_evidence_evaluators_accept_notes_fallback(monkeypatch) -> None:
     assert evaluators.eval_citation_accuracy(inputs, outputs)["score"] == 1
 
 
+def test_factual_accuracy_is_not_aliased_to_groundedness(monkeypatch) -> None:
+    monkeypatch.setattr(evaluators, "_get_eval_model", lambda: _FakeJudge())
+    inputs = {"messages": [{"role": "user", "content": "Research claim A"}]}
+
+    metrics = evaluators.eval_evidence_integrity(inputs, _outputs())
+    factual = next(item for item in metrics if item["key"] == "factual_accuracy_score")
+
+    assert factual["comment"].startswith("Not scored:")
+
+
+def test_citation_accuracy_uses_the_cited_source_not_any_evidence(monkeypatch) -> None:
+    class WrongCitationRunner:
+        def with_retry(self, **_kwargs: Any) -> "WrongCitationRunner":
+            return self
+
+        def invoke(self, _messages: list[dict[str, Any]]) -> Any:
+            return evaluators.EvidenceIntegrityScore(
+                claims=[
+                    evaluators.EvidenceIntegrityClaim(
+                        claim="Claim A",
+                        citation="https://wrong.example/source-a",
+                        has_citation=True,
+                        entailed_by_evidence=True,
+                        cited_source_entails_claim=False,
+                        source_authority="primary",
+                        reasoning="source B supports it, cited source A does not",
+                    )
+                ],
+                reasoning="wrong citation target",
+            )
+
+    monkeypatch.setattr(
+        evaluators,
+        "_structured_output",
+        lambda _schema: WrongCitationRunner(),
+    )
+    metrics = evaluators.eval_evidence_integrity(
+        {"messages": [{"role": "user", "content": "Research claim A"}]},
+        _outputs(),
+    )
+
+    assert next(item for item in metrics if item["key"] == "groundedness_score")[
+        "score"
+    ] == 1
+    assert next(item for item in metrics if item["key"] == "citation_accuracy_score")[
+        "score"
+    ] == 0
+
+
+def test_evidence_context_prefers_bounded_accepted_registry(monkeypatch) -> None:
+    monkeypatch.setenv("EVALUATION_EVIDENCE_MAX_CHARS", "600")
+    outputs = {
+        "evidence_registry": [
+            {
+                "evidence_id": "ev-1",
+                "claim": "Accepted canonical claim",
+                "supporting_excerpt": "Accepted canonical excerpt",
+                "source_url": "https://primary.example/source",
+                "source_title": "Primary source",
+                "source_authority": 0.95,
+                "locator": "page 3",
+                "security_status": "accepted",
+            },
+            {
+                "evidence_id": "ev-2",
+                "claim": "Quarantined claim",
+                "source_url": "https://bad.example",
+                "security_status": "quarantined",
+            },
+        ],
+        "raw_notes": ["MALICIOUS LEGACY NOTE " * 1000],
+    }
+
+    context = evaluators._evidence_context(outputs)
+
+    assert "Accepted canonical claim" in context
+    assert "source_authority" in context
+    assert "page 3" in context
+    assert "Quarantined claim" not in context
+    assert "MALICIOUS LEGACY NOTE" not in context
+    assert len(context) <= 600
+
+
+def test_completeness_ignores_duplicate_and_unknown_requirement_ids(monkeypatch) -> None:
+    class DuplicateRunner:
+        def invoke(self, _messages: list[dict[str, Any]]) -> Any:
+            return evaluators.CompletenessScore(
+                reasoning="incorrectly optimistic",
+                score=5,
+                checklist=[
+                    evaluators.CoverageAssessment(
+                        requirement_id="COV-01",
+                        status="covered",
+                        explanation="covered",
+                    ),
+                    evaluators.CoverageAssessment(
+                        requirement_id="COV-01",
+                        status="covered",
+                        explanation="duplicate",
+                    ),
+                    evaluators.CoverageAssessment(
+                        requirement_id="COV-99",
+                        status="covered",
+                        explanation="invented",
+                    ),
+                ],
+            )
+
+    monkeypatch.setattr(evaluators, "_structured_output", lambda _schema: DuplicateRunner())
+    result = evaluators.eval_completeness(
+        {"messages": [{"role": "user", "content": "比较成本、安全性，并给出上线计划。"}]},
+        _outputs(),
+    )
+
+    assert result["score"] <= 0.6
+    assert "1/" in result["comment"]
+
+
 def test_required_quality_metrics_are_emitted(monkeypatch) -> None:
     monkeypatch.setattr(evaluators, "_get_eval_model", lambda: _FakeJudge())
     inputs = {"messages": [{"role": "user", "content": "Research claim A"}]}
@@ -156,3 +288,11 @@ def test_parallelism_evaluator_reads_current_top_level_state() -> None:
 
     assert result["score"] is True
     assert "observed 1" in result["comment"]
+
+
+def test_langsmith_default_registration_uses_canonical_evidence_judge() -> None:
+    from tests import run_evaluate
+
+    assert evaluators.eval_evidence_integrity in run_evaluate.evaluators
+    assert evaluators.eval_groundedness not in run_evaluate.evaluators
+    assert evaluators.eval_citation_accuracy not in run_evaluate.evaluators

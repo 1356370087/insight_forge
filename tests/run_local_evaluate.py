@@ -13,6 +13,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from dotenv import load_dotenv
+
 from open_deep_research.agents.query_engine import QueryEngine
 from tests.evaluators import (
     eval_completeness,
@@ -104,16 +106,19 @@ def build_run_config() -> dict[str, Any]:
         "max_react_tool_calls": _env_int("MAX_REACT_TOOL_CALLS", 8),
         # Quality experiments must exercise the evidence admission path.
         "web_pipeline_mode": "enforced",
+        # Read-only governed SEARCH tools may fetch their selected targets;
+        # arbitrary shell/MCP egress remains outside this policy.
+        "sandbox_network_mode": "allow-search-only",
         "web_min_source_authority": float(os.getenv("WEB_MIN_SOURCE_AUTHORITY", "0.65")),
-        "web_rerank_model": os.getenv("WEB_RERANK_MODEL", "openai:deepseek-v4-flash"),
-        "web_evidence_model": os.getenv("WEB_EVIDENCE_MODEL", "openai:deepseek-v4-flash"),
-        "summarization_model": os.getenv("SUMMARIZATION_MODEL", "openai:deepseek-v4-pro"),
+        "web_rerank_model": os.getenv("WEB_RERANK_MODEL", "openai:deepseek-v4-flash[1m]"),
+        "web_evidence_model": os.getenv("WEB_EVIDENCE_MODEL", "openai:deepseek-v4-flash[1m]"),
+        "summarization_model": os.getenv("SUMMARIZATION_MODEL", "openai:deepseek-v4-flash[1m]"),
         "summarization_model_max_tokens": _env_int("SUMMARIZATION_MODEL_MAX_TOKENS", 8192),
-        "research_model": os.getenv("RESEARCH_MODEL", "openai:deepseek-v4-pro"),
+        "research_model": os.getenv("RESEARCH_MODEL", "openai:deepseek-v4-flash[1m]"),
         "research_model_max_tokens": _env_int("RESEARCH_MODEL_MAX_TOKENS", 10000),
-        "compression_model": os.getenv("COMPRESSION_MODEL", "openai:deepseek-v4-pro"),
+        "compression_model": os.getenv("COMPRESSION_MODEL", "openai:deepseek-v4-flash[1m]"),
         "compression_model_max_tokens": _env_int("COMPRESSION_MODEL_MAX_TOKENS", 10000),
-        "final_report_model": os.getenv("FINAL_REPORT_MODEL", "openai:deepseek-v4-pro"),
+        "final_report_model": os.getenv("FINAL_REPORT_MODEL", "openai:deepseek-v4-flash[1m]"),
         "final_report_model_max_tokens": _env_int("FINAL_REPORT_MODEL_MAX_TOKENS", 10000),
     }
     return {
@@ -181,7 +186,6 @@ def reconcile_judge_metrics(metrics: list[dict[str, Any]]) -> list[dict[str, Any
     issues: list[str] = []
     evidence_keys = {
         "groundedness_score",
-        "factual_accuracy_score",
         "citation_accuracy_score",
         "source_authority_score",
     }
@@ -193,22 +197,6 @@ def reconcile_judge_metrics(metrics: list[dict[str, Any]]) -> list[dict[str, Any
     evidence_inventory_available = evidence_keys <= available_evidence_keys
     if not evidence_inventory_available:
         issues.append("canonical evidence inventory was unavailable or incomplete")
-    groundedness = _metric(metrics, "groundedness_score")
-    factual_accuracy = _metric(metrics, "factual_accuracy_score")
-    if (
-        groundedness
-        and factual_accuracy
-        and groundedness.get("score") is not None
-        and factual_accuracy.get("score") is not None
-        and abs(float(groundedness["score"]) - float(factual_accuracy["score"])) > 1e-9
-    ):
-        conservative = min(
-            float(groundedness["score"]), float(factual_accuracy["score"])
-        )
-        groundedness["score"] = conservative
-        factual_accuracy["score"] = conservative
-        issues.append("groundedness and factual_accuracy disagreed; both capped to the lower score")
-
     source_quality = _metric(metrics, "source_quality_score")
     source_authority = _metric(metrics, "source_authority_score")
     if (
@@ -429,8 +417,8 @@ def _render_summary(results: list[dict[str, Any]], metadata: dict[str, Any]) -> 
         f"五题平均综合得分：{overall_text}",
         "",
         (
-            "`correctness_score` 因没有独立黄金答案而不评分；综合得分不会重复计算与 groundedness "
-            "相同的 factual_accuracy_score，也不会重复计入仅用于来源门禁校准的 source_authority_score。"
+            "`correctness_score` 与 `factual_accuracy_score` 因没有独立黄金答案或外部事实核验源而不评分；"
+            "综合得分不会计入仅用于来源门禁校准的 source_authority_score。"
         ),
         "",
         "## 汇总",
@@ -453,12 +441,18 @@ def _render_summary(results: list[dict[str, Any]], metadata: dict[str, Any]) -> 
     return "\n".join(lines)
 
 
-async def run_question(question: dict[str, str], output_dir: Path, index: int) -> dict[str, Any]:
+async def run_question(
+    question: dict[str, str],
+    output_dir: Path,
+    index: int,
+    *,
+    total: int = 1,
+) -> dict[str, Any]:
     """Run one complete research-and-evaluate cycle and checkpoint it."""
     config = build_run_config()
     inputs = {"messages": [{"role": "user", "content": question["question"]}]}
     engine = QueryEngine(config)
-    print(f"[{index}/{len(LOCAL_QUESTIONS)}] Research started: {question['title']}", flush=True)  # noqa: T201
+    print(f"[{index}/{total}] Research started: {question['title']}", flush=True)  # noqa: T201
     research_started = time.perf_counter()
     try:
         state = await engine.submit_message(inputs["messages"], config)
@@ -474,7 +468,7 @@ async def run_question(question: dict[str, str], output_dir: Path, index: int) -
             "max_react_tool_calls",
         )
     }
-    print(f"[{index}/{len(LOCAL_QUESTIONS)}] Judge started: {question['title']}", flush=True)  # noqa: T201
+    print(f"[{index}/{total}] Judge started: {question['title']}", flush=True)  # noqa: T201
     evaluation_started = time.perf_counter()
     metrics = await evaluate_state(inputs, state)
     evaluation_elapsed = time.perf_counter() - evaluation_started
@@ -503,19 +497,25 @@ async def run_question(question: dict[str, str], output_dir: Path, index: int) -
     stem = f"{index:02d}_{question['id']}"
     _write_json(output_dir / f"{stem}.json", result)
     (output_dir / f"{stem}.md").write_text(_render_question_markdown(result), encoding="utf-8")
-    print(f"[{index}/{len(LOCAL_QUESTIONS)}] Completed: {question['title']}", flush=True)  # noqa: T201
+    print(f"[{index}/{total}] Completed: {question['title']}", flush=True)  # noqa: T201
     return result
 
 
-async def main() -> Path:
+def build_argument_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser; a bare invocation intentionally runs one question."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, help="Directory for local JSON and Markdown results")
-    parser.add_argument("--question-limit", type=int, default=5, choices=range(1, 6))
+    parser.add_argument("--question-limit", type=int, default=1, choices=range(1, 6))
     parser.add_argument("--resume", action="store_true", help="Reuse per-question result files that already exist")
     parser.add_argument("--rescore-json", type=Path, help="Re-run only the judges for one existing result")
     parser.add_argument("--refresh-quality-json", type=Path, help="Recompute only aggregate quality gates")
     parser.add_argument("--run-id", help="Persisted run ID used to recover evidence while rescoring")
-    args = parser.parse_args()
+    return parser
+
+
+async def main() -> Path:
+    load_dotenv(ROOT / ".env")
+    args = build_argument_parser().parse_args()
 
     if args.rescore_json:
         await rescore_existing(args.rescore_json, args.run_id)
@@ -537,18 +537,19 @@ async def main() -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     started_at = datetime.now().astimezone().isoformat()
     results: list[dict[str, Any]] = []
-    for index, question in enumerate(LOCAL_QUESTIONS[: args.question_limit], 1):
+    questions = LOCAL_QUESTIONS[: args.question_limit]
+    for index, question in enumerate(questions, 1):
         existing_path = output_dir / f"{index:02d}_{question['id']}.json"
         if args.resume and existing_path.exists():
             results.append(json.loads(existing_path.read_text(encoding="utf-8")))
             print(f"[{index}/{args.question_limit}] Reused: {question['title']}", flush=True)  # noqa: T201
             continue
-        results.append(await run_question(question, output_dir, index))
+        results.append(await run_question(question, output_dir, index, total=len(questions)))
 
     metadata = {
         "started_at": started_at,
         "completed_at": datetime.now().astimezone().isoformat(),
-        "evaluation_model": os.getenv("EVALUATION_MODEL", "deepseek-v4-flash"),
+        "evaluation_model": os.getenv("EVALUATION_MODEL", "deepseek-v4-flash[1m]"),
         "langsmith_used": False,
         "question_count": len(results),
     }
