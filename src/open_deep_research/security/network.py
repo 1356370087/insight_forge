@@ -61,3 +61,29 @@ async def validate_public_http_url(url: str) -> str:
     if not resolved or any(_is_forbidden_ip(value) for value in resolved):
         raise ValueError("Hostname resolves to a private, local, or reserved address")
     return url
+
+
+def validate_connected_peer(peername: object) -> None:
+    """Reject a connected socket peer that resolves to a forbidden address.
+
+    URL validation happens before the HTTP client connects. Checking the actual
+    peer closes the DNS rebinding/TOCTOU window when the transport exposes it.
+    """
+    if not peername:
+        return
+    value = peername[0] if isinstance(peername, tuple) and peername else peername
+    try:
+        if _is_forbidden_ip(str(value)):
+            raise ValueError("Connected peer is private, local, or reserved")
+    except ValueError as exc:
+        if "Connected peer" in str(exc):
+            raise
+
+
+def validate_response_peer(response: object) -> None:
+    """Validate an aiohttp response's actual socket peer when available."""
+    connection = getattr(response, "connection", None)
+    transport = getattr(connection, "transport", None)
+    if transport is None or not hasattr(transport, "get_extra_info"):
+        return
+    validate_connected_peer(transport.get_extra_info("peername"))

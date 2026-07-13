@@ -95,6 +95,12 @@ class AgentState(AgentInputState, total=False):
     # render the References section in the selected style. Populated by the
     # report orchestrator only when reference handling runs (non-default style).
     sources: Annotated[list[dict], override_reducer]
+    # Deterministically derived report requirements used by both writer and Judge.
+    coverage_checklist: Annotated[list[str], override_reducer]
+    candidate_registry: Annotated[list[dict], override_reducer]
+    document_registry: Annotated[list[dict], override_reducer]
+    evidence_registry: Annotated[list[dict], override_reducer]
+    web_research_iterations: Annotated[list[dict], override_reducer]
 
 class SupervisorState(TypedDict, total=False):
     """State for the supervisor that manages research tasks."""
@@ -111,6 +117,10 @@ class SupervisorState(TypedDict, total=False):
     handoff_assessments: Annotated[list[dict], override_reducer]
     pending_mailbox_acks: Annotated[list[dict], override_reducer]
     processed_mailbox_message_ids: Annotated[list[str], override_reducer]
+    candidate_registry: Annotated[list[dict], override_reducer]
+    document_registry: Annotated[list[dict], override_reducer]
+    evidence_registry: Annotated[list[dict], override_reducer]
+    web_research_iterations: Annotated[list[dict], override_reducer]
 
 class ResearcherState(TypedDict, total=False):
     """State for individual researchers conducting research."""
@@ -124,6 +134,10 @@ class ResearcherState(TypedDict, total=False):
     pending_tool_results: list[dict]
     research_complete_requested: bool
     result_assessment: dict
+    candidate_registry: Annotated[list[dict], override_reducer]
+    document_registry: Annotated[list[dict], override_reducer]
+    evidence_registry: Annotated[list[dict], override_reducer]
+    web_research_iterations: Annotated[list[dict], override_reducer]
 
 class ResearcherOutputState(BaseModel):
     """Output state from individual researchers."""

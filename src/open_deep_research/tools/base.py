@@ -35,6 +35,7 @@ class ToolOrigin(str, Enum):
     MCP = "mcp"
     PROVIDER_NATIVE = "provider_native"
     SKILL = "skill"
+    BROWSER = "browser"
 
 
 class ToolEffect(str, Enum):

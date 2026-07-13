@@ -6,6 +6,13 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from open_deep_research.agents import deep_researcher
+from open_deep_research.tools.utils import get_model_token_limit
+
+
+def test_deepseek_v4_models_use_one_million_token_context() -> None:
+    assert get_model_token_limit("openai:deepseek-v4-flash") == 1_000_000
+    assert get_model_token_limit("openai:deepseek-v4-pro") == 1_000_000
+    assert get_model_token_limit("openai:deepseek-v4-pro[1m]") == 1_000_000
 
 
 @pytest.mark.asyncio

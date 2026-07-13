@@ -93,6 +93,10 @@ REDUCER_KEYS = {
     "completed_task_outputs",
     "memory_candidates",
     "human_feedback",
+    "candidate_registry",
+    "document_registry",
+    "evidence_registry",
+    "web_research_iterations",
 }
 
 def apply_update_to_state(state: dict[str, Any], update: Mapping[str, Any] | None) -> dict[str, Any]:

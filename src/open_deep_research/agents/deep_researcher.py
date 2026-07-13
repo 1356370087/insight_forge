@@ -1155,10 +1155,27 @@ async def _execute_supervisor_tools(
                     await state_store.upsert(snapshot)
                 accepted_outputs.append(output)
             update["completed_task_outputs"] = accepted_outputs
+            for registry_key in (
+                "candidate_registry",
+                "document_registry",
+                "evidence_registry",
+                "web_research_iterations",
+            ):
+                values = [
+                    item
+                    for output in accepted_outputs
+                    for item in output.get(registry_key, [])
+                ]
+                if values:
+                    update[registry_key] = values
             await shutdown_teammate_pool(config)
         return Command(goto=END, update=update)
 
     raw_notes: list[str] = []
+    candidate_registry: list[dict] = []
+    document_registry: list[dict] = []
+    evidence_registry: list[dict] = []
+    research_iterations: list[dict] = []
     for call in ordinary_calls:
         outcome = outcomes_by_id[call["id"]]
         if call["name"] != "ConductResearch" or outcome.result is None:
@@ -1171,6 +1188,10 @@ async def _execute_supervisor_tools(
             notes = observation.get("raw_notes", [])
             if notes:
                 raw_notes.extend(str(note) for note in notes)
+            candidate_registry.extend(observation.get("candidate_registry", []))
+            document_registry.extend(observation.get("document_registry", []))
+            evidence_registry.extend(observation.get("evidence_registry", []))
+            research_iterations.extend(observation.get("web_research_iterations", []))
 
     pending_mailbox_acks: list[dict[str, Any]] = []
     if state.get("enable_async_research", False) and tool_messages:
@@ -1195,6 +1216,14 @@ async def _execute_supervisor_tools(
     update_payload: dict[str, Any] = {"supervisor_messages": tool_messages}
     if raw_notes:
         update_payload["raw_notes"] = ["\n".join(raw_notes)]
+    if candidate_registry:
+        update_payload["candidate_registry"] = candidate_registry
+    if document_registry:
+        update_payload["document_registry"] = document_registry
+    if evidence_registry:
+        update_payload["evidence_registry"] = evidence_registry
+    if research_iterations:
+        update_payload["web_research_iterations"] = research_iterations
     if handoff_assessments:
         update_payload["handoff_assessments"] = [
             {
@@ -1380,7 +1409,7 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
         is_external = (
             tool is not None
             and (
-                tool.origin in {ToolOrigin.SEARCH, ToolOrigin.MCP}
+                tool.origin in {ToolOrigin.SEARCH, ToolOrigin.MCP, ToolOrigin.BROWSER}
                 or tool.name == "fetch_webpage"
             )
             and outcome.error is None
@@ -1388,7 +1417,7 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
         if is_external and configurable.prompt_injection_protection_enabled:
             source_type = (
                 "mcp"
-                if tool.origin is ToolOrigin.MCP
+                if tool.origin in {ToolOrigin.MCP, ToolOrigin.BROWSER}
                 else "webpage"
                 if tool.name == "fetch_webpage"
                 else "search"
@@ -1442,6 +1471,36 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
         }
         for call, output, outcome in zip(tool_calls, tool_outputs, tool_outcomes)
     ]
+    registry_update: dict[str, Any] = {}
+    candidate_registry: list[dict] = []
+    document_registry: list[dict] = []
+    evidence_registry: list[dict] = []
+    research_iterations: list[dict] = []
+    for output in tool_outputs:
+        if output.name not in {"web_research", "fetch_url"}:
+            continue
+        try:
+            payload = json.loads(str(output.content))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        candidate_registry.extend(payload.get("candidates", []))
+        document_registry.extend(payload.get("documents", []))
+        evidence_registry.extend(payload.get("evidence", []))
+        research_iterations.append(
+            {
+                "request": payload.get("request", {}),
+                "gap_analysis": payload.get("gap_analysis", {}),
+                "approval_batch": payload.get("approval_batch"),
+            }
+        )
+    if candidate_registry:
+        registry_update["candidate_registry"] = candidate_registry
+    if document_registry:
+        registry_update["document_registry"] = document_registry
+    if evidence_registry:
+        registry_update["evidence_registry"] = evidence_registry
+    if research_iterations:
+        registry_update["web_research_iterations"] = research_iterations
 
     # Step 3: Check late exit conditions (after processing tools)
     exceeded_iterations = state.get("tool_call_iterations", 0) >= configurable.max_react_tool_calls
@@ -1457,6 +1516,7 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
                 "researcher_messages": tool_outputs,
                 "pending_tool_results": pending_tool_results,
                 "research_complete_requested": research_complete_called,
+                **registry_update,
             },
         )
 
@@ -1464,13 +1524,13 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
         # End research and proceed to compression
         return Command(
             goto="compress_research",
-            update={"researcher_messages": tool_outputs}
+            update={"researcher_messages": tool_outputs, **registry_update}
         )
 
     # Continue research loop with tool results
     return Command(
         goto="researcher",
-        update={"researcher_messages": tool_outputs}
+        update={"researcher_messages": tool_outputs, **registry_update}
     )
 
 
@@ -1624,6 +1684,10 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
                 "compressed_research": str(response.content),
                 "raw_notes": [raw_notes_content],
                 "metrics": metrics,
+                "candidate_registry": state.get("candidate_registry", []),
+                "document_registry": state.get("document_registry", []),
+                "evidence_registry": state.get("evidence_registry", []),
+                "web_research_iterations": state.get("web_research_iterations", []),
             }
             
         except Exception as e:

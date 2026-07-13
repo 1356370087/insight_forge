@@ -170,7 +170,35 @@ def deterministic_tool_checks(
         bool(item.get("error")) or any(marker in content.lower() for marker in _ERROR_MARKERS)
         for item, content in zip(evidence, contents)
     )
-    source_count = len(set(_URL_RE.findall(combined)))
+    fetched_source_urls: set[str] = set()
+    structured_evidence_count = 0
+    for item in evidence:
+        if item.get("name") not in {"web_research", "fetch_url"}:
+            continue
+        try:
+            payload = json.loads(str(item.get("content", "")))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        successful_documents = {
+            str(document.get("final_url") or document.get("canonical_url") or "")
+            for document in payload.get("documents", [])
+            if document.get("final_url") or document.get("canonical_url")
+        }
+        evidence_urls = {
+            str(record.get("source_url", ""))
+            for record in payload.get("evidence", [])
+            if record.get("source_url") in successful_documents
+        }
+        fetched_source_urls.update(evidence_urls)
+        structured_evidence_count += sum(
+            record.get("source_url") in successful_documents
+            for record in payload.get("evidence", [])
+        )
+    source_count = (
+        len(fetched_source_urls)
+        if any(item.get("name") in {"web_research", "fetch_url"} for item in evidence)
+        else len(set(_URL_RE.findall(combined)))
+    )
     search_used = any("search" in str(item.get("name", "")).lower() for item in evidence)
     failures: list[str] = []
     if not evidence or not any(contents):
@@ -185,6 +213,7 @@ def deterministic_tool_checks(
         "evidence_result_count": len(evidence),
         "error_count": error_count,
         "source_count": source_count,
+        "structured_evidence_count": structured_evidence_count,
     }
 
 

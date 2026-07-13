@@ -75,6 +75,14 @@ Open Deep Research supports a wide range of LLM providers via the [init_chat_mod
 
 Open Deep Research supports a wide range of search tools. By default it uses the [Tavily](https://www.tavily.com/) search API. Has full MCP compatibility and work native web search for Anthropic and OpenAI. See the `search_api` and `mcp_config` fields in the [configuration.py](https://github.com/langchain-ai/open_deep_research/blob/main/src/open_deep_research/configuration.py) file for more details. This can be passed in the HTTP request `configurable` object or Python runtime config. 
 
+The structured web evidence pipeline is controlled by `web_pipeline_mode`:
+
+- `legacy` preserves the provider-specific search tools.
+- `shadow` preserves legacy output while sampling candidate normalization, deduplication, and Top-K selection metrics.
+- `enforced` exposes `web_research` and `fetch_url`, separates candidate discovery from Top-K fetching, extracts HTML/PDF content, and permits final citations only from fetched evidence.
+
+The default fetch order is local HTTP, optional Playwright MCP rendering, Tavily Extract, then Firecrawl Scrape. Remote extractors are skipped when their credentials are absent. Strict network modes collect the selected logical target domains into an approval batch before fetching.
+
 #### Other 
 
 See the fields in the [configuration.py](https://github.com/langchain-ai/open_deep_research/blob/main/src/open_deep_research/configuration.py) for various other settings to customize the behavior of Open Deep Research. 

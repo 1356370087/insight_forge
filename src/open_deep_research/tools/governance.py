@@ -821,6 +821,12 @@ def _egress_host_for_tool(
     already statically derived in :func:`allowed_domains`.
     """
     origin = get_tool_origin(tool)
+    if origin is ToolOrigin.BROWSER:
+        for key in ("url", "target_url", "href"):
+            value = args.get(key)
+            if isinstance(value, str):
+                return egress_host_from_url(value)
+        return None
     if origin is ToolOrigin.MCP:
         if configurable.mcp_config and configurable.mcp_config.url:
             return egress_host_from_url(configurable.mcp_config.url)

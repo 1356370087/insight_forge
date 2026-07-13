@@ -812,6 +812,50 @@ class Configuration(BaseModel):
             }
         },
     )
+    web_pipeline_mode: Literal["legacy", "shadow", "enforced"] = Field(
+        default="shadow",
+        metadata={
+            "x_oap_ui_config": {
+                "type": "select",
+                "default": "shadow",
+                "description": "Web evidence pipeline rollout mode.",
+                "options": [
+                    {"label": "Legacy", "value": "legacy"},
+                    {"label": "Shadow", "value": "shadow"},
+                    {"label": "Enforced", "value": "enforced"},
+                ],
+            }
+        },
+    )
+    web_pipeline_shadow_sample_rate: float = Field(default=0.1, ge=0.0, le=1.0)
+    fetch_backend_order: List[str] = Field(
+        default_factory=lambda: ["local", "playwright", "tavily_extract", "firecrawl"]
+    )
+    external_extract_backends: List[str] = Field(
+        default_factory=lambda: ["tavily_extract", "firecrawl"]
+    )
+    fetch_top_k: int = Field(default=5, ge=3, le=8)
+    web_min_source_authority: float = Field(
+        default=0.65,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum authority score required before a web candidate may be fetched "
+            "and promoted to report evidence."
+        ),
+    )
+    search_candidate_limit: int = Field(default=20, ge=1, le=100)
+    max_fetches_per_researcher: int = Field(default=12, ge=1, le=100)
+    max_fetches_per_run: int = Field(default=40, ge=1, le=500)
+    fetch_global_concurrency: int = Field(default=4, ge=1, le=32)
+    fetch_per_host_concurrency: int = Field(default=2, ge=1, le=8)
+    web_rerank_model: str = Field(default="openai:gpt-4.1-mini")
+    web_evidence_model: str = Field(default="openai:gpt-4.1-mini")
+    html_max_bytes: int = Field(default=2 * 1024 * 1024, ge=1024)
+    pdf_max_bytes: int = Field(default=20 * 1024 * 1024, ge=1024)
+    pdf_max_pages: int = Field(default=100, ge=1, le=1000)
+    respect_robots_txt: bool = Field(default=True)
+    browser_render_fallback_enabled: bool = Field(default=True)
     max_persistent_teammates: int = Field(default=5, ge=1, le=50)
     mailbox_poll_interval_ms: int = Field(default=500, ge=50, le=10000)
     mailbox_lock_timeout_seconds: float = Field(default=5, gt=0, le=60)

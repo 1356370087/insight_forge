@@ -78,7 +78,7 @@ async def test_load_browser_mcp_tools_uses_stdio_connection_and_tags_origin(monk
     )
 
     assert [tool.name for tool in tools] == ["browser_navigate"]
-    assert get_tool_origin(tools[0]) == ToolOrigin.MCP
+    assert get_tool_origin(tools[0]) == ToolOrigin.BROWSER
     assert FakeMCPClient.connections_seen == {
         "browser": {
             "transport": "stdio",

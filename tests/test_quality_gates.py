@@ -1,6 +1,7 @@
 """Tests for Qwen JSON runtime quality gates."""
 
 import pytest
+from langchain_core.messages import ToolMessage
 
 from open_deep_research.agents import deep_researcher
 from open_deep_research.configuration import Configuration
@@ -11,6 +12,7 @@ from open_deep_research.quality import (
     deterministic_handoff_checks,
     deterministic_tool_checks,
 )
+from open_deep_research.tools.utils import get_notes_from_tool_calls
 
 
 def test_quality_model_uses_json_mode_and_disables_thinking(monkeypatch) -> None:
@@ -64,6 +66,26 @@ def test_deterministic_handoff_checks_reject_short_unsourced_output() -> None:
 
     assert checks["passed"] is False
     assert checks["failures"] == ["handoff_too_short", "insufficient_traceable_sources"]
+
+
+def test_final_notes_include_only_accepted_research_handoffs() -> None:
+    messages = [
+        ToolMessage(content="planning", name="think_tool", tool_call_id="think-1"),
+        ToolMessage(
+            content='{"status":"rejected_by_supervisor_quality_gate"}',
+            name="ConductResearch",
+            tool_call_id="research-1",
+        ),
+        ToolMessage(
+            content="accepted evidence https://primary.example/paper",
+            name="ConductResearch",
+            tool_call_id="research-2",
+        ),
+    ]
+
+    assert get_notes_from_tool_calls(messages) == [
+        "accepted evidence https://primary.example/paper"
+    ]
 
 
 @pytest.mark.asyncio
