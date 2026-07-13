@@ -33,7 +33,11 @@ def allowed_domains(configurable: Configuration) -> list[str]:
         configurable.summarization_model,
     ):
         model = (model_name or "").lower()
-        if model.startswith("openai:"):
+        if model.startswith("deepseek:") or (
+            model.startswith("openai:") and "deepseek" in model
+        ):
+            domains.add("api.deepseek.com")
+        elif model.startswith("openai:"):
             domains.add("api.openai.com")
         elif model.startswith("anthropic:"):
             domains.add("api.anthropic.com")

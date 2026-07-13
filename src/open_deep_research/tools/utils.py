@@ -146,7 +146,7 @@ async def tavily_search(
     summarization_model = init_chat_model(
         model=configurable.summarization_model,
         max_tokens=configurable.summarization_model_max_tokens,
-        api_key=get_api_key_for_model(configurable.summarization_model, config),
+        **get_model_connection_kwargs(configurable.summarization_model, config),
         tags=["langsmith:nostream"],
         **get_model_compatibility_kwargs(configurable.summarization_model),
     ).with_structured_output(Summary, method="function_calling")
@@ -389,11 +389,10 @@ async def fetch_webpage(
     if not summarize:
         return f"<url>{current_url}</url>\n<content>\n{raw}\n</content>"
 
-    model_api_key = get_api_key_for_model(configurable.summarization_model, config)
     summarization_model = init_chat_model(
         model=configurable.summarization_model,
         max_tokens=configurable.summarization_model_max_tokens,
-        api_key=model_api_key,
+        **get_model_connection_kwargs(configurable.summarization_model, config),
         tags=["langsmith:nostream"],
         **get_model_compatibility_kwargs(configurable.summarization_model),
     ).with_structured_output(Summary, method="function_calling")
@@ -1014,8 +1013,7 @@ async def _sdk_call_with_observability(
 
 def _build_openai_client(config: RunnableConfig) -> AsyncOpenAI:
     """Build an AsyncOpenAI client using the configured research-provider key/base URL."""
-    configurable = Configuration.from_runnable_config(config)
-    api_key = get_api_key_for_model(configurable.research_model, config) or os.getenv("OPENAI_API_KEY")
+    api_key = get_api_key_for_model("openai:gpt-4.1", config)
     kwargs: dict[str, Any] = {"api_key": api_key, "timeout": 60.0}
     base_url = os.getenv("OPENAI_BASE_URL")
     if base_url:
@@ -1025,8 +1023,7 @@ def _build_openai_client(config: RunnableConfig) -> AsyncOpenAI:
 
 def _build_anthropic_client(config: RunnableConfig) -> AsyncAnthropic:
     """Build an AsyncAnthropic client using the configured research-provider key/base URL."""
-    configurable = Configuration.from_runnable_config(config)
-    api_key = get_api_key_for_model(configurable.research_model, config) or os.getenv("ANTHROPIC_API_KEY")
+    api_key = get_api_key_for_model("anthropic:claude-sonnet-4", config)
     kwargs: dict[str, Any] = {"api_key": api_key, "timeout": 60.0}
     base_url = os.getenv("ANTHROPIC_BASE_URL")
     if base_url:
@@ -1037,11 +1034,10 @@ def _build_anthropic_client(config: RunnableConfig) -> AsyncAnthropic:
 def _build_summarization_model(config: RunnableConfig):
     """Build the structured-output summarization model shared by the search tools."""
     configurable = Configuration.from_runnable_config(config)
-    model_api_key = get_api_key_for_model(configurable.summarization_model, config)
     return init_chat_model(
         model=configurable.summarization_model,
         max_tokens=configurable.summarization_model_max_tokens,
-        api_key=model_api_key,
+        **get_model_connection_kwargs(configurable.summarization_model, config),
         tags=["langsmith:nostream"],
         **get_model_compatibility_kwargs(configurable.summarization_model),
     ).with_structured_output(Summary, method="function_calling")
@@ -1404,7 +1400,7 @@ async def _rerank_web_candidates(
         model=model_name,
         temperature=0,
         max_tokens=3000,
-        api_key=get_api_key_for_model(model_name, config),
+        **get_model_connection_kwargs(model_name, config),
         tags=["langsmith:nostream"],
         **get_model_compatibility_kwargs(model_name),
     ).with_structured_output(_SemanticCandidateScores, method="function_calling")
@@ -1454,7 +1450,7 @@ async def _extract_web_evidence(
         model=model_name,
         temperature=0,
         max_tokens=5000,
-        api_key=get_api_key_for_model(model_name, config),
+        **get_model_connection_kwargs(model_name, config),
         tags=["langsmith:nostream"],
         **get_model_compatibility_kwargs(model_name),
     ).with_structured_output(_ExtractedEvidenceItems, method="function_calling")
@@ -1519,8 +1515,20 @@ async def _approve_candidate_batch(
     run_id = str(config.get("metadata", {}).get("run_id", "default"))
     domains = sorted({candidate.domain for candidate in candidates})
     urls = [candidate.canonical_url for candidate in candidates]
-    if not is_enforced_mode(configurable):
+    network_mode = configurable.sandbox_network_mode
+    if network_mode in {"open-network", "allow-search-only"}:
+        # These URLs are fetched only inside the governed, read-only SEARCH
+        # pipeline. ``allow-search-only`` must not deadlock a synchronous
+        # Researcher that has no supervisor approval channel.
         return DomainApprovalBatch(run_id=run_id, iteration=iteration, domains=domains, urls=urls)
+    if network_mode == "no-network":
+        return DomainApprovalBatch(
+            run_id=run_id,
+            iteration=iteration,
+            domains=domains,
+            urls=urls,
+            denied_domains=domains,
+        )
     statically_allowed = set(allowed_domains(configurable))
     registry = get_domain_approval_registry()
     pending: list[str] = []
@@ -1785,6 +1793,10 @@ async def fetch_url(url: str, objective: str, config: RunnableConfig = None) -> 
     request = SearchRequest(objective=objective, queries=[url], candidate_limit=1)
     settings = _web_pipeline_settings(configurable)
     settings.fetch_top_k = 1
+    # This URL was selected explicitly rather than discovered by Search. It
+    # still passes network approval, fetch, extraction, and evidence checks, but
+    # must not be rejected by a pre-fetch discovery-authority heuristic.
+    settings.min_source_authority = 0.0
     settings.cache_namespace = str(config.get("metadata", {}).get("run_id", "default"))
     pipeline = WebResearchPipeline(
         search=direct_search,
@@ -1825,8 +1837,8 @@ anthropic_web_search = adapt_langchain_tool(
     origin=ToolOrigin.SEARCH,
     retryable=True,
 )
-web_research = adapt_langchain_tool(web_research, origin=ToolOrigin.SYSTEM, retryable=True)
-fetch_url = adapt_langchain_tool(fetch_url, origin=ToolOrigin.SYSTEM, retryable=True)
+web_research = adapt_langchain_tool(web_research, origin=ToolOrigin.SEARCH, retryable=True)
+fetch_url = adapt_langchain_tool(fetch_url, origin=ToolOrigin.SEARCH, retryable=True)
 fetch_webpage = adapt_langchain_tool(
     fetch_webpage,
     origin=ToolOrigin.SYSTEM,
@@ -2095,10 +2107,12 @@ def _check_gemini_token_limit(exception: Exception, error_str: str) -> bool:
 
 # NOTE: This may be out of date or not applicable to your models. Please update this as needed.
 MODEL_TOKEN_LIMITS = {
-    # DeepSeek's OpenAI-compatible API uses these model IDs without a [1m]
-    # suffix. Both V4 variants expose a 1M context window.
-    "openai:deepseek-v4-flash": 1_000_000,
-    "openai:deepseek-v4-pro": 1_000_000,
+    # The explicit [1m] model suffix opts into DeepSeek V4's 1M context.
+    # Unsuffixed aliases retain the provider's smaller compatibility window.
+    "openai:deepseek-v4-flash[1m]": 1_000_000,
+    "openai:deepseek-v4-pro[1m]": 1_000_000,
+    "openai:deepseek-v4-flash": 200_000,
+    "openai:deepseek-v4-pro": 200_000,
     "openai:gpt-4.1-mini": 1047576,
     "openai:gpt-4.1-nano": 1047576,
     "openai:gpt-4.1": 1047576,
@@ -2202,6 +2216,13 @@ def get_config_value(value):
     else:
         return value.value
 
+def _uses_deepseek_compatible_endpoint(model_name: str) -> bool:
+    normalized = (model_name or "").lower()
+    return normalized.startswith("deepseek:") or (
+        normalized.startswith("openai:") and "deepseek" in normalized
+    )
+
+
 def get_api_key_for_model(model_name: str, config: RunnableConfig):
     """Get API key for a specific model from environment or config."""
     should_get_from_config = os.getenv("GET_API_KEYS_FROM_CONFIG", "false")
@@ -2210,6 +2231,8 @@ def get_api_key_for_model(model_name: str, config: RunnableConfig):
         api_keys = config.get("configurable", {}).get("apiKeys", {})
         if not api_keys:
             return None
+        if _uses_deepseek_compatible_endpoint(model_name):
+            return api_keys.get("DEEPSEEK_API_KEY") or api_keys.get("OPENAI_API_KEY")
         if model_name.startswith("openai:"):
             return api_keys.get("OPENAI_API_KEY")
         elif model_name.startswith("anthropic:"):
@@ -2218,13 +2241,40 @@ def get_api_key_for_model(model_name: str, config: RunnableConfig):
             return api_keys.get("GOOGLE_API_KEY")
         return None
     else:
-        if model_name.startswith("openai:"): 
+        if _uses_deepseek_compatible_endpoint(model_name):
+            return os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENAI_API_KEY")
+        if model_name.startswith("openai:"):
             return os.getenv("OPENAI_API_KEY")
         elif model_name.startswith("anthropic:"):
             return os.getenv("ANTHROPIC_API_KEY")
         elif model_name.startswith("google"):
             return os.getenv("GOOGLE_API_KEY")
         return None
+
+
+def get_base_url_for_model(model_name: str) -> str | None:
+    """Resolve an OpenAI-compatible endpoint without rerouting real OpenAI models."""
+    normalized = (model_name or "").lower()
+    if _uses_deepseek_compatible_endpoint(normalized):
+        return os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+    if normalized.startswith("openai:"):
+        return os.getenv("OPENAI_BASE_URL")
+    if normalized.startswith("anthropic:"):
+        return os.getenv("ANTHROPIC_BASE_URL")
+    return None
+
+
+def get_model_connection_kwargs(
+    model_name: str,
+    config: RunnableConfig,
+) -> dict[str, str | None]:
+    """Return provider credentials and an optional compatible base URL."""
+    connection: dict[str, str | None] = {
+        "api_key": get_api_key_for_model(model_name, config)
+    }
+    if base_url := get_base_url_for_model(model_name):
+        connection["base_url"] = base_url
+    return connection
 
 def get_tavily_api_key(config: RunnableConfig):
     """Get Tavily API key from environment or config."""
