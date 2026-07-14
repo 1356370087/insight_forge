@@ -9,7 +9,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
@@ -17,11 +17,18 @@ from pydantic import BaseModel, Field
 from open_deep_research.agents.query_engine import QueryEngine
 from open_deep_research.configuration import Configuration
 from open_deep_research.observability import SQLiteTraceStore
+from open_deep_research.public_events import (
+    PublicEvent,
+    RunEventStore,
+    event_publisher_from_config,
+    is_terminal_event,
+)
 from open_deep_research.run_context import (
     JournalCorruptedError,
     RunContextError,
     RunContextStore,
 )
+from open_deep_research.run_control import RunControlStore
 from open_deep_research.security.inputs import (
     validate_http_configurable,
     validate_http_metadata,
@@ -59,6 +66,7 @@ class HumanFeedbackRequest(BaseModel):
     task_id: str | None = None
     source_url: str | None = None
     claim_text: str | None = None
+    command_id: str | None = None
 
 
 @dataclass
@@ -85,11 +93,48 @@ async def prometheus_metrics() -> Response:
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
-def _sse(event: dict[str, Any]) -> str:
+def _sse(event: PublicEvent) -> str:
     return (
-        f"event: {event.get('event', 'message')}\n"
-        f"data: {json.dumps(event.get('data', {}), ensure_ascii=False, default=str)}\n\n"
+        f"id: {event.sequence}\n"
+        f"event: {event.type}\n"
+        f"data: {json.dumps(event.public_dict(), ensure_ascii=False, default=str)}\n\n"
     )
+
+
+def _sse_headers() -> dict[str, str]:
+    return {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+        "Connection": "keep-alive",
+    }
+
+
+async def _public_event_iterator(store: RunEventStore, *, after: int = 0):
+    """Replay then tail a durable public stream, including cross-worker writes."""
+    configurable = Configuration.from_runnable_config(None)
+    poll_seconds = configurable.sse_poll_interval_ms / 1000
+    heartbeat_seconds = configurable.sse_heartbeat_seconds
+    cursor = after
+    last_output_at = asyncio.get_running_loop().time()
+    while True:
+        events = await asyncio.to_thread(store.read, cursor)
+        for event in events:
+            yield _sse(event)
+            cursor = event.sequence
+            last_output_at = asyncio.get_running_loop().time()
+            if is_terminal_event(event):
+                return
+        if not events:
+            last_sequence = await asyncio.to_thread(store.last_sequence)
+            if last_sequence and cursor >= last_sequence:
+                latest = await asyncio.to_thread(store.read, last_sequence - 1)
+                if latest and is_terminal_event(latest[-1]):
+                    return
+            now = asyncio.get_running_loop().time()
+            if now - last_output_at >= heartbeat_seconds:
+                yield ": keep-alive\n\n"
+                last_output_at = now
+        await asyncio.sleep(poll_seconds)
 
 
 def _config_from_request(request: RunRequest, user: dict[str, Any]) -> dict[str, Any]:
@@ -123,6 +168,22 @@ def _require_record_owner(record: RunRecord, user: dict[str, Any]) -> None:
     owner = metadata.get("owner") or metadata.get("user_id")
     if owner and str(owner) != _user_identity(user):
         raise HTTPException(status_code=404, detail="Run not found")
+
+
+def _require_run_owner(run_id: str, user: dict[str, Any]) -> tuple[RunRecord | None, Configuration]:
+    """Authorize an active or persisted run and return its effective config."""
+    record = _runs.get(run_id)
+    if record is not None:
+        _require_record_owner(record, user)
+        return record, Configuration.from_runnable_config(getattr(record.engine, "config", None))
+    configurable = Configuration.from_runnable_config(None)
+    try:
+        manifest = RunContextStore(run_id, runs_dir=configurable.runs_dir).load_manifest()
+    except (ValueError, JournalCorruptedError, OSError):
+        raise HTTPException(status_code=404, detail="Run not found") from None
+    if manifest.owner_id and manifest.owner_id != _user_identity(user):
+        raise HTTPException(status_code=404, detail="Run not found")
+    return None, configurable
 
 
 def _span_tree_rows(spans: list[dict[str, Any]]) -> str:
@@ -162,6 +223,7 @@ def _span_tree_rows(spans: list[dict[str, Any]]) -> str:
 
 async def _run_background(record: RunRecord, request: RunRequest, config: dict[str, Any]) -> None:
     record.status = "running"
+    control_task = asyncio.create_task(_run_control_listener(record, config))
     try:
         async for event in record.engine.stream_message(request.messages, config):
             record.events.append(event)
@@ -182,11 +244,23 @@ async def _run_background(record: RunRecord, request: RunRequest, config: dict[s
         record.events.append(event)
         record.result = {"result": {"status": "error", "error": str(exc)}}
         record.status = "failed"
+        try:
+            await event_publisher_from_config(config).publish(
+                "run.failed",
+                payload={"status": "failed", "error_code": "run_execution_failed", "message": "Research failed."},
+                dedupe_key="run:failed",
+            )
+        except Exception:
+            pass
+    finally:
+        control_task.cancel()
+        await asyncio.gather(control_task, return_exceptions=True)
 
 
 async def _run_resumed_background(record: RunRecord) -> None:
     """Continue a persisted Query run in the background."""
     record.status = "running"
+    control_task = asyncio.create_task(_run_control_listener(record, record.engine.config))
     try:
         async for event in record.engine.stream_resume():
             record.events.append(event)
@@ -199,6 +273,56 @@ async def _run_resumed_background(record: RunRecord) -> None:
         record.events.append({"event": "run.failed", "data": {"run_id": record.run_id, "error": str(exc)}})
         record.result = {"result": {"status": "error", "error": str(exc)}}
         record.status = "failed"
+        try:
+            await event_publisher_from_config(record.engine.config).publish(
+                "run.failed",
+                payload={"status": "failed", "error_code": "run_execution_failed", "message": "Research failed."},
+                dedupe_key="run:failed",
+            )
+        except Exception:
+            pass
+    finally:
+        control_task.cancel()
+        await asyncio.gather(control_task, return_exceptions=True)
+
+
+async def _run_control_listener(record: RunRecord, config: dict[str, Any]) -> None:
+    """Consume durable commands for the worker that owns a live run."""
+    configurable = Configuration.from_runnable_config(config)
+    store = RunControlStore(record.run_id, runs_dir=configurable.runs_dir)
+    publisher = event_publisher_from_config(config)
+    poll_seconds = configurable.sse_poll_interval_ms / 1000
+    while True:
+        for command in await store.pending():
+            try:
+                if command.type == "cancel":
+                    record.engine.interrupt()
+                    record.status = "cancelled"
+                    await publisher.publish(
+                        "run.cancelled",
+                        payload={"status": "cancelled"},
+                        dedupe_key="run:cancelled",
+                    )
+                elif command.type == "human_action":
+                    record.engine.handle_human_action(
+                        str(command.payload.get("action_id", "")),
+                        str(command.payload.get("action", "")),
+                        str(command.payload.get("message", "")),
+                    )
+                elif command.type == "feedback":
+                    await record.engine.submit_feedback(dict(command.payload))
+                await store.ack(command)
+            except Exception:
+                await publisher.publish(
+                    "system.warning",
+                    payload={
+                        "warning_code": "control_command_rejected",
+                        "message": "A run control command could not be applied.",
+                    },
+                    dedupe_key=f"control:{command.command_id}:rejected",
+                )
+                await store.ack(command)
+        await asyncio.sleep(poll_seconds)
 
 
 @app.post("/runs/stream")
@@ -209,26 +333,47 @@ async def stream_run(
     """Run a research request and stream events with SSE."""
     config = _config_from_request(request, user)
     engine = QueryEngine(config)
-
-    async def iterator():
-        async for event in engine.stream_message(request.messages, config):
-            yield _sse(event)
-
-    return StreamingResponse(iterator(), media_type="text/event-stream")
+    record = RunRecord(run_id=engine.run_id, engine=engine, status="running")
+    await event_publisher_from_config(config).publish(
+        "run.created",
+        payload={"status": "pending"},
+        dedupe_key="run:created",
+    )
+    record.task = asyncio.create_task(_run_background(record, request, config))
+    _runs[record.run_id] = record
+    store = RunEventStore(
+        record.run_id,
+        runs_dir=Configuration.from_runnable_config(config).runs_dir,
+    )
+    return StreamingResponse(
+        _public_event_iterator(store),
+        media_type="text/event-stream",
+        headers=_sse_headers(),
+    )
 
 
 @app.post("/runs")
 async def create_run(
     request: RunRequest,
     user: dict[str, Any] = Depends(get_current_user),
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Create a background research run."""
     config = _config_from_request(request, user)
     engine = QueryEngine(config)
-    record = RunRecord(run_id=engine.run_id, engine=engine)
+    record = RunRecord(run_id=engine.run_id, engine=engine, status="running")
+    created = await event_publisher_from_config(config).publish(
+        "run.created",
+        payload={"status": "pending"},
+        dedupe_key="run:created",
+    )
     record.task = asyncio.create_task(_run_background(record, request, config))
     _runs[record.run_id] = record
-    return {"run_id": record.run_id, "status": record.status}
+    return {
+        "run_id": record.run_id,
+        "status": record.status,
+        "events_url": f"/runs/{record.run_id}/events",
+        "last_event_id": created.sequence,
+    }
 
 
 @app.get("/runs/{run_id}")
@@ -252,6 +397,8 @@ async def get_run(
             report_path = store.context_dir / "final_report.md"
             if report_path.exists():
                 result = {"status": "success", "result": report_path.read_text(encoding="utf-8")}
+        event_store = RunEventStore(run_id, runs_dir=configurable.runs_dir)
+        projection = event_store.project() if event_store.exists else None
         return {
             "run_id": run_id,
             "status": manifest.status,
@@ -259,14 +406,23 @@ async def get_run(
             "result": result,
             "event_count": manifest.last_journal_seq,
             "persistence_degraded": manifest.persistence_degraded,
+            "progress": projection.model_dump() if projection else None,
+            "events_url": f"/runs/{run_id}/events",
+            "last_event_id": projection.last_event_id if projection else 0,
         }
     _require_record_owner(record, user)
+    configurable = Configuration.from_runnable_config(record.engine.config)
+    event_store = RunEventStore(run_id, runs_dir=configurable.runs_dir)
+    projection = event_store.project()
     return {
         "run_id": run_id,
         "status": record.status,
         "pending_human_action": getattr(record.engine, "pending_human_action", None),
         "result": record.result,
-        "event_count": len(record.events),
+        "event_count": projection.last_event_id,
+        "progress": projection.model_dump(),
+        "events_url": f"/runs/{run_id}/events",
+        "last_event_id": projection.last_event_id,
     }
 
 
@@ -333,17 +489,21 @@ async def submit_human_action(
     user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Resolve a pending human approval, revision, or cancellation action."""
-    record = _runs.get(run_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail="Run not found")
-    _require_record_owner(record, user)
-    try:
-        result = record.engine.handle_human_action(action_id, request.action, request.message or "")
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if request.action == "cancel":
-        record.status = "cancelled"
-    return result
+    record, configurable = _require_run_owner(run_id, user)
+    if record is not None:
+        try:
+            result = record.engine.handle_human_action(action_id, request.action, request.message or "")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if request.action == "cancel":
+            record.status = "cancelled"
+        return result
+    command = await RunControlStore(run_id, runs_dir=configurable.runs_dir).enqueue(
+        "human_action",
+        {"action_id": action_id, "action": request.action, "message": request.message or ""},
+        command_id=f"human-action-{action_id}",
+    )
+    return {"status": "accepted", "command_id": command.command_id, "action": request.action}
 
 
 @app.post("/runs/{run_id}/feedback")
@@ -353,41 +513,61 @@ async def submit_feedback(
     user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Accept mid-run human direction or evidence questions."""
-    record = _runs.get(run_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail="Run not found")
-    _require_record_owner(record, user)
-    try:
-        result = await record.engine.submit_feedback(request.model_dump(exclude_none=True))
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    event_name = "hitl.evidence_question_received" if request.type == "evidence_question" else "hitl.feedback_received"
-    record.events.append({"event": event_name, "data": {"run_id": run_id, **result}})
-    return result
+    record, configurable = _require_run_owner(run_id, user)
+    payload = request.model_dump(exclude_none=True)
+    if record is not None:
+        try:
+            return await record.engine.submit_feedback(payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    command = await RunControlStore(run_id, runs_dir=configurable.runs_dir).enqueue(
+        "feedback",
+        payload,
+        command_id=request.command_id,
+    )
+    return {"status": "accepted", "command_id": command.command_id}
 
 
 @app.get("/runs/{run_id}/events")
 async def stream_run_events(
     run_id: str,
+    after: int = 0,
+    last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
     user: dict[str, Any] = Depends(get_current_user),
 ) -> StreamingResponse:
-    """Subscribe to stored and future events for a background run."""
+    """Replay and tail the durable public event stream for a run."""
     record = _runs.get(run_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail="Run not found")
-    _require_record_owner(record, user)
+    if record is not None:
+        _require_record_owner(record, user)
+        configurable = Configuration.from_runnable_config(record.engine.config)
+    else:
+        configurable = Configuration.from_runnable_config(None)
+        try:
+            manifest = RunContextStore(run_id, runs_dir=configurable.runs_dir).load_manifest()
+        except (ValueError, JournalCorruptedError, OSError):
+            raise HTTPException(status_code=404, detail="Run not found") from None
+        if manifest.owner_id and manifest.owner_id != _user_identity(user):
+            raise HTTPException(status_code=404, detail="Run not found")
 
-    async def iterator():
-        index = 0
-        while True:
-            while index < len(record.events):
-                yield _sse(record.events[index])
-                index += 1
-            if record.status in {"completed", "failed", "cancelled"}:
-                break
-            await asyncio.sleep(0.25)
-
-    return StreamingResponse(iterator(), media_type="text/event-stream")
+    store = RunEventStore(run_id, runs_dir=configurable.runs_dir)
+    if not store.exists:
+        raise HTTPException(status_code=409, detail="event_stream_unavailable_legacy_run")
+    cursor = after
+    if last_event_id is not None:
+        try:
+            cursor = int(last_event_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid_event_cursor") from None
+    if cursor < 0:
+        raise HTTPException(status_code=400, detail="invalid_event_cursor")
+    current = await asyncio.to_thread(store.last_sequence)
+    if cursor > current:
+        raise HTTPException(status_code=409, detail="event_cursor_ahead")
+    return StreamingResponse(
+        _public_event_iterator(store, after=cursor),
+        media_type="text/event-stream",
+        headers=_sse_headers(),
+    )
 
 
 @app.get("/observability/runs")
@@ -554,13 +734,27 @@ async def cancel_run(
     user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, str]:
     """Cancel a background run."""
-    record = _runs.get(run_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail="Run not found")
-    _require_record_owner(record, user)
-    record.engine.interrupt()
-    if record.task and not record.task.done():
-        record.task.cancel()
-    record.status = "cancelled"
-    record.events.append({"event": "run.cancelled", "data": {"run_id": run_id}})
+    record, configurable = _require_run_owner(run_id, user)
+    if record is not None:
+        record.engine.interrupt()
+        record.status = "cancelled"
+    else:
+        await RunControlStore(run_id, runs_dir=configurable.runs_dir).enqueue(
+            "cancel",
+            {},
+            command_id=f"cancel-{run_id}",
+        )
+    config = record.engine.config if record is not None else {
+        "configurable": {"runs_dir": configurable.runs_dir},
+        "metadata": {"run_id": run_id},
+    }
+    await event_publisher_from_config(config).publish(
+        "run.cancelled",
+        payload={"status": "cancelled"},
+        dedupe_key="run:cancelled",
+    )
+    try:
+        RunContextStore(run_id, runs_dir=configurable.runs_dir)._update_manifest(status="cancelled")  # noqa: SLF001
+    except Exception:
+        pass
     return {"run_id": run_id, "status": "cancelled"}
