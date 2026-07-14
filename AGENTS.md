@@ -120,12 +120,6 @@ FastAPI 部署时的认证 dependency：
 - `on_thread_read/delete/update/search`：过滤只允许 owner 访问
 - Store 访问通过 namespace 第一段（user identity）进行授权
 
-### 9. 遗留实现（src/legacy/）
-
-包含两个早期版本供参考：
-- `graph.py`：Plan-and-Execute 工作流，人工参与规划
-- `multi_agent.py`：Supervisor-Researcher 多智能体架构，并行处理
-
 ## 开发注意事项
 
 - 所有模型配置格式为 `provider:model_name`，通过 `init_chat_model()` 统一初始化
