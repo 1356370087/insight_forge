@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, ToolMessage
 
 from open_deep_research.agents import deep_researcher
 from open_deep_research.agents.query_engine import QueryEngine
@@ -141,7 +141,10 @@ async def test_researcher_registry_survives_structured_web_injection_filter(
 
 
 @pytest.mark.asyncio
-async def test_sync_researcher_receives_unique_tool_call_task_id(monkeypatch) -> None:
+async def test_sync_researcher_receives_unique_tool_call_task_id(
+    monkeypatch,
+    tmp_path,
+) -> None:
     captured: dict[str, Any] = {}
 
     async def fake_ainvoke(_state, config):
@@ -159,7 +162,10 @@ async def test_sync_researcher_receives_unique_tool_call_task_id(monkeypatch) ->
     await conduct.call(
         ConductResearch(research_topic="topic"),
         ToolContext(
-            config={"configurable": {}, "metadata": {"run_id": "run-1"}},
+            config={
+                "configurable": {"runs_dir": str(tmp_path)},
+                "metadata": {"run_id": "run-1"},
+            },
             role="supervisor",
             tool_call_id="conduct-17",
         ),
@@ -167,6 +173,166 @@ async def test_sync_researcher_receives_unique_tool_call_task_id(monkeypatch) ->
 
     assert captured["metadata"]["task_id"] == "conduct-17"
     assert captured["metadata"]["run_id"] == "run-1"
+
+
+@pytest.mark.asyncio
+async def test_sync_research_handoff_is_compact_and_persists_full_context(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    raw_search_output = "raw search evidence that must not enter supervisor context"
+
+    async def fake_ainvoke(_state, _config):
+        return {
+            "research_topic": "topic",
+            "researcher_messages": [
+                AIMessage(content="research reasoning"),
+                ToolMessage(
+                    content=raw_search_output,
+                    name="web_research",
+                    tool_call_id="search-1",
+                ),
+            ],
+            "compressed_research": (
+                "A sufficiently detailed compressed finding with traceable sources. "
+                "https://example.test/a https://example.test/b " * 3
+            ),
+            "raw_notes": [raw_search_output],
+            "metrics": {"sources_read": 2, "query_count": 1},
+            "evidence_registry": [{"evidence_id": "ev-1", "claim": "fact"}],
+        }
+
+    monkeypatch.setattr(deep_researcher.researcher_runtime, "ainvoke", fake_ainvoke)
+    tools = deep_researcher.build_supervisor_tools({"enable_async_research": False})
+    conduct = next(tool for tool in tools if tool.name == "ConductResearch")
+    context = ToolContext(
+        config={
+            "configurable": {"runs_dir": str(tmp_path)},
+            "metadata": {"run_id": "compact-handoff"},
+        },
+        role="supervisor",
+        tool_call_id="conduct-17",
+    )
+
+    result = await conduct.call(ConductResearch(research_topic="topic"), context)
+
+    assert result.output["compressed_research"]
+    assert result.output["task_id"] == "conduct-17"
+    assert "researcher_messages" not in result.output
+    assert "raw_notes" not in result.output
+    assert "evidence_registry" not in result.output
+    assert raw_search_output not in json.dumps(result.output)
+
+    artifact_ref = result.output["artifact_ref"]
+    artifact_path = tmp_path / "compact-handoff" / artifact_ref["path"]
+    assert artifact_path.is_file()
+    assert raw_search_output in artifact_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_supervisor_can_read_bounded_research_artifact_sections(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    raw_search_output = "bounded raw evidence"
+
+    async def fake_ainvoke(_state, _config):
+        return {
+            "research_topic": "topic",
+            "researcher_messages": [],
+            "compressed_research": "summary",
+            "raw_notes": [raw_search_output * 100],
+            "metrics": {"sources_read": 1},
+        }
+
+    monkeypatch.setattr(deep_researcher.researcher_runtime, "ainvoke", fake_ainvoke)
+    tools = deep_researcher.build_supervisor_tools({"enable_async_research": False})
+    conduct = next(tool for tool in tools if tool.name == "ConductResearch")
+    read_artifact = next(tool for tool in tools if tool.name == "ReadResearchArtifact")
+    context = ToolContext(
+        config={
+            "configurable": {"runs_dir": str(tmp_path)},
+            "metadata": {"run_id": "bounded-read"},
+        },
+        role="supervisor",
+        tool_call_id="conduct-18",
+    )
+    handoff = (await conduct.call(ConductResearch(research_topic="topic"), context)).output
+
+    read_result = await read_artifact.call(
+        read_artifact.input_schema(
+            task_id=handoff["task_id"],
+            artifact_sha256=handoff["artifact_ref"]["sha256"],
+            section="raw_notes",
+            offset=0,
+            max_chars=100,
+        ),
+        ToolContext(
+            config=context.config,
+            role="supervisor",
+            tool_call_id="read-1",
+        ),
+    )
+
+    assert raw_search_output in read_result.output["content"]
+    assert len(read_result.output["content"]) == 100
+    assert read_result.output["truncated"] is True
+    assert read_result.output["next_offset"] == 100
+
+
+@pytest.mark.asyncio
+async def test_parallel_sync_handoffs_do_not_merge_raw_context_into_supervisor(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    async def fake_ainvoke(state, _config):
+        topic = state["research_topic"]
+        return {
+            "research_topic": topic,
+            "researcher_messages": [AIMessage(content=f"raw message for {topic}")],
+            "compressed_research": f"compressed finding for {topic}",
+            "raw_notes": [f"raw note for {topic}"],
+            "metrics": {"sources_read": 1},
+        }
+
+    monkeypatch.setattr(deep_researcher.researcher_runtime, "ainvoke", fake_ainvoke)
+    state = {
+        "enable_async_research": False,
+        "supervisor_messages": [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "ConductResearch",
+                        "args": {"research_topic": "alpha"},
+                        "id": "conduct-alpha",
+                    },
+                    {
+                        "name": "ConductResearch",
+                        "args": {"research_topic": "beta"},
+                        "id": "conduct-beta",
+                    },
+                ],
+            )
+        ],
+    }
+    command = await deep_researcher._execute_supervisor_tools(
+        state,
+        {
+            "configurable": {
+                "runs_dir": str(tmp_path),
+                "quality_evaluation_enabled": False,
+            },
+            "metadata": {"run_id": "parallel-compact"},
+        },
+    )
+
+    contents = [message.content for message in command.update["supervisor_messages"]]
+    assert len(contents) == 2
+    assert all("compressed finding" in content for content in contents)
+    assert all("raw message" not in content for content in contents)
+    assert all("raw note" not in content for content in contents)
+    assert "raw_notes" not in command.update
 
 
 @pytest.mark.asyncio

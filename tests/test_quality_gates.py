@@ -68,6 +68,20 @@ def test_deterministic_handoff_checks_reject_short_unsourced_output() -> None:
     assert checks["failures"] == ["handoff_too_short", "insufficient_traceable_sources"]
 
 
+def test_compact_handoff_can_report_source_count_without_raw_notes() -> None:
+    checks = deterministic_handoff_checks(
+        {
+            "compressed_research": "A detailed compressed finding. " * 10,
+            "artifact_ref": {"path": "context/artifact.json", "sha256": "a" * 64},
+            "metrics": {"sources_read": 3},
+        },
+        min_sources=2,
+    )
+
+    assert checks["passed"] is True
+    assert checks["source_count"] == 3
+
+
 def test_final_notes_include_only_accepted_research_handoffs() -> None:
     messages = [
         ToolMessage(content="planning", name="think_tool", tool_call_id="think-1"),
@@ -81,10 +95,21 @@ def test_final_notes_include_only_accepted_research_handoffs() -> None:
             name="ConductResearch",
             tool_call_id="research-2",
         ),
+        ToolMessage(
+            content='{"content":"selected evidence https://primary.example/detail"}',
+            name="ReadResearchArtifact",
+            tool_call_id="artifact-1",
+        ),
+        ToolMessage(
+            content='{"error_type":"validation_error"}',
+            name="ReadResearchArtifact",
+            tool_call_id="artifact-2",
+        ),
     ]
 
     assert get_notes_from_tool_calls(messages) == [
-        "accepted evidence https://primary.example/paper"
+        "accepted evidence https://primary.example/paper",
+        '{"content":"selected evidence https://primary.example/detail"}',
     ]
 
 

@@ -225,7 +225,13 @@ def deterministic_handoff_checks(
     """Reject empty handoffs and handoffs without enough traceable sources."""
     compressed = str(handoff.get("compressed_research", "")).strip()
     raw_notes = "\n".join(str(note) for note in handoff.get("raw_notes", []))
-    source_count = len(set(_URL_RE.findall(f"{compressed}\n{raw_notes}")))
+    traced_source_count = len(set(_URL_RE.findall(f"{compressed}\n{raw_notes}")))
+    metrics = handoff.get("metrics", {})
+    try:
+        reported_source_count = int(metrics.get("sources_read", 0))
+    except (AttributeError, TypeError, ValueError):
+        reported_source_count = 0
+    source_count = max(traced_source_count, reported_source_count)
     failures: list[str] = []
     if len(compressed) < 200:
         failures.append("handoff_too_short")

@@ -104,7 +104,8 @@ async def build_report(state: dict, config: RunnableConfig) -> dict:
     """
     cfg = Configuration.from_runnable_config(config)
     has_accepted_evidence = bool(
-        state.get("raw_notes")
+        state.get("notes")
+        or state.get("raw_notes")
         or state.get("completed_task_outputs")
         or state.get("evidence_registry")
     )
@@ -123,7 +124,13 @@ async def build_report(state: dict, config: RunnableConfig) -> dict:
     ctx = ReportContext.from_state(state, config, profile)
     coverage_checklist = derive_state_coverage_checklist(state)
     if cfg.quality_evaluation_enabled and not ctx.sources:
-        raw_evidence = "\n".join(str(note) for note in state.get("raw_notes", []))
+        raw_evidence = "\n".join(
+            str(note)
+            for note in [
+                *state.get("notes", []),
+                *state.get("raw_notes", []),
+            ]
+        )
         ctx.sources = parse_sources_from_text(raw_evidence)
     result = await assemble(ctx)
 

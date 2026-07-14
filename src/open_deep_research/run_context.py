@@ -441,8 +441,33 @@ class RunContextStore:
             return
 
     def persist_task_result(self, task_id: str, result: dict[str, Any]) -> str:
-        """Persist a completed async research task before its checkpoint is removed."""
+        """Persist a completed research task before its in-memory context is released."""
+        if not _RUN_ID_RE.fullmatch(task_id) or ".." in task_id:
+            raise ValueError(f"Invalid task_id: {task_id!r}")
         return self.write_json_atomic(f"artifacts/research_tasks/{task_id}.json", result)
+
+    def load_task_result(
+        self,
+        task_id: str,
+        *,
+        expected_sha256: str,
+    ) -> dict[str, Any]:
+        """Load a task artifact after validating its task id and content digest."""
+        if not _RUN_ID_RE.fullmatch(task_id) or ".." in task_id:
+            raise ValueError(f"Invalid task_id: {task_id!r}")
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+            raise ValueError("Invalid artifact SHA-256")
+        target = self._resolve_artifact(f"artifacts/research_tasks/{task_id}.json")
+        try:
+            content = target.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise FileNotFoundError(f"Research artifact is unavailable: {task_id}") from exc
+        if _sha256_text(content) != expected_sha256:
+            raise ValueError(f"Research artifact hash mismatch: {task_id}")
+        payload = json.loads(content)
+        if not isinstance(payload, dict):
+            raise ValueError(f"Research artifact must contain an object: {task_id}")
+        return payload
 
     def replay(self) -> ReplayResult:
         """Replay state deltas and stable checkpoints from the journal."""

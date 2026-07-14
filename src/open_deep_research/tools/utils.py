@@ -1966,14 +1966,23 @@ async def get_all_tools(config: RunnableConfig) -> list[Tool]:
     return tools
 
 def get_notes_from_tool_calls(messages: list[MessageLikeRepresentation]):
-    """Extract only successful synchronous research handoffs as report notes."""
+    """Extract compact handoffs and explicitly requested evidence as report notes."""
     notes = []
     for tool_msg in filter_messages(messages, include_types="tool"):
-        if getattr(tool_msg, "name", None) != "ConductResearch":
+        if getattr(tool_msg, "name", None) not in {
+            "ConductResearch",
+            "ReadResearchArtifact",
+        }:
             continue
         content = str(tool_msg.content)
         lowered = content.lower()
         if "rejected_by_supervisor_quality_gate" in lowered or lowered.startswith("error:"):
+            continue
+        try:
+            payload = json.loads(content)
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict) and "error_type" in payload:
             continue
         notes.append(tool_msg.content)
     return notes

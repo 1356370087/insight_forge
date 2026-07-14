@@ -15,6 +15,7 @@ from langchain_core.messages import (
     ToolMessage,
     filter_messages,
     get_buffer_string,
+    message_to_dict,
 )
 from langchain_core.messages.utils import count_tokens_approximately
 from langchain_core.runnables import RunnableConfig
@@ -47,6 +48,7 @@ from open_deep_research.quality import (
     evaluate_subagent_handoff,
     evaluate_tool_results,
 )
+from open_deep_research.run_context import RunContextStore
 from open_deep_research.runtime import (
     END,
     REMOVE_ALL_MESSAGES,
@@ -64,6 +66,7 @@ from open_deep_research.state import (
     AgentState,
     ClarifyWithUser,
     ConductResearch,
+    ReadResearchArtifact,
     ResearchComplete,
     ResearcherState,
     ResearchQuestion,
@@ -586,12 +589,14 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
             date=get_today_str(),
             max_concurrent_research_units=configurable.max_persistent_teammates,
             max_researcher_iterations=configurable.max_researcher_iterations,
+            max_react_tool_calls=configurable.max_react_tool_calls,
         )
     else:
         supervisor_system_prompt = lead_researcher_prompt.format(
             date=get_today_str(),
             max_concurrent_research_units=configurable.max_concurrent_research_units,
             max_researcher_iterations=configurable.max_researcher_iterations,
+            max_react_tool_calls=configurable.max_react_tool_calls,
         )
     supervisor_context: list[BaseMessage] = [SystemMessage(content=supervisor_system_prompt)]
     if memory_context:
@@ -846,7 +851,65 @@ def build_supervisor_tools(state: SupervisorState) -> list[Tool]:
                 },
                 researcher_config,
             )
-            return ToolResult(output=observation)
+            configurable = Configuration.from_runnable_config(context.config)
+            run_id = str(context.config.get("metadata", {}).get("run_id", "default"))
+            task_id = context.tool_call_id
+            artifact = {
+                "schema_version": 1,
+                "task_id": task_id,
+                "research_topic": input.research_topic,
+                "compressed_research": str(observation.get("compressed_research", "")),
+                "researcher_messages": [
+                    message_to_dict(message)
+                    if isinstance(message, BaseMessage)
+                    else message
+                    for message in observation.get("researcher_messages", [])
+                ],
+                "raw_notes": list(observation.get("raw_notes", [])),
+                "candidate_registry": list(observation.get("candidate_registry", [])),
+                "document_registry": list(observation.get("document_registry", [])),
+                "evidence_registry": list(observation.get("evidence_registry", [])),
+                "web_research_iterations": list(
+                    observation.get("web_research_iterations", [])
+                ),
+                "result_assessment": observation.get("result_assessment", {}),
+                "metrics": dict(observation.get("metrics", {})),
+            }
+            context_store = RunContextStore(
+                run_id,
+                runs_dir=configurable.runs_dir,
+                inline_content_max_chars=(
+                    configurable.query_journal_inline_content_max_chars
+                ),
+            )
+            digest = context_store.persist_task_result(task_id, artifact)
+            relative_path = f"context/artifacts/research_tasks/{task_id}.json"
+            artifact_path = context_store.run_dir / relative_path
+            available_sections = [
+                key
+                for key in (
+                    "researcher_messages",
+                    "raw_notes",
+                    "candidate_registry",
+                    "document_registry",
+                    "evidence_registry",
+                    "web_research_iterations",
+                    "result_assessment",
+                )
+                if artifact.get(key)
+            ]
+            return ToolResult(output={
+                "task_id": task_id,
+                "research_topic": input.research_topic,
+                "compressed_research": artifact["compressed_research"],
+                "artifact_ref": {
+                    "path": relative_path,
+                    "sha256": digest,
+                    "content_bytes": artifact_path.stat().st_size,
+                    "available_sections": available_sections,
+                },
+                "metrics": artifact["metrics"],
+            })
 
         conduct_tool = build_tool(
             name="ConductResearch",
@@ -855,7 +918,57 @@ def build_supervisor_tools(state: SupervisorState) -> list[Tool]:
             call=conduct_call,
             origin=ToolOrigin.SYSTEM,
         )
-        return [conduct_tool, complete_tool, reflection_tool]
+
+        async def read_artifact_call(input, context, on_progress=None):
+            del on_progress
+            configurable = Configuration.from_runnable_config(context.config)
+            run_id = str(context.config.get("metadata", {}).get("run_id", "default"))
+            context_store = RunContextStore(
+                run_id,
+                runs_dir=configurable.runs_dir,
+                inline_content_max_chars=(
+                    configurable.query_journal_inline_content_max_chars
+                ),
+            )
+            artifact = context_store.load_task_result(
+                input.task_id,
+                expected_sha256=input.artifact_sha256,
+            )
+            if input.section not in artifact:
+                raise ValueError(
+                    f"Section {input.section!r} is unavailable for task {input.task_id}"
+                )
+            section = artifact[input.section]
+            content = (
+                section
+                if isinstance(section, str)
+                else json.dumps(section, ensure_ascii=False, default=str)
+            )
+            start = min(input.offset, len(content))
+            end = min(start + input.max_chars, len(content))
+            truncated = end < len(content)
+            return ToolResult(output={
+                "task_id": input.task_id,
+                "section": input.section,
+                "offset": start,
+                "content": content[start:end],
+                "truncated": truncated,
+                "next_offset": end if truncated else None,
+                "total_chars": len(content),
+            })
+
+        read_artifact_tool = build_tool(
+            name="ReadResearchArtifact",
+            description=(
+                "Read a bounded section of a completed Researcher's persisted evidence. "
+                "Use the task id and SHA-256 returned by ConductResearch, and only call "
+                "this when the compressed findings are insufficient."
+            ),
+            input_schema=ReadResearchArtifact,
+            call=read_artifact_call,
+            origin=ToolOrigin.SYSTEM,
+        )
+        return [conduct_tool, read_artifact_tool, complete_tool, reflection_tool]
 
     async def start_call(input, context, on_progress=None):
         del on_progress

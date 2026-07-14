@@ -158,6 +158,24 @@ def test_artifact_path_cannot_escape_context(tmp_path) -> None:
         store.write_json_atomic("../escape.json", {"x": 1})
 
 
+def test_task_result_is_hash_verified_and_task_scoped(tmp_path) -> None:
+    store = _store(tmp_path)
+    digest = store.persist_task_result("task-1", {"raw_notes": ["evidence"]})
+
+    assert store.load_task_result(
+        "task-1",
+        expected_sha256=digest,
+    ) == {"raw_notes": ["evidence"]}
+
+    artifact = store.context_dir / "artifacts" / "research_tasks" / "task-1.json"
+    artifact.write_text('{"raw_notes":["tampered"]}', encoding="utf-8")
+    with pytest.raises(ValueError, match="hash mismatch"):
+        store.load_task_result("task-1", expected_sha256=digest)
+
+    with pytest.raises(ValueError, match="Invalid task_id"):
+        store.persist_task_result("../escape", {"raw_notes": []})
+
+
 def test_manifest_never_contains_plain_credentials(tmp_path) -> None:
     store = RunContextStore("run-secure", runs_dir=str(tmp_path))
     store.initialize(
