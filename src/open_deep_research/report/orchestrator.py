@@ -103,8 +103,13 @@ async def build_report(state: dict, config: RunnableConfig) -> dict:
         and ``sources`` only when non-default reference handling runs.
     """
     cfg = Configuration.from_runnable_config(config)
+    accepted_notes = [
+        note
+        for note in state.get("notes", [])
+        if "rejected_by_supervisor_quality_gate" not in str(note)
+    ]
     has_accepted_evidence = bool(
-        state.get("notes")
+        accepted_notes
         or state.get("raw_notes")
         or state.get("completed_task_outputs")
         or state.get("evidence_registry")
