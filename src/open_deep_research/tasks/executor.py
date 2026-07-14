@@ -15,6 +15,11 @@ from langchain_core.runnables import RunnableConfig
 
 from open_deep_research.configuration import Configuration
 from open_deep_research.observability.telemetry import get_prometheus_metrics
+from open_deep_research.public_events import (
+    event_publisher_from_config,
+    extract_public_sources,
+    summarize_public_findings,
+)
 from open_deep_research.run_context import RunContextStore
 from open_deep_research.sandbox.manager import DockerSandboxManager
 from open_deep_research.tasks.coordination import publish_task_update
@@ -89,6 +94,87 @@ async def _emit_state_change(
         metrics.observe_task_transition(task_record, event_type)
     store = get_task_state_store(configurable)
     snapshot = await store.update_from_record(task_record)
+    public_type = {
+        EventType.TASK_STARTED: "research.task.started",
+        EventType.TASK_COMPLETED: "research.task.completed",
+        EventType.TASK_FAILED: "research.task.failed",
+        EventType.TASK_CANCELLED: "research.task.cancelled",
+        EventType.TASK_TIMED_OUT: "research.task.timed_out",
+        EventType.TASK_UPDATED: "research.task.progress",
+        EventType.TASK_PHASE_CHANGE: "research.task.progress",
+        EventType.TASK_DOMAIN_CONFIRMATION_REQUESTED: "research.task.progress",
+        EventType.TASK_DOMAIN_DECISION: "research.task.progress",
+    }.get(event_type)
+    if public_type is not None:
+        status = task_record.status.value
+        public_payload: dict[str, Any] = {
+            "task_id": task_record.task_id,
+            "wave_id": task_record.wave_id,
+            "plan_task_id": task_record.plan_task_id,
+            "title": task_record.display_title,
+            "mode": "async",
+            "status": status,
+            "phase": phase or task_record.phase.value,
+            "elapsed_ms": int(task_record.elapsed_seconds * 1000),
+            "source_count": task_record.source_count,
+        }
+        if public_type in {"research.task.failed", "research.task.timed_out"}:
+            public_payload.update({
+                "error_code": "research_task_timed_out" if event_type == EventType.TASK_TIMED_OUT else "research_task_failed",
+                "message": "The research task timed out." if event_type == EventType.TASK_TIMED_OUT else "The research task failed.",
+            })
+        if public_type == "research.task.completed":
+            public_payload["admission_status"] = task_record.admission_status
+            if not configurable.quality_evaluation_enabled:
+                public_payload["summary_status"] = "pending"
+        publisher = event_publisher_from_config(config)
+        transition = event_type.value.removeprefix("task.")
+        dedupe_suffix = (
+            f"{transition}:{snapshot.version}"
+            if public_type == "research.task.progress"
+            else transition
+        )
+        await publisher.publish(
+            public_type,
+            stage="researching",
+            payload=public_payload,
+            dedupe_key=f"task:{task_record.task_id}:{dedupe_suffix}",
+        )
+        if (
+            event_type == EventType.TASK_COMPLETED
+            and not configurable.quality_evaluation_enabled
+            and task_record.result
+        ):
+            summary = await summarize_public_findings(task_record.result, config)
+            sources = extract_public_sources(
+                task_record.result,
+                limit=configurable.public_event_source_limit,
+            )
+            if summary:
+                await publisher.publish(
+                    "findings.updated",
+                    stage="researching",
+                    payload={
+                        "task_id": task_record.task_id,
+                        "wave_id": task_record.wave_id,
+                        "summary": summary,
+                        "sources": sources,
+                        "source_count": len(sources),
+                    },
+                    dedupe_key=f"task:{task_record.task_id}:findings",
+                )
+            else:
+                await publisher.publish(
+                    "research.task.completed",
+                    stage="researching",
+                    payload={
+                        **public_payload,
+                        "source_count": max(task_record.source_count, len(sources)),
+                        "summary_status": "unavailable",
+                        "message": "Research summary is temporarily unavailable.",
+                    },
+                    dedupe_key=f"task:{task_record.task_id}:summary:unavailable",
+                )
     if metrics is not None:
         pending = await store.list(status_filter=TaskStatus.PENDING, run_id=run_id)
         metrics.set_task_counts(len(pending), await store.count_active(run_id=run_id))
@@ -547,6 +633,10 @@ async def run_task_with_control(
                 "compressed_research": result.get("compressed_research", ""),
                 "raw_notes": result.get("raw_notes", []),
                 "metrics": result.get("metrics", {}),
+                "candidate_registry": result.get("candidate_registry", []),
+                "document_registry": result.get("document_registry", []),
+                "evidence_registry": result.get("evidence_registry", []),
+                "web_research_iterations": result.get("web_research_iterations", []),
             }
             registry.update_status(
                 task_record.task_id,

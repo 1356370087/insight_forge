@@ -29,6 +29,9 @@ class TaskSnapshot(BaseModel):
     status: TaskStatus = TaskStatus.PENDING
     phase: TaskPhase = TaskPhase.RESEARCHING
     research_topic: str = ""
+    display_title: str = ""
+    wave_id: str = ""
+    plan_task_id: str = ""
     created_at: float = Field(default_factory=time.time)
     started_at: Optional[float] = None
     completed_at: Optional[float] = None
@@ -71,6 +74,9 @@ class TaskSnapshot(BaseModel):
             status=record.status,
             phase=record.phase,
             research_topic=record.research_topic,
+            display_title=record.display_title,
+            wave_id=record.wave_id,
+            plan_task_id=record.plan_task_id,
             created_at=record.created_at,
             started_at=record.started_at,
             completed_at=record.completed_at,

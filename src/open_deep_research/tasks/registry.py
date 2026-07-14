@@ -50,6 +50,9 @@ class TaskRecord:
 
     task_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     research_topic: str = ""
+    display_title: str = ""
+    wave_id: str = ""
+    plan_task_id: str = ""
 
     # Isolation — prevents cross-run / cross-user contamination
     run_id: str = ""
@@ -138,12 +141,18 @@ class TaskRegistry:
         *,
         run_id: str = "",
         user_id: Optional[str] = None,
+        display_title: str = "",
+        wave_id: str = "",
+        plan_task_id: str = "",
     ) -> TaskRecord:
         """Create a new PENDING task record and return it."""
         record = TaskRecord(
             research_topic=research_topic,
             run_id=run_id,
             user_id=user_id,
+            display_title=display_title,
+            wave_id=wave_id,
+            plan_task_id=plan_task_id,
         )
         self._tasks[record.task_id] = record
         return record

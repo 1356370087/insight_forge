@@ -18,6 +18,10 @@ from pydantic import BaseModel, Field
 from open_deep_research.configuration import Configuration
 from open_deep_research.observability import current_span_ids, get_trace_recorder
 from open_deep_research.observability.telemetry import get_prometheus_metrics
+from open_deep_research.public_events import (
+    event_publisher_from_config,
+    public_display_title,
+)
 from open_deep_research.sandbox.manager import stop_sandbox_container
 from open_deep_research.tasks.coordination import (
     FileDomainDecisionStore,
@@ -55,6 +59,11 @@ class StartResearchTask(BaseModel):
             "research objective, not a search-engine query to copy verbatim; the sub-agent will "
             "begin with short, broad queries and narrow them based on evidence."
         ),
+    )
+    display_title: Optional[str] = Field(
+        default=None,
+        max_length=160,
+        description="Short user-visible label for this delegated research task.",
     )
 
 
@@ -359,7 +368,18 @@ async def handle_start_research_task(
         )
 
     research_topic = tool_call["args"]["research_topic"]
-    record = registry.create(research_topic=research_topic, run_id=run_id, user_id=user_id)
+    display_title = public_display_title(
+        str(tool_call.get("args", {}).get("display_title") or research_topic)
+    )
+    wave_id = str(config.get("metadata", {}).get("research_wave_id") or "wave-1")
+    record = registry.create(
+        research_topic=research_topic,
+        run_id=run_id,
+        user_id=user_id,
+        display_title=display_title,
+        wave_id=wave_id,
+        plan_task_id=tool_call["id"],
+    )
     _trace_run_id, trace_parent_span_id = current_span_ids()
     record.trace_parent_span_id = trace_parent_span_id
     record.langfuse_parent_span_id = getattr(
@@ -390,6 +410,28 @@ async def handle_start_research_task(
     await _publish_snapshot_update(
         configurable, snapshot, EventType.TASK_CREATED, event_writer
     )
+    publisher = event_publisher_from_config(config)
+    common_public = {
+        "task_id": record.task_id,
+        "wave_id": record.wave_id,
+        "plan_task_id": record.plan_task_id,
+        "title": record.display_title,
+        "mode": "async",
+        "status": "pending",
+        "phase": record.phase.value,
+    }
+    await publisher.publish(
+        "plan.task.added",
+        stage="researching",
+        payload=common_public,
+        dedupe_key=f"plan:task:{record.task_id}:added",
+    )
+    await publisher.publish(
+        "research.task.created",
+        stage="researching",
+        payload=common_public,
+        dedupe_key=f"task:{record.task_id}:created",
+    )
 
     # Submit to the persistent pool. Assignment is durable before this returns.
     # If pool admission itself fails, persist a terminal state so a task created
@@ -405,6 +447,21 @@ async def handle_start_research_task(
         snapshot = await state_store.update_from_record(record)
         await _publish_snapshot_update(
             configurable, snapshot, EventType.TASK_FAILED, event_writer
+        )
+        await publisher.publish(
+            "research.task.failed",
+            stage="researching",
+            payload={
+                "task_id": record.task_id,
+                "wave_id": record.wave_id,
+                "mode": "async",
+                "status": "failed",
+                "phase": record.phase.value,
+                "elapsed_ms": int(record.elapsed_seconds * 1000),
+                "error_code": "task_launch_failed",
+                "message": "The research task could not be started.",
+            },
+            dedupe_key=f"task:{record.task_id}:failed",
         )
         raise
 
