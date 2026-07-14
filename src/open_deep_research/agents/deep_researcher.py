@@ -44,6 +44,12 @@ from open_deep_research.prompts import (
     research_system_prompt,
     transform_messages_into_research_topic_prompt,
 )
+from open_deep_research.public_events import (
+    event_publisher_from_config,
+    extract_public_sources,
+    public_display_title,
+    summarize_public_findings,
+)
 from open_deep_research.quality import (
     evaluate_subagent_handoff,
     evaluate_tool_results,
@@ -1179,16 +1185,86 @@ async def _execute_supervisor_tools(
         if call["name"] != "ConductResearch" or call["id"] in runnable_conduct_ids
     ]
 
+    run_id = str(config.get("metadata", {}).get("run_id", "default"))
+    wave_id = f"wave-{int(state.get('research_iterations', 0) or 0)}"
+    publisher = event_publisher_from_config(config)
+    research_calls = [
+        call for call in ordinary_calls
+        if call["name"] in {"ConductResearch", "StartResearchTask"}
+    ]
+    if research_calls:
+        await publisher.publish(
+            "research.wave.started",
+            stage="researching",
+            payload={
+                "wave_id": wave_id,
+                "mode": "async" if state.get("enable_async_research", False) else "sync",
+                "task_ids": [call["id"] for call in research_calls],
+                "task_count": len(research_calls),
+            },
+            dedupe_key=f"wave:{wave_id}:started",
+        )
+
+    for call in conduct_calls:
+        task_id = call["id"]
+        title = public_display_title(
+            str(call.get("args", {}).get("display_title") or call.get("args", {}).get("research_topic", ""))
+        )
+        common = {
+            "task_id": task_id,
+            "wave_id": wave_id,
+            "title": title,
+            "mode": "sync",
+            "status": "pending",
+        }
+        await publisher.publish(
+            "plan.task.added",
+            stage="researching",
+            payload=common,
+            dedupe_key=f"plan:task:{task_id}:added",
+        )
+        await publisher.publish(
+            "research.task.created",
+            stage="researching",
+            payload={**common, "plan_task_id": task_id, "phase": "researching"},
+            dedupe_key=f"task:{task_id}:created",
+        )
+
     async def execute_one(tool_call: dict[str, Any]):
-        return await observe_tool_call(
+        call_config: RunnableConfig = dict(config)  # type: ignore[assignment]
+        call_config["metadata"] = {
+            **(config.get("metadata") or {}),
+            "research_wave_id": wave_id,
+            "supervisor_turn": int(state.get("research_iterations", 0) or 0),
+        }
+        is_sync_research = tool_call["name"] == "ConductResearch"
+        if is_sync_research:
+            await publisher.publish(
+                "research.task.started",
+                stage="researching",
+                payload={
+                    "task_id": tool_call["id"],
+                    "wave_id": wave_id,
+                    "plan_task_id": tool_call["id"],
+                    "title": public_display_title(str(
+                        tool_call.get("args", {}).get("display_title")
+                        or tool_call.get("args", {}).get("research_topic", "")
+                    )),
+                    "mode": "sync",
+                    "status": "running",
+                    "phase": "researching",
+                },
+                dedupe_key=f"task:{tool_call['id']}:started",
+            )
+        outcome = await observe_tool_call(
             tool_call,
             AgentRole.SUPERVISOR.value,
-            config,
+            call_config,
             lambda: execute_governed_tool_call(
                 tool_call,
                 registry,
                 AgentRole.SUPERVISOR,
-                config,
+                call_config,
                 allowed_tools=allowed,
                 apply_retry=True,
                 max_retries=configurable.max_tool_retries,
@@ -1196,6 +1272,50 @@ async def _execute_supervisor_tools(
                 max_delay=configurable.tool_retry_max_delay,
             ),
         )
+        if is_sync_research:
+            if outcome.error is not None or outcome.result is None:
+                await publisher.publish(
+                    "research.task.failed",
+                    stage="researching",
+                    payload={
+                        "task_id": tool_call["id"],
+                        "wave_id": wave_id,
+                        "mode": "sync",
+                        "status": "failed",
+                        "phase": "researching",
+                        "error_code": "research_task_failed",
+                        "message": "The research task failed.",
+                    },
+                    dedupe_key=f"task:{tool_call['id']}:failed",
+                )
+            else:
+                observation = outcome.result.output
+                sources = extract_public_sources(
+                    observation if isinstance(observation, dict) else {},
+                    limit=configurable.public_event_source_limit,
+                )
+                for source in sources:
+                    await publisher.publish(
+                        "research.source.discovered",
+                        stage="researching",
+                        payload={"task_id": tool_call["id"], **source},
+                        dedupe_key=f"source:{source['source_id']}",
+                    )
+                await publisher.publish(
+                    "research.task.completed",
+                    stage="researching",
+                    payload={
+                        "task_id": tool_call["id"],
+                        "wave_id": wave_id,
+                        "mode": "sync",
+                        "status": "completed",
+                        "phase": "completed",
+                        "source_count": len(sources),
+                        "admission_status": "pending",
+                    },
+                    dedupe_key=f"task:{tool_call['id']}:completed",
+                )
+        return outcome
 
     if state.get("enable_async_research", False):
         outcomes = []
@@ -1239,6 +1359,114 @@ async def _execute_supervisor_tools(
 
         assessed = await asyncio.gather(*(assess_handoff(call) for call in assessable_calls))
         handoff_assessments = {call_id: assessment for call_id, assessment in assessed}
+
+    completed_sync = 0
+    failed_sync = 0
+    rejected_sync = 0
+    for call in conduct_calls:
+        if call["id"] not in outcomes_by_id:
+            continue
+        outcome = outcomes_by_id[call["id"]]
+        if outcome.error is not None or outcome.result is None:
+            failed_sync += 1
+            continue
+        completed_sync += 1
+        assessment = handoff_assessments.get(call["id"])
+        accepted = assessment is None or assessment.accepted
+        admission_status = "accepted" if accepted else "rejected"
+        if not accepted:
+            rejected_sync += 1
+        visible_result: dict[str, Any] = {}
+        summary: str | None = None
+        sources: list[dict[str, str]] = []
+        if accepted:
+            visible_result = outcome.result.output if isinstance(outcome.result.output, dict) else {}
+            artifact_ref = visible_result.get("artifact_ref", {})
+            try:
+                if artifact_ref.get("sha256"):
+                    visible_result = RunContextStore(
+                        run_id,
+                        runs_dir=configurable.runs_dir,
+                    ).load_task_result(
+                        call["id"],
+                        expected_sha256=str(artifact_ref["sha256"]),
+                    )
+            except Exception:
+                pass
+            summary = await summarize_public_findings(visible_result, config)
+            sources = extract_public_sources(
+                visible_result,
+                limit=configurable.public_event_source_limit,
+            )
+        await publisher.publish(
+            "research.task.completed",
+            stage="researching",
+            payload={
+                "task_id": call["id"],
+                "wave_id": wave_id,
+                "mode": "sync",
+                "status": "completed",
+                "phase": "completed",
+                "admission_status": admission_status,
+                "reason_code": None if accepted else "quality_gate_rejected",
+                "source_count": len(sources),
+                "summary_status": (
+                    "available" if summary else "unavailable"
+                ) if accepted else "not_applicable",
+                "message": (
+                    "Research summary is temporarily unavailable."
+                    if accepted and summary is None
+                    else None
+                ),
+            },
+            dedupe_key=f"task:{call['id']}:admission:{admission_status}",
+        )
+        if summary:
+            await publisher.publish(
+                "findings.updated",
+                stage="researching",
+                payload={
+                    "task_id": call["id"],
+                    "wave_id": wave_id,
+                    "summary": summary,
+                    "sources": sources,
+                    "source_count": len(sources),
+                },
+                dedupe_key=f"task:{call['id']}:findings",
+            )
+
+    for overflow in overflow_conduct:
+        await publisher.publish(
+            "research.task.failed",
+            stage="researching",
+            payload={
+                "task_id": overflow["id"],
+                "wave_id": wave_id,
+                "mode": "sync",
+                "status": "failed",
+                "phase": "researching",
+                "error_code": "task_capacity_exceeded",
+                "message": "The research task exceeded the concurrency limit.",
+            },
+            dedupe_key=f"task:{overflow['id']}:failed",
+        )
+        failed_sync += 1
+
+    if conduct_calls:
+        await publisher.publish(
+            "research.wave.completed",
+            stage="researching",
+            payload={
+                "wave_id": wave_id,
+                "mode": "sync",
+                "task_ids": [call["id"] for call in conduct_calls],
+                "task_count": len(conduct_calls),
+                "completed": completed_sync,
+                "failed": failed_sync,
+                "rejected": rejected_sync,
+            },
+            dedupe_key=f"wave:{wave_id}:completed",
+        )
 
     tool_messages: list[ToolMessage] = []
     for call in ordinary_calls:
@@ -1334,12 +1562,65 @@ async def _execute_supervisor_tools(
                         snapshot.admission_status = "accepted" if assessment.accepted else "rejected"
                         await state_store.upsert(snapshot)
                     if not assessment.accepted:
+                        await publisher.publish(
+                            "research.task.completed",
+                            stage="researching",
+                            payload={
+                                "task_id": str(output["task_id"]),
+                                "wave_id": snapshot.wave_id if snapshot else "",
+                                "mode": "async",
+                                "status": "completed",
+                                "phase": "completed",
+                                "admission_status": "rejected",
+                                "reason_code": "quality_gate_rejected",
+                                "summary_status": "not_applicable",
+                            },
+                            dedupe_key=f"task:{output['task_id']}:admission:rejected",
+                        )
                         continue
                     output["handoff_assessment"] = assessment.model_dump()
                 elif snapshot is not None:
                     snapshot.admission_status = "accepted"
                     await state_store.upsert(snapshot)
                 accepted_outputs.append(output)
+                summary = await summarize_public_findings(output, config)
+                sources = extract_public_sources(
+                    output,
+                    limit=configurable.public_event_source_limit,
+                )
+                await publisher.publish(
+                    "research.task.completed",
+                    stage="researching",
+                    payload={
+                        "task_id": str(output["task_id"]),
+                        "wave_id": snapshot.wave_id if snapshot else "",
+                        "mode": "async",
+                        "status": "completed",
+                        "phase": "completed",
+                        "admission_status": "accepted",
+                        "source_count": len(sources),
+                        "summary_status": "available" if summary else "unavailable",
+                        "message": (
+                            "Research summary is temporarily unavailable."
+                            if summary is None
+                            else None
+                        ),
+                    },
+                    dedupe_key=f"task:{output['task_id']}:admission:accepted",
+                )
+                if summary:
+                    await publisher.publish(
+                        "findings.updated",
+                        stage="researching",
+                        payload={
+                            "task_id": str(output["task_id"]),
+                            "wave_id": snapshot.wave_id if snapshot else "",
+                            "summary": summary,
+                            "sources": sources,
+                            "source_count": len(sources),
+                        },
+                        dedupe_key=f"task:{output['task_id']}:findings",
+                    )
             update["completed_task_outputs"] = accepted_outputs
             for registry_key in (
                 "candidate_registry",
@@ -1355,6 +1636,25 @@ async def _execute_supervisor_tools(
                 if values:
                     update[registry_key] = values
             await shutdown_teammate_pool(config)
+            snapshots = await state_store.list(run_id=run_id)
+            by_wave: dict[str, list[Any]] = {}
+            for snapshot in snapshots:
+                by_wave.setdefault(snapshot.wave_id or "wave-unknown", []).append(snapshot)
+            for async_wave_id, wave_tasks in by_wave.items():
+                await publisher.publish(
+                    "research.wave.completed",
+                    stage="researching",
+                    payload={
+                        "wave_id": async_wave_id,
+                        "mode": "async",
+                        "task_ids": [task.task_id for task in wave_tasks],
+                        "task_count": len(wave_tasks),
+                        "completed": sum(task.status == TaskStatus.COMPLETED for task in wave_tasks),
+                        "failed": sum(task.status in {TaskStatus.FAILED, TaskStatus.TIMED_OUT} for task in wave_tasks),
+                        "rejected": sum(task.admission_status == "rejected" for task in wave_tasks),
+                    },
+                    dedupe_key=f"wave:{async_wave_id}:completed",
+                )
         return Command(goto=END, update=update)
 
     raw_notes: list[str] = []

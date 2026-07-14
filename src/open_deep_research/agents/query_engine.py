@@ -7,6 +7,7 @@ lives in :mod:`open_deep_research.agents.query`.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 import uuid
@@ -27,6 +28,11 @@ from open_deep_research.agents.query import (
 )
 from open_deep_research.configuration import Configuration
 from open_deep_research.observability import get_trace_recorder
+from open_deep_research.public_events import (
+    PUBLIC_STAGES,
+    event_publisher_from_config,
+    extract_public_sources,
+)
 from open_deep_research.run_context import (
     JournalCorruptedError,
     ResearchBriefPersistenceError,
@@ -96,6 +102,52 @@ class QueryEngine:
         self.context_store: RunContextStore | None = None
         self.persistence_degraded = False
         self._configure_context_store()
+
+    async def _publish_public(
+        self,
+        event_type: str,
+        *,
+        stage: str | None = None,
+        payload: dict[str, Any] | None = None,
+        dedupe_key: str,
+    ) -> None:
+        """Persist a sanitized event before it can be observed over SSE."""
+        await event_publisher_from_config(self.config).publish(
+            event_type,
+            stage=stage,
+            payload=payload,
+            dedupe_key=dedupe_key,
+        )
+
+    async def _public_stage_event(self, stage: str, status: str) -> None:
+        index = PUBLIC_STAGES.index(stage) + 1
+        await self._publish_public(
+            f"stage.{status}",
+            stage=stage,
+            payload={"stage_id": stage, "stage_index": index, "stage_count": len(PUBLIC_STAGES)},
+            dedupe_key=f"stage:{stage}:{status}",
+        )
+
+    @staticmethod
+    def _public_stage_for_internal(stage: str) -> str:
+        if stage in {"summarize_messages", "memory_recall", "clarify_with_user", "write_research_brief"}:
+            return "preparing"
+        if stage == "plan_approval":
+            return "planning"
+        if stage.startswith("supervisor."):
+            return "researching"
+        if stage == "outline_approval":
+            return "synthesizing"
+        if stage == "final_report_generation":
+            return "writing"
+        return "finalizing"
+
+    async def _publish_public_cancelled(self) -> None:
+        await self._publish_public(
+            "run.cancelled",
+            payload={"status": "cancelled"},
+            dedupe_key="run:cancelled",
+        )
 
     def _configure_context_store(self) -> None:
         """Configure the optional run-scoped persistence store."""
@@ -364,8 +416,15 @@ class QueryEngine:
         message = str(feedback.get("message") or "").strip()
         if not message:
             raise ValueError("Feedback message is required")
+        feedback_id = str(feedback.get("command_id") or uuid.uuid4())
+        existing = next(
+            (item for item in self.human_feedback if item.get("feedback_id") == feedback_id),
+            None,
+        )
+        if existing is not None:
+            return {"status": "accepted", "feedback_id": feedback_id}
         entry = {
-            "feedback_id": str(uuid.uuid4()),
+            "feedback_id": feedback_id,
             "type": feedback_type,
             "message": message,
             "task_id": feedback.get("task_id"),
@@ -375,6 +434,17 @@ class QueryEngine:
         }
         self.human_feedback.append(entry)
         await self._queue_task_feedback_if_possible(entry)
+        await self._publish_public(
+            "feedback.received",
+            stage="researching",
+            payload={
+                "feedback_id": entry["feedback_id"],
+                "feedback_type": feedback_type,
+                "task_id": entry.get("task_id"),
+                "status": "accepted",
+            },
+            dedupe_key=f"feedback:{entry['feedback_id']}",
+        )
         return {"status": "accepted", "feedback_id": entry["feedback_id"]}
 
     async def _queue_task_feedback_if_possible(self, entry: dict[str, Any]) -> None:
@@ -434,6 +504,18 @@ class QueryEngine:
             state["human_feedback"] = list(self.human_feedback)
             self.status = "awaiting_plan_approval"
             pending = self._open_human_action("plan_approval", {"research_plan": plan})
+            await self._publish_public(
+                "approval.required",
+                stage="planning",
+                payload={
+                    "action_id": pending["action_id"],
+                    "approval_type": "plan",
+                    "status": "pending",
+                    "plan_id": f"plan-{self.run_id}",
+                    "revision": revisions + 1,
+                },
+                dedupe_key=f"approval:plan:{pending['action_id']}:required",
+            )
             yield self._event(
                 "hitl.plan_pending",
                 {
@@ -448,6 +530,17 @@ class QueryEngine:
                 state["approved_research_plan"] = plan
                 state["pending_human_action"] = None
                 self.status = "running"
+                await self._publish_public(
+                    "approval.resolved",
+                    stage="planning",
+                    payload={
+                        "action_id": decision["action_id"],
+                        "approval_type": "plan",
+                        "action": "approve",
+                        "status": "resolved",
+                    },
+                    dedupe_key=f"approval:plan:{decision['action_id']}:resolved",
+                )
                 yield self._event("hitl.plan_approved", {"run_id": self.run_id, "status": self.status})
                 return
             if decision["action"] == "cancel":
@@ -466,6 +559,12 @@ class QueryEngine:
             })
             state["human_feedback"] = list(self.human_feedback)
             self.status = "running"
+            await self._publish_public(
+                "plan.revised",
+                stage="planning",
+                payload={"plan_id": f"plan-{self.run_id}", "revision": revisions + 1},
+                dedupe_key=f"plan:revised:{revisions + 1}",
+            )
             yield self._event(
                 "hitl.plan_revised",
                 {"run_id": self.run_id, "status": self.status, "revision_count": revisions},
@@ -482,6 +581,16 @@ class QueryEngine:
         while True:
             self.status = "awaiting_outline_approval"
             pending = self._open_human_action("outline_approval", {"report_outline": outline})
+            await self._publish_public(
+                "approval.required",
+                stage="synthesizing",
+                payload={
+                    "action_id": pending["action_id"],
+                    "approval_type": "outline",
+                    "status": "pending",
+                },
+                dedupe_key=f"approval:outline:{pending['action_id']}:required",
+            )
             yield self._event(
                 "hitl.outline_pending",
                 {
@@ -495,6 +604,17 @@ class QueryEngine:
             if decision["action"] == "approve":
                 state["pending_human_action"] = None
                 self.status = "running"
+                await self._publish_public(
+                    "approval.resolved",
+                    stage="synthesizing",
+                    payload={
+                        "action_id": decision["action_id"],
+                        "approval_type": "outline",
+                        "action": "approve",
+                        "status": "resolved",
+                    },
+                    dedupe_key=f"approval:outline:{decision['action_id']}:resolved",
+                )
                 yield self._event("hitl.outline_approved", {"run_id": self.run_id, "status": self.status})
                 return
             if decision["action"] == "cancel":
@@ -584,6 +704,11 @@ class QueryEngine:
             "human_feedback": list(self.human_feedback),
         }
         self.messages = state["messages"]
+        await self._publish_public(
+            "run.created",
+            payload={"status": "pending"},
+            dedupe_key="run:created",
+        )
         if self.context_store is not None:
             try:
                 self.context_store.initialize(_config_user_id(self.config), self.config)
@@ -669,6 +794,23 @@ class QueryEngine:
             input_payload=state.get("messages", []),
         ):
             event_name = "run.resumed" if recovered else "run.started"
+            run_transition_key = "run:started"
+            if recovered:
+                publisher = event_publisher_from_config(self.config)
+                previous_resumes = await asyncio.to_thread(
+                    lambda: sum(
+                        event.type == "run.resumed"
+                        for event in publisher.store.read()
+                    )
+                )
+                run_transition_key = f"run:resumed:{previous_resumes + 1}"
+            await self._publish_public(
+                event_name,
+                payload={"status": "running", "recovered": recovered},
+                dedupe_key=run_transition_key,
+            )
+            public_stage = self._public_stage_for_internal(start_stage)
+            await self._public_stage_event(public_stage, "started")
             yield self._event(event_name, {"run_id": self.run_id, "recovered": recovered})
             try:
                 from open_deep_research.agents import deep_researcher as graph
@@ -713,12 +855,36 @@ class QueryEngine:
                         await self._persist_artifact_event("research_brief_written", "research_brief.md", digest)
                     await self._persist_checkpoint("research_brief_written", "plan_approval")
                     yield self._event("lead.message", {"stage": "write_research_brief"})
+                    await self._public_stage_event("preparing", "completed")
+                    await self._public_stage_event("planning", "started")
                     stage = "plan_approval"
 
                 if self.context_store is not None and self.context_store.brief_path.exists():
                     state["research_brief"] = self.context_store.load_research_brief()
 
                 if stage == "plan_approval":
+                    if not state.get("research_plan"):
+                        plan = self._draft_research_plan(state)
+                        state["research_plan"] = plan
+                        state["approved_research_plan"] = plan
+                    await self._publish_public(
+                        "plan.created",
+                        stage="planning",
+                        payload={
+                            "plan_id": f"plan-{self.run_id}",
+                            "revision": 1,
+                            "objective": str(state.get("research_brief") or "")[:1200],
+                            "stages": [
+                                {"id": "preparing", "title": "理解请求"},
+                                {"id": "planning", "title": "制定计划"},
+                                {"id": "researching", "title": "并行研究"},
+                                {"id": "synthesizing", "title": "汇总证据"},
+                                {"id": "writing", "title": "生成报告"},
+                                {"id": "finalizing", "title": "完成研究"},
+                            ],
+                        },
+                        dedupe_key="plan:created:1",
+                    )
                     with recorder.start_span(
                         name="node.plan_approval",
                         kind="agent",
@@ -731,6 +897,7 @@ class QueryEngine:
                         await self._persist_checkpoint("cancelled", "cancelled", status="cancelled")
                         self.total_usage = recorder.finish_run(self.run_id, "cancelled")
                         self._cancelled_state(state)
+                        await self._publish_public_cancelled()
                         yield self._event(
                             "run.cancelled",
                             {
@@ -754,6 +921,8 @@ class QueryEngine:
                         },
                     )
                     await self._persist_checkpoint("plan_approved", "supervisor.supervisor")
+                    await self._public_stage_event("planning", "completed")
+                    await self._public_stage_event("researching", "started")
                     stage = "supervisor.supervisor"
 
                 if stage.startswith("supervisor."):
@@ -777,6 +946,8 @@ class QueryEngine:
                     await self._persist_task_outputs(state)
                     await self._persist_checkpoint("research_complete", "outline_approval")
                     yield self._event("lead.message", {"stage": "research_supervisor"})
+                    await self._public_stage_event("researching", "completed")
+                    await self._public_stage_event("synthesizing", "started")
                     stage = "outline_approval"
 
                 if stage == "outline_approval":
@@ -792,6 +963,7 @@ class QueryEngine:
                         await self._persist_checkpoint("cancelled", "cancelled", status="cancelled")
                         self.total_usage = recorder.finish_run(self.run_id, "cancelled")
                         self._cancelled_state(state)
+                        await self._publish_public_cancelled()
                         yield self._event(
                             "run.cancelled",
                             {
@@ -811,9 +983,17 @@ class QueryEngine:
                         update={"report_outline": state.get("report_outline")},
                     )
                     await self._persist_checkpoint("outline_approved", "final_report_generation")
+                    await self._public_stage_event("synthesizing", "completed")
+                    await self._public_stage_event("writing", "started")
                     stage = "final_report_generation"
 
                 if stage == "final_report_generation":
+                    await self._publish_public(
+                        "report.started",
+                        stage="writing",
+                        payload={"status": "running"},
+                        dedupe_key="report:started",
+                    )
                     if self.context_store is not None:
                         state["research_brief"] = self.context_store.load_research_brief()
                     with recorder.start_span(name="node.final_report_generation", kind="agent", agent_role="lead"):
@@ -828,7 +1008,21 @@ class QueryEngine:
                         "report_generated", "final_report.md", str(state.get("final_report", ""))
                     )
                     await self._persist_checkpoint("report_generated", "memory_extract_and_write")
+                    report_text = str(state.get("final_report", ""))
+                    await self._publish_public(
+                        "report.completed",
+                        stage="writing",
+                        payload={
+                            "status": "completed",
+                            "result_ref": f"/runs/{self.run_id}",
+                            "sha256": hashlib.sha256(report_text.encode("utf-8")).hexdigest(),
+                            "length": len(report_text),
+                        },
+                        dedupe_key="report:completed",
+                    )
                     yield self._event("report.completed", {"run_id": self.run_id})
+                    await self._public_stage_event("writing", "completed")
+                    await self._public_stage_event("finalizing", "started")
                     stage = "memory_extract_and_write"
 
                 if stage == "memory_extract_and_write":
@@ -844,6 +1038,7 @@ class QueryEngine:
                         update=memory_cmd.update,
                     )
                     await self._persist_checkpoint("memory_written", "completed")
+                    await self._public_stage_event("finalizing", "completed")
 
                 async for event in self._finish_success(state, recorder, str(state.get("final_report", ""))):
                     yield event
@@ -863,6 +1058,7 @@ class QueryEngine:
                     await self._persist_checkpoint("cancelled", "cancelled", status="cancelled")
                     self.total_usage = recorder.finish_run(self.run_id, "cancelled")
                     self._cancelled_state(state)
+                    await self._publish_public_cancelled()
                     yield self._event(
                         "run.cancelled",
                         {
@@ -873,6 +1069,32 @@ class QueryEngine:
                     )
                     return
                 self.status = "failed"
+                try:
+                    failed_stage = self._public_stage_for_internal(stage)
+                    await self._publish_public(
+                        "stage.failed",
+                        stage=failed_stage,
+                        payload={
+                            "stage_id": failed_stage,
+                            "stage_index": PUBLIC_STAGES.index(failed_stage) + 1,
+                            "stage_count": len(PUBLIC_STAGES),
+                            "error_code": "run_stage_failed",
+                            "message": "The research stage failed.",
+                        },
+                        dedupe_key=f"stage:{failed_stage}:failed",
+                    )
+                    await self._publish_public(
+                        "run.failed",
+                        stage=failed_stage,
+                        payload={
+                            "status": "failed",
+                            "error_code": "research_run_failed",
+                            "message": "The research run failed.",
+                        },
+                        dedupe_key="run:failed",
+                    )
+                except Exception:
+                    pass
                 if self.context_store is not None:
                     try:
                         await self.context_store.append(
@@ -947,6 +1169,12 @@ class QueryEngine:
             except Exception as exc:  # noqa: BLE001
                 self.persistence_degraded = True
                 self.context_store.mark_persistence_degraded(exc)
+        await self._publish_public(
+            "run.completed",
+            stage="finalizing",
+            payload={"status": "completed", "result_ref": f"/runs/{self.run_id}"},
+            dedupe_key="run:completed",
+        )
         yield self._event(
             "run.completed",
             {
@@ -1441,6 +1669,54 @@ class ResearcherQueryEngine:
                     tools_by_name,
                     cfg,
                 )
+                task_id = str(cfg.get("metadata", {}).get("task_id", ""))
+                if task_id:
+                    from open_deep_research.tasks.registry import get_task_registry
+
+                    task_record = get_task_registry().get(task_id)
+                    source_values = [
+                        getattr(getattr(outcome, "result", None), "output", None)
+                        for outcome in outcomes
+                    ]
+                    sources = extract_public_sources(
+                        {"candidate_registry": source_values},
+                        limit=configurable.public_event_source_limit,
+                    )
+                    if task_record is not None:
+                        task_record.source_urls.update(source["url"] for source in sources)
+                        task_record.source_count = len(task_record.source_urls)
+                    publisher = event_publisher_from_config(cfg)
+                    categories: set[str] = set()
+                    for call in tool_calls:
+                        name = str(call.get("name", "")).lower()
+                        if "search" in name:
+                            categories.add("search")
+                        elif any(token in name for token in ("fetch", "browse", "read", "open")):
+                            categories.add("fetch")
+                        else:
+                            categories.add("mcp")
+                    await publisher.publish(
+                        "research.task.progress",
+                        stage="researching",
+                        payload={
+                            "task_id": task_id,
+                            "wave_id": task_record.wave_id if task_record else "",
+                            "mode": "async",
+                            "status": "running",
+                            "phase": "researching",
+                            "iteration": turn,
+                            "source_count": task_record.source_count if task_record else len(sources),
+                            "tool_categories": sorted(categories),
+                        },
+                        dedupe_key=f"task:{task_id}:progress:{turn}",
+                    )
+                    for source in sources:
+                        await publisher.publish(
+                            "research.source.discovered",
+                            stage="researching",
+                            payload={"task_id": task_id, **source},
+                            dedupe_key=f"source:{source['source_id']}",
+                        )
                 domain_updates = {
                     key: value
                     for key, value in batch_update.items()
@@ -1540,6 +1816,31 @@ class ResearcherQueryEngine:
                     "compressed_research": "",
                     "raw_notes": [],
                 }
+            task_id = str(cfg.get("metadata", {}).get("task_id", ""))
+            if task_id:
+                from open_deep_research.tasks.registry import (
+                    TaskPhase,
+                    get_task_registry,
+                )
+
+                task_record = get_task_registry().get(task_id)
+                if task_record is not None:
+                    task_record.phase = TaskPhase.COMPRESSING
+                await event_publisher_from_config(cfg).publish(
+                    "research.task.progress",
+                    stage="researching",
+                    payload={
+                        "task_id": task_id,
+                        "wave_id": task_record.wave_id if task_record else "",
+                        "mode": "async",
+                        "status": "running",
+                        "phase": "compressing",
+                        "iteration": completed_turn,
+                        "source_count": task_record.source_count if task_record else 0,
+                        "tool_categories": [],
+                    },
+                    dedupe_key=f"task:{task_id}:compressing",
+                )
             update = await graph.compress_research(researcher_state, cfg)
             apply_update_to_state(researcher_state, update)
             return researcher_state

@@ -21,6 +21,11 @@ class ConductResearch(BaseModel):
             "begin with short, broad queries and narrow them based on evidence."
         ),
     )
+    display_title: Optional[str] = Field(
+        default=None,
+        max_length=160,
+        description="Short user-visible label for this delegated research task.",
+    )
 
 
 class ReadResearchArtifact(BaseModel):
