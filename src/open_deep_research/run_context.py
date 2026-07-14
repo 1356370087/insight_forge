@@ -82,6 +82,7 @@ class RunManifest(BaseModel):
     last_stable_stage: str = "received"
     next_stage: str = "summarize_messages"
     last_journal_seq: int = 0
+    last_public_event_seq: int = 0
     research_brief_sha256: Optional[str] = None
     persistence_degraded: bool = False
     persistence_error: Optional[str] = None
@@ -436,6 +437,17 @@ class RunContextStore:
             self._update_manifest(
                 persistence_degraded=True,
                 persistence_error=str(error)[:1000],
+            )
+        except Exception:
+            return
+
+    def mark_event_persistence_failed(self, error: Exception | str) -> None:
+        """Mark a public-event contract failure as a terminal run failure."""
+        try:
+            self._update_manifest(
+                status="failed",
+                persistence_degraded=True,
+                persistence_error=f"event_persistence_failed: {error}"[:1000],
             )
         except Exception:
             return

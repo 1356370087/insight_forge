@@ -798,6 +798,30 @@ class Configuration(BaseModel):
             }
         }
     )
+    public_event_summary_max_chars: int = Field(
+        default=1200,
+        ge=200,
+        le=10_000,
+        description="Maximum characters exposed in one public findings summary.",
+    )
+    public_event_source_limit: int = Field(
+        default=10,
+        ge=0,
+        le=100,
+        description="Maximum source references exposed by one public event.",
+    )
+    sse_heartbeat_seconds: float = Field(
+        default=15,
+        ge=1,
+        le=120,
+        description="Seconds between SSE keep-alive comments.",
+    )
+    sse_poll_interval_ms: int = Field(
+        default=250,
+        ge=25,
+        le=5000,
+        description="Polling interval used to tail public events across workers.",
+    )
     task_state_backend: Literal["file", "memory"] = Field(
         default="file",
         metadata={

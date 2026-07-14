@@ -1,0 +1,559 @@
+"""Durable, sanitized public events for research run progress.
+
+This module is deliberately separate from the Query recovery journal and the
+diagnostic task log.  Its JSONL file is the only source exposed through SSE.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import os
+import re
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Literal, Optional
+from urllib.parse import urlsplit, urlunsplit
+
+import portalocker
+from langchain_core.runnables import RunnableConfig
+from pydantic import BaseModel, Field
+
+from open_deep_research.configuration import Configuration
+
+PUBLIC_EVENT_SCHEMA_VERSION = 1
+PUBLIC_STAGES = (
+    "preparing",
+    "planning",
+    "researching",
+    "synthesizing",
+    "writing",
+    "finalizing",
+)
+TERMINAL_EVENT_TYPES = {"run.completed", "run.failed", "run.cancelled"}
+_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_SECRET_KEY_RE = re.compile(
+    r"(?:api[_-]?key|authorization|token|cookie|password|secret|prompt|reasoning|memory_context|tool_result)",
+    re.IGNORECASE,
+)
+_SECRET_TEXT_RE = re.compile(
+    r"(?i)\b(api[_-]?key|authorization|access[_-]?token|refresh[_-]?token|cookie|password|secret)"
+    r"\s*[:=]\s*([^\s,;]+)"
+)
+
+_COMMON_KEYS = {"status", "error_code", "message", "recovered"}
+_PAYLOAD_KEYS: dict[str, set[str]] = {
+    "run.created": {"status"},
+    "run.started": {"status", "recovered"},
+    "run.resumed": {"status", "recovered"},
+    "run.completed": {"status", "result_ref"},
+    "run.failed": {"status", "error_code", "message"},
+    "run.cancelled": {"status"},
+    "stage.started": {"stage_id", "stage_index", "stage_count"},
+    "stage.completed": {"stage_id", "stage_index", "stage_count"},
+    "stage.failed": {"stage_id", "stage_index", "stage_count", "error_code", "message"},
+    "plan.created": {"plan_id", "revision", "objective", "stages"},
+    "plan.revised": {"plan_id", "revision"},
+    "plan.task.added": {"task_id", "wave_id", "title", "mode", "status"},
+    "research.wave.started": {"wave_id", "mode", "task_ids", "task_count"},
+    "research.wave.completed": {
+        "wave_id", "mode", "task_ids", "task_count", "completed", "failed", "rejected"
+    },
+    "research.task.created": {
+        "task_id", "wave_id", "plan_task_id", "title", "mode", "status", "phase"
+    },
+    "research.task.started": {
+        "task_id", "wave_id", "plan_task_id", "title", "mode", "status", "phase"
+    },
+    "research.task.progress": {
+        "task_id", "wave_id", "mode", "status", "phase", "iteration", "source_count", "tool_categories"
+    },
+    "research.source.discovered": {"task_id", "source_id", "title", "domain", "url"},
+    "research.task.completed": {
+        "task_id", "wave_id", "mode", "status", "phase", "elapsed_ms", "source_count",
+        "admission_status", "reason_code", "summary_status", "message"
+    },
+    "research.task.failed": {
+        "task_id", "wave_id", "mode", "status", "phase", "elapsed_ms", "error_code", "message"
+    },
+    "research.task.cancelled": {"task_id", "wave_id", "mode", "status", "phase", "elapsed_ms"},
+    "research.task.timed_out": {
+        "task_id", "wave_id", "mode", "status", "phase", "elapsed_ms", "error_code", "message"
+    },
+    "findings.updated": {"task_id", "wave_id", "summary", "sources", "source_count"},
+    "report.started": {"status"},
+    "report.completed": {"status", "result_ref", "sha256", "length"},
+    "approval.required": {"action_id", "approval_type", "status", "plan_id", "revision"},
+    "approval.resolved": {"action_id", "approval_type", "action", "status"},
+    "feedback.received": {"feedback_id", "feedback_type", "task_id", "status"},
+    "system.warning": {"warning_code", "message"},
+}
+
+
+class PublicEventError(RuntimeError):
+    """Base error for public-event persistence."""
+
+
+class PublicEventLogCorrupted(PublicEventError):
+    """Raised when a non-tail event record cannot be recovered."""
+
+
+class PublicEvent(BaseModel):
+    """One stable event exposed to external clients."""
+
+    schema_version: int = PUBLIC_EVENT_SCHEMA_VERSION
+    event_id: str
+    sequence: int = Field(ge=1)
+    run_id: str
+    type: str
+    timestamp: str
+    stage: Optional[Literal[
+        "preparing", "planning", "researching", "synthesizing", "writing", "finalizing"
+    ]] = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    dedupe_key: str
+
+    def public_dict(self) -> dict[str, Any]:
+        """Return the wire representation without persistence-only metadata."""
+        return self.model_dump(exclude={"dedupe_key"})
+
+
+class PublicRunProjection(BaseModel):
+    """Replay-derived current state for a public research run."""
+
+    current_stage: Optional[str] = None
+    stage_index: int = 0
+    stage_count: int = len(PUBLIC_STAGES)
+    plan: dict[str, Any] = Field(default_factory=dict)
+    tasks: dict[str, int] = Field(default_factory=lambda: {
+        "total": 0,
+        "pending": 0,
+        "running": 0,
+        "completed": 0,
+        "failed": 0,
+        "cancelled": 0,
+        "timed_out": 0,
+    })
+    waves: dict[str, int] = Field(default_factory=lambda: {"total": 0, "completed": 0})
+    latest_findings: list[dict[str, Any]] = Field(default_factory=list)
+    last_event_id: int = 0
+
+
+class PublicFindingsSummary(BaseModel):
+    """Structured, user-visible summary produced from compressed findings."""
+
+    findings: list[str] = Field(default_factory=list, max_length=3)
+
+
+def utc_timestamp() -> str:
+    """Return an RFC 3339 UTC timestamp."""
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def public_display_title(value: str, *, limit: int = 160) -> str:
+    """Derive a short display label without exposing a complete task contract."""
+    text = _SECRET_TEXT_RE.sub(lambda match: f"{match.group(1)}=[REDACTED]", str(value))
+    for prefix in ("Objective:", "**Objective**:", "目标：", "目标:"):
+        if prefix in text:
+            text = text.split(prefix, 1)[1]
+            break
+    first = next((part.strip(" -*#\t") for part in text.splitlines() if part.strip()), "Research task")
+    first = re.split(r"(?<=[.!?。！？])\s+", first, maxsplit=1)[0]
+    return first[:limit] or "Research task"
+
+
+def canonical_public_source(url: str, title: str = "") -> Optional[dict[str, str]]:
+    """Return a safe public source reference, dropping credentials and URL queries."""
+    try:
+        parsed = urlsplit(str(url).strip())
+    except ValueError:
+        return None
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        return None
+    host = parsed.hostname.lower()
+    try:
+        port = f":{parsed.port}" if parsed.port else ""
+    except ValueError:
+        return None
+    canonical = urlunsplit((parsed.scheme.lower(), f"{host}{port}", parsed.path or "/", "", ""))
+    return {
+        "source_id": hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24],
+        "title": public_display_title(title or host, limit=200),
+        "domain": host,
+        "url": canonical,
+    }
+
+
+def extract_public_sources(result: dict[str, Any], *, limit: int = 10) -> list[dict[str, str]]:
+    """Extract and canonicalize source metadata without exposing result bodies."""
+    found: dict[str, dict[str, str]] = {}
+
+    def visit(value: Any) -> None:
+        if len(found) >= limit:
+            return
+        if isinstance(value, dict):
+            url = value.get("url") or value.get("source_url") or value.get("link")
+            if url:
+                source = canonical_public_source(
+                    str(url),
+                    str(value.get("title") or value.get("name") or ""),
+                )
+                if source is not None:
+                    found.setdefault(source["source_id"], source)
+            for key, item in value.items():
+                if key not in {"content", "raw_content", "text", "snippet"}:
+                    visit(item)
+        elif isinstance(value, list | tuple):
+            for item in value:
+                visit(item)
+
+    for registry_key in ("evidence_registry", "document_registry", "candidate_registry"):
+        visit(result.get(registry_key, []))
+    return list(found.values())[:limit]
+
+
+async def summarize_public_findings(
+    result: dict[str, Any],
+    config: RunnableConfig,
+) -> Optional[str]:
+    """Create a bounded public summary; failure never exposes raw findings."""
+    compressed = str(result.get("compressed_research") or "").strip()
+    if not compressed:
+        return None
+    configurable = Configuration.from_runnable_config(config)
+    try:
+        from langchain.chat_models import init_chat_model
+        from langchain_core.messages import HumanMessage
+
+        from open_deep_research.configuration import get_model_compatibility_kwargs
+        from open_deep_research.tools.utils import get_model_connection_kwargs
+
+        model = init_chat_model(
+            model=configurable.summarization_model,
+            max_tokens=min(configurable.summarization_model_max_tokens, 800),
+            **get_model_connection_kwargs(configurable.summarization_model, config),
+            **get_model_compatibility_kwargs(configurable.summarization_model),
+        ).with_structured_output(PublicFindingsSummary, method="function_calling")
+        response = await model.ainvoke([
+            HumanMessage(content=(
+                "Summarize the completed research into at most three concise user-visible findings. "
+                "Do not mention prompts, hidden reasoning, tool internals, credentials, or implementation details. "
+                "Preserve uncertainty and do not add claims.\n\nCompressed research:\n"
+                + compressed[:50_000]
+            ))
+        ])
+        findings = [str(item).strip() for item in response.findings if str(item).strip()][:3]
+        if not findings:
+            return None
+        return "\n".join(f"- {item}" for item in findings)[: configurable.public_event_summary_max_chars]
+    except Exception:
+        return None
+
+
+def _sanitize_scalar(value: Any) -> Any:
+    if value is None or isinstance(value, bool | int | float):
+        return value
+    text = _SECRET_TEXT_RE.sub(lambda match: f"{match.group(1)}=[REDACTED]", str(value))
+    return text
+
+
+def _sanitize_nested(value: Any, *, depth: int = 0) -> Any:
+    if depth > 5:
+        return "[TRUNCATED]"
+    if isinstance(value, dict):
+        return {
+            str(key): _sanitize_nested(item, depth=depth + 1)
+            for key, item in value.items()
+            if not _SECRET_KEY_RE.search(str(key))
+        }
+    if isinstance(value, list | tuple):
+        return [_sanitize_nested(item, depth=depth + 1) for item in value[:100]]
+    return _sanitize_scalar(value)
+
+
+def sanitize_public_payload(event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Apply an event-specific field allowlist and generic secret redaction."""
+    allowed = _PAYLOAD_KEYS.get(event_type, _COMMON_KEYS)
+    return {
+        key: _sanitize_nested(value)
+        for key, value in payload.items()
+        if key in allowed and not _SECRET_KEY_RE.search(key)
+    }
+
+
+class RunEventStore:
+    """Inter-process-safe append-only public event store for one run."""
+
+    def __init__(self, run_id: str, *, runs_dir: str = ".runs", lock_timeout_seconds: float = 30) -> None:
+        """Initialize paths and the inter-process lock timeout."""
+        if not _COMPONENT_RE.fullmatch(run_id) or ".." in run_id:
+            raise ValueError("Invalid run_id")
+        self.run_id = run_id
+        self.run_dir = Path(runs_dir).resolve() / run_id
+        self.path = self.run_dir / "public_events.jsonl"
+        self.index_path = self.run_dir / "public_events_index.json"
+        self.lock_path = self.run_dir / "public_events.lock"
+        self.lock_timeout_seconds = lock_timeout_seconds
+
+    @property
+    def exists(self) -> bool:
+        """Return whether this run has a public event stream."""
+        return self.path.exists()
+
+    def _read_records_unlocked(self, *, repair_tail: bool = True) -> list[PublicEvent]:
+        if not self.path.exists():
+            return []
+        raw_lines = self.path.read_bytes().splitlines()
+        records: list[PublicEvent] = []
+        expected = 1
+        for index, raw in enumerate(raw_lines):
+            if not raw.strip():
+                continue
+            try:
+                event = PublicEvent.model_validate_json(raw)
+            except Exception as exc:
+                if repair_tail and index == len(raw_lines) - 1:
+                    valid = b"\n".join(raw_lines[:index])
+                    if valid:
+                        valid += b"\n"
+                    with self.path.open("wb") as handle:
+                        handle.write(valid)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    break
+                raise PublicEventLogCorrupted("public_event_log_corrupted") from exc
+            if event.run_id != self.run_id or event.sequence != expected:
+                raise PublicEventLogCorrupted("public_event_log_corrupted")
+            records.append(event)
+            expected += 1
+        return records
+
+    def _mark_event_persistence_failed(self, error: Exception) -> None:
+        try:
+            from open_deep_research.run_context import RunContextStore
+
+            context = RunContextStore(self.run_id, runs_dir=str(self.run_dir.parent))
+            if context.manifest_path.exists():
+                context.mark_event_persistence_failed(error)
+        except Exception:
+            pass
+
+    def _read_records_locked(self) -> list[PublicEvent]:
+        try:
+            with portalocker.Lock(str(self.lock_path), mode="a+b", timeout=self.lock_timeout_seconds):
+                return self._read_records_unlocked()
+        except Exception as exc:
+            self._mark_event_persistence_failed(exc)
+            raise
+
+    def read(self, after: int = 0) -> list[PublicEvent]:
+        """Return durable events with sequence greater than ``after``."""
+        if not self.path.exists():
+            return []
+        records = self._read_records_locked()
+        return [event for event in records if event.sequence > after]
+
+    def last_sequence(self) -> int:
+        """Return the last durable sequence, or zero for an empty stream."""
+        if not self.path.exists():
+            return 0
+        records = self._read_records_locked()
+        return records[-1].sequence if records else 0
+
+    def _write_index(self, last_sequence: int, keys: dict[str, int]) -> None:
+        self.index_path.parent.mkdir(parents=True, exist_ok=True)
+        temp = self.index_path.with_name(f".{self.index_path.name}.{uuid.uuid4().hex}.tmp")
+        data = {"schema_version": 1, "last_sequence": last_sequence, "keys": keys}
+        try:
+            with temp.open("w", encoding="utf-8") as handle:
+                json.dump(data, handle, ensure_ascii=False, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, self.index_path)
+        finally:
+            if temp.exists():
+                temp.unlink()
+
+    def _load_index(self, records: list[PublicEvent]) -> tuple[int, dict[str, int]]:
+        try:
+            data = json.loads(self.index_path.read_text(encoding="utf-8"))
+            keys = {str(key): int(value) for key, value in data.get("keys", {}).items()}
+            last = int(data.get("last_sequence", 0))
+            expected_keys = {event.dedupe_key: event.sequence for event in records}
+            if last == (records[-1].sequence if records else 0) and keys == expected_keys:
+                return last, keys
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+        keys = {event.dedupe_key: event.sequence for event in records}
+        last = records[-1].sequence if records else 0
+        self._write_index(last, keys)
+        return last, keys
+
+    def _append_sync(
+        self,
+        event_type: str,
+        *,
+        stage: Optional[str],
+        payload: dict[str, Any],
+        dedupe_key: str,
+    ) -> PublicEvent:
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        with portalocker.Lock(str(self.lock_path), mode="a+b", timeout=self.lock_timeout_seconds):
+            records = self._read_records_unlocked()
+            last, keys = self._load_index(records)
+            if dedupe_key in keys:
+                sequence = keys[dedupe_key]
+                return next(event for event in records if event.sequence == sequence)
+            sequence = last + 1
+            event = PublicEvent(
+                event_id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{self.run_id}:{dedupe_key}")),
+                sequence=sequence,
+                run_id=self.run_id,
+                type=event_type,
+                timestamp=utc_timestamp(),
+                stage=stage,
+                payload=sanitize_public_payload(event_type, payload),
+                dedupe_key=dedupe_key,
+            )
+            data = (event.model_dump_json() + "\n").encode("utf-8")
+            fd = os.open(self.path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+            try:
+                os.write(fd, data)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            keys[dedupe_key] = sequence
+            self._write_index(sequence, keys)
+            try:
+                from open_deep_research.run_context import RunContextStore
+
+                context = RunContextStore(self.run_id, runs_dir=str(self.run_dir.parent))
+                if context.manifest_path.exists():
+                    context._update_manifest(last_public_event_seq=sequence)  # noqa: SLF001
+            except Exception:
+                # The event log remains authoritative; manifest is only a fast cache.
+                pass
+            return event
+
+    async def append(
+        self,
+        event_type: str,
+        *,
+        stage: Optional[str] = None,
+        payload: Optional[dict[str, Any]] = None,
+        dedupe_key: str,
+    ) -> PublicEvent:
+        """Persist one idempotent public event."""
+        try:
+            return await asyncio.to_thread(
+                self._append_sync,
+                event_type,
+                stage=stage,
+                payload=payload or {},
+                dedupe_key=dedupe_key,
+            )
+        except Exception as exc:
+            self._mark_event_persistence_failed(exc)
+            raise
+
+    def project(self) -> PublicRunProjection:
+        """Replay this stream into its current public projection."""
+        if not self.path.exists():
+            return PublicRunProjection()
+        records = self._read_records_locked()
+        return project_public_events(records)
+
+
+class RunEventPublisher:
+    """Small async facade used by runtime components."""
+
+    def __init__(self, store: RunEventStore) -> None:
+        """Wrap a run-scoped durable event store."""
+        self.store = store
+
+    async def publish(
+        self,
+        event_type: str,
+        *,
+        stage: Optional[str] = None,
+        payload: Optional[dict[str, Any]] = None,
+        dedupe_key: str,
+    ) -> PublicEvent:
+        """Persist and return one sanitized public event."""
+        return await self.store.append(
+            event_type,
+            stage=stage,
+            payload=payload,
+            dedupe_key=dedupe_key,
+        )
+
+
+def event_store_from_config(config: RunnableConfig | dict[str, Any]) -> RunEventStore:
+    """Build a run-scoped store from runtime configuration."""
+    configurable = Configuration.from_runnable_config(config)
+    run_id = str((config.get("metadata") or {}).get("run_id", "default"))
+    return RunEventStore(
+        run_id,
+        runs_dir=configurable.runs_dir,
+    )
+
+
+def event_publisher_from_config(config: RunnableConfig | dict[str, Any]) -> RunEventPublisher:
+    """Build a run-scoped public event publisher from runtime config."""
+    return RunEventPublisher(event_store_from_config(config))
+
+
+def project_public_events(events: list[PublicEvent]) -> PublicRunProjection:
+    """Reduce public events into a deterministic client-facing progress snapshot."""
+    projection = PublicRunProjection()
+    task_statuses: dict[str, str] = {}
+    waves: set[str] = set()
+    completed_waves: set[str] = set()
+    findings: dict[str, dict[str, Any]] = {}
+    for event in events:
+        projection.last_event_id = event.sequence
+        payload = event.payload
+        if event.type.startswith("stage.") and payload.get("stage_id"):
+            projection.current_stage = str(payload["stage_id"])
+            projection.stage_index = int(payload.get("stage_index", 0))
+        elif event.type in {"plan.created", "plan.revised"}:
+            if event.type == "plan.created":
+                projection.plan = dict(payload)
+            else:
+                projection.plan.update(payload)
+        elif event.type == "plan.task.added":
+            tasks = projection.plan.setdefault("tasks", [])
+            if not any(item.get("task_id") == payload.get("task_id") for item in tasks):
+                tasks.append(dict(payload))
+            task_statuses[str(payload.get("task_id"))] = str(payload.get("status", "pending"))
+        elif event.type.startswith("research.task."):
+            task_id = str(payload.get("task_id", ""))
+            if task_id:
+                status = payload.get("status")
+                if status:
+                    task_statuses[task_id] = str(status)
+        elif event.type == "research.wave.started":
+            waves.add(str(payload.get("wave_id")))
+        elif event.type == "research.wave.completed":
+            wave_id = str(payload.get("wave_id"))
+            waves.add(wave_id)
+            completed_waves.add(wave_id)
+        elif event.type == "findings.updated":
+            findings[str(payload.get("task_id"))] = dict(payload)
+
+    counts = {key: 0 for key in ("pending", "running", "completed", "failed", "cancelled", "timed_out")}
+    for status in task_statuses.values():
+        normalized = "running" if status in {"created", "researching", "compressing"} else status
+        if normalized in counts:
+            counts[normalized] += 1
+    projection.tasks = {"total": len(task_statuses), **counts}
+    projection.waves = {"total": len(waves), "completed": len(completed_waves)}
+    projection.latest_findings = list(findings.values())
+    return projection
+
+
+def is_terminal_event(event: PublicEvent) -> bool:
+    """Return whether an event closes the public stream."""
+    return event.type in TERMINAL_EVENT_TYPES
