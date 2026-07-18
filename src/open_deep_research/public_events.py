@@ -42,6 +42,7 @@ _SECRET_TEXT_RE = re.compile(
     r"(?i)\b(api[_-]?key|authorization|access[_-]?token|refresh[_-]?token|cookie|password|secret)"
     r"\s*[:=]\s*([^\s,;]+)"
 )
+_PUBLIC_URL_RE = re.compile(r"https?://[^\s<>\]\[\"']+", re.IGNORECASE)
 
 _COMMON_KEYS = {"status", "error_code", "message", "recovered"}
 _PAYLOAD_KEYS: dict[str, set[str]] = {
@@ -208,8 +209,22 @@ def extract_public_sources(result: dict[str, Any], *, limit: int = 10) -> list[d
         elif isinstance(value, list | tuple):
             for item in value:
                 visit(item)
+        elif isinstance(value, str):
+            for raw_url in _PUBLIC_URL_RE.findall(value):
+                source = canonical_public_source(raw_url.rstrip(".,;:!?)}`"))
+                if source is not None:
+                    found.setdefault(source["source_id"], source)
 
-    for registry_key in ("evidence_registry", "document_registry", "candidate_registry"):
+    for registry_key in (
+        "evidence_registry",
+        "document_registry",
+        "candidate_registry",
+        "sources",
+        "citations",
+        "source_urls",
+        "compressed_research",
+        "raw_notes",
+    ):
         visit(result.get(registry_key, []))
     return list(found.values())[:limit]
 

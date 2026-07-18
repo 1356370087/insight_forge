@@ -8,6 +8,7 @@ from open_deep_research.public_events import (
     PublicEventLogCorrupted,
     RunEventStore,
     canonical_public_source,
+    extract_public_sources,
     project_public_events,
     sanitize_public_payload,
 )
@@ -134,6 +135,22 @@ def test_public_sanitizer_and_source_canonicalization():
     assert source is not None
     assert source["url"] == "https://example.com/path"
     assert "password" not in json.dumps(source)
+
+
+def test_public_sources_are_extracted_from_compressed_text_without_leaking_body():
+    sources = extract_public_sources({
+        "compressed_research": (
+            "Finding with [official source](https://user:secret@example.com/docs?q=private#part) "
+            "and duplicate https://example.com/docs?other=value."
+        ),
+        "raw_notes": ["Also see https://numpy.org/devdocs/reference/thread_safety.html)."],
+    })
+
+    assert [source["url"] for source in sources] == [
+        "https://example.com/docs",
+        "https://numpy.org/devdocs/reference/thread_safety.html",
+    ]
+    assert all("private" not in json.dumps(source) for source in sources)
 
 
 @pytest.mark.asyncio

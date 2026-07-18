@@ -150,6 +150,13 @@ async def _emit_state_change(
                 task_record.result,
                 limit=configurable.public_event_source_limit,
             )
+            for source in sources:
+                await publisher.publish(
+                    "research.source.discovered",
+                    stage="researching",
+                    payload={"task_id": task_record.task_id, **source},
+                    dedupe_key=f"source:{source['source_id']}",
+                )
             if summary:
                 await publisher.publish(
                     "findings.updated",
