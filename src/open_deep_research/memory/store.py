@@ -1,26 +1,20 @@
-"""Unified mem0 long-term memory interface for Open Deep Research.
+"""Unified Mem0 long-term-memory stores and versioned memory contracts."""
 
-Provides a :class:`MemoryStore` Protocol that abstracts the difference between
-the mem0 Platform (``AsyncMemoryClient``) and OSS (``Memory``) backends, plus a
-``NoopMemoryStore`` fallback for when memory is disabled or unavailable.
-
-All ``mem0`` imports are deferred to store constructors so the graph compiles
-cleanly even when the package is not installed.
-"""
+# Adapter methods intentionally share their contract documentation via MemoryStore.
+# ruff: noqa: D102, D107
 
 from __future__ import annotations
 
 import asyncio
+import builtins
 import os
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Optional, Protocol, runtime_checkable
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
-
-# ---------------------------------------------------------------------------
-# Data models
-# ---------------------------------------------------------------------------
+MEMORY_SCHEMA_VERSION = 2
 
 
 class MemoryCategory(str, Enum):
@@ -29,40 +23,190 @@ class MemoryCategory(str, Enum):
     USER_RESEARCH_PREFERENCE = "user_research_preference"
     DOMAIN_PROFILE = "domain_profile"
     PROJECT_MEMORY = "project_memory"
+    VERIFIED_RESEARCH_INSIGHT = "verified_research_insight"
+
+
+class MemoryKind(str, Enum):
+    """Lifecycle role of one durable memory."""
+
+    OBSERVATION = "observation"
+    REFLECTION = "reflection"
+    PROFILE = "profile"
+
+
+class MemoryStatus(str, Enum):
+    """Recall eligibility of one durable memory."""
+
+    ACTIVE = "active"
+    ARCHIVED = "archived"
+    SUPERSEDED = "superseded"
+
+
+class MemorySourceKind(str, Enum):
+    """Trusted provenance boundary for memory creation."""
+
+    USER_MESSAGE = "user_message"
+    PROJECT_CONFIG = "project_config"
+    VERIFIED_EVIDENCE = "verified_evidence"
+    REFLECTION = "reflection"
+
+
+def utc_now_iso() -> str:
+    """Return an RFC 3339 UTC timestamp."""
+    return datetime.now(timezone.utc).isoformat()
 
 
 class MemoryCandidate(BaseModel):
-    """A potential memory extracted by the policy engine (before writing)."""
+    """A potential observation extracted before conflict resolution."""
 
     category: MemoryCategory
-    content: str = Field(
-        description="Memory content, max 240 characters. Factual and derived from user input.",
-        max_length=240,
-    )
+    content: str = Field(max_length=240)
     confidence: float = Field(ge=0.0, le=1.0)
-    reason: str = Field(default="")
-    source: str = Field(default="user_message")
+    importance: int = Field(default=5, ge=1, le=10)
+    reason: str = ""
+    source: str = MemorySourceKind.USER_MESSAGE.value
+    source_refs: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class MemoryRecord(BaseModel):
+    """Versioned application-level memory persisted through Mem0."""
+
+    memory_id: str = ""
+    kind: MemoryKind = MemoryKind.OBSERVATION
+    category: MemoryCategory = MemoryCategory.PROJECT_MEMORY
+    content: str = Field(min_length=1, max_length=4000)
+    importance: int = Field(default=5, ge=1, le=10)
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    status: MemoryStatus = MemoryStatus.ACTIVE
+    observed_at: str = Field(default_factory=utc_now_iso)
+    last_accessed_at: Optional[str] = None
+    access_count: int = Field(default=0, ge=0)
+    source_kind: MemorySourceKind = MemorySourceKind.USER_MESSAGE
+    source_refs: list[str] = Field(default_factory=list)
+    valid_from: Optional[str] = None
+    valid_to: Optional[str] = None
+    conflict_group: Optional[str] = None
+    supersedes_ids: list[str] = Field(default_factory=list)
+    app_id: str = ""
+    project_id: str = ""
+    agent_id: str = ""
+    user_id: str = ""
+    schema_version: int = MEMORY_SCHEMA_VERSION
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_content_limit(self) -> MemoryRecord:
+        """Apply kind-specific content limits."""
+        limits = {
+            MemoryKind.OBSERVATION: 240,
+            MemoryKind.REFLECTION: 2000,
+            MemoryKind.PROFILE: 4000,
+        }
+        if len(self.content) > limits[self.kind]:
+            raise ValueError(f"{self.kind.value} content exceeds {limits[self.kind]} characters")
+        return self
+
+    def mem0_metadata(self) -> dict[str, Any]:
+        """Return the complete searchable metadata payload."""
+        return {
+            **self.metadata,
+            "schema_version": self.schema_version,
+            "kind": self.kind.value,
+            "category": self.category.value,
+            "importance": self.importance,
+            "confidence": self.confidence,
+            "status": self.status.value,
+            "observed_at": self.observed_at,
+            "last_accessed_at": self.last_accessed_at,
+            "access_count": self.access_count,
+            "source_kind": self.source_kind.value,
+            "source_refs": self.source_refs,
+            "valid_from": self.valid_from,
+            "valid_to": self.valid_to,
+            "conflict_group": self.conflict_group,
+            "supersedes_ids": self.supersedes_ids,
+            "app_id": self.app_id,
+            "project_id": self.project_id,
+            "agent_id": self.agent_id,
+            "user_id": self.user_id,
+        }
+
+    @classmethod
+    def from_mem0(cls, item: dict[str, Any]) -> MemoryRecord:
+        """Normalize a Platform or OSS response into one record."""
+        metadata = item.get("metadata") or item.get("payload") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        content = str(item.get("content", item.get("memory", metadata.get("data", ""))))
+        category = metadata.get("category", MemoryCategory.PROJECT_MEMORY.value)
+        try:
+            parsed_category = MemoryCategory(category)
+        except ValueError:
+            parsed_category = MemoryCategory.PROJECT_MEMORY
+        kind = metadata.get("kind", MemoryKind.OBSERVATION.value)
+        status = metadata.get("status", MemoryStatus.ACTIVE.value)
+        source_kind = metadata.get("source_kind", MemorySourceKind.USER_MESSAGE.value)
+        try:
+            parsed_kind = MemoryKind(kind)
+        except ValueError:
+            parsed_kind = MemoryKind.OBSERVATION
+        try:
+            parsed_status = MemoryStatus(status)
+        except ValueError:
+            parsed_status = MemoryStatus.ACTIVE
+        try:
+            parsed_source = MemorySourceKind(source_kind)
+        except ValueError:
+            parsed_source = MemorySourceKind.USER_MESSAGE
+        source_refs_value = metadata.get("source_refs", [])
+        if isinstance(source_refs_value, str):
+            source_refs_value = [source_refs_value]
+        supersedes_value = metadata.get("supersedes_ids", [])
+        if isinstance(supersedes_value, str):
+            supersedes_value = [supersedes_value]
+        return cls(
+            memory_id=str(item.get("id", item.get("memory_id", ""))),
+            kind=parsed_kind,
+            category=parsed_category,
+            content=content[: {MemoryKind.OBSERVATION: 240, MemoryKind.REFLECTION: 2000, MemoryKind.PROFILE: 4000}[parsed_kind]],
+            importance=int(metadata.get("importance", 5) or 5),
+            confidence=float(metadata.get("confidence", 1.0) or 1.0),
+            status=parsed_status,
+            observed_at=str(metadata.get("observed_at") or item.get("created_at") or utc_now_iso()),
+            last_accessed_at=metadata.get("last_accessed_at"),
+            access_count=max(0, int(metadata.get("access_count", 0) or 0)),
+            source_kind=parsed_source,
+            source_refs=[str(value) for value in source_refs_value],
+            valid_from=metadata.get("valid_from"),
+            valid_to=metadata.get("valid_to"),
+            conflict_group=metadata.get("conflict_group"),
+            supersedes_ids=[str(value) for value in supersedes_value],
+            app_id=str(metadata.get("app_id", "")),
+            project_id=str(metadata.get("project_id", "")),
+            agent_id=str(metadata.get("agent_id", "")),
+            schema_version=int(metadata.get("schema_version", 1) or 1),
+            metadata=metadata,
+        )
+
+
 class RetrievedMemory(BaseModel):
-    """A memory retrieved from mem0 during recall."""
+    """A memory plus explainable retrieval scores."""
 
     category: MemoryCategory
     content: str
     score: float
     memory_id: str = ""
     metadata: dict[str, Any] = Field(default_factory=dict)
-
-
-# ---------------------------------------------------------------------------
-# Store protocol
-# ---------------------------------------------------------------------------
+    relevance_score: float = 0.0
+    recency_score: float = 0.0
+    importance_score: float = 0.5
+    final_score: float = 0.0
 
 
 @runtime_checkable
 class MemoryStore(Protocol):
-    """Protocol satisfied by all memory store backends."""
+    """Common capability surface for managed and OSS Mem0 backends."""
 
     async def search(
         self,
@@ -70,9 +214,11 @@ class MemoryStore(Protocol):
         user_id: str,
         top_k: int = 8,
         filters: Optional[dict[str, Any]] = None,
-    ) -> list[dict[str, Any]]:
-        """Search for relevant memories."""
-        ...
+        *,
+        threshold: float = 0.1,
+        rerank: bool = False,
+        reference_date: Optional[str] = None,
+    ) -> list[dict[str, Any]]: ...
 
     async def add(
         self,
@@ -80,201 +226,230 @@ class MemoryStore(Protocol):
         user_id: str,
         category: MemoryCategory,
         metadata: Optional[dict[str, Any]] = None,
-    ) -> str:
-        """Persist a single memory and return its ID."""
-        ...
+        *,
+        infer: bool = True,
+        timestamp: Optional[int] = None,
+    ) -> str: ...
 
-
-# ---------------------------------------------------------------------------
-# Noop store (safe default)
-# ---------------------------------------------------------------------------
+    async def update(self, memory_id: str, *, text: Optional[str] = None, metadata: Optional[dict[str, Any]] = None) -> None: ...
+    async def delete(self, memory_id: str) -> None: ...
+    async def list(self, user_id: str, filters: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]: ...
+    async def list_users(self) -> builtins.list[str]: ...
+    async def configure_project(self, *, decay: bool) -> None: ...
 
 
 class NoopMemoryStore:
-    """No-op store that silently discards all reads and writes."""
+    """No-op store used when durable memory is unavailable."""
 
-    async def search(
-        self,
-        query: str,
-        user_id: str,
-        top_k: int = 8,
-        filters: Optional[dict[str, Any]] = None,
-    ) -> list[dict[str, Any]]:
+    async def search(self, query: str, user_id: str, top_k: int = 8, filters: Optional[dict[str, Any]] = None, **_: Any) -> list[dict[str, Any]]:
         return []
 
-    async def add(
-        self,
-        content: str,
-        user_id: str,
-        category: MemoryCategory,
-        metadata: Optional[dict[str, Any]] = None,
-    ) -> str:
+    async def add(self, content: str, user_id: str, category: MemoryCategory, metadata: Optional[dict[str, Any]] = None, **_: Any) -> str:
         return "noop"
 
+    async def update(self, memory_id: str, **_: Any) -> None:
+        return None
 
-# ---------------------------------------------------------------------------
-# Platform store (mem0 cloud) — uses ``mem0.AsyncMemoryClient``
-# ---------------------------------------------------------------------------
+    async def delete(self, memory_id: str) -> None:
+        return None
+
+    async def list(self, user_id: str, filters: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
+        return []
+
+    async def list_users(self) -> builtins.list[str]:
+        return []
+
+    async def configure_project(self, *, decay: bool) -> None:
+        return None
 
 
 class PlatformMem0Store:
-    """Uses ``mem0.AsyncMemoryClient`` for the hosted platform.
+    """Mem0 Platform v3 adapter using the mem0ai 2.x typed client surface."""
 
-    The SDK signature is::
-
-        AsyncMemoryClient.add(messages, options=None, **kwargs)
-        AsyncMemoryClient.search(query, user_id, top_k, filters)
-
-    where ``messages`` is a plain string or ``[{"role":"user","content":...}]``
-    and ``options`` is an ``AddMemoryOptions`` dataclass carrying
-    ``user_id``, ``agent_id``, ``metadata``, etc.
-    """
-
-    def __init__(
-        self,
-        api_key: str,
-        org_id: str = "default",
-        project_id: str = "default",
-    ) -> None:
+    def __init__(self, api_key: str, org_id: str = "default", project_id: str = "default") -> None:
         from mem0 import AsyncMemoryClient
 
-        self._client = AsyncMemoryClient(
-            api_key=api_key,
-            org_id=org_id,
-            project_id=project_id,
-        )
+        # In mem0ai 2.x project selection is associated with the API key/client
+        # project manager. org_id/project_id are retained only for source compatibility.
+        self.org_id = org_id
+        self.project_id = project_id
+        self._client = AsyncMemoryClient(api_key=api_key)
 
-    async def search(
-        self,
-        query: str,
-        user_id: str,
-        top_k: int = 8,
-        filters: Optional[dict[str, Any]] = None,
-    ) -> list[dict[str, Any]]:
-        result = await self._client.search(
-            query=query,
-            user_id=user_id,
+    async def search(self, query: str, user_id: str, top_k: int = 8, filters: Optional[dict[str, Any]] = None, *, threshold: float = 0.1, rerank: bool = False, reference_date: Optional[str] = None) -> list[dict[str, Any]]:
+        from mem0.client.types import SearchMemoryOptions
+
+        merged_filters = {**(filters or {}), "user_id": user_id}
+        options = SearchMemoryOptions(
+            filters=merged_filters,
             top_k=top_k,
-            filters=filters,
+            threshold=threshold,
+            rerank=rerank,
         )
-        if isinstance(result, list):
-            return result
-        if isinstance(result, dict):
-            return result.get("results", [])
-        return []
+        kwargs = {"reference_date": reference_date} if reference_date else {}
+        result = await self._client.search(query, options=options, **kwargs)
+        return result.get("results", []) if isinstance(result, dict) else list(result or [])
 
-    async def add(
-        self,
-        content: str,
-        user_id: str,
-        category: MemoryCategory,
-        metadata: Optional[dict[str, Any]] = None,
-    ) -> str:
-        from mem0.client.types import AddMemoryOptions  # deferred
+    async def add(self, content: str, user_id: str, category: MemoryCategory, metadata: Optional[dict[str, Any]] = None, *, infer: bool = True, timestamp: Optional[int] = None) -> str:
+        from mem0.client.types import AddMemoryOptions
 
-        meta = metadata or {}
-        meta["category"] = category.value
-
+        meta = {**(metadata or {}), "category": category.value}
         options = AddMemoryOptions(
             filters={"user_id": user_id},
             metadata=meta,
+            infer=infer,
+            timestamp=timestamp,
         )
-        # messages is the first positional argument (plain string or message list)
-        result = await self._client.add(
-            [{"role": "user", "content": content}],
-            options=options,
-        )
+        result = await self._client.add([{"role": "user", "content": content}], options=options)
         if isinstance(result, dict):
-            return result.get("id", str(result))
+            results = result.get("results") or []
+            if results and isinstance(results[0], dict):
+                return str(results[0].get("id", ""))
+            return str(result.get("id", ""))
         return str(result)
 
+    async def update(self, memory_id: str, *, text: Optional[str] = None, metadata: Optional[dict[str, Any]] = None) -> None:
+        from mem0.client.types import UpdateMemoryOptions
 
-# ---------------------------------------------------------------------------
-# OSS store (self-hosted) — uses ``mem0.Memory``
-# ---------------------------------------------------------------------------
+        await self._client.update(memory_id, options=UpdateMemoryOptions(text=text, metadata=metadata))
+
+    async def delete(self, memory_id: str) -> None:
+        await self._client.delete(memory_id)
+
+    async def list(self, user_id: str, filters: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
+        from mem0.client.types import GetAllMemoryOptions
+
+        page = 1
+        page_size = 1000
+        memories: list[dict[str, Any]] = []
+        while True:
+            result = await self._client.get_all(options=GetAllMemoryOptions(
+                filters={**(filters or {}), "user_id": user_id},
+                page=page,
+                page_size=page_size,
+            ))
+            if not isinstance(result, dict):
+                memories.extend(list(result or []))
+                break
+            batch = result.get("results", [])
+            memories.extend(batch)
+            count = result.get("count")
+            if (
+                not result.get("next")
+                or not batch
+                or (count is not None and len(memories) >= int(count))
+            ):
+                break
+            page += 1
+        return memories
+
+    async def list_users(self) -> builtins.list[str]:
+        result = await self._client.users()
+        entities = result.get("results", result) if isinstance(result, dict) else result
+        users: list[str] = []
+        for item in entities or []:
+            if isinstance(item, dict):
+                if item.get("type") not in {None, "user", "user_id"}:
+                    continue
+                value = item.get("user_id") or item.get("id") or item.get("name")
+                if value:
+                    users.append(str(value))
+        return users
+
+    async def configure_project(self, *, decay: bool) -> None:
+        await self._client.project.update(decay=decay)
 
 
 class OSSMem0Store:
-    """Uses ``mem0.Memory``, wrapping synchronous calls in ``asyncio.to_thread``.
-
-    SDK signatures::
-
-        Memory.add(messages, *, user_id=None, agent_id=None, metadata=None, ...)
-        Memory.search(query, *, top_k=20, filters=None, ...)
-
-    ``Memory.search`` does **not** accept a top-level ``user_id`` — it must
-    be merged into the ``filters`` dict.
-    """
+    """Self-hosted Mem0 adapter with explicit Platform capability degradation."""
 
     def __init__(self, config: dict[str, Any]) -> None:
         from mem0 import Memory
 
         self._memory = Memory.from_config(config_dict=config)
 
-    async def search(
-        self,
-        query: str,
-        user_id: str,
-        top_k: int = 8,
-        filters: Optional[dict[str, Any]] = None,
-    ) -> list[dict[str, Any]]:
-        merged_filters = filters or {}
-        merged_filters["user_id"] = user_id
-        return await asyncio.to_thread(
+    async def search(self, query: str, user_id: str, top_k: int = 8, filters: Optional[dict[str, Any]] = None, *, threshold: float = 0.1, rerank: bool = False, reference_date: Optional[str] = None) -> list[dict[str, Any]]:
+        merged_filters = {**(filters or {}), "user_id": user_id}
+        result = await asyncio.to_thread(
             self._memory.search,
             query=query,
             top_k=top_k,
             filters=merged_filters,
+            threshold=threshold,
+            rerank=rerank,
         )
+        return result.get("results", []) if isinstance(result, dict) else list(result or [])
 
-    async def add(
-        self,
-        content: str,
-        user_id: str,
-        category: MemoryCategory,
-        metadata: Optional[dict[str, Any]] = None,
-    ) -> str:
-        meta = metadata or {}
-        meta["category"] = category.value
-        return await asyncio.to_thread(
+    async def add(self, content: str, user_id: str, category: MemoryCategory, metadata: Optional[dict[str, Any]] = None, *, infer: bool = True, timestamp: Optional[int] = None) -> str:
+        meta = {**(metadata or {}), "category": category.value}
+        result = await asyncio.to_thread(
             self._memory.add,
             [{"role": "user", "content": content}],
             user_id=user_id,
             metadata=meta,
+            infer=infer,
+            timestamp=timestamp,
+        )
+        if isinstance(result, dict):
+            results = result.get("results") or []
+            if results and isinstance(results[0], dict):
+                return str(results[0].get("id", ""))
+            return str(result.get("id", ""))
+        return str(result)
+
+    async def update(self, memory_id: str, *, text: Optional[str] = None, metadata: Optional[dict[str, Any]] = None) -> None:
+        content = text
+        if content is None:
+            existing = await asyncio.to_thread(self._memory.get, memory_id)
+            if not existing:
+                raise KeyError(f"Memory not found: {memory_id}")
+            content = str(existing.get("memory", existing.get("data", "")))
+        await asyncio.to_thread(
+            self._memory.update,
+            memory_id,
+            content,
+            metadata=metadata,
         )
 
+    async def delete(self, memory_id: str) -> None:
+        await asyncio.to_thread(self._memory.delete, memory_id)
 
-# ---------------------------------------------------------------------------
-# Factory
-# ---------------------------------------------------------------------------
+    async def list(self, user_id: str, filters: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
+        result = await asyncio.to_thread(
+            self._memory.get_all,
+            filters={**(filters or {}), "user_id": user_id},
+            top_k=1000,
+        )
+        return result.get("results", []) if isinstance(result, dict) else list(result or [])
+
+    async def list_users(self) -> builtins.list[str]:
+        return []
+
+    async def configure_project(self, *, decay: bool) -> None:
+        # Decay is a Platform v3 project feature. OSS recall still uses the
+        # deterministic application-side importance/recency reranker.
+        return None
 
 
-def create_memory_store(config: Any) -> MemoryStore:  # 'Configuration' at runtime
-    """Build the appropriate :class:`MemoryStore` for the current configuration.
-
-    Deferred imports of ``mem0`` keep the graph importable when the
-    package is not installed and ``enable_memory`` is ``False``.
-    """
+def create_memory_store(config: Any) -> MemoryStore:
+    """Build the configured backend, preserving the existing no-op fallback."""
     if not getattr(config, "enable_memory", False):
         return NoopMemoryStore()
-
     api_key = os.environ.get("MEM0_API_KEY")
-    if not api_key:
-        return NoopMemoryStore()
-
     provider = getattr(config, "memory_provider", "platform")
-
     if provider == "platform":
-        project_id = getattr(config, "memory_project_id", None) or "default"
-        return PlatformMem0Store(api_key=api_key, project_id=project_id)
-
+        if not api_key:
+            return NoopMemoryStore()
+        return PlatformMem0Store(
+            api_key=api_key,
+            project_id=getattr(config, "memory_project_id", None) or "default",
+        )
     if provider == "oss":
-        oss_config_path = os.environ.get("MEM0_CONFIG_PATH")
-        oss_config: dict[str, Any] = {}
-        if oss_config_path:
-            import json
-            with open(oss_config_path, encoding="utf-8") as fh:
-                oss_config = json.load(fh)
-        return OSSMem0Store(config=oss_config)
+        import json
 
+        path = os.environ.get("MEM0_CONFIG_PATH")
+        oss_config: dict[str, Any] = {}
+        if path:
+            with open(path, encoding="utf-8") as handle:
+                oss_config = json.load(handle)
+        return OSSMem0Store(config=oss_config)
     return NoopMemoryStore()

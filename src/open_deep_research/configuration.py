@@ -1265,6 +1265,50 @@ class Configuration(BaseModel):
             }
         }
     )
+    memory_advanced_enabled: bool = Field(
+        default=False,
+        description="Enable schema-v2 observations, explainable reranking, reflection, profiles, and forgetting.",
+    )
+    memory_decay_enabled: bool = Field(
+        default=True,
+        description="Enable Mem0 Platform v3 project-level access decay when advanced memory is active.",
+    )
+    memory_reflection_enabled: bool = Field(default=True)
+    memory_profile_enabled: bool = Field(default=True)
+    memory_soft_forgetting_enabled: bool = Field(default=True)
+    memory_verified_insights_enabled: bool = Field(default=True)
+    memory_search_threshold: float = Field(default=0.1, ge=0.0, le=1.0)
+    memory_search_rerank: bool = Field(default=True)
+    memory_importance_weight: float = Field(default=0.25, ge=0.0, le=1.0)
+    memory_relevance_weight: float = Field(default=0.55, ge=0.0, le=1.0)
+    memory_recency_weight: float = Field(default=0.20, ge=0.0, le=1.0)
+    memory_reflection_observation_threshold: int = Field(default=5, ge=1)
+    memory_reflection_importance_threshold: int = Field(default=25, ge=1)
+    memory_reflection_max_age_hours: int = Field(default=24, ge=1)
+    memory_profile_max_chars: int = Field(default=4000, ge=512, le=4000)
+    memory_v2_app_suffix: str = Field(default=".v2", min_length=1, max_length=32)
+    memory_half_life_days: dict[str, int] = Field(
+        default_factory=lambda: {
+            "user_research_preference": 180,
+            "domain_profile": 180,
+            "project_memory": 90,
+            "verified_research_insight": 30,
+            "reflection": 90,
+        }
+    )
+
+    @field_validator("memory_half_life_days", mode="before")
+    @classmethod
+    def parse_memory_half_lives(cls, value: Any) -> dict[str, int]:
+        """Accept a JSON object from environment-based configuration."""
+        if isinstance(value, str):
+            value = json.loads(value)
+        if not isinstance(value, dict):
+            raise ValueError("memory_half_life_days must be an object")
+        parsed = {str(key): int(days) for key, days in value.items()}
+        if any(days < 1 for days in parsed.values()):
+            raise ValueError("memory half-lives must be at least one day")
+        return parsed
 
     @field_validator("sandbox_allowed_domains", mode="before")
     @classmethod
@@ -1325,6 +1369,13 @@ class Configuration(BaseModel):
                 "leader_heartbeat_seconds must be no more than one third of "
                 "leader_lease_seconds"
             )
+        memory_weight_sum = (
+            self.memory_relevance_weight
+            + self.memory_importance_weight
+            + self.memory_recency_weight
+        )
+        if abs(memory_weight_sum - 1.0) > 1e-9:
+            raise ValueError("advanced memory retrieval weights must sum to 1.0")
         return self
 
     @classmethod

@@ -880,6 +880,33 @@ class TestCollectCompletedTaskOutputs:
         topics = {o["research_topic"] for o in outputs}
         assert topics == {"topic A", "topic C"}
 
+    @pytest.mark.asyncio
+    async def test_preserves_public_source_registries(self):
+        from open_deep_research.tasks.async_tools import collect_completed_task_outputs
+        from open_deep_research.tasks.registry import TaskRegistry, TaskStatus
+
+        registry = TaskRegistry()
+        record = registry.create("topic")
+        registry.update_status(
+            record.task_id,
+            TaskStatus.COMPLETED,
+            result={
+                "compressed_research": "finding https://example.com/doc",
+                "raw_notes": [],
+                "candidate_registry": [{"url": "https://example.com/doc"}],
+                "document_registry": [{"url": "https://example.com/doc"}],
+                "evidence_registry": [{"source_url": "https://example.com/doc"}],
+                "web_research_iterations": [{"iteration": 1}],
+            },
+        )
+
+        output = (await collect_completed_task_outputs(registry))[0]
+
+        assert output["candidate_registry"]
+        assert output["document_registry"]
+        assert output["evidence_registry"]
+        assert output["web_research_iterations"]
+
 
 # ---------------------------------------------------------------------------
 # Recovery — CheckpointManager
@@ -1102,3 +1129,60 @@ class TestAsyncSupervisorTermination:
                 },
                 config,
             )
+
+    @pytest.mark.asyncio
+    async def test_empty_tool_turn_finalizes_terminal_tasks_and_wave(self, monkeypatch, tmp_path):
+        from langchain_core.messages import AIMessage
+
+        from open_deep_research.agents import deep_researcher
+        from open_deep_research.configuration import Configuration
+        from open_deep_research.public_events import RunEventStore
+        from open_deep_research.tasks.registry import get_task_registry
+        from open_deep_research.tasks.state import get_task_state_store
+
+        async def fake_summary(_output, _config):
+            return "- public finding"
+
+        monkeypatch.setattr(deep_researcher, "summarize_public_findings", fake_summary)
+        run_id = "supervisor-terminal-run"
+        config = {
+            "configurable": {
+                "enable_async_research": True,
+                "quality_evaluation_enabled": False,
+                "task_state_backend": "memory",
+                "runs_dir": str(tmp_path),
+            },
+            "metadata": {"run_id": run_id},
+        }
+        record = TaskRecord(
+            task_id="terminal-task",
+            run_id=run_id,
+            research_topic="topic",
+            wave_id="wave-2",
+            status=TaskStatus.COMPLETED,
+            result={
+                "compressed_research": "finding https://example.com/doc?secret=value",
+                "raw_notes": [],
+                "metrics": {},
+            },
+        )
+        get_task_registry().restore(record)
+        configurable = Configuration.from_runnable_config(config)
+        await get_task_state_store(configurable).update_from_record(record)
+
+        command = await deep_researcher._execute_supervisor_tools(
+            {
+                "enable_async_research": True,
+                "research_iterations": 1,
+                "research_brief": "brief",
+                "supervisor_messages": [AIMessage(content="", tool_calls=[])],
+            },
+            config,
+        )
+
+        events = RunEventStore(run_id, runs_dir=str(tmp_path)).read()
+        assert command.goto == "__end__"
+        assert command.update["completed_task_outputs"][0]["task_id"] == "terminal-task"
+        assert sum(event.type == "research.wave.completed" for event in events) == 1
+        source_event = next(event for event in events if event.type == "research.source.discovered")
+        assert source_event.payload["url"] == "https://example.com/doc"

@@ -3,6 +3,7 @@
 import asyncio
 import json
 import re
+import time
 from typing import Any, Literal
 
 from langchain.chat_models import init_chat_model
@@ -25,8 +26,24 @@ from open_deep_research.configuration import (
     Configuration,
     get_model_compatibility_kwargs,
 )
-from open_deep_research.memory.policy import extract_memory_candidates
+from open_deep_research.memory.lifecycle import (
+    configure_advanced_store,
+    list_v2_records,
+    maintain_user_memories,
+    rank_legacy_memories,
+    rank_v2_memories,
+    reinforce_access,
+    v2_filters,
+    write_observation,
+)
+from open_deep_research.memory.policy import (
+    decide_memory_conflict,
+    extract_memory_candidates,
+)
 from open_deep_research.memory.store import (
+    MemoryKind,
+    MemoryStatus,
+    NoopMemoryStore,
     create_memory_store,
 )
 from open_deep_research.observability import (
@@ -351,7 +368,7 @@ async def summarize_messages(
     )
 
 
-def _format_memory_context(results: list[dict]) -> str:
+def _format_memory_context(results: list[dict], profiles: list[dict] | None = None) -> str:
     """Format retrieved memories into the fixed advisory context block."""
     lines = [
         "<Memory Context>",
@@ -367,6 +384,12 @@ def _format_memory_context(results: list[dict]) -> str:
             continue
         content = content.replace("<", "&lt;").replace(">", "&gt;")
         lines.append(f"- [{category}] {content}")
+    for profile in profiles or []:
+        content = str(profile.get("content", profile.get("memory", "")))
+        if inspect_untrusted_content(content):
+            continue
+        content = content.replace("<", "&lt;").replace(">", "&gt;")
+        lines.extend(["", "<Research Profile>", content, "</Research Profile>"])
     lines.append("</Memory Context>")
     return "\n".join(lines)
 
@@ -412,19 +435,90 @@ async def memory_recall(
     if configurable.event_log_enabled:
         event_writer = JSONLEventWriter(run_id=run_id, runs_dir=configurable.runs_dir)
 
+    profiles: list[dict] = []
+    v2_selected: list[dict] = []
+    recall_started = time.perf_counter()
     try:
         store = create_memory_store(configurable)
-        filters: dict = {
+        legacy_filters: dict = {
             "project_id": configurable.memory_project_id,
             "app_id": configurable.memory_app_id,
         }
+        if not configurable.memory_advanced_enabled:
+            try:
+                await configure_advanced_store(store, configurable)
+            except Exception:
+                get_trace_recorder(config).active_span().score("memory.decay_disable_failed", True)
+        if configurable.memory_advanced_enabled:
+            advanced_available = True
+            try:
+                await configure_advanced_store(store, configurable)
+            except Exception:
+                advanced_available = False
+                get_trace_recorder(config).active_span().score("memory.advanced_degraded", True)
 
-        results = await store.search(
-            query=user_query,
-            user_id=user_id,
-            top_k=configurable.memory_top_k,
-            filters=filters,
-        )
+            legacy_call = store.search(
+                query=user_query,
+                user_id=user_id,
+                top_k=configurable.memory_top_k,
+                filters=legacy_filters,
+            )
+            if advanced_available:
+                v2_call = store.search(
+                    query=user_query,
+                    user_id=user_id,
+                    top_k=configurable.memory_top_k,
+                    filters=v2_filters(configurable, status=MemoryStatus.ACTIVE.value),
+                    threshold=configurable.memory_search_threshold,
+                    rerank=configurable.memory_search_rerank,
+                    reference_date=get_today_str(),
+                )
+                legacy_raw, v2_raw = await asyncio.gather(
+                    legacy_call,
+                    v2_call,
+                    return_exceptions=True,
+                )
+                if isinstance(legacy_raw, BaseException):
+                    legacy_raw = []
+                if isinstance(v2_raw, BaseException):
+                    v2_raw = []
+                    get_trace_recorder(config).active_span().score("memory.advanced_degraded", True)
+                legacy_ranked = rank_legacy_memories(legacy_raw, configurable)
+                v2_selected = rank_v2_memories(v2_raw, configurable)
+                results = sorted(
+                    [*legacy_ranked, *v2_selected],
+                    key=lambda item: float(item.get("score", 0.0) or 0.0),
+                    reverse=True,
+                )[: configurable.memory_top_k]
+                selected_ids = {str(item.get("id", "")) for item in results}
+                v2_selected = [
+                    item for item in v2_selected if str(item.get("id", "")) in selected_ids
+                ]
+                try:
+                    records = await list_v2_records(store, user_id, configurable)
+                    canonical_profiles = [
+                        record for record in records
+                        if record.kind == MemoryKind.PROFILE
+                        and record.status == MemoryStatus.ACTIVE
+                        and bool(record.metadata.get("canonical", False))
+                    ]
+                    profiles = [{
+                        "id": record.memory_id,
+                        "content": record.content,
+                        "metadata": record.mem0_metadata(),
+                    } for record in canonical_profiles[:1]]
+                except Exception:
+                    profiles = []
+                await reinforce_access(store, v2_selected)
+            else:
+                results = rank_legacy_memories(await legacy_call, configurable)
+        else:
+            results = await store.search(
+                query=user_query,
+                user_id=user_id,
+                top_k=configurable.memory_top_k,
+                filters=legacy_filters,
+            )
     except Exception:
         results = []
         get_trace_recorder(config).active_span().score("memory.recall_failed", True)
@@ -439,12 +533,33 @@ async def memory_recall(
         if event_writer is not None:
             event_writer.close()
 
-    if not results:
+    get_trace_recorder(config).active_span().score(
+        "memory.recall_latency_ms",
+        (time.perf_counter() - recall_started) * 1000,
+    )
+
+    if not results and not profiles:
         get_trace_recorder(config).active_span().score("memory.recall_count", 0)
         return Command(goto="clarify_with_user")
 
-    memory_context = _format_memory_context(results)
+    memory_context = _format_memory_context(results, profiles)
     get_trace_recorder(config).active_span().score("memory.recall_count", len(results))
+    if configurable.memory_advanced_enabled:
+        score_payloads = [item.get("retrieval_scores", {}) for item in results]
+        if score_payloads:
+            active_span = get_trace_recorder(config).active_span()
+            active_span.score(
+                "memory.recall_avg_relevance",
+                sum(float(item.get("relevance", 0.0)) for item in score_payloads) / len(score_payloads),
+            )
+            active_span.score(
+                "memory.recall_avg_importance",
+                sum(float(item.get("importance", 0.0)) for item in score_payloads) / len(score_payloads),
+            )
+            active_span.score(
+                "memory.recall_avg_recency",
+                sum(float(item.get("recency", 0.0)) for item in score_payloads) / len(score_payloads),
+            )
 
     # Log recall event (summary only)
     if configurable.event_log_enabled:
@@ -1128,12 +1243,148 @@ def build_supervisor_tool_registry(state: SupervisorState) -> dict[str, Tool]:
     return build_tool_registry(build_supervisor_tools(state))
 
 
+async def _finalize_async_research_outputs(
+    state: SupervisorState,
+    config: RunnableConfig,
+    configurable: Configuration,
+    publisher: Any,
+) -> dict[str, Any]:
+    """Admit terminal async results and close every research wave exactly once."""
+    run_id = str(config.get("metadata", {}).get("run_id", "default"))
+    state_store = get_task_state_store(configurable)
+    outputs = await collect_completed_task_outputs(
+        get_task_registry(),
+        run_id=run_id,
+        state_store=state_store,
+    )
+    accepted_outputs: list[dict[str, Any]] = []
+    for output in outputs:
+        task_id = str(output["task_id"])
+        snapshot = await state_store.get(task_id, run_id=run_id)
+        if configurable.quality_evaluation_enabled:
+            assessment = await evaluate_subagent_handoff(
+                str(output.get("research_topic", "")), output, config
+            )
+            if snapshot is not None:
+                snapshot.admission_status = "accepted" if assessment.accepted else "rejected"
+                await state_store.upsert(snapshot)
+            if not assessment.accepted:
+                await publisher.publish(
+                    "research.task.completed",
+                    stage="researching",
+                    payload={
+                        "task_id": task_id,
+                        "wave_id": snapshot.wave_id if snapshot else "",
+                        "mode": "async",
+                        "status": "completed",
+                        "phase": "completed",
+                        "admission_status": "rejected",
+                        "reason_code": "quality_gate_rejected",
+                        "summary_status": "not_applicable",
+                    },
+                    dedupe_key=f"task:{task_id}:admission:rejected",
+                )
+                continue
+            output["handoff_assessment"] = assessment.model_dump()
+        elif snapshot is not None:
+            snapshot.admission_status = "accepted"
+            await state_store.upsert(snapshot)
+
+        accepted_outputs.append(output)
+        summary = await summarize_public_findings(output, config)
+        sources = extract_public_sources(
+            output,
+            limit=configurable.public_event_source_limit,
+        )
+        for source in sources:
+            await publisher.publish(
+                "research.source.discovered",
+                stage="researching",
+                payload={"task_id": task_id, **source},
+                dedupe_key=f"source:{source['source_id']}",
+            )
+        await publisher.publish(
+            "research.task.completed",
+            stage="researching",
+            payload={
+                "task_id": task_id,
+                "wave_id": snapshot.wave_id if snapshot else "",
+                "mode": "async",
+                "status": "completed",
+                "phase": "completed",
+                "admission_status": "accepted",
+                "source_count": len(sources),
+                "summary_status": "available" if summary else "unavailable",
+                "message": (
+                    "Research summary is temporarily unavailable."
+                    if summary is None
+                    else None
+                ),
+            },
+            dedupe_key=f"task:{task_id}:admission:accepted",
+        )
+        if summary:
+            await publisher.publish(
+                "findings.updated",
+                stage="researching",
+                payload={
+                    "task_id": task_id,
+                    "wave_id": snapshot.wave_id if snapshot else "",
+                    "summary": summary,
+                    "sources": sources,
+                    "source_count": len(sources),
+                },
+                dedupe_key=f"task:{task_id}:findings",
+            )
+
+    update: dict[str, Any] = {"completed_task_outputs": accepted_outputs}
+    for registry_key in (
+        "candidate_registry",
+        "document_registry",
+        "evidence_registry",
+        "web_research_iterations",
+    ):
+        values = [
+            item
+            for output in accepted_outputs
+            for item in output.get(registry_key, [])
+        ]
+        if values:
+            update[registry_key] = values
+
+    await shutdown_teammate_pool(config)
+    snapshots = await state_store.list(run_id=run_id)
+    by_wave: dict[str, list[Any]] = {}
+    for snapshot in snapshots:
+        by_wave.setdefault(snapshot.wave_id or "wave-unknown", []).append(snapshot)
+    for wave_id, wave_tasks in by_wave.items():
+        await publisher.publish(
+            "research.wave.completed",
+            stage="researching",
+            payload={
+                "wave_id": wave_id,
+                "mode": "async",
+                "task_ids": [task.task_id for task in wave_tasks],
+                "task_count": len(wave_tasks),
+                "completed": sum(task.status == TaskStatus.COMPLETED for task in wave_tasks),
+                "failed": sum(
+                    task.status in {TaskStatus.FAILED, TaskStatus.TIMED_OUT}
+                    for task in wave_tasks
+                ),
+                "rejected": sum(task.admission_status == "rejected" for task in wave_tasks),
+            },
+            dedupe_key=f"wave:{wave_id}:completed",
+        )
+    return update
+
+
 async def _execute_supervisor_tools(
     state: SupervisorState,
     config: RunnableConfig,
 ) -> Command[Literal["supervisor", "__end__"]]:
     """Execute every supervisor request through the governed Tool.call pipeline."""
     configurable = Configuration.from_runnable_config(config)
+    publisher = event_publisher_from_config(config)
     supervisor_messages = state.get("supervisor_messages", [])
     most_recent_message = supervisor_messages[-1]
     tool_calls = most_recent_message.tool_calls
@@ -1158,13 +1409,20 @@ async def _execute_supervisor_tools(
                     "Supervisor attempted to exit while async research tasks remain active: "
                     + ", ".join(unfinished)
                 )
-        return Command(
-            goto=END,
-            update={
-                "notes": get_notes_from_tool_calls(supervisor_messages),
-                "research_brief": state.get("research_brief", ""),
-            },
-        )
+        update: dict[str, Any] = {
+            "notes": get_notes_from_tool_calls(supervisor_messages),
+            "research_brief": state.get("research_brief", ""),
+        }
+        if state.get("enable_async_research", False):
+            update.update(
+                await _finalize_async_research_outputs(
+                    state,
+                    config,
+                    configurable,
+                    publisher,
+                )
+            )
+        return Command(goto=END, update=update)
 
     registry = build_supervisor_tool_registry(state)
     allowed = resolve_allowed_tools(
@@ -1187,7 +1445,6 @@ async def _execute_supervisor_tools(
 
     run_id = str(config.get("metadata", {}).get("run_id", "default"))
     wave_id = f"wave-{int(state.get('research_iterations', 0) or 0)}"
-    publisher = event_publisher_from_config(config)
     research_calls = [
         call for call in ordinary_calls
         if call["name"] in {"ConductResearch", "StartResearchTask"}
@@ -1542,119 +1799,14 @@ async def _execute_supervisor_tools(
             "research_brief": state.get("research_brief", ""),
         }
         if state.get("enable_async_research", False):
-            run_id = config.get("metadata", {}).get("run_id", "default")
-            outputs = await collect_completed_task_outputs(
-                get_task_registry(),
-                run_id=run_id,
-                state_store=get_task_state_store(configurable),
+            update.update(
+                await _finalize_async_research_outputs(
+                    state,
+                    config,
+                    configurable,
+                    publisher,
+                )
             )
-            accepted_outputs: list[dict[str, Any]] = []
-            state_store = get_task_state_store(configurable)
-            for output in outputs:
-                snapshot = await state_store.get(
-                    str(output["task_id"]), run_id=run_id
-                )
-                if configurable.quality_evaluation_enabled:
-                    assessment = await evaluate_subagent_handoff(
-                        str(output.get("research_topic", "")), output, config
-                    )
-                    if snapshot is not None:
-                        snapshot.admission_status = "accepted" if assessment.accepted else "rejected"
-                        await state_store.upsert(snapshot)
-                    if not assessment.accepted:
-                        await publisher.publish(
-                            "research.task.completed",
-                            stage="researching",
-                            payload={
-                                "task_id": str(output["task_id"]),
-                                "wave_id": snapshot.wave_id if snapshot else "",
-                                "mode": "async",
-                                "status": "completed",
-                                "phase": "completed",
-                                "admission_status": "rejected",
-                                "reason_code": "quality_gate_rejected",
-                                "summary_status": "not_applicable",
-                            },
-                            dedupe_key=f"task:{output['task_id']}:admission:rejected",
-                        )
-                        continue
-                    output["handoff_assessment"] = assessment.model_dump()
-                elif snapshot is not None:
-                    snapshot.admission_status = "accepted"
-                    await state_store.upsert(snapshot)
-                accepted_outputs.append(output)
-                summary = await summarize_public_findings(output, config)
-                sources = extract_public_sources(
-                    output,
-                    limit=configurable.public_event_source_limit,
-                )
-                await publisher.publish(
-                    "research.task.completed",
-                    stage="researching",
-                    payload={
-                        "task_id": str(output["task_id"]),
-                        "wave_id": snapshot.wave_id if snapshot else "",
-                        "mode": "async",
-                        "status": "completed",
-                        "phase": "completed",
-                        "admission_status": "accepted",
-                        "source_count": len(sources),
-                        "summary_status": "available" if summary else "unavailable",
-                        "message": (
-                            "Research summary is temporarily unavailable."
-                            if summary is None
-                            else None
-                        ),
-                    },
-                    dedupe_key=f"task:{output['task_id']}:admission:accepted",
-                )
-                if summary:
-                    await publisher.publish(
-                        "findings.updated",
-                        stage="researching",
-                        payload={
-                            "task_id": str(output["task_id"]),
-                            "wave_id": snapshot.wave_id if snapshot else "",
-                            "summary": summary,
-                            "sources": sources,
-                            "source_count": len(sources),
-                        },
-                        dedupe_key=f"task:{output['task_id']}:findings",
-                    )
-            update["completed_task_outputs"] = accepted_outputs
-            for registry_key in (
-                "candidate_registry",
-                "document_registry",
-                "evidence_registry",
-                "web_research_iterations",
-            ):
-                values = [
-                    item
-                    for output in accepted_outputs
-                    for item in output.get(registry_key, [])
-                ]
-                if values:
-                    update[registry_key] = values
-            await shutdown_teammate_pool(config)
-            snapshots = await state_store.list(run_id=run_id)
-            by_wave: dict[str, list[Any]] = {}
-            for snapshot in snapshots:
-                by_wave.setdefault(snapshot.wave_id or "wave-unknown", []).append(snapshot)
-            for async_wave_id, wave_tasks in by_wave.items():
-                await publisher.publish(
-                    "research.wave.completed",
-                    stage="researching",
-                    payload={
-                        "wave_id": async_wave_id,
-                        "mode": "async",
-                        "task_ids": [task.task_id for task in wave_tasks],
-                        "task_count": len(wave_tasks),
-                        "completed": sum(task.status == TaskStatus.COMPLETED for task in wave_tasks),
-                        "failed": sum(task.status in {TaskStatus.FAILED, TaskStatus.TIMED_OUT} for task in wave_tasks),
-                        "rejected": sum(task.admission_status == "rejected" for task in wave_tasks),
-                    },
-                    dedupe_key=f"wave:{async_wave_id}:completed",
-                )
         return Command(goto=END, update=update)
 
     raw_notes: list[str] = []
@@ -2311,6 +2463,11 @@ async def memory_extract_and_write(
             research_model_max_tokens=configurable.research_model_max_tokens,
             max_structured_output_retries=configurable.max_structured_output_retries,
             config=config,
+            evidence_registry=state.get("evidence_registry", []),
+            verified_insights_enabled=(
+                configurable.memory_advanced_enabled
+                and configurable.memory_verified_insights_enabled
+            ),
         )
     except Exception:
         get_trace_recorder(config).active_span().score("memory.extract_failed", True)
@@ -2328,31 +2485,89 @@ async def memory_extract_and_write(
     # Write candidates to mem0 (fail-open: store init + writes are both guarded)
     written_count = 0
     skipped_count = 0
+    noop_count = 0
+    decision_counts: dict[str, int] = {}
+    maintenance_result = None
     store_init_failed = False
+    advanced_available = configurable.memory_advanced_enabled
     try:
         store = create_memory_store(configurable)
+        if isinstance(store, NoopMemoryStore):
+            raise RuntimeError("Configured memory backend is unavailable")
+        if advanced_available:
+            try:
+                await configure_advanced_store(store, configurable)
+            except Exception:
+                advanced_available = False
+                get_trace_recorder(config).active_span().score("memory.advanced_degraded", True)
     except Exception:
         store_init_failed = True
         if not configurable.memory_fail_open:
             raise
 
+    if configurable.memory_advanced_enabled and not advanced_available:
+        candidates = [
+            candidate for candidate in candidates
+            if candidate.category.value != "verified_research_insight"
+        ]
+
     if not store_init_failed:
         for candidate in candidates:
             try:
-                await store.add(
-                    content=candidate.content,
-                    user_id=user_id,
-                    category=candidate.category,
-                    metadata={
-                        "source": candidate.source,
-                        "app_id": configurable.memory_app_id or "open_deep_research",
-                        "agent_id": configurable.memory_agent_id or "lead_researcher",
-                        "project_id": configurable.memory_project_id or "default",
-                    },
-                )
-                written_count += 1
+                if advanced_available:
+                    async def decide(candidate_value, existing_values):
+                        return await decide_memory_conflict(
+                            candidate_value,
+                            existing_values,
+                            model=configurable_model,
+                            model_name=configurable.research_model,
+                            model_max_tokens=configurable.research_model_max_tokens,
+                            config=config,
+                        )
+
+                    action, _ = await write_observation(
+                        store,
+                        candidate,
+                        user_id=user_id,
+                        config=configurable,
+                        run_id=run_id,
+                        decide=decide,
+                    )
+                    decision_counts[action] = decision_counts.get(action, 0) + 1
+                    if action == "NOOP":
+                        noop_count += 1
+                    else:
+                        written_count += 1
+                else:
+                    await store.add(
+                        content=candidate.content,
+                        user_id=user_id,
+                        category=candidate.category,
+                        metadata={
+                            "source": candidate.source,
+                            "app_id": configurable.memory_app_id,
+                            "agent_id": configurable.memory_agent_id or "lead_researcher",
+                            "project_id": configurable.memory_project_id,
+                        },
+                    )
+                    written_count += 1
             except Exception:
                 skipped_count += 1
+                if not configurable.memory_fail_open:
+                    raise
+        if advanced_available:
+            try:
+                maintenance_result = await maintain_user_memories(
+                    store,
+                    user_id=user_id,
+                    config=configurable,
+                    model=configurable_model,
+                    model_name=configurable.research_model,
+                    model_max_tokens=configurable.research_model_max_tokens,
+                    runnable_config=config,
+                )
+            except Exception:
+                get_trace_recorder(config).active_span().score("memory.maintenance_failed", True)
                 if not configurable.memory_fail_open:
                     raise
     else:
@@ -2362,6 +2577,14 @@ async def memory_extract_and_write(
     active_span.score("memory.candidate_count", len(candidates))
     active_span.score("memory.written_count", written_count)
     active_span.score("memory.skipped_count", skipped_count)
+    active_span.score("memory.noop_count", noop_count)
+    if maintenance_result is not None:
+        active_span.score("memory.reflections_generated", maintenance_result.reflections_generated)
+        active_span.score("memory.profile_updated", maintenance_result.profile_updated)
+        active_span.score("memory.archived_count", maintenance_result.archived)
+        active_span.score("memory.active_count", maintenance_result.status_counts.get("active", 0))
+        active_span.score("memory.superseded_count", maintenance_result.status_counts.get("superseded", 0))
+        active_span.score("memory.profile_version", maintenance_result.profile_version)
 
     # Emit events (summary only)
     if configurable.event_log_enabled:
@@ -2373,13 +2596,20 @@ async def memory_extract_and_write(
             data={
                 "candidate_count": len(candidates),
                 "categories": [c.category.value for c in candidates],
+                "sources": [c.source for c in candidates],
             },
         ))
         writer.write(ResearchEvent(
             event_type=EventType.MEMORY_WRITTEN,
             task_id="lead_agent",
             run_id=run_id,
-            data={"written_count": written_count, "skipped_count": skipped_count},
+            data={
+                "written_count": written_count,
+                "skipped_count": skipped_count,
+                "noop_count": noop_count,
+                "decision_counts": decision_counts,
+                "maintenance": maintenance_result.model_dump() if maintenance_result else None,
+            },
         ))
         if skipped_count > 0:
             writer.write(ResearchEvent(
