@@ -238,7 +238,7 @@ async def _run_background(record: RunRecord, request: RunRequest, config: dict[s
             }:
                 record.status = status
         record.result = record.engine.final_state
-        record.status = "cancelled" if record.engine.status == "cancelled" else "completed"
+        record.status = record.engine.status
     except Exception as exc:  # noqa: BLE001 - surface in run state
         event = {"event": "run.failed", "data": {"run_id": record.run_id, "error": str(exc)}}
         record.events.append(event)
@@ -248,7 +248,7 @@ async def _run_background(record: RunRecord, request: RunRequest, config: dict[s
             await event_publisher_from_config(config).publish(
                 "run.failed",
                 payload={"status": "failed", "error_code": "run_execution_failed", "message": "Research failed."},
-                dedupe_key="run:failed",
+                dedupe_key="run:terminal",
             )
         except Exception:
             pass
@@ -277,7 +277,7 @@ async def _run_resumed_background(record: RunRecord) -> None:
             await event_publisher_from_config(record.engine.config).publish(
                 "run.failed",
                 payload={"status": "failed", "error_code": "run_execution_failed", "message": "Research failed."},
-                dedupe_key="run:failed",
+                dedupe_key="run:terminal",
             )
         except Exception:
             pass
@@ -297,12 +297,7 @@ async def _run_control_listener(record: RunRecord, config: dict[str, Any]) -> No
             try:
                 if command.type == "cancel":
                     record.engine.interrupt()
-                    record.status = "cancelled"
-                    await publisher.publish(
-                        "run.cancelled",
-                        payload={"status": "cancelled"},
-                        dedupe_key="run:cancelled",
-                    )
+                    record.status = "cancelling"
                 elif command.type == "human_action":
                     record.engine.handle_human_action(
                         str(command.payload.get("action_id", "")),
@@ -321,7 +316,6 @@ async def _run_control_listener(record: RunRecord, config: dict[str, Any]) -> No
                     },
                     dedupe_key=f"control:{command.command_id}:rejected",
                 )
-                await store.ack(command)
         await asyncio.sleep(poll_seconds)
 
 
@@ -474,6 +468,14 @@ async def resume_run(
         raise HTTPException(status_code=409, detail="run_already_completed")
     if replay.manifest.status == "cancelled" or replay.manifest.next_stage == "cancelled":
         raise HTTPException(status_code=409, detail="run_not_recoverable")
+    try:
+        await engine.acquire_run_lease()
+    except Exception as exc:
+        from open_deep_research.tasks.lease import LeaseConflictError
+
+        if isinstance(exc, LeaseConflictError):
+            raise HTTPException(status_code=409, detail="run_already_active") from None
+        raise
 
     record = RunRecord(run_id=run_id, engine=engine, status="running")
     record.task = asyncio.create_task(_run_resumed_background(record))
@@ -735,26 +737,22 @@ async def cancel_run(
 ) -> dict[str, str]:
     """Cancel a background run."""
     record, configurable = _require_run_owner(run_id, user)
+    terminal_statuses = {"completed", "failed", "cancelled"}
     if record is not None:
+        if record.status in terminal_statuses:
+            return {"run_id": run_id, "status": record.status}
         record.engine.interrupt()
-        record.status = "cancelled"
+        record.status = "cancelling"
     else:
+        manifest = RunContextStore(
+            run_id,
+            runs_dir=configurable.runs_dir,
+        ).load_manifest()
+        if manifest.status in terminal_statuses:
+            return {"run_id": run_id, "status": manifest.status}
         await RunControlStore(run_id, runs_dir=configurable.runs_dir).enqueue(
             "cancel",
             {},
             command_id=f"cancel-{run_id}",
         )
-    config = record.engine.config if record is not None else {
-        "configurable": {"runs_dir": configurable.runs_dir},
-        "metadata": {"run_id": run_id},
-    }
-    await event_publisher_from_config(config).publish(
-        "run.cancelled",
-        payload={"status": "cancelled"},
-        dedupe_key="run:cancelled",
-    )
-    try:
-        RunContextStore(run_id, runs_dir=configurable.runs_dir)._update_manifest(status="cancelled")  # noqa: SLF001
-    except Exception:
-        pass
-    return {"run_id": run_id, "status": "cancelled"}
+    return {"run_id": run_id, "status": "cancelling"}
