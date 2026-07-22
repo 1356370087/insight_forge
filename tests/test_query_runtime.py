@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -15,8 +16,11 @@ from open_deep_research.agents.query import (
     prepare_messages_for_query,
     query,
 )
+from open_deep_research.agents.tool_protocol import validate_tool_transcript
+from open_deep_research.budgets import BudgetGate, RunBudgetLedger, RunBudgetPolicy
 from open_deep_research.tools.adapters import adapt_langchain_tool
 from open_deep_research.tools.base import ToolOrigin
+from open_deep_research.tools.governance import ToolErrorType
 
 
 def _config(**configurable: Any) -> dict[str, Any]:
@@ -260,3 +264,534 @@ async def test_stop_hook_can_block_stop_and_continue():
     transitions = [event for event in events if event.type == "query.transition"]
     assert transitions[0].data["transition"]["reason"] == "stop_hook_blocked"
     assert len(model.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_query_closes_missing_batch_hook_results_before_termination():
+    model = FakeModel([
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "echo_tool", "args": {"text": "first"}, "id": "tc1"},
+                {"name": "echo_tool", "args": {"text": "second"}, "id": "tc2"},
+            ],
+        ),
+    ])
+
+    async def incomplete_hook(_messages, tool_calls, _tools, _turn, _config):
+        return ToolResultsHookResult(
+            messages=[ToolMessage(
+                content="batch:first",
+                name="echo_tool",
+                tool_call_id=tool_calls[0]["id"],
+            )],
+            should_continue=False,
+        )
+
+    events = [
+        event
+        async for event in query(QueryParams(
+            messages=[HumanMessage(content="start")],
+            system_prompt=None,
+            model=model,
+            tools=[echo_tool],
+            config=_config(),
+            tool_batch_hook=incomplete_hook,
+        ))
+    ]
+
+    result_event = next(event for event in events if event.type == "query.tool_result")
+    assert [message.tool_call_id for message in result_event.data["messages"]] == ["tc1", "tc2"]
+    assert "runtime_missing_result" in str(result_event.data["messages"][1].content)
+    assert result_event.data["should_continue"] is False
+    assert events[-1].data["transition"]["reason"] == "tool_protocol_violation"
+
+
+@pytest.mark.asyncio
+async def test_query_rejects_duplicate_and_unknown_hook_results():
+    model = FakeModel([
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "echo_tool", "args": {"text": "hi"}, "id": "tc1"}],
+        ),
+    ])
+
+    async def malformed_hook(_messages, _tool_calls, _tools, _turn, _config):
+        return ToolResultsHookResult(
+            messages=[
+                ToolMessage(content="first", name="echo_tool", tool_call_id="tc1"),
+                ToolMessage(content="duplicate", name="echo_tool", tool_call_id="tc1"),
+                ToolMessage(content="unknown", name="echo_tool", tool_call_id="other"),
+            ],
+            should_continue=True,
+        )
+
+    events = [
+        event
+        async for event in query(QueryParams(
+            messages=[HumanMessage(content="start")],
+            system_prompt=None,
+            model=model,
+            tools=[echo_tool],
+            config=_config(),
+            tool_batch_hook=malformed_hook,
+        ))
+    ]
+
+    result_event = next(event for event in events if event.type == "query.tool_result")
+    assert len(result_event.data["messages"]) == 1
+    assert result_event.data["messages"][0].tool_call_id == "tc1"
+    assert "runtime_duplicate_result" in str(result_event.data["messages"][0].content)
+    diagnostics = result_event.data["protocol_diagnostics"]
+    assert {item["code"] for item in diagnostics} == {
+        "duplicate_tool_result",
+        "unknown_tool_result",
+    }
+    assert result_event.data["should_continue"] is False
+
+
+@pytest.mark.asyncio
+async def test_query_closes_batch_when_hook_raises():
+    model = FakeModel([
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "echo_tool", "args": {"text": "hi"}, "id": "tc1"}],
+        ),
+    ])
+
+    async def raising_hook(*_args):
+        raise RuntimeError("hook failed")
+
+    events = [
+        event
+        async for event in query(QueryParams(
+            messages=[HumanMessage(content="start")],
+            system_prompt=None,
+            model=model,
+            tools=[echo_tool],
+            config=_config(),
+            tool_batch_hook=raising_hook,
+        ))
+    ]
+
+    result_event = next(event for event in events if event.type == "query.tool_result")
+    assert [message.tool_call_id for message in result_event.data["messages"]] == ["tc1"]
+    assert "runtime_hook_error" in str(result_event.data["messages"][0].content)
+    assert events[-1].data["transition"]["reason"] == "tool_protocol_violation"
+
+
+@pytest.mark.asyncio
+async def test_query_closes_batch_before_propagating_cancellation():
+    model = FakeModel([
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "echo_tool", "args": {"text": "one"}, "id": "tc1"},
+                {"name": "echo_tool", "args": {"text": "two"}, "id": "tc2"},
+            ],
+        ),
+    ])
+
+    async def cancelled_hook(*_args):
+        raise asyncio.CancelledError
+
+    events: list[Any] = []
+    async for event in query(QueryParams(
+        messages=[HumanMessage(content="start")],
+        system_prompt=None,
+        model=model,
+        tools=[echo_tool],
+        config=_config(),
+        tool_batch_hook=cancelled_hook,
+    )):
+        events.append(event)
+
+    result_event = next(event for event in events if event.type == "query.tool_result")
+    assert [message.tool_call_id for message in result_event.data["messages"]] == ["tc1", "tc2"]
+    assert all("cancelled" in str(message.content) for message in result_event.data["messages"])
+    assert events[-1].data["transition"]["reason"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_query_canonicalizes_missing_and_duplicate_tool_call_ids():
+    first_response = AIMessage(
+        content="",
+        tool_calls=[
+            {"name": "echo_tool", "args": {"text": "first"}, "id": ""},
+            {"name": "echo_tool", "args": {"text": "second"}, "id": "dup"},
+            {"name": "echo_tool", "args": {"text": "third"}, "id": "dup"},
+        ],
+    )
+    first_response.additional_kwargs["tool_calls"] = [
+        {"id": "", "type": "function", "function": {"name": "echo_tool", "arguments": '{"text":"first"}'}},
+        {"id": "dup", "type": "function", "function": {"name": "echo_tool", "arguments": '{"text":"second"}'}},
+        {"id": "dup", "type": "function", "function": {"name": "echo_tool", "arguments": '{"text":"third"}'}},
+    ]
+    model = FakeModel([
+        first_response,
+        AIMessage(content="done"),
+    ])
+
+    events = [
+        event
+        async for event in query(QueryParams(
+            messages=[HumanMessage(content="start")],
+            system_prompt=None,
+            model=model,
+            tools=[echo_tool],
+            config=_config(),
+        ))
+    ]
+
+    model_event = next(event for event in events if event.type == "query.model_event")
+    canonical_ids = [call["id"] for call in model_event.data["message"].tool_calls]
+    assert len(set(canonical_ids)) == 3
+    assert all(canonical_ids)
+    assert canonical_ids[1] == "dup"
+    raw_ids = [
+        call["id"]
+        for call in model_event.data["message"].additional_kwargs["tool_calls"]
+    ]
+    assert raw_ids == canonical_ids
+    result_event = next(event for event in events if event.type == "query.tool_result")
+    assert [message.tool_call_id for message in result_event.data["messages"]] == canonical_ids
+
+
+@pytest.mark.asyncio
+async def test_terminal_tool_updates_are_emitted_once():
+    model = FakeModel([
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "echo_tool", "args": {"text": "hi"}, "id": "tc1"}],
+        ),
+    ])
+
+    async def hook(_messages, _tool_calls, outcomes, _tools, _turn, _config):
+        return ToolResultsHookResult(
+            messages=[outcomes[0].message],
+            updates={"evidence_registry": [{"id": "ev-1"}]},
+            should_continue=False,
+        )
+
+    events = [
+        event
+        async for event in query(QueryParams(
+            messages=[HumanMessage(content="start")],
+            system_prompt=None,
+            model=model,
+            tools=[echo_tool],
+            config=_config(),
+            tool_results_hook=hook,
+        ))
+    ]
+
+    events_with_updates = [event for event in events if event.data.get("updates")]
+    assert [event.type for event in events_with_updates] == ["query.tool_result"]
+    assert "updates" not in events[-1].data
+
+
+@pytest.mark.asyncio
+async def test_query_rejects_tool_messages_in_additional_messages():
+    model = FakeModel([
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "echo_tool", "args": {"text": "hi"}, "id": "tc1"}],
+        ),
+    ])
+
+    async def hook(_messages, _tool_calls, outcomes, _tools, _turn, _config):
+        return ToolResultsHookResult(
+            messages=[outcomes[0].message],
+            additional_messages=[
+                ToolMessage(content="second channel", name="echo_tool", tool_call_id="tc1")
+            ],
+            should_continue=True,
+        )
+
+    events = [
+        event
+        async for event in query(QueryParams(
+            messages=[HumanMessage(content="start")],
+            system_prompt=None,
+            model=model,
+            tools=[echo_tool],
+            config=_config(),
+            tool_results_hook=hook,
+        ))
+    ]
+
+    result_event = next(event for event in events if event.type == "query.tool_result")
+    assert result_event.data["additional_messages"] == []
+    assert result_event.data["should_continue"] is False
+    assert any(
+        item["code"] == "tool_message_in_additional_messages"
+        for item in result_event.data["protocol_diagnostics"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_query_bounds_tool_concurrency():
+    active = 0
+    peak = 0
+
+    @lc_tool("slow_echo")
+    async def slow_echo_impl(text: str) -> str:
+        """Echo text after yielding control."""
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return text
+
+    slow_echo = adapt_langchain_tool(slow_echo_impl, origin=ToolOrigin.SYSTEM)
+    model = FakeModel([
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "slow_echo", "args": {"text": str(index)}, "id": f"tc{index}"}
+                for index in range(5)
+            ],
+        ),
+        AIMessage(content="done"),
+    ])
+
+    _events = [
+        event
+        async for event in query(QueryParams(
+            messages=[HumanMessage(content="start")],
+            system_prompt=None,
+            model=model,
+            tools=[slow_echo],
+            config=_config(),
+            max_concurrent_tools=2,
+        ))
+    ]
+
+    assert peak == 2
+
+
+@pytest.mark.asyncio
+async def test_query_stops_when_model_call_budget_is_exhausted(tmp_path):
+    model = FakeModel([
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "echo_tool", "args": {"text": "hi"}, "id": "tc1"}],
+        ),
+        AIMessage(content="done"),
+    ])
+    ledger = RunBudgetLedger(
+        "budget-run",
+        runs_dir=str(tmp_path),
+        policy=RunBudgetPolicy(max_model_calls=1),
+    )
+    gate = BudgetGate(ledger=ledger)
+
+    events = [
+        event
+        async for event in query(QueryParams(
+            messages=[HumanMessage(content="start")],
+            system_prompt="system",
+            model=model,
+            tools=[echo_tool],
+            config=_config(),
+            budget_gate=gate,
+        ))
+    ]
+
+    assert len(model.calls) == 1
+    completed = events[-1]
+    assert completed.type == "query.completed"
+    assert completed.data["transition"]["reason"] == "budget_exhausted"
+    assert completed.data.get("budget_exhausted") is True
+    assert ledger.snapshot().model_calls == 1
+    assert ledger.snapshot().exhausted is True
+
+
+@pytest.mark.asyncio
+async def test_model_budget_keys_are_scoped_by_researcher_task(tmp_path):
+    ledger = RunBudgetLedger(
+        "shared-budget-run",
+        runs_dir=str(tmp_path),
+        policy=RunBudgetPolicy(max_model_calls=1),
+    )
+    gate = BudgetGate(ledger=ledger)
+    first = FakeModel([AIMessage(content="done")])
+    second = FakeModel([AIMessage(content="must not execute")])
+
+    first_events = [
+        event
+        async for event in query(QueryParams(
+            messages=[HumanMessage(content="first")],
+            system_prompt=None,
+            model=first,
+            config=_config(),
+            execution_namespace="researcher:task-1",
+            budget_gate=gate,
+        ))
+    ]
+    second_events = [
+        event
+        async for event in query(QueryParams(
+            messages=[HumanMessage(content="second")],
+            system_prompt=None,
+            model=second,
+            config=_config(),
+            execution_namespace="researcher:task-2",
+            budget_gate=gate,
+        ))
+    ]
+
+    assert first_events[-1].data["transition"]["reason"] == "completed"
+    assert second_events[-1].data["transition"]["reason"] == "budget_exhausted"
+    assert len(first.calls) == 1
+    assert second.calls == []
+
+
+@pytest.mark.asyncio
+async def test_tool_timeout_preserves_successful_sibling_result():
+    @lc_tool("timed_echo")
+    async def timed_echo_impl(text: str, delay: float) -> str:
+        """Echo text after a configurable delay."""
+        await asyncio.sleep(delay)
+        return text
+
+    timed_echo = adapt_langchain_tool(timed_echo_impl, origin=ToolOrigin.SYSTEM)
+    model = FakeModel([
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "timed_echo",
+                    "args": {"text": "fast", "delay": 0.0},
+                    "id": "fast-call",
+                },
+                {
+                    "name": "timed_echo",
+                    "args": {"text": "slow", "delay": 0.2},
+                    "id": "slow-call",
+                },
+            ],
+        ),
+        AIMessage(content="done"),
+    ])
+    observed_outcomes = []
+
+    async def capture(_messages, _calls, outcomes, _tools, _turn, _config):
+        observed_outcomes.extend(outcomes)
+        return ToolResultsHookResult(
+            messages=[outcome.message for outcome in outcomes],
+            should_continue=True,
+        )
+
+    events = [
+        event
+        async for event in query(QueryParams(
+            messages=[HumanMessage(content="start")],
+            system_prompt=None,
+            model=model,
+            tools=[timed_echo],
+            config=_config(),
+            tool_results_hook=capture,
+            tool_timeout_seconds=0.1,
+        ))
+    ]
+
+    result = next(event for event in events if event.type == "query.tool_result")
+    assert result.data["messages"][0].content == "fast"
+    assert "timeout" in str(result.data["messages"][1].content).lower()
+    assert observed_outcomes[0].error is None
+    assert observed_outcomes[1].error is not None
+    assert observed_outcomes[1].error.error_type == ToolErrorType.timeout
+
+
+@pytest.mark.asyncio
+async def test_query_stops_on_run_deadline(tmp_path):
+    model = FakeModel([AIMessage(content="done")])
+    gate = BudgetGate(
+        ledger=None,
+        deadline_at=0.0,
+    )
+
+    events = [
+        event
+        async for event in query(QueryParams(
+            messages=[HumanMessage(content="start")],
+            system_prompt=None,
+            model=model,
+            config=_config(),
+            budget_gate=gate,
+        ))
+    ]
+
+    assert len(model.calls) == 0
+    assert events[-1].type == "query.completed"
+    assert events[-1].data["transition"]["reason"] == "deadline_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_query_rejects_non_positive_tool_limits():
+    model = FakeModel([AIMessage(content="done")])
+
+    with pytest.raises(ValueError, match="max_concurrent_tools"):
+        _events = [
+            event
+            async for event in query(QueryParams(
+                messages=[HumanMessage(content="start")],
+                system_prompt=None,
+                model=model,
+                tools=[echo_tool],
+                config=_config(),
+                max_concurrent_tools=0,
+            ))
+        ]
+
+    with pytest.raises(ValueError, match="max_tool_batch_size"):
+        _events = [
+            event
+            async for event in query(QueryParams(
+                messages=[HumanMessage(content="start")],
+                system_prompt=None,
+                model=model,
+                tools=[echo_tool],
+                config=_config(),
+                max_tool_batch_size=-1,
+            ))
+        ]
+
+
+def test_validate_tool_transcript_allows_only_explicit_pending_tail():
+    pending = [
+        HumanMessage(content="start"),
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "echo_tool", "args": {"text": "hi"}, "id": "tc1"}],
+        ),
+    ]
+
+    validate_tool_transcript(pending, allow_pending_tail=True)
+    with pytest.raises(ValueError, match="tool_batch_not_closed"):
+        validate_tool_transcript(pending)
+
+
+def test_validate_tool_transcript_rejects_orphan_and_out_of_order_results():
+    orphan = [
+        HumanMessage(content="start"),
+        ToolMessage(content="orphan", name="echo_tool", tool_call_id="tc1"),
+    ]
+    with pytest.raises(ValueError, match="orphan_tool_result"):
+        validate_tool_transcript(orphan)
+
+    out_of_order = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "echo_tool", "args": {"text": "one"}, "id": "tc1"},
+                {"name": "echo_tool", "args": {"text": "two"}, "id": "tc2"},
+            ],
+        ),
+        ToolMessage(content="two", name="echo_tool", tool_call_id="tc2"),
+        ToolMessage(content="one", name="echo_tool", tool_call_id="tc1"),
+    ]
+    with pytest.raises(ValueError, match="tool_result_order_mismatch"):
+        validate_tool_transcript(out_of_order)

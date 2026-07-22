@@ -42,6 +42,28 @@ async def test_public_event_store_is_ordered_and_idempotent(tmp_path):
     assert [event.sequence for event in store.read()] == [1, 2]
 
 
+def test_public_terminal_payload_exposes_safe_outcome_fields():
+    payload = sanitize_public_payload(
+        "run.completed",
+        {
+            "status": "completed",
+            "result_ref": "/runs/run-1",
+            "termination_reason": "budget_exhausted",
+            "result_status": "partial",
+            "permission_denial_count": 2,
+            "permission_denials": [{"tool_name": "secret_tool"}],
+        },
+    )
+
+    assert payload == {
+        "status": "completed",
+        "result_ref": "/runs/run-1",
+        "termination_reason": "budget_exhausted",
+        "result_status": "partial",
+        "permission_denial_count": 2,
+    }
+
+
 @pytest.mark.asyncio
 async def test_public_event_store_serializes_concurrent_publishers(tmp_path):
     stores = [RunEventStore("run-concurrent", runs_dir=str(tmp_path)) for _ in range(4)]
@@ -61,6 +83,36 @@ async def test_public_event_store_serializes_concurrent_publishers(tmp_path):
     assert sorted(event.sequence for event in events) == list(range(1, 41))
     assert [event.sequence for event in stores[0].read()] == list(range(1, 41))
     assert len({event.event_id for event in events}) == 40
+
+
+@pytest.mark.asyncio
+async def test_public_event_store_allows_only_one_terminal_outcome(tmp_path):
+    store = RunEventStore("run-terminal", runs_dir=str(tmp_path))
+
+    completed = await store.append(
+        "run.completed",
+        payload={"status": "completed"},
+        dedupe_key="run:terminal",
+    )
+    duplicate = await store.append(
+        "run.completed",
+        payload={"status": "completed"},
+        dedupe_key="run:terminal",
+    )
+
+    assert duplicate == completed
+    with pytest.raises(RuntimeError, match="terminal_event_conflict"):
+        await store.append(
+            "run.cancelled",
+            payload={"status": "cancelled"},
+            dedupe_key="run:terminal",
+        )
+    with pytest.raises(RuntimeError, match="run_already_terminal"):
+        await store.append(
+            "research.task.progress",
+            payload={"task_id": "late", "status": "running"},
+            dedupe_key="late:progress",
+        )
 
 
 @pytest.mark.asyncio

@@ -154,6 +154,9 @@ def test_resume_api_launches_explicit_recovery(monkeypatch) -> None:
         final_state = None
         status = "running"
 
+        async def acquire_run_lease(self):
+            return 1
+
         async def stream_resume(self):
             self.status = "completed"
             self.final_state = {"result": {"status": "success"}}

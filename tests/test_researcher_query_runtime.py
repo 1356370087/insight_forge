@@ -8,9 +8,15 @@ from langchain_core.tools import tool as lc_tool
 
 from open_deep_research.agents import deep_researcher
 from open_deep_research.agents.query_engine import ResearcherQueryEngine
+from open_deep_research.completion import CompletionDecision
 from open_deep_research.tasks import registry as task_registry
 from open_deep_research.tools.adapters import adapt_langchain_tool
 from open_deep_research.tools.base import ToolOrigin
+from open_deep_research.tools.governance import (
+    GovernedToolCallResult,
+    ToolError,
+    ToolErrorType,
+)
 
 
 @lc_tool("research_echo")
@@ -63,11 +69,14 @@ async def test_researcher_engine_uses_unified_query_loop(monkeypatch) -> None:
                 {"name": "research_echo", "args": {"text": "fact"}, "id": "tool-1"},
             ],
         ),
-        AIMessage(content="research complete"),
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "ResearchComplete", "args": {}, "id": "done-1"}],
+        ),
     ])
 
     async def fake_get_all_tools(_config):
-        return [research_echo]
+        return [research_echo, *deep_researcher.build_supervisor_tools({})[-2:-1]]
 
     async def old_node_must_not_run(*_args, **_kwargs):
         raise AssertionError("legacy researcher node loop was invoked")
@@ -90,6 +99,7 @@ async def test_researcher_engine_uses_unified_query_loop(monkeypatch) -> None:
             "researcher_messages": [HumanMessage(content="topic")],
             "research_topic": "topic",
             "memory_context": None,
+            "evidence_registry": [{"id": "ev-1", "source_url": "https://example.com"}],
         },
     )
 
@@ -138,3 +148,102 @@ async def test_researcher_observes_cancellation_at_terminal_boundary(monkeypatch
     assert result["cancelled"] is True
     assert result["compressed_research"] == ""
     assert result["raw_notes"] == []
+
+
+@pytest.mark.asyncio
+async def test_failed_research_complete_is_not_a_successful_completion():
+    call = {"name": "ResearchComplete", "args": {}, "id": "done-1"}
+    error = ToolError(
+        error_type=ToolErrorType.permission_denied,
+        tool_name="ResearchComplete",
+        message="not permitted",
+    )
+    outcome = GovernedToolCallResult(
+        message=error.to_tool_message("done-1"),
+        error=error,
+    )
+
+    _messages, update = await deep_researcher.prepare_researcher_tool_outcomes(
+        [call],
+        [outcome],
+        {},
+        _config(),
+    )
+
+    assert update["research_complete_requested"] is True
+    assert update["research_complete_succeeded"] is False
+
+
+@pytest.mark.asyncio
+async def test_no_tool_response_without_evidence_does_not_complete(monkeypatch) -> None:
+    model = FakeResearchModel([
+        AIMessage(content="I think this is done"),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "research_echo", "args": {"text": "fact"}, "id": "tool-1"},
+            ],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "ResearchComplete", "args": {}, "id": "done-1"}],
+        ),
+    ])
+
+    async def fake_get_all_tools(_config):
+        return [research_echo, *deep_researcher.build_supervisor_tools({})[-2:-1]]
+
+    async def fake_compress(state, _config):
+        return {"compressed_research": "compressed", "raw_notes": ["evidence"]}
+
+    monkeypatch.setattr(deep_researcher, "configurable_model", model)
+    monkeypatch.setattr(deep_researcher, "get_all_tools", fake_get_all_tools)
+    monkeypatch.setattr(deep_researcher, "compress_research", fake_compress)
+
+    result = await ResearcherQueryEngine(_config()).ainvoke({
+        "researcher_messages": [HumanMessage(content="topic")],
+        "research_topic": "topic",
+        "evidence_registry": [{"id": "ev-1", "source_url": "https://example.com"}],
+    })
+
+    assert len(model.calls) == 3
+    assert result["completion_decision"]["action"] == CompletionDecision.COMPLETE.value
+
+
+@pytest.mark.asyncio
+async def test_researcher_collects_permission_denials(monkeypatch) -> None:
+    model = FakeResearchModel([
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "research_echo", "args": {"text": "fact"}, "id": "denied-1"},
+            ],
+        ),
+    ])
+
+    async def fake_get_all_tools(_config):
+        return [research_echo, deep_researcher.think_tool]
+
+    async def fake_compress(state, _config):
+        return {"compressed_research": "", "raw_notes": []}
+
+    monkeypatch.setattr(deep_researcher, "configurable_model", model)
+    monkeypatch.setattr(deep_researcher, "get_all_tools", fake_get_all_tools)
+    monkeypatch.setattr(deep_researcher, "compress_research", fake_compress)
+
+    result = await ResearcherQueryEngine(_config(
+        researcher_tool_whitelist=["think_tool"],
+        max_react_tool_calls=1,
+    )).ainvoke({
+        "researcher_messages": [HumanMessage(content="topic")],
+        "research_topic": "topic",
+    })
+
+    assert result["permission_denials"] == [{
+        "tool_call_id": "denied-1",
+        "tool_name": "research_echo",
+        "role": "researcher",
+        "reason_code": "permission_denied",
+        "turn": 1,
+        "task_id": "researcher-1",
+    }]

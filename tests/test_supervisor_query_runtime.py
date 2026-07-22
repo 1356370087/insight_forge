@@ -40,7 +40,7 @@ def _config(**overrides: Any) -> dict[str, Any]:
     }
 
 
-def _main_state() -> dict[str, Any]:
+def _main_state(*, with_evidence: bool = False) -> dict[str, Any]:
     return {
         "supervisor_messages": [
             SystemMessage(content="supervisor system"),
@@ -48,6 +48,11 @@ def _main_state() -> dict[str, Any]:
         ],
         "research_brief": "research brief",
         "enable_async_research": False,
+        "evidence_registry": (
+            [{"id": "ev-1", "source_url": "https://example.com"}]
+            if with_evidence
+            else []
+        ),
     }
 
 
@@ -77,7 +82,7 @@ async def test_supervisor_uses_unified_query_loop(monkeypatch) -> None:
     monkeypatch.setattr(deep_researcher, "supervisor", legacy_node_must_not_run)
     monkeypatch.setattr(deep_researcher, "supervisor_tools", legacy_node_must_not_run)
 
-    result = await QueryEngine(_config())._run_supervisor(_main_state())
+    result = await QueryEngine(_config())._run_supervisor(_main_state(with_evidence=True))
 
     messages = result["supervisor_messages"]["value"]
     assert len(model.calls) == 2
@@ -89,9 +94,9 @@ async def test_supervisor_uses_unified_query_loop(monkeypatch) -> None:
 async def test_supervisor_resume_from_tool_boundary_does_not_repeat_model(monkeypatch) -> None:
     model = FakeSupervisorModel([])
     restored = {
-        **_main_state(),
+        **_main_state(with_evidence=True),
         "supervisor_messages": [
-            *_main_state()["supervisor_messages"],
+            *_main_state(with_evidence=True)["supervisor_messages"],
             AIMessage(
                 content="",
                 tool_calls=[
@@ -104,7 +109,7 @@ async def test_supervisor_resume_from_tool_boundary_does_not_repeat_model(monkey
     monkeypatch.setattr(deep_researcher, "configurable_model", model)
 
     result = await QueryEngine(_config())._run_supervisor(
-        _main_state(),
+        _main_state(with_evidence=True),
         restored_state=restored,
         start_step="supervisor_tools",
     )
@@ -115,7 +120,13 @@ async def test_supervisor_resume_from_tool_boundary_does_not_repeat_model(monkey
 
 @pytest.mark.asyncio
 async def test_supervisor_no_tool_response_uses_domain_exit_policy(monkeypatch) -> None:
-    model = FakeSupervisorModel([AIMessage(content="research complete")])
+    model = FakeSupervisorModel([
+        AIMessage(content="research complete"),
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "ResearchComplete", "args": {}, "id": "done-1"}],
+        ),
+    ])
 
     async def legacy_node_must_not_run(*_args, **_kwargs):
         raise AssertionError("legacy supervisor node loop was invoked")
@@ -124,9 +135,49 @@ async def test_supervisor_no_tool_response_uses_domain_exit_policy(monkeypatch) 
     monkeypatch.setattr(deep_researcher, "supervisor", legacy_node_must_not_run)
     monkeypatch.setattr(deep_researcher, "supervisor_tools", legacy_node_must_not_run)
 
-    result = await QueryEngine(_config())._run_supervisor(_main_state())
+    result = await QueryEngine(_config())._run_supervisor(_main_state(with_evidence=True))
 
     messages = result["supervisor_messages"]["value"]
-    assert len(model.calls) == 1
-    assert messages[-1].content == "research complete"
+    assert len(model.calls) == 2
+    assert messages[2].content == "research complete"
     assert result["notes"]["value"] == []
+
+
+@pytest.mark.asyncio
+async def test_supervisor_rejects_explicit_completion_without_evidence(monkeypatch) -> None:
+    model = FakeSupervisorModel([
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "ResearchComplete", "args": {}, "id": "done-1"}],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "ResearchComplete", "args": {}, "id": "done-2"}],
+        ),
+    ])
+    calls = {"count": 0}
+    original = deep_researcher._execute_supervisor_tools
+
+    async def execute_with_evidence(state, config):
+        command = await original(state, config)
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return command
+        return command.__class__(
+            goto=command.goto,
+            update={
+                **command.update,
+                "evidence_registry": [
+                    {"id": "ev-1", "source_url": "https://example.com"}
+                ],
+            },
+        )
+
+    monkeypatch.setattr(deep_researcher, "configurable_model", model)
+    monkeypatch.setattr(deep_researcher, "_execute_supervisor_tools", execute_with_evidence)
+
+    result = await QueryEngine(_config())._run_supervisor(_main_state())
+
+    assert len(model.calls) == 2
+    assert result["completion_decision"]["value"]["action"] == "complete"
+    assert result["evidence_registry"]["value"]

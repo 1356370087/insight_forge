@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import multiprocessing
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
@@ -69,6 +70,20 @@ async def test_journal_replays_state_and_externalized_messages(tmp_path) -> None
     assert list((store.context_dir / "artifacts" / "messages").glob("*.json"))
 
 
+def _append_in_process(runs_dir: str, run_id: str, start: int, count: int) -> None:
+    async def append_all() -> None:
+        store = RunContextStore(run_id, runs_dir=runs_dir)
+        for index in range(start, start + count):
+            await store.append(
+                channel="lead",
+                record_type="state_delta",
+                stage="received",
+                payload={"scope": "main", "update": {"value": index}},
+            )
+
+    asyncio.run(append_all())
+
+
 @pytest.mark.asyncio
 async def test_journal_concurrent_appends_have_contiguous_sequence(tmp_path) -> None:
     store = _store(tmp_path)
@@ -85,6 +100,25 @@ async def test_journal_concurrent_appends_have_contiguous_sequence(tmp_path) -> 
 
     records = store.replay().records
     assert [record.seq for record in records] == list(range(1, 21))
+
+
+def test_journal_is_contiguous_across_processes(tmp_path) -> None:
+    store = _store(tmp_path, run_id="run-processes")
+    processes = [
+        multiprocessing.Process(
+            target=_append_in_process,
+            args=(str(tmp_path), store.run_id, index * 10, 10),
+        )
+        for index in range(3)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=10)
+        assert process.exitcode == 0
+
+    records = store.replay().records
+    assert [record.seq for record in records] == list(range(1, 31))
 
 
 @pytest.mark.asyncio
@@ -125,6 +159,36 @@ async def test_replay_rejects_corruption_before_final_record(tmp_path) -> None:
 
     with pytest.raises(JournalCorruptedError, match="journal_corrupted"):
         store.replay()
+
+
+@pytest.mark.asyncio
+async def test_replay_rejects_complete_corrupt_final_record(tmp_path) -> None:
+    store = _store(tmp_path)
+    await store.append(
+        channel="lead",
+        record_type="state_delta",
+        stage="received",
+        payload={"scope": "main", "update": {"value": 1}},
+    )
+    with store.journal_path.open("ab") as handle:
+        handle.write(b"not-json\n")
+
+    with pytest.raises(JournalCorruptedError, match="journal_corrupted"):
+        store.replay()
+    assert store.journal_path.read_bytes().endswith(b"not-json\n")
+
+
+@pytest.mark.asyncio
+async def test_manifest_sequence_updates_are_monotonic(tmp_path) -> None:
+    store = _store(tmp_path)
+    store._update_manifest(last_journal_seq=5, last_public_event_seq=3)  # noqa: SLF001
+
+    store._update_manifest(last_journal_seq=2, persistence_degraded=True)  # noqa: SLF001
+    manifest = store.load_manifest()
+
+    assert manifest.last_journal_seq == 5
+    assert manifest.last_public_event_seq == 3
+    assert manifest.persistence_degraded is True
 
 
 @pytest.mark.asyncio
@@ -204,6 +268,8 @@ async def test_manifest_can_be_rebuilt_from_journal(tmp_path) -> None:
             "update": {"messages": [HumanMessage(content="hello")]},
             "owner_id": "user-1",
             "config": {"configurable": {"research_model": "model"}},
+            "coordination_schema_version": 1,
+            "coordination_backend": "file_mailbox",
         },
     )
     await store.checkpoint("research_brief_written", "plan_approval")
@@ -215,3 +281,26 @@ async def test_manifest_can_be_rebuilt_from_journal(tmp_path) -> None:
     assert manifest.last_stable_stage == "research_brief_written"
     assert manifest.next_stage == "plan_approval"
     assert manifest.last_journal_seq == 2
+    assert manifest.coordination_backend == "file_mailbox"
+
+
+@pytest.mark.asyncio
+async def test_manifest_rebuild_without_markers_remains_legacy(tmp_path) -> None:
+    store = _store(tmp_path, run_id="legacy-run")
+    await store.append(
+        channel="lead",
+        record_type="state_delta",
+        stage="received",
+        payload={
+            "scope": "main",
+            "update": {"messages": [HumanMessage(content="legacy")]},
+            "owner_id": "user-1",
+            "config": {"configurable": {"research_model": "model"}},
+        },
+    )
+    store.manifest_path.write_text("broken", encoding="utf-8")
+
+    manifest = store.load_manifest()
+
+    assert manifest.coordination_schema_version == 0
+    assert manifest.coordination_backend == "legacy"

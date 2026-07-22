@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import tempfile
 from typing import Any
 
 import pytest
@@ -18,6 +19,7 @@ def _config(**configurable: Any) -> dict[str, Any]:
         "configurable": {
             "event_log_enabled": False,
             "search_api": "none",
+            "runs_dir": tempfile.mkdtemp(prefix="open-deep-research-hitl-"),
             **configurable,
         },
         "metadata": {"run_id": "hitl-test"},
@@ -187,6 +189,35 @@ async def test_hitl_cancellation_finalizes_observability_run(monkeypatch, tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_interrupt_wakes_hitl_without_human_action(monkeypatch):
+    await _install_basic_graph(monkeypatch)
+    engine = QueryEngine(
+        _config(
+            enable_human_in_loop=True,
+            hitl_require_outline_approval=False,
+        )
+    )
+    queue: asyncio.Queue = asyncio.Queue()
+    events: list[dict[str, Any]] = []
+
+    async def run():
+        async for event in engine.stream_message([HumanMessage(content="research HITL")]):
+            events.append(event)
+            await queue.put(event)
+
+    task = asyncio.create_task(run())
+    await asyncio.wait_for(_collect_until([], "hitl.plan_pending", queue), 2)
+
+    engine.interrupt()
+    assert engine.status == "cancelling"
+    await asyncio.wait_for(task, 2)
+
+    assert engine.status == "cancelled"
+    assert engine.pending_human_action is None
+    assert sum(event["event"] == "run.cancelled" for event in events) == 1
+
+
+@pytest.mark.asyncio
 async def test_hitl_outline_approval_pauses_before_final_report(monkeypatch):
     calls = await _install_basic_graph(monkeypatch, final_report="approved outline report")
     engine = QueryEngine(
@@ -268,6 +299,72 @@ def test_hitl_api_accepts_human_action():
 
     assert response.status_code == 200
     assert response.json()["status"] == "accepted"
+
+
+def test_cancel_api_requests_cancellation_without_terminal_event(monkeypatch):
+    from open_deep_research import server
+    from security.auth import get_current_user
+
+    class FakeEngine:
+        pending_human_action = None
+        status = "running"
+        config = _config(runs_dir=".runs")
+
+        def interrupt(self):
+            self.status = "cancelling"
+
+    async def terminal_publish_must_not_run(*_args, **_kwargs):
+        raise AssertionError("cancel endpoint must not publish a terminal event")
+
+    fake_engine = FakeEngine()
+    server._runs.clear()
+    server._runs["run-1"] = server.RunRecord(
+        run_id="run-1",
+        engine=fake_engine,
+        status="running",
+    )
+    server.app.dependency_overrides[get_current_user] = lambda: {
+        "identity": "u1",
+        "permissions": [],
+    }
+    monkeypatch.setattr(
+        server,
+        "event_publisher_from_config",
+        terminal_publish_must_not_run,
+    )
+    client = TestClient(server.app)
+    try:
+        response = client.post("/runs/run-1/cancel")
+    finally:
+        server.app.dependency_overrides.clear()
+        server._runs.clear()
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelling"
+    assert fake_engine.status == "cancelling"
+
+
+@pytest.mark.asyncio
+async def test_background_run_preserves_engine_failed_status():
+    from open_deep_research import server
+
+    class FakeEngine:
+        status = "failed"
+        final_state = {"result": {"status": "error"}}
+
+        async def stream_message(self, _messages, _config):
+            if False:
+                yield None
+
+    record = server.RunRecord(run_id="failed-run", engine=FakeEngine())
+    await server._run_background(
+        record,
+        server.RunRequest(messages=[]),
+        _config(),
+    )
+
+    assert record.status == "failed"
+    assert record.result == {"result": {"status": "error"}}
 
 
 def test_hitl_api_records_feedback():

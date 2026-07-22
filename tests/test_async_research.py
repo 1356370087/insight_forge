@@ -921,6 +921,11 @@ class TestResearcherCheckpoint:
         cp = ResearcherCheckpoint(
             task_id="task-1",
             phase="researching",
+            next_step="compress",
+            fence_token=7,
+            committed_tool_call_ids=["call-1"],
+            artifact_refs=[{"path": "artifact.json", "sha256": "a" * 64}],
+            completion_decision={"action": "complete_partial"},
             messages_snapshot=[{"type": "human", "content": "hello"}],
             tool_call_iterations=3,
             completed_queries=["q1", "q2"],
@@ -933,6 +938,12 @@ class TestResearcherCheckpoint:
         assert restored.tool_call_iterations == cp.tool_call_iterations
         assert restored.completed_queries == cp.completed_queries
         assert restored.fetched_sources == cp.fetched_sources
+        assert restored.schema_version == 2
+        assert restored.next_step == "compress"
+        assert restored.fence_token == 7
+        assert restored.committed_tool_call_ids == ["call-1"]
+        assert restored.artifact_refs == [{"path": "artifact.json", "sha256": "a" * 64}]
+        assert restored.completion_decision == {"action": "complete_partial"}
 
     def test_defaults_are_sensible(self):
         from open_deep_research.tasks.recovery import ResearcherCheckpoint
