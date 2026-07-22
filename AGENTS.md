@@ -122,8 +122,6 @@ FastAPI 部署时的认证 dependency：
 
 ## 开发注意事项
 
-- 运行 Claude Code、Codex 等编程类 Agent 时，尽量避免同时启动多个 subagent；优先使用单个 subagent 或串行执行，以免触发并发限制，导致 HTTP 429 错误或频繁重试
-- 所有模型配置格式为 `provider:model_name`，通过 `init_chat_model()` 统一初始化
 - `configurable_model` 在模块顶层通过 `init_chat_model(configurable_fields=...)` 创建，每次调用时通过 `.with_config()` 传入具体模型配置
 - Researcher 由 `ResearcherQueryEngine` 以干净上下文窗口运行，在 supervisor_tools 中通过 `asyncio.gather` 并行调用
 - API 密钥获取：`get_api_key_for_model()` 根据 `GET_API_KEYS_FROM_CONFIG` 环境变量决定从环境变量还是 `RunnableConfig` 中读取（OAP 部署时需要设为 `true`）
