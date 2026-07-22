@@ -13,6 +13,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, Optional, TypeAlias
 
+import portalocker
 from langchain_core.messages import (
     AIMessage,
     BaseMessage,
@@ -164,6 +165,8 @@ class RunContextStore:
         self.context_dir = self.run_dir / "context"
         self.journal_path = self.context_dir / "session_memory.jsonl"
         self.manifest_path = self.context_dir / "manifest.json"
+        self.journal_lock_path = self.context_dir / "session_memory.lock"
+        self.manifest_lock_path = self.context_dir / "manifest.lock"
         self.brief_path = self.context_dir / "research_brief.md"
         self.inline_content_max_chars = inline_content_max_chars
         lock_key = str(self.context_dir)
@@ -236,10 +239,7 @@ class RunContextStore:
         """Strictly persist the complete authoritative research brief."""
         try:
             digest = self.write_text_atomic("research_brief.md", content)
-            manifest = self.load_manifest()
-            manifest.research_brief_sha256 = digest
-            manifest.updated_at = time.time()
-            self._write_json_atomic_path(self.manifest_path, manifest.model_dump(mode="json"))
+            self._update_manifest(research_brief_sha256=digest)
             return digest
         except Exception as exc:
             raise ResearchBriefPersistenceError("research_brief_persistence_failed") from exc
@@ -267,17 +267,18 @@ class RunContextStore:
         records = self._read_records()
         if not records:
             raise JournalCorruptedError("manifest_corrupted")
-        coordination_dir = self.run_dir / "coordination"
-        manifest = RunManifest(
-            run_id=self.run_id,
-            coordination_schema_version=1 if coordination_dir.exists() else 0,
-            coordination_backend="file_mailbox" if coordination_dir.exists() else "legacy",
-        )
+        manifest = RunManifest(run_id=self.run_id)
         for record in records:
             payload = record.payload
             if record.seq == 1:
                 manifest.owner_id = payload.get("owner_id")
                 manifest.config = payload.get("config", {})
+                manifest.coordination_schema_version = int(
+                    payload.get("coordination_schema_version", 0)
+                )
+                manifest.coordination_backend = str(
+                    payload.get("coordination_backend", "legacy")
+                )
             if record.record_type == "stage_checkpoint":
                 manifest.last_stable_stage = record.stage
                 manifest.next_stage = str(payload.get("next_stage", manifest.next_stage))
@@ -290,17 +291,36 @@ class RunContextStore:
         manifest.last_journal_seq = records[-1].seq
         if self.brief_path.exists():
             manifest.research_brief_sha256 = _sha256_text(self.brief_path.read_text(encoding="utf-8"))
-        self._write_json_atomic_path(self.manifest_path, manifest.model_dump(mode="json"))
+        self.context_dir.mkdir(parents=True, exist_ok=True)
+        with portalocker.Lock(str(self.manifest_lock_path), mode="a+b", timeout=30):
+            self._write_json_atomic_path(self.manifest_path, manifest.model_dump(mode="json"))
         return manifest
 
     def _update_manifest(self, **updates: Any) -> RunManifest:
-        manifest = self.load_manifest()
-        for key, value in updates.items():
-            if hasattr(manifest, key):
+        fallback = self.load_manifest()
+        self.context_dir.mkdir(parents=True, exist_ok=True)
+        with portalocker.Lock(str(self.manifest_lock_path), mode="a+b", timeout=30):
+            try:
+                manifest = RunManifest.model_validate_json(
+                    self.manifest_path.read_text(encoding="utf-8")
+                )
+            except Exception:
+                manifest = fallback
+            for key, value in updates.items():
+                if not hasattr(manifest, key):
+                    continue
+                if key in {"last_journal_seq", "last_public_event_seq"}:
+                    value = max(int(getattr(manifest, key)), int(value))
+                if key == "status" and manifest.status in {
+                    "completed",
+                    "failed",
+                    "cancelled",
+                } and value not in {manifest.status}:
+                    continue
                 setattr(manifest, key, value)
-        manifest.updated_at = time.time()
-        self._write_json_atomic_path(self.manifest_path, manifest.model_dump(mode="json"))
-        return manifest
+            manifest.updated_at = time.time()
+            self._write_json_atomic_path(self.manifest_path, manifest.model_dump(mode="json"))
+            return manifest
 
     async def _encode(self, value: Any, artifact_refs: list[str]) -> Any:
         if isinstance(value, BaseMessage):
@@ -345,10 +365,12 @@ class RunContextStore:
             return [self._decode(item) for item in value]
         return value
 
-    def _read_records(self) -> list[SessionJournalRecord]:
+    def _read_records_unlocked(self, *, repair_tail: bool = True) -> list[SessionJournalRecord]:
         if not self.journal_path.exists():
             return []
-        raw_lines = self.journal_path.read_bytes().splitlines()
+        content = self.journal_path.read_bytes()
+        has_complete_tail = content.endswith(b"\n")
+        raw_lines = content.splitlines()
         records: list[SessionJournalRecord] = []
         expected_seq = 1
         for index, raw in enumerate(raw_lines):
@@ -357,7 +379,8 @@ class RunContextStore:
             try:
                 record = SessionJournalRecord.model_validate_json(raw)
             except Exception as exc:
-                if index == len(raw_lines) - 1:
+                is_partial_tail = index == len(raw_lines) - 1 and not has_complete_tail
+                if repair_tail and is_partial_tail:
                     valid_prefix = b"\n".join(raw_lines[:index])
                     if valid_prefix:
                         valid_prefix += b"\n"
@@ -373,6 +396,13 @@ class RunContextStore:
             expected_seq += 1
         return records
 
+    def _read_records(self) -> list[SessionJournalRecord]:
+        if not self.journal_path.exists():
+            return []
+        self.context_dir.mkdir(parents=True, exist_ok=True)
+        with portalocker.Lock(str(self.journal_lock_path), mode="a+b", timeout=30):
+            return self._read_records_unlocked()
+
     async def append(
         self,
         *,
@@ -381,31 +411,48 @@ class RunContextStore:
         stage: str,
         payload: dict[str, Any],
     ) -> SessionJournalRecord:
-        """Append one durable journal line under the run-scoped lock."""
+        """Append one durable journal line under process and file locks."""
+        artifact_refs: list[str] = []
+        encoded = await self._encode(payload, artifact_refs)
+
+        def append_locked() -> SessionJournalRecord:
+            self.context_dir.mkdir(parents=True, exist_ok=True)
+            with portalocker.Lock(
+                str(self.journal_lock_path),
+                mode="a+b",
+                timeout=30,
+            ):
+                manifest = self.load_manifest()
+                seq = max(
+                    manifest.last_journal_seq,
+                    len(self._read_records_unlocked()),
+                ) + 1
+                record = SessionJournalRecord(
+                    seq=seq,
+                    run_id=self.run_id,
+                    channel=channel,
+                    record_type=record_type,
+                    stage=stage,
+                    payload=encoded,
+                    artifact_refs=artifact_refs,
+                )
+                self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+                data = (record.model_dump_json() + "\n").encode("utf-8")
+                fd = os.open(
+                    self.journal_path,
+                    os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+                    0o600,
+                )
+                try:
+                    os.write(fd, data)
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                self._update_manifest(last_journal_seq=seq)
+                return record
+
         async with self._lock:
-            manifest = self.load_manifest()
-            seq = max(manifest.last_journal_seq, len(self._read_records())) + 1
-            artifact_refs: list[str] = []
-            encoded = await self._encode(payload, artifact_refs)
-            record = SessionJournalRecord(
-                seq=seq,
-                run_id=self.run_id,
-                channel=channel,
-                record_type=record_type,
-                stage=stage,
-                payload=encoded,
-                artifact_refs=artifact_refs,
-            )
-            self.journal_path.parent.mkdir(parents=True, exist_ok=True)
-            data = (record.model_dump_json() + "\n").encode("utf-8")
-            fd = os.open(self.journal_path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
-            try:
-                os.write(fd, data)
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            self._update_manifest(last_journal_seq=seq)
-            return record
+            return await asyncio.to_thread(append_locked)
 
     async def checkpoint(
         self,
@@ -451,6 +498,24 @@ class RunContextStore:
             )
         except Exception:
             return
+
+    def load_evidence_artifact(
+        self,
+        relative_path: str,
+        *,
+        expected_sha256: str,
+    ) -> dict[str, Any]:
+        """Load one evidence artifact after path and content-hash validation."""
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+            raise ValueError("Invalid artifact SHA-256")
+        target = self._resolve_artifact(relative_path)
+        content = target.read_text(encoding="utf-8")
+        if _sha256_text(content) != expected_sha256:
+            raise ValueError("Evidence artifact hash mismatch")
+        payload = json.loads(content)
+        if not isinstance(payload, dict):
+            raise ValueError("Evidence artifact must contain an object")
+        return payload
 
     def persist_task_result(self, task_id: str, result: dict[str, Any]) -> str:
         """Persist a completed research task before its in-memory context is released."""
