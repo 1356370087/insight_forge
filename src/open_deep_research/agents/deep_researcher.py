@@ -4,7 +4,7 @@ import asyncio
 import json
 import re
 import time
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import (
@@ -156,6 +156,23 @@ from open_deep_research.tools.utils import (
     remove_up_to_last_ai_message,
     think_tool,
 )
+
+
+def _bind_run_context_fence(
+    store: RunContextStore,
+    config: RunnableConfig,
+) -> RunContextStore:
+    """Bind a context store to propagated Lead ownership when available."""
+    metadata = config.get("metadata", {})
+    token = metadata.get("run_fence_token")
+    owner_id = metadata.get("run_lease_owner_id")
+    if token is not None and owner_id:
+        store.bind_fence_token(
+            int(token),
+            str(owner_id),
+            advance_manifest=False,
+        )
+    return store
 
 # Initialize a configurable model that we will use throughout the agent
 configurable_model = init_chat_model(
@@ -476,15 +493,24 @@ async def memory_recall(
                     rerank=configurable.memory_search_rerank,
                     reference_date=get_today_str(),
                 )
-                legacy_raw, v2_raw = await asyncio.gather(
+                legacy_result: Any
+                v2_result: Any
+                legacy_result, v2_result = await asyncio.gather(
                     legacy_call,
                     v2_call,
                     return_exceptions=True,
                 )
-                if isinstance(legacy_raw, BaseException):
-                    legacy_raw = []
-                if isinstance(v2_raw, BaseException):
-                    v2_raw = []
+                legacy_raw = (
+                    []
+                    if isinstance(legacy_result, BaseException)
+                    else cast(list[dict[str, Any]], legacy_result)
+                )
+                v2_raw = (
+                    []
+                    if isinstance(v2_result, BaseException)
+                    else cast(list[dict[str, Any]], v2_result)
+                )
+                if isinstance(v2_result, BaseException):
                     get_trace_recorder(config).active_span().score("memory.advanced_degraded", True)
                 legacy_ranked = rank_legacy_memories(legacy_raw, configurable)
                 v2_selected = rank_v2_memories(v2_raw, configurable)
@@ -968,12 +994,15 @@ def build_supervisor_tools(state: SupervisorState) -> list[Tool]:
                     "task_id": context.tool_call_id,
                 },
             }
-            context_store = RunContextStore(
-                run_id,
-                runs_dir=configurable.runs_dir,
-                inline_content_max_chars=(
-                    configurable.query_journal_inline_content_max_chars
+            context_store = _bind_run_context_fence(
+                RunContextStore(
+                    run_id,
+                    runs_dir=configurable.runs_dir,
+                    inline_content_max_chars=(
+                        configurable.query_journal_inline_content_max_chars
+                    ),
                 ),
+                context.config,
             )
             existing_ref = state.get("research_artifact_refs", {}).get(task_id, {})
             if existing_ref.get("sha256"):
@@ -1174,6 +1203,9 @@ def build_supervisor_tools(state: SupervisorState) -> list[Tool]:
                 writer,
                 get_task_state_store(configurable),
                 run_id=run_id,
+                fence_token=int(
+                    context.config.get("metadata", {}).get("run_fence_token", 0) or 0
+                ),
             )
             return ToolResult(output=message.content)
         finally:
@@ -1193,6 +1225,9 @@ def build_supervisor_tools(state: SupervisorState) -> list[Tool]:
                 get_task_state_store(configurable),
                 configurable,
                 run_id=run_id,
+                fence_token=int(
+                    context.config.get("metadata", {}).get("run_fence_token", 0) or 0
+                ),
             )
             return ToolResult(output=message.content)
         finally:
@@ -1810,7 +1845,7 @@ async def _execute_supervisor_tools(
         snapshots = await get_task_state_store(configurable).list(
             run_id=config.get("metadata", {}).get("run_id", "default")
         )
-        unfinished = [
+        unfinished_snapshots = [
             snapshot
             for snapshot in snapshots
             if snapshot.status not in {
@@ -1820,7 +1855,7 @@ async def _execute_supervisor_tools(
                 TaskStatus.TIMED_OUT,
             }
         ]
-        if unfinished:
+        if unfinished_snapshots:
             successful_complete = False
             complete_ids = {
                 call["id"] for call in ordinary_calls if call["name"] == "ResearchComplete"
@@ -1829,7 +1864,9 @@ async def _execute_supervisor_tools(
                 ToolMessage(
                     content=(
                         "ResearchComplete rejected: async tasks are still pending or active: "
-                        + ", ".join(snapshot.task_id for snapshot in unfinished)
+                        + ", ".join(
+                            snapshot.task_id for snapshot in unfinished_snapshots
+                        )
                         + ". Use WaitForResearchUpdates or CheckResearchTask."
                     ),
                     name=message.name,
@@ -1838,22 +1875,6 @@ async def _execute_supervisor_tools(
                 if message.tool_call_id in complete_ids else message
                 for message in tool_messages
             ]
-    if successful_complete:
-        update: dict[str, Any] = {
-            "notes": get_notes_from_tool_calls(supervisor_messages),
-            "research_brief": state.get("research_brief", ""),
-        }
-        if state.get("enable_async_research", False):
-            update.update(
-                await _finalize_async_research_outputs(
-                    state,
-                    config,
-                    configurable,
-                    publisher,
-                )
-            )
-        return Command(goto=END, update={**update, "supervisor_messages": tool_messages})
-
     research_artifact_refs = dict(state.get("research_artifact_refs", {}))
     raw_notes: list[str] = []
     candidate_registry: list[dict] = []
@@ -1872,6 +1893,19 @@ async def _execute_supervisor_tools(
             artifact_ref = observation.get("artifact_ref")
             if isinstance(artifact_ref, dict) and artifact_ref.get("sha256"):
                 research_artifact_refs[str(call["id"])] = dict(artifact_ref)
+                try:
+                    observation = RunContextStore(
+                        run_id,
+                        runs_dir=configurable.runs_dir,
+                    ).load_task_result(
+                        str(call["id"]),
+                        expected_sha256=str(artifact_ref["sha256"]),
+                    )
+                except (FileNotFoundError, ValueError, json.JSONDecodeError):
+                    # Keep the compact handoff visible to the Supervisor, but do
+                    # not fabricate evidence when its durable artifact is absent
+                    # or fails integrity verification.
+                    observation = outcome.result.output
             notes = observation.get("raw_notes", [])
             if notes:
                 raw_notes.extend(str(note) for note in notes)
@@ -1928,6 +1962,21 @@ async def _execute_supervisor_tools(
             "type": "override",
             "value": update_payload_ids,
         }
+    if successful_complete:
+        update_payload.update({
+            "notes": get_notes_from_tool_calls(supervisor_messages),
+            "research_brief": state.get("research_brief", ""),
+        })
+        if state.get("enable_async_research", False):
+            update_payload.update(
+                await _finalize_async_research_outputs(
+                    state,
+                    config,
+                    configurable,
+                    publisher,
+                )
+            )
+        return Command(goto=END, update=update_payload)
     return Command(goto="supervisor", update=update_payload)
 
 
@@ -2121,15 +2170,22 @@ async def prepare_researcher_tool_outcomes(
 
     run_id = str(config.get("metadata", {}).get("run_id", "default"))
     task_id = str(config.get("metadata", {}).get("task_id", "researcher"))
-    context_store = RunContextStore(
-        run_id,
-        runs_dir=configurable.runs_dir,
-        inline_content_max_chars=configurable.query_journal_inline_content_max_chars,
+    context_store = _bind_run_context_fence(
+        RunContextStore(
+            run_id,
+            runs_dir=configurable.runs_dir,
+            inline_content_max_chars=configurable.query_journal_inline_content_max_chars,
+        ),
+        config,
     )
     context_store.initialize(
         config.get("metadata", {}).get("user_id"),
         config,
     )
+    # Evidence extraction must inspect the protected full result. Offloading
+    # replaces large content with a compact artifact reference, so parsing the
+    # post-offload messages would silently discard candidates/documents/evidence.
+    registry_source_outputs = list(tool_outputs)
     tool_outputs = [
         offload_tool_message(
             output,
@@ -2153,7 +2209,7 @@ async def prepare_researcher_tool_outcomes(
     document_registry: list[dict] = []
     evidence_registry: list[dict] = []
     research_iterations: list[dict] = []
-    for output in tool_outputs:
+    for output in registry_source_outputs:
         if output.name not in {"web_research", "fetch_url"}:
             continue
         try:
