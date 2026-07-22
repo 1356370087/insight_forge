@@ -77,11 +77,17 @@ class CancellationScope:
         """Create an uncancelled scope."""
         self._event = asyncio.Event()
         self._reason = "cancel_requested"
+        self._completion_claimed = False
 
     @property
     def is_cancelled(self) -> bool:
         """Return whether cancellation has been requested."""
         return self._event.is_set()
+
+    @property
+    def is_completed(self) -> bool:
+        """Return whether successful completion won the terminal race."""
+        return self._completion_claimed
 
     @property
     def reason(self) -> str:
@@ -90,10 +96,18 @@ class CancellationScope:
 
     def request(self, reason: str = "cancel_requested") -> bool:
         """Request cancellation once and return whether this call won."""
-        if self._event.is_set():
+        if self._completion_claimed or self._event.is_set():
             return False
         self._reason = reason
         self._event.set()
+        return True
+
+    def claim_completion(self, stage: str) -> bool:
+        """Atomically claim successful termination unless cancellation won first."""
+        self.checkpoint(stage)
+        if self._completion_claimed:
+            return False
+        self._completion_claimed = True
         return True
 
     async def wait(self) -> None:
