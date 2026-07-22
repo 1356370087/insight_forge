@@ -66,6 +66,12 @@ def _emit_event(
         writer.close()
 
 
+def _run_fence_token(config: RunnableConfig) -> int:
+    """Return the ownership epoch propagated by the run orchestrator."""
+    value = (config.get("metadata") or {}).get("run_fence_token", 0)
+    return int(value or 0)
+
+
 async def _emit_state_change(
     task_record: TaskRecord,
     config: RunnableConfig,
@@ -93,7 +99,10 @@ async def _emit_state_change(
     if metrics is not None:
         metrics.observe_task_transition(task_record, event_type)
     store = get_task_state_store(configurable)
-    snapshot = await store.update_from_record(task_record)
+    snapshot = await store.update_from_record(
+        task_record,
+        fence_token=_run_fence_token(config),
+    )
     public_type = {
         EventType.TASK_STARTED: "research.task.started",
         EventType.TASK_COMPLETED: "research.task.completed",
@@ -297,7 +306,10 @@ async def run_task(
         )
         try:
             configurable = Configuration.from_runnable_config(config)
-            snapshot = await get_task_state_store(configurable).update_from_record(task_record)
+            snapshot = await get_task_state_store(configurable).update_from_record(
+                task_record,
+                fence_token=_run_fence_token(config),
+            )
             await publish_task_update(configurable, snapshot, EventType.TASK_FAILED)
         except Exception:
             pass
@@ -438,7 +450,10 @@ async def run_task_with_control(
             completed_at=time.time(),
         )
         try:
-            snapshot = await get_task_state_store(configurable).update_from_record(task_record)
+            snapshot = await get_task_state_store(configurable).update_from_record(
+                task_record,
+                fence_token=fence_token,
+            )
             await publish_task_update(configurable, snapshot, EventType.TASK_FAILED)
         except Exception:
             pass
@@ -634,7 +649,6 @@ async def run_task_with_control(
                     continue
                 # Domain-decision markers are informational; the governance
                 # future has already resumed the active researcher.
-                control_wait = None
                 result = await research_task
             else:
                 result = await research_task
@@ -679,6 +693,15 @@ async def run_task_with_control(
                 runs_dir=configurable.runs_dir,
                 inline_content_max_chars=configurable.query_journal_inline_content_max_chars,
             )
+            lease_owner_id = (config.get("metadata") or {}).get(
+                "run_lease_owner_id"
+            )
+            if fence_token and lease_owner_id:
+                context_store.bind_fence_token(
+                    fence_token,
+                    str(lease_owner_id),
+                    advance_manifest=False,
+                )
             digest = context_store.persist_task_result(task_record.task_id, durable_result)
             task_record.result_artifact_path = (
                 f"context/artifacts/research_tasks/{task_record.task_id}.json"

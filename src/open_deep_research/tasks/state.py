@@ -176,6 +176,20 @@ class MemoryTaskStateStore(TaskStateStore):
 
     async def upsert(self, snapshot: TaskSnapshot) -> TaskSnapshot:
         """Store one snapshot in process memory."""
+        current = self._snapshots.get(snapshot.task_id)
+        if current is not None:
+            if snapshot.fence_token < current.fence_token:
+                raise RuntimeError("stale_fence_token")
+            terminal_statuses = {
+                TaskStatus.COMPLETED,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+                TaskStatus.TIMED_OUT,
+            }
+            if current.status in terminal_statuses and snapshot.status != current.status:
+                return current
+            if snapshot.version <= current.version:
+                snapshot.version = current.version + 1
         self._snapshots[snapshot.task_id] = snapshot
         return snapshot
 

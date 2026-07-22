@@ -183,7 +183,10 @@ class TeammatePool:
                             error_message=f"Lead lease lost: {exc}",
                         )
                         try:
-                            snapshot = await self.store.update_from_record(record)
+                            snapshot = await self.store.update_from_record(
+                                record,
+                                fence_token=self.fence_token or 0,
+                            )
                             await publish_task_update(
                                 self.configurable,
                                 snapshot,
@@ -216,7 +219,10 @@ class TeammatePool:
     async def submit(self, record: TaskRecord) -> str | None:
         """Persist a pending task and dispatch it to an idle/new teammate."""
         await self.start()
-        await self.store.update_from_record(record)
+        await self.store.update_from_record(
+            record,
+            fence_token=self.fence_token or 0,
+        )
         await self._dispatch_pending()
         return record.assigned_teammate_id
 
@@ -269,7 +275,10 @@ class TeammatePool:
                 idle.descriptor.current_task_id = record.task_id
                 idle.descriptor.updated_at = time.time()
                 await self._write_descriptor(idle.descriptor)
-                await self.store.update_from_record(record)
+                await self.store.update_from_record(
+                    record,
+                    fence_token=self.fence_token or 0,
+                )
                 await self.mailbox.send(
                     recipient=idle.descriptor.teammate_id,
                     sender="lead",
@@ -313,7 +322,10 @@ class TeammatePool:
             instruction = str(message.payload["instruction"])
             if instruction not in record.pending_update_instructions:
                 record.pending_update_instructions.append(instruction)
-                await self.store.update_from_record(record)
+                await self.store.update_from_record(
+                    record,
+                    fence_token=self.fence_token or 0,
+                )
             await record.control_queue.put({"type": "update", "instruction": instruction})
         elif message.type == "cancel_request" and record is not None:
             record.cancelled.set()

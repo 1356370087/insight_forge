@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+import portalocker
+
 from open_deep_research.tasks.mailbox import (
     atomic_write_json,
     read_json_file,
@@ -116,6 +118,10 @@ class CheckpointManager:
         safe_task_id = validate_component(task_id, "task_id")
         return self._dir / f"{safe_task_id}.json"
 
+    def _lock_path(self, task_id: str) -> Path:
+        safe_task_id = validate_component(task_id, "task_id")
+        return self._dir / f"{safe_task_id}.lock"
+
     # ------------------------------------------------------------------
     # CRUD
     # ------------------------------------------------------------------
@@ -123,28 +129,32 @@ class CheckpointManager:
     def save(self, checkpoint: ResearcherCheckpoint) -> None:
         """Write a checkpoint without allowing an older fence to overwrite it."""
         path = self._path(checkpoint.task_id)
-        if path.is_file():
-            current = ResearcherCheckpoint.from_dict(read_json_file(path))
-            if checkpoint.fence_token < current.fence_token:
-                raise RuntimeError("stale_fence_token")
-        checkpoint.timestamp = time.time()
-        atomic_write_json(path, checkpoint.to_dict())
+        lock_path = self._lock_path(checkpoint.task_id)
+        with portalocker.Lock(str(lock_path), mode="a+b", timeout=30):
+            if path.is_file():
+                current = ResearcherCheckpoint.from_dict(read_json_file(path))
+                if checkpoint.fence_token < current.fence_token:
+                    raise RuntimeError("stale_fence_token")
+            checkpoint.timestamp = time.time()
+            atomic_write_json(path, checkpoint.to_dict())
 
     def load(self, task_id: str) -> Optional[ResearcherCheckpoint]:
         """Load the checkpoint for *task_id*, or ``None`` if it doesn't exist."""
         path = self._path(task_id)
-        if not path.is_file():
-            return None
-        return ResearcherCheckpoint.from_dict(read_json_file(path))
+        with portalocker.Lock(str(self._lock_path(task_id)), mode="a+b", timeout=30):
+            if not path.is_file():
+                return None
+            return ResearcherCheckpoint.from_dict(read_json_file(path))
 
     def delete(self, task_id: str, *, fence_token: int | None = None) -> None:
         """Remove a checkpoint only from the current or a newer ownership epoch."""
         path = self._path(task_id)
-        if path.is_file():
-            current = ResearcherCheckpoint.from_dict(read_json_file(path))
-            if fence_token is not None and fence_token < current.fence_token:
-                raise RuntimeError("stale_fence_token")
-            path.unlink()
+        with portalocker.Lock(str(self._lock_path(task_id)), mode="a+b", timeout=30):
+            if path.is_file():
+                current = ResearcherCheckpoint.from_dict(read_json_file(path))
+                if fence_token is not None and fence_token < current.fence_token:
+                    raise RuntimeError("stale_fence_token")
+                path.unlink()
 
     def list_checkpoints(self) -> list[ResearcherCheckpoint]:
         """Load every valid checkpoint for this run."""

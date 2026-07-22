@@ -39,6 +39,12 @@ from open_deep_research.tasks.state import (
     get_task_state_store,
 )
 
+
+def _run_fence_token(config: RunnableConfig | None) -> int:
+    """Read the current run ownership epoch from propagated metadata."""
+    value = ((config or {}).get("metadata") or {}).get("run_fence_token", 0)
+    return int(value or 0)
+
 # ---------------------------------------------------------------------------
 # Pydantic tool models (bound to the supervisor LLM)
 # ---------------------------------------------------------------------------
@@ -401,7 +407,10 @@ async def handle_start_research_task(
             run_id=event_writer.run_id,
             data={"research_topic": research_topic},
         ))
-    snapshot = await state_store.update_from_record(record)
+    snapshot = await state_store.update_from_record(
+        record,
+        fence_token=_run_fence_token(config),
+    )
     metrics = get_prometheus_metrics(configurable)
     if metrics is not None:
         metrics.observe_task_transition(record, EventType.TASK_CREATED)
@@ -444,7 +453,10 @@ async def handle_start_research_task(
             TaskStatus.FAILED,
             error_message=f"Unable to launch task: {exc}",
         )
-        snapshot = await state_store.update_from_record(record)
+        snapshot = await state_store.update_from_record(
+            record,
+            fence_token=_run_fence_token(config),
+        )
         await _publish_snapshot_update(
             configurable, snapshot, EventType.TASK_FAILED, event_writer
         )
@@ -573,6 +585,7 @@ async def handle_update_research_task(
     state_store: Optional[TaskStateStore] = None,
     *,
     run_id: str = "",
+    fence_token: int = 0,
 ) -> ToolMessage:
     """Queue an update instruction on the task's control queue."""
     task_id: str = tool_call["args"]["task_id"]
@@ -611,7 +624,10 @@ async def handle_update_research_task(
             if instruction not in record.pending_update_instructions:
                 record.pending_update_instructions.append(instruction)
                 if state_store is not None:
-                    await state_store.update_from_record(record)
+                    await state_store.update_from_record(
+                        record,
+                        fence_token=fence_token,
+                    )
             await record.control_queue.put({"type": "update", "instruction": instruction})
     else:
         await record.control_queue.put({"type": "update", "instruction": instruction})
@@ -644,6 +660,7 @@ async def handle_cancel_research_task(
     configurable: Optional[Configuration] = None,
     *,
     run_id: str = "",
+    fence_token: int = 0,
 ) -> ToolMessage:
     """Signal cancellation for one or more tasks."""
     effective_config = configurable or Configuration.from_runnable_config(None)
@@ -697,7 +714,10 @@ async def handle_cancel_research_task(
                 phase=record.phase.value,
                 data={"reason": reason, "sandbox_stop_error": stop_error},
             ))
-        snapshot = await store.update_from_record(record)
+        snapshot = await store.update_from_record(
+            record,
+            fence_token=fence_token,
+        )
         metrics = get_prometheus_metrics(effective_config)
         if metrics is not None:
             metrics.observe_task_transition(record, EventType.TASK_CANCELLED)
@@ -809,7 +829,10 @@ async def handle_approve_research_domain(
         ))
 
     store = state_store or get_task_state_store(configurable)
-    snapshot = await store.update_from_record(record)
+    snapshot = await store.update_from_record(
+        record,
+        fence_token=_run_fence_token(config),
+    )
     await _publish_snapshot_update(
         configurable, snapshot, EventType.TASK_DOMAIN_DECISION, event_writer
     )
