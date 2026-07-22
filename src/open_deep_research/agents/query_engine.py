@@ -118,7 +118,27 @@ class QueryEngine:
         self.final_state: dict[str, Any] | None = None
         self.context_store: RunContextStore | None = None
         self.persistence_degraded = False
+        self.run_fence_token: int | None = None
+        self._lease_heartbeat_task: asyncio.Task[None] | None = None
+        self._configure_run_lease()
+        self._configure_context_store()
+
+    def _configure_run_lease(self) -> None:
+        """Bind the lease manager to the current run and persistence settings."""
         configurable = Configuration.from_runnable_config(self.config)
+        expected_root = Path(configurable.runs_dir).resolve() / self.run_id / "coordination"
+        current = getattr(self, "run_lease", None)
+        matches = (
+            current is not None
+            and current.run_id == self.run_id
+            and current.root == expected_root
+            and current.lease_seconds == configurable.leader_lease_seconds
+            and current.lock_timeout == configurable.mailbox_lock_timeout_seconds
+        )
+        if matches:
+            return
+        if self.run_fence_token is not None:
+            raise RuntimeError("cannot_reconfigure_run_resources_while_lease_is_held")
         self.run_lease = LeaderLeaseManager(
             runs_dir=configurable.runs_dir,
             run_id=self.run_id,
@@ -126,9 +146,6 @@ class QueryEngine:
             lock_timeout=configurable.mailbox_lock_timeout_seconds,
             owner_id=f"query-{uuid.uuid4()}",
         )
-        self.run_fence_token: int | None = None
-        self._lease_heartbeat_task: asyncio.Task[None] | None = None
-        self._configure_context_store()
 
     async def acquire_run_lease(self) -> int:
         """Acquire this engine's durable run ownership epoch once."""
@@ -143,6 +160,11 @@ class QueryEngine:
         self.config.setdefault("metadata", {})["run_started_at"] = self.started_at
         self.config["metadata"]["run_fence_token"] = lease.fence_token
         self.config["metadata"]["run_lease_owner_id"] = self.run_lease.owner_id
+        if self.context_store is not None:
+            self.context_store.bind_fence_token(
+                lease.fence_token,
+                self.run_lease.owner_id,
+            )
         self._lease_heartbeat_task = asyncio.create_task(self._lease_heartbeat())
         return lease.fence_token
 
@@ -155,9 +177,11 @@ class QueryEngine:
                 return
             try:
                 await self.run_lease.renew(expected_fence_token=token)
-            except FenceLostError:
-                self.cancellation_scope.request("lease_lost")
-                self.cancelled = True
+            except Exception:  # noqa: BLE001 - ownership is unknown after any renew failure
+                if self.cancellation_scope.request("lease_lost"):
+                    self.cancelled = True
+                    if self.status not in {"completed", "failed", "cancelled"}:
+                        self.status = "cancelling"
                 return
 
     async def release_run_lease(self) -> None:
@@ -173,8 +197,8 @@ class QueryEngine:
             return
         try:
             await self.run_lease.release(expected_fence_token=token)
-        except FenceLostError:
-            pass
+        except Exception:  # noqa: BLE001 - the lease will expire after heartbeat stops
+            self.persistence_degraded = True
 
     async def _publish_public(
         self,
@@ -238,6 +262,26 @@ class QueryEngine:
             runs_dir=configurable.runs_dir,
             inline_content_max_chars=configurable.query_journal_inline_content_max_chars,
         )
+        metadata = self.config.get("metadata", {})
+        fence_token = metadata.get("run_fence_token")
+        fence_owner_id = metadata.get("run_lease_owner_id")
+        if self.run_fence_token is not None and fence_token is not None and fence_owner_id:
+            self.context_store.bind_fence_token(
+                int(fence_token),
+                str(fence_owner_id),
+                advance_manifest=False,
+            )
+
+    def _validate_resume_manifest(self, manifest: Any) -> None:
+        """Reject unauthorized or terminal resumes before acquiring ownership."""
+        expected_owner = manifest.owner_id
+        current_owner = _config_user_id(self.config)
+        if expected_owner and current_owner != expected_owner:
+            raise PermissionError("run_owner_mismatch")
+        if manifest.status == "completed":
+            raise RuntimeError("run_already_completed")
+        if manifest.status == "cancelled" or manifest.next_stage == "cancelled":
+            raise RuntimeError("run_not_recoverable")
 
     def _clear_run_resources(self) -> None:
         """Best-effort cleanup of process-local resources owned by this run."""
@@ -383,7 +427,8 @@ class QueryEngine:
 
     def interrupt(self) -> None:
         """Request cooperative cancellation of the active run."""
-        self.cancellation_scope.request("cancel_requested")
+        if not self.cancellation_scope.request("cancel_requested"):
+            return
         self.cancelled = True
         if self.status not in {"completed", "failed", "cancelled"}:
             self.status = "cancelling"
@@ -791,9 +836,11 @@ class QueryEngine:
     ) -> AsyncIterator[dict[str, Any]]:
         """Stream protocol events for a complete research request."""
         validate_client_messages(messages)
+        if self.run_fence_token is not None:
+            raise RuntimeError("run_already_active")
         self.config = _ensure_config(config, self.config)
         self.run_id = self.config["metadata"]["run_id"]
-        await self.acquire_run_lease()
+        self._configure_run_lease()
         self._configure_context_store()
         self.status = "running"
         state: dict[str, Any] = {
@@ -801,6 +848,18 @@ class QueryEngine:
             "human_feedback": list(self.human_feedback),
         }
         self.messages = state["messages"]
+        try:
+            await self.acquire_run_lease()
+            async for event in self._stream_new_message(state):
+                yield event
+        finally:
+            await self.release_run_lease()
+
+    async def _stream_new_message(
+        self,
+        state: dict[str, Any],
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Initialize and execute a new run while its caller owns the lease."""
         await self._publish_public(
             "run.created",
             payload={"status": "pending"},
@@ -834,41 +893,42 @@ class QueryEngine:
         """Replay a persisted Query run and continue from its stable checkpoint."""
         if self.context_store is None:
             raise JournalCorruptedError("run_context_persistence_disabled")
-        await self.acquire_run_lease()
-        replay = self.context_store.replay()
-        expected_owner = replay.manifest.owner_id
-        current_owner = _config_user_id(self.config)
-        if expected_owner and current_owner != expected_owner:
-            raise PermissionError("run_owner_mismatch")
-        if replay.manifest.status == "completed":
-            raise RuntimeError("run_already_completed")
-        if replay.manifest.status == "cancelled" or replay.manifest.next_stage == "cancelled":
-            raise RuntimeError("run_not_recoverable")
-        self.persistence_degraded = replay.manifest.persistence_degraded
-        state = replay.state
-        self.messages = list(state.get("messages", []))
-        self.human_feedback = list(state.get("human_feedback", []))
-        self._feedback_cursor = len(self.human_feedback)
-        self.status = "running"
-        if state.get("enable_async_research"):
-            from open_deep_research.agents import deep_researcher as graph
-
-            await graph.restore_async_research_tasks(self.config)
+        self._validate_resume_manifest(self.context_store.load_manifest())
         try:
-            self.context_store._update_manifest(  # noqa: SLF001 - same persistence boundary
-                status="running",
-                recovered_from_degraded_persistence=replay.manifest.persistence_degraded,
-            )
-        except Exception as exc:  # noqa: BLE001
-            self.persistence_degraded = True
-            self.context_store.mark_persistence_degraded(exc)
-        async for event in self._stream_execution(
-            state,
-            replay.manifest.next_stage,
-            restored_supervisor_state=replay.supervisor_state or None,
-            recovered=True,
-        ):
-            yield event
+            await self.acquire_run_lease()
+            replay = self.context_store.replay()
+            self._validate_resume_manifest(replay.manifest)
+            self.persistence_degraded = replay.manifest.persistence_degraded
+            state = replay.state
+            self.messages = list(state.get("messages", []))
+            self.human_feedback = list(state.get("human_feedback", []))
+            self._feedback_cursor = len(self.human_feedback)
+            self.status = "running"
+            if state.get("enable_async_research"):
+                from open_deep_research.agents import deep_researcher as graph
+
+                await graph.restore_async_research_tasks(self.config)
+            try:
+                self.context_store._update_manifest(  # noqa: SLF001
+                    allow_failed_resume=True,
+                    status="running",
+                    result=None,
+                    recovered_from_degraded_persistence=(
+                        replay.manifest.persistence_degraded
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.persistence_degraded = True
+                self.context_store.mark_persistence_degraded(exc)
+            async for event in self._stream_execution(
+                state,
+                replay.manifest.next_stage,
+                restored_supervisor_state=replay.supervisor_state or None,
+                recovered=True,
+            ):
+                yield event
+        finally:
+            await self.release_run_lease()
 
     async def _stream_execution(
         self,
@@ -1307,9 +1367,6 @@ class QueryEngine:
                         "metrics": self._metrics_subset(self.total_usage),
                     },
                 )
-            finally:
-                await self.release_run_lease()
-
     async def _finish_success(
         self,
         state: dict[str, Any],
@@ -1324,7 +1381,7 @@ class QueryEngine:
             shutdown_teammate_pool(self.config),
             stage="shutdown_teammate_pool",
         )
-        self.cancellation_scope.checkpoint("finish_success")
+        self.cancellation_scope.claim_completion("finish_success")
         self._clear_run_resources()
         recorder.active_span().set_output(result_text)
         self.total_usage = recorder.finish_run(self.run_id, "success")
@@ -1631,7 +1688,9 @@ class QueryEngine:
                 return BeforeTurnHookResult(replace_messages=replacement)
 
             completion_policy = ResearchCompletionPolicy(
-                min_evidence=1,
+                min_evidence=(
+                    1 if configurable.web_pipeline_mode == "enforced" else 0
+                ),
                 min_sources=0,
             )
 
@@ -1769,6 +1828,7 @@ class QueryEngine:
                 model_timeout_seconds=configurable.model_call_timeout_seconds,
                 budget_gate=self._budget_gate(),
                 execution_namespace="supervisor",
+                cancellation_scope=self.cancellation_scope,
             )):
                 if event.type == "query.model_event":
                     completed_turn = int(event.data["turn"])
@@ -1938,7 +1998,9 @@ class ResearcherQueryEngine:
             memory_prefix_count = len(runtime_messages)
             runtime_messages.extend(researcher_state["researcher_messages"])
             completion_policy = ResearchCompletionPolicy(
-                min_evidence=1,
+                min_evidence=(
+                    1 if configurable.web_pipeline_mode == "enforced" else 0
+                ),
                 min_sources=0,
             )
 

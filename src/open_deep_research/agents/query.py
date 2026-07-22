@@ -30,6 +30,7 @@ from open_deep_research.observability import (
     observe_tool_call,
 )
 from open_deep_research.runtime import normalize_messages
+from open_deep_research.runtime_control import CancellationScope
 from open_deep_research.tools.base import (
     Tool,
     build_tool_registry,
@@ -175,6 +176,7 @@ class QueryParams:
     model_timeout_seconds: float | None = None
     budget_gate: Any = None
     execution_namespace: str | None = None
+    cancellation_scope: CancellationScope | None = None
 
 
 def prepare_messages_for_query(
@@ -377,6 +379,9 @@ async def query(params: QueryParams) -> AsyncIterator[QueryEvent]:
                     },
                 )
                 return
+        model_stage = f"{params.role.value}.model"
+        if params.cancellation_scope is not None:
+            params.cancellation_scope.checkpoint(model_stage)
         if params.call_model:
             with recorder.start_span(
                 name=params.model_span_name,
@@ -389,11 +394,18 @@ async def query(params: QueryParams) -> AsyncIterator[QueryEvent]:
         else:
             model_call = _default_call_model(params, request_messages)
         try:
-            response = await (
-                asyncio.wait_for(model_call, timeout=params.model_timeout_seconds)
-                if params.model_timeout_seconds is not None
-                else model_call
-            )
+            if params.cancellation_scope is not None:
+                response = await params.cancellation_scope.run(
+                    model_call,
+                    stage=model_stage,
+                    timeout_seconds=params.model_timeout_seconds,
+                )
+            else:
+                response = await (
+                    asyncio.wait_for(model_call, timeout=params.model_timeout_seconds)
+                    if params.model_timeout_seconds is not None
+                    else model_call
+                )
         except TimeoutError:
             transition = QueryTransition(reason="deadline_exceeded", turn=turn)
             yield QueryEvent(
