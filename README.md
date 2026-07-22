@@ -81,9 +81,10 @@ The structured web evidence pipeline is controlled by `web_pipeline_mode`:
 - `shadow` preserves legacy output while sampling candidate normalization, deduplication, and Top-K selection metrics.
 - `enforced` exposes `web_research` and `fetch_url`, separates candidate discovery from Top-K fetching, extracts HTML/PDF content, and permits final citations only from fetched evidence.
 
-The compatibility default in `Configuration` remains `shadow`, while the shipped `.env.example`
-selects `enforced` as the recommended evaluation/production quality profile. In shadow mode
-`WEB_MIN_SOURCE_AUTHORITY` is observational and does not gate legacy evidence.
+`Configuration` and the shipped `.env.example` default to `enforced` so a run cannot
+complete solely from provider synthesis without fetched, traceable evidence. Select
+`legacy` or `shadow` explicitly when validating compatibility; in shadow mode
+`WEB_MIN_SOURCE_AUTHORITY` is observational and does not gate legacy output.
 
 The default fetch order is local HTTP, optional Playwright MCP rendering, Tavily Extract, then Firecrawl Scrape. Remote extractors are skipped when their credentials are absent. Strict network modes collect the selected logical target domains into an approval batch before fetching.
 

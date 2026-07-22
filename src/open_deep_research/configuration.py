@@ -864,11 +864,11 @@ class Configuration(BaseModel):
         },
     )
     web_pipeline_mode: Literal["legacy", "shadow", "enforced"] = Field(
-        default="shadow",
+        default="enforced",
         metadata={
             "x_oap_ui_config": {
                 "type": "select",
-                "default": "shadow",
+                "default": "enforced",
                 "description": "Web evidence pipeline rollout mode.",
                 "options": [
                     {"label": "Legacy", "value": "legacy"},
