@@ -22,6 +22,7 @@ from langchain_core.messages.utils import count_tokens_approximately
 from langchain_core.runnables import RunnableConfig
 
 from open_deep_research.agents.query_engine import QueryEngine, ResearcherQueryEngine
+from open_deep_research.agents.research_context import offload_tool_message
 from open_deep_research.configuration import (
     Configuration,
     get_model_compatibility_kwargs,
@@ -139,6 +140,8 @@ from open_deep_research.tools.base import (
 from open_deep_research.tools.governance import (
     AgentRole,
     GovernedToolCallResult,
+    ToolError,
+    ToolErrorType,
     execute_governed_tool_call,
     filter_tools_by_permission,
     resolve_allowed_tools,
@@ -955,6 +958,9 @@ def build_supervisor_tools(state: SupervisorState) -> list[Tool]:
     if not state.get("enable_async_research", False):
         async def conduct_call(input, context, on_progress=None):
             del on_progress
+            configurable = Configuration.from_runnable_config(context.config)
+            run_id = str(context.config.get("metadata", {}).get("run_id", "default"))
+            task_id = context.tool_call_id
             researcher_config = {
                 **context.config,
                 "metadata": {
@@ -962,6 +968,29 @@ def build_supervisor_tools(state: SupervisorState) -> list[Tool]:
                     "task_id": context.tool_call_id,
                 },
             }
+            context_store = RunContextStore(
+                run_id,
+                runs_dir=configurable.runs_dir,
+                inline_content_max_chars=(
+                    configurable.query_journal_inline_content_max_chars
+                ),
+            )
+            existing_ref = state.get("research_artifact_refs", {}).get(task_id, {})
+            if existing_ref.get("sha256"):
+                try:
+                    existing = context_store.load_task_result(
+                        task_id,
+                        expected_sha256=str(existing_ref["sha256"]),
+                    )
+                    return ToolResult(output={
+                        "task_id": task_id,
+                        "research_topic": input.research_topic,
+                        "compressed_research": str(existing.get("compressed_research", "")),
+                        "artifact_ref": existing_ref,
+                        "metrics": dict(existing.get("metrics", {})),
+                    })
+                except (FileNotFoundError, ValueError):
+                    pass
             observation = await researcher_runtime.ainvoke(
                 {
                     "researcher_messages": [
@@ -972,9 +1001,6 @@ def build_supervisor_tools(state: SupervisorState) -> list[Tool]:
                 },
                 researcher_config,
             )
-            configurable = Configuration.from_runnable_config(context.config)
-            run_id = str(context.config.get("metadata", {}).get("run_id", "default"))
-            task_id = context.tool_call_id
             artifact = {
                 "schema_version": 1,
                 "task_id": task_id,
@@ -996,13 +1022,6 @@ def build_supervisor_tools(state: SupervisorState) -> list[Tool]:
                 "result_assessment": observation.get("result_assessment", {}),
                 "metrics": dict(observation.get("metrics", {})),
             }
-            context_store = RunContextStore(
-                run_id,
-                runs_dir=configurable.runs_dir,
-                inline_content_max_chars=(
-                    configurable.query_journal_inline_content_max_chars
-                ),
-            )
             digest = context_store.persist_task_result(task_id, artifact)
             relative_path = f"context/artifacts/research_tasks/{task_id}.json"
             artifact_path = context_store.run_dir / relative_path
@@ -1422,6 +1441,18 @@ async def _execute_supervisor_tools(
                     publisher,
                 )
             )
+        if tool_calls:
+            update["supervisor_messages"] = [
+                ToolError(
+                    error_type=ToolErrorType.task_capacity_exceeded,
+                    tool_name=str(call.get("name", "unknown_tool")),
+                    message=(
+                        "The Supervisor iteration limit was reached before this "
+                        "tool call could run."
+                    ),
+                ).to_tool_message(str(call["id"]))
+                for call in tool_calls
+            ]
         return Command(goto=END, update=update)
 
     registry = build_supervisor_tool_registry(state)
@@ -1588,7 +1619,13 @@ async def _execute_supervisor_tools(
         outcomes = []
         for tool_call in non_conduct:
             outcomes.append(await execute_one(tool_call))
-        outcomes.extend(await asyncio.gather(*(execute_one(call) for call in conduct)))
+        semaphore = asyncio.Semaphore(configurable.max_concurrent_tool_calls)
+
+        async def execute_bounded(call: dict[str, Any]):
+            async with semaphore:
+                return await execute_one(call)
+
+        outcomes.extend(await asyncio.gather(*(execute_bounded(call) for call in conduct)))
 
     outcomes_by_id = {
         outcome.message.tool_call_id: outcome
@@ -1614,7 +1651,15 @@ async def _execute_supervisor_tools(
             topic = str(call.get("args", {}).get("research_topic", ""))
             return call["id"], await evaluate_subagent_handoff(topic, observation, config)
 
-        assessed = await asyncio.gather(*(assess_handoff(call) for call in assessable_calls))
+        assessment_semaphore = asyncio.Semaphore(
+            configurable.max_concurrent_tool_calls
+        )
+
+        async def assess_bounded(call: dict[str, Any]):
+            async with assessment_semaphore:
+                return await assess_handoff(call)
+
+        assessed = await asyncio.gather(*(assess_bounded(call) for call in assessable_calls))
         handoff_assessments = {call_id: assessment for call_id, assessment in assessed}
 
     completed_sync = 0
@@ -1807,8 +1852,9 @@ async def _execute_supervisor_tools(
                     publisher,
                 )
             )
-        return Command(goto=END, update=update)
+        return Command(goto=END, update={**update, "supervisor_messages": tool_messages})
 
+    research_artifact_refs = dict(state.get("research_artifact_refs", {}))
     raw_notes: list[str] = []
     candidate_registry: list[dict] = []
     document_registry: list[dict] = []
@@ -1823,6 +1869,9 @@ async def _execute_supervisor_tools(
             continue
         observation = outcome.result.output
         if isinstance(observation, dict):
+            artifact_ref = observation.get("artifact_ref")
+            if isinstance(artifact_ref, dict) and artifact_ref.get("sha256"):
+                research_artifact_refs[str(call["id"])] = dict(artifact_ref)
             notes = observation.get("raw_notes", [])
             if notes:
                 raw_notes.extend(str(note) for note in notes)
@@ -1851,7 +1900,10 @@ async def _execute_supervisor_tools(
             })
             update_payload_ids = sorted(processed_ids.union(message_ids))
 
-    update_payload: dict[str, Any] = {"supervisor_messages": tool_messages}
+    update_payload: dict[str, Any] = {
+        "supervisor_messages": tool_messages,
+        "research_artifact_refs": research_artifact_refs,
+    }
     if raw_notes:
         update_payload["raw_notes"] = ["\n".join(raw_notes)]
     if candidate_registry:
@@ -2067,6 +2119,27 @@ async def prepare_researcher_tool_outcomes(
                         writer.close()
         tool_outputs.append(output)
 
+    run_id = str(config.get("metadata", {}).get("run_id", "default"))
+    task_id = str(config.get("metadata", {}).get("task_id", "researcher"))
+    context_store = RunContextStore(
+        run_id,
+        runs_dir=configurable.runs_dir,
+        inline_content_max_chars=configurable.query_journal_inline_content_max_chars,
+    )
+    context_store.initialize(
+        config.get("metadata", {}).get("user_id"),
+        config,
+    )
+    tool_outputs = [
+        offload_tool_message(
+            output,
+            store=context_store,
+            task_id=task_id,
+            max_inline_chars=configurable.max_mcp_output_chars,
+        )
+        for output in tool_outputs
+    ]
+
     pending_tool_results = [
         {
             "name": output.name or call.get("name", ""),
@@ -2108,6 +2181,10 @@ async def prepare_researcher_tool_outcomes(
         "pending_tool_results": pending_tool_results,
         "research_complete_requested": any(
             call.get("name") == "ResearchComplete" for call in tool_calls
+        ),
+        "research_complete_succeeded": any(
+            call.get("name") == "ResearchComplete" and outcome.error is None
+            for call, outcome in zip(tool_calls, tool_outcomes)
         ),
         **registry_update,
     }
@@ -2300,8 +2377,8 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
     synthesizer_model = configurable_model.with_config(compression_model_config)
     
     # Step 2: Prepare messages for compression
-    researcher_messages = state.get("researcher_messages", [])
-    
+    researcher_messages = list(state.get("researcher_messages", []))
+
     # Add instruction to switch from research mode to compression mode
     researcher_messages.append(HumanMessage(content=compress_research_simple_human_message))
     
@@ -2640,33 +2717,46 @@ async def restore_async_research_tasks(config: RunnableConfig) -> None:
     registry = get_task_registry()
     checkpoint_manager = CheckpointManager(runs_dir=configurable.runs_dir, run_id=run_id)
 
-    # Completed task artifacts survive successful checkpoint deletion.
+    state_store = get_task_state_store(configurable)
+    snapshots = await state_store.list(run_id=run_id)
     context_store = RunContextStore(
         run_id,
         runs_dir=configurable.runs_dir,
         inline_content_max_chars=configurable.query_journal_inline_content_max_chars,
     )
-    task_artifact_dir = context_store.context_dir / "artifacts" / "research_tasks"
-    if task_artifact_dir.exists():
-        for artifact in task_artifact_dir.glob("*.json"):
-            task_id = artifact.stem
-            existing = registry.get(task_id)
-            if existing is not None and existing.run_id == run_id:
-                continue
-            try:
-                result = json.loads(artifact.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            record = TaskRecord(
-                task_id=task_id,
-                research_topic=str(result.get("research_topic", "")),
-                run_id=run_id,
-                status=TaskStatus.COMPLETED,
-                phase=TaskPhase.COMPLETED,
-                result=result,
+    for snapshot in snapshots:
+        existing = registry.get(snapshot.task_id)
+        if existing is not None and existing.run_id == run_id:
+            continue
+        if snapshot.status != TaskStatus.COMPLETED:
+            continue
+        if not snapshot.result_artifact_path or not snapshot.result_artifact_sha256:
+            continue
+        try:
+            result = context_store.load_task_result(
+                snapshot.task_id,
+                expected_sha256=snapshot.result_artifact_sha256,
             )
-            registry.restore(record)
-            await get_task_state_store(configurable).update_from_record(record)
+        except (FileNotFoundError, ValueError):
+            continue
+        record = TaskRecord(
+            task_id=snapshot.task_id,
+            research_topic=snapshot.research_topic,
+            display_title=snapshot.display_title,
+            wave_id=snapshot.wave_id,
+            plan_task_id=snapshot.plan_task_id,
+            run_id=run_id,
+            user_id=snapshot.user_id,
+            status=TaskStatus.COMPLETED,
+            phase=TaskPhase.COMPLETED,
+            result=result,
+            admission_status=snapshot.admission_status,
+            result_artifact_path=snapshot.result_artifact_path,
+            result_artifact_sha256=snapshot.result_artifact_sha256,
+            assigned_teammate_id=snapshot.assigned_teammate_id,
+            completed_at=snapshot.completed_at,
+        )
+        registry.restore(record)
 
     for checkpoint in checkpoint_manager.list_checkpoints():
         if checkpoint.run_id and checkpoint.run_id != run_id:

@@ -8,10 +8,22 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, ToolMessage
+from langchain_core.messages.utils import count_tokens_approximately
 from langchain_core.runnables import RunnableConfig
 
+from open_deep_research.agents.tool_protocol import (
+    ToolProtocolDiagnostic,
+    canonicalize_ai_tool_calls,
+    close_tool_batch,
+    validate_tool_transcript,
+)
+from open_deep_research.budgets import (
+    BudgetExhausted,
+    DeadlineExceeded,
+)
 from open_deep_research.configuration import Configuration
 from open_deep_research.observability import (
+    TokenUsage,
     apply_helicone_config,
     get_trace_recorder,
     invoke_model_with_retry_observability,
@@ -26,6 +38,8 @@ from open_deep_research.tools.base import (
 from open_deep_research.tools.governance import (
     AgentRole,
     GovernedToolCallResult,
+    ToolError,
+    ToolErrorType,
     execute_governed_tool_call,
     resolve_allowed_tools,
 )
@@ -38,6 +52,11 @@ TransitionReason = Literal[
     "external_update",
     "cancelled",
     "max_turns",
+    "tool_protocol_violation",
+    "explicit_completion",
+    "completion_policy_satisfied",
+    "budget_exhausted",
+    "deadline_exceeded",
     "completed",
 ]
 
@@ -95,6 +114,7 @@ class ToolResultsHookResult:
     additional_messages: list[BaseMessage] = field(default_factory=list)
     updates: dict[str, Any] = field(default_factory=dict)
     should_continue: bool = True
+    reason: TransitionReason | None = None
 
 
 StopHook = Callable[[list[BaseMessage], RunnableConfig], Awaitable[StopHookResult | None]]
@@ -135,6 +155,7 @@ class QueryParams:
     model: Any
     config: RunnableConfig
     tools: Sequence[Tool] = field(default_factory=list)
+    execution_tools: Sequence[Tool] | None = None
     role: AgentRole = AgentRole.RESEARCHER
     model_span_name: str = "query.model"
     model_config: dict[str, Any] = field(default_factory=dict)
@@ -147,6 +168,13 @@ class QueryParams:
     tool_batch_hook: ToolBatchHook | None = None
     tool_results_hook: ToolResultsHook | None = None
     call_model: CallModel | None = None
+    max_concurrent_tools: int | None = None
+    max_tool_batch_size: int | None = None
+    tool_timeout_seconds: float | None = None
+    hook_timeout_seconds: float | None = None
+    model_timeout_seconds: float | None = None
+    budget_gate: Any = None
+    execution_namespace: str | None = None
 
 
 def prepare_messages_for_query(
@@ -228,18 +256,36 @@ async def query(params: QueryParams) -> AsyncIterator[QueryEvent]:
     stream, and package events. The loop owns continuation decisions.
     """
     messages: list[BaseMessage] = normalize_messages(list(params.messages))
+    if params.max_concurrent_tools is not None and params.max_concurrent_tools <= 0:
+        raise ValueError("max_concurrent_tools must be greater than zero")
+    if params.max_tool_batch_size is not None and params.max_tool_batch_size <= 0:
+        raise ValueError("max_tool_batch_size must be greater than zero")
+    validate_tool_transcript(messages, allow_pending_tail=True)
     transition = QueryTransition(reason="start", turn=params.initial_turn)
     yield QueryEvent("query.started", {"transition": transition.__dict__})
 
     turn = params.initial_turn
     while True:
         if params.max_turns is not None and turn >= params.max_turns:
+            validate_tool_transcript(messages)
             transition = QueryTransition(reason="max_turns", turn=turn)
             yield QueryEvent("query.completed", {"transition": transition.__dict__, "messages": messages})
             return
 
-        for before_turn_hook in params.before_turn_hooks:
-            before_turn_result = await before_turn_hook(messages, turn + 1, params.config)
+        if params.hook_timeout_seconds is not None and params.hook_timeout_seconds <= 0:
+            raise ValueError("hook_timeout_seconds must be greater than zero")
+        if params.tool_timeout_seconds is not None and params.tool_timeout_seconds <= 0:
+            raise ValueError("tool_timeout_seconds must be greater than zero")
+        before_turn_hooks = params.before_turn_hooks
+        for before_turn_hook in before_turn_hooks:
+            before_turn_result = await (
+                asyncio.wait_for(
+                    before_turn_hook(messages, turn + 1, params.config),
+                    timeout=params.hook_timeout_seconds,
+                )
+                if params.hook_timeout_seconds is not None
+                else before_turn_hook(messages, turn + 1, params.config)
+            )
             if before_turn_result is None:
                 continue
             if before_turn_result.replace_messages is not None:
@@ -257,6 +303,7 @@ async def query(params: QueryParams) -> AsyncIterator[QueryEvent]:
                 },
             )
             if before_turn_result.should_stop:
+                validate_tool_transcript(messages)
                 yield QueryEvent(
                     "query.completed",
                     {
@@ -275,6 +322,7 @@ async def query(params: QueryParams) -> AsyncIterator[QueryEvent]:
             agent_role=params.role.value,
             attributes={"turn": turn},
         ):
+            validate_tool_transcript(messages)
             messages_for_query = prepare_messages_for_query(messages, params.context_policy)
             request_messages = list(messages_for_query)
             if params.system_prompt:
@@ -294,6 +342,41 @@ async def query(params: QueryParams) -> AsyncIterator[QueryEvent]:
             },
         )
 
+        budget_gate = params.budget_gate
+        execution_namespace = params.execution_namespace or str(
+            params.config.get("metadata", {}).get("task_id")
+            or params.role.value
+        )
+        model_op_key = f"model:{execution_namespace}:{params.role.value}:{turn}"
+        model_name = str(params.model_config.get("model", ""))
+        if budget_gate is not None and budget_gate.enabled:
+            estimated_input = count_tokens_approximately(request_messages)
+            estimated_output = int(params.model_config.get("max_tokens") or 0)
+            try:
+                budget_gate.reserve_model_call(
+                    model_op_key,
+                    estimated_input_tokens=estimated_input,
+                    estimated_output_tokens=estimated_output,
+                    model_name=model_name,
+                )
+            except DeadlineExceeded:
+                transition = QueryTransition(reason="deadline_exceeded", turn=turn)
+                yield QueryEvent(
+                    "query.completed",
+                    {"transition": transition.__dict__, "messages": messages},
+                )
+                return
+            except BudgetExhausted:
+                transition = QueryTransition(reason="budget_exhausted", turn=turn)
+                yield QueryEvent(
+                    "query.completed",
+                    {
+                        "transition": transition.__dict__,
+                        "messages": messages,
+                        "budget_exhausted": True,
+                    },
+                )
+                return
         if params.call_model:
             with recorder.start_span(
                 name=params.model_span_name,
@@ -302,11 +385,51 @@ async def query(params: QueryParams) -> AsyncIterator[QueryEvent]:
                 attributes={"custom_call_model": True},
                 input_payload=request_messages,
             ):
-                response = await params.call_model(request_messages)
+                model_call = params.call_model(request_messages)
         else:
-            response = await _default_call_model(params, request_messages)
+            model_call = _default_call_model(params, request_messages)
+        try:
+            response = await (
+                asyncio.wait_for(model_call, timeout=params.model_timeout_seconds)
+                if params.model_timeout_seconds is not None
+                else model_call
+            )
+        except TimeoutError:
+            transition = QueryTransition(reason="deadline_exceeded", turn=turn)
+            yield QueryEvent(
+                "query.completed",
+                {"transition": transition.__dict__, "messages": messages},
+            )
+            return
+        if budget_gate is not None and budget_gate.ledger is not None:
+            usage = TokenUsage.from_response(response)
+            try:
+                budget_gate.settle_model_call(
+                    model_op_key,
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
+                    model_name=model_name,
+                )
+            except (BudgetExhausted, DeadlineExceeded):
+                pass
+        run_id = str(params.config.get("metadata", {}).get("run_id", "default"))
+        response, call_diagnostics = canonicalize_ai_tool_calls(
+            response,
+            run_id=run_id,
+            role=params.role.value,
+            turn=turn,
+        )
         messages.append(response)
-        yield QueryEvent("query.model_event", {"turn": turn, "message": response})
+        yield QueryEvent(
+            "query.model_event",
+            {
+                "turn": turn,
+                "message": response,
+                "protocol_diagnostics": [
+                    diagnostic.to_dict() for diagnostic in call_diagnostics
+                ],
+            },
+        )
 
         tool_calls = list(getattr(response, "tool_calls", []) or [])
         if not tool_calls:
@@ -334,6 +457,7 @@ async def query(params: QueryParams) -> AsyncIterator[QueryEvent]:
                     break
             else:
                 messages.extend(stop_messages)
+                validate_tool_transcript(messages)
                 transition = QueryTransition(reason=completion_reason, turn=turn)
                 yield QueryEvent(
                     "query.completed",
@@ -346,60 +470,201 @@ async def query(params: QueryParams) -> AsyncIterator[QueryEvent]:
                 return
             continue
 
-        tools_by_name = build_tool_registry(list(params.tools))
+        execution_tools = list(params.execution_tools or params.tools)
+        tools_by_name = build_tool_registry(execution_tools)
         allowed = resolve_allowed_tools(params.role, params.config, set(tools_by_name))
         yield QueryEvent("query.tool_call", {"turn": turn, "tool_calls": tool_calls})
 
-        tool_results_result = None
-        if params.tool_batch_hook is not None:
-            tool_results_result = await params.tool_batch_hook(
-                messages,
-                tool_calls,
-                tools_by_name,
-                turn,
-                params.config,
-            )
-            outcomes: list[GovernedToolCallResult] = []
-        else:
-            configurable = Configuration.from_runnable_config(params.config)
-
-            async def _execute_tool(tool_call: dict[str, Any]) -> GovernedToolCallResult:
-                return await observe_tool_call(
-                    tool_call,
-                    params.role.value,
-                    params.config,
-                    lambda: execute_governed_tool_call(
-                        tool_call,
-                        tools_by_name,
-                        params.role,
-                        params.config,
-                        allowed_tools=allowed,
-                        apply_retry=True,
-                        max_retries=configurable.max_tool_retries,
-                        base_delay=configurable.tool_retry_base_delay,
-                        max_delay=configurable.tool_retry_max_delay,
-                    ),
-                )
-
-            tool_tasks = [_execute_tool(tool_call) for tool_call in tool_calls]
-            outcomes = await asyncio.gather(*tool_tasks)
-            if params.tool_results_hook is not None:
-                tool_results_result = await params.tool_results_hook(
+        outcomes: list[GovernedToolCallResult] = []
+        tool_results_result: ToolResultsHookResult | None = None
+        batch_diagnostics: tuple[ToolProtocolDiagnostic, ...] = ()
+        hook_failed = False
+        batch_cancelled = False
+        try:
+            if params.tool_batch_hook is not None:
+                batch_hook_call = params.tool_batch_hook(
                     messages,
                     tool_calls,
-                    outcomes,
                     tools_by_name,
                     turn,
                     params.config,
                 )
-        tool_results = (
+                tool_results_result = await (
+                    asyncio.wait_for(
+                        batch_hook_call,
+                        timeout=params.hook_timeout_seconds,
+                    )
+                    if params.hook_timeout_seconds is not None
+                    else batch_hook_call
+                )
+            else:
+                configurable = Configuration.from_runnable_config(params.config)
+                concurrency = params.max_concurrent_tools or len(tool_calls) or 1
+                semaphore = asyncio.Semaphore(concurrency)
+
+                async def _execute_tool(
+                    tool_call: dict[str, Any],
+                ) -> GovernedToolCallResult:
+                    async with semaphore:
+                        budget_op_key = (
+                            f"tool:{execution_namespace}:{params.role.value}:"
+                            f"{turn}:{tool_call['id']}"
+                        )
+                        if budget_gate is not None and budget_gate.enabled:
+                            try:
+                                budget_gate.reserve_tool_call(budget_op_key)
+                            except (BudgetExhausted, DeadlineExceeded):
+                                error = ToolError(
+                                    error_type=ToolErrorType.budget_exhausted,
+                                    tool_name=str(tool_call.get("name", "unknown_tool")),
+                                    message=(
+                                        "The tool call was skipped because the run "
+                                        "budget or deadline was exhausted."
+                                    ),
+                                )
+                                get_trace_recorder(params.config).active_span() \
+                                    .record_outcome(error_type=error.error_type.value)
+                                return GovernedToolCallResult(
+                                    message=error.to_tool_message(str(tool_call["id"])),
+                                    error=error,
+                                )
+                        invocation = observe_tool_call(
+                            tool_call,
+                            params.role.value,
+                            params.config,
+                            lambda: execute_governed_tool_call(
+                                tool_call,
+                                tools_by_name,
+                                params.role,
+                                params.config,
+                                allowed_tools=allowed,
+                                apply_retry=True,
+                                max_retries=configurable.max_tool_retries,
+                                base_delay=configurable.tool_retry_base_delay,
+                                max_delay=configurable.tool_retry_max_delay,
+                            ),
+                        )
+                        try:
+                            return await (
+                                asyncio.wait_for(
+                                    invocation,
+                                    timeout=params.tool_timeout_seconds,
+                                )
+                                if params.tool_timeout_seconds is not None
+                                else invocation
+                            )
+                        except TimeoutError:
+                            error = ToolError(
+                                error_type=ToolErrorType.timeout,
+                                tool_name=str(tool_call.get("name", "unknown_tool")),
+                                message="The tool call exceeded its execution timeout.",
+                                retryable=True,
+                                detail={"timeout_seconds": params.tool_timeout_seconds},
+                            )
+                            return GovernedToolCallResult(
+                                message=error.to_tool_message(str(tool_call["id"])),
+                                error=error,
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:  # noqa: BLE001 - close this call independently
+                            error = ToolError(
+                                error_type=ToolErrorType.internal_error,
+                                tool_name=str(tool_call.get("name", "unknown_tool")),
+                                message="The tool call failed unexpectedly.",
+                                detail={"error_type": type(exc).__name__},
+                            )
+                            return GovernedToolCallResult(
+                                message=error.to_tool_message(str(tool_call["id"])),
+                                error=error,
+                            )
+
+                batch_limit = params.max_tool_batch_size or len(tool_calls)
+                runnable_calls = tool_calls[:batch_limit]
+                outcomes = list(await asyncio.gather(*(
+                    _execute_tool(tool_call) for tool_call in runnable_calls
+                )))
+                if len(runnable_calls) < len(tool_calls):
+                    overflow = tool_calls[len(runnable_calls):]
+                    batch_diagnostics = tuple(
+                        ToolProtocolDiagnostic(
+                            code="tool_batch_capacity_exceeded",
+                            tool_call_id=str(call["id"]),
+                        )
+                        for call in overflow
+                    )
+                if params.tool_results_hook is not None:
+                    results_hook_call = params.tool_results_hook(
+                        messages,
+                        tool_calls,
+                        outcomes,
+                        tools_by_name,
+                        turn,
+                        params.config,
+                    )
+                    tool_results_result = await (
+                        asyncio.wait_for(
+                            results_hook_call,
+                            timeout=params.hook_timeout_seconds,
+                        )
+                        if params.hook_timeout_seconds is not None
+                        else results_hook_call
+                    )
+        except asyncio.CancelledError:
+            batch_cancelled = True
+            batch_diagnostics = (*batch_diagnostics, ToolProtocolDiagnostic(
+                code="tool_batch_cancelled",
+            ))
+        except Exception as exc:  # noqa: BLE001 - close the current batch before stopping
+            hook_failed = True
+            batch_diagnostics = (*batch_diagnostics, ToolProtocolDiagnostic(
+                code="tool_batch_hook_error",
+                detail={"error_type": type(exc).__name__},
+            ))
+
+        candidate_messages = (
             list(tool_results_result.messages)
             if tool_results_result is not None and tool_results_result.messages is not None
             else [outcome.message for outcome in outcomes]
         )
+        missing_error_type = (
+            ToolErrorType.cancelled
+            if batch_cancelled
+            else ToolErrorType.runtime_hook_error
+            if hook_failed
+            else ToolErrorType.task_capacity_exceeded
+            if params.max_tool_batch_size is not None
+            and len(outcomes) < len(tool_calls)
+            else ToolErrorType.runtime_missing_result
+        )
+        missing_message = {
+            ToolErrorType.cancelled: "The tool call was cancelled before it completed.",
+            ToolErrorType.runtime_hook_error: "The tool batch hook failed before returning a result.",
+            ToolErrorType.task_capacity_exceeded: "The tool call exceeded the configured batch capacity.",
+            ToolErrorType.runtime_missing_result: "The runtime did not produce a result for this tool call.",
+        }[missing_error_type]
+        closed_batch = close_tool_batch(
+            tool_calls,
+            candidate_messages,
+            tool_results_result.additional_messages if tool_results_result is not None else [],
+            missing_error_type=missing_error_type,
+            missing_message=missing_message,
+            initial_diagnostics=batch_diagnostics,
+        )
+        tool_results = list(closed_batch.messages)
+        additional_messages = list(closed_batch.additional_messages)
         messages.extend(tool_results)
-        if tool_results_result is not None:
-            messages.extend(tool_results_result.additional_messages)
+        messages.extend(additional_messages)
+        validate_tool_transcript(messages)
+
+        protocol_failed = not closed_batch.is_valid and not batch_cancelled
+        requested_continue = (
+            tool_results_result.should_continue
+            if tool_results_result is not None
+            else True
+        )
+        should_continue = requested_continue and not protocol_failed and not batch_cancelled
+        updates = tool_results_result.updates if tool_results_result is not None else {}
         transition = QueryTransition(reason="tool_results", turn=turn)
         yield QueryEvent(
             "query.tool_result",
@@ -407,29 +672,30 @@ async def query(params: QueryParams) -> AsyncIterator[QueryEvent]:
                 "turn": turn,
                 "transition": transition.__dict__,
                 "messages": tool_results,
-                "additional_messages": (
-                    tool_results_result.additional_messages
-                    if tool_results_result is not None
-                    else []
-                ),
-                "updates": (
-                    tool_results_result.updates if tool_results_result is not None else {}
-                ),
-                "should_continue": (
-                    tool_results_result.should_continue
-                    if tool_results_result is not None
-                    else True
-                ),
+                "additional_messages": additional_messages,
+                "updates": updates,
+                "should_continue": should_continue,
+                "protocol_diagnostics": [
+                    diagnostic.to_dict() for diagnostic in closed_batch.diagnostics
+                ],
             },
         )
-        if tool_results_result is not None and not tool_results_result.should_continue:
-            transition = QueryTransition(reason="completed", turn=turn)
+        if not should_continue:
+            completion_reason = (
+                "cancelled"
+                if batch_cancelled
+                else "tool_protocol_violation"
+                if protocol_failed
+                else tool_results_result.reason
+                if tool_results_result is not None and tool_results_result.reason is not None
+                else "completed"
+            )
+            transition = QueryTransition(reason=completion_reason, turn=turn)
             yield QueryEvent(
                 "query.completed",
                 {
                     "transition": transition.__dict__,
                     "messages": messages,
-                    "updates": tool_results_result.updates,
                 },
             )
             return

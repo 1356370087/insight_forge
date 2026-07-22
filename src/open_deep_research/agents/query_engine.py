@@ -15,7 +15,11 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
-from langchain_core.messages import BaseMessage, HumanMessage, get_buffer_string
+from langchain_core.messages import (
+    BaseMessage,
+    HumanMessage,
+    get_buffer_string,
+)
 from langchain_core.runnables import RunnableConfig
 
 from open_deep_research.agents.query import (
@@ -25,6 +29,12 @@ from open_deep_research.agents.query import (
     StopHookResult,
     ToolResultsHookResult,
     query,
+)
+from open_deep_research.budgets import BudgetGate
+from open_deep_research.completion import (
+    CompletionDecision,
+    ResearchCompletionPolicy,
+    completion_policy_context,
 )
 from open_deep_research.configuration import Configuration
 from open_deep_research.observability import get_trace_recorder
@@ -45,7 +55,12 @@ from open_deep_research.runtime import (
     coerce_command,
     normalize_messages,
 )
+from open_deep_research.runtime_control import CancellationScope, RunCancelled
 from open_deep_research.security.inputs import validate_client_messages
+from open_deep_research.tasks.lease import (
+    FenceLostError,
+    LeaderLeaseManager,
+)
 
 
 def _ensure_config(config: RunnableConfig | None, fallback: RunnableConfig | None = None) -> RunnableConfig:
@@ -91,8 +106,10 @@ class QueryEngine:
             "tool_success_rate": 0.0,
         }
         self.permission_denials: list[dict[str, Any]] = []
+        self.cancellation_scope = CancellationScope()
         self.cancelled = False
         self.status = "pending"
+        self.started_at = time.time()
         self.pending_human_action: dict[str, Any] | None = None
         self.human_feedback: list[dict[str, Any]] = []
         self._feedback_cursor = 0
@@ -101,7 +118,63 @@ class QueryEngine:
         self.final_state: dict[str, Any] | None = None
         self.context_store: RunContextStore | None = None
         self.persistence_degraded = False
+        configurable = Configuration.from_runnable_config(self.config)
+        self.run_lease = LeaderLeaseManager(
+            runs_dir=configurable.runs_dir,
+            run_id=self.run_id,
+            lease_seconds=configurable.leader_lease_seconds,
+            lock_timeout=configurable.mailbox_lock_timeout_seconds,
+            owner_id=f"query-{uuid.uuid4()}",
+        )
+        self.run_fence_token: int | None = None
+        self._lease_heartbeat_task: asyncio.Task[None] | None = None
         self._configure_context_store()
+
+    async def acquire_run_lease(self) -> int:
+        """Acquire this engine's durable run ownership epoch once."""
+        if self.run_fence_token is not None:
+            if await self.run_lease.is_owner(
+                expected_fence_token=self.run_fence_token
+            ):
+                return self.run_fence_token
+            raise FenceLostError(f"Lost Lead lease for run {self.run_id}")
+        lease = await self.run_lease.acquire()
+        self.run_fence_token = lease.fence_token
+        self.config.setdefault("metadata", {})["run_started_at"] = self.started_at
+        self.config["metadata"]["run_fence_token"] = lease.fence_token
+        self.config["metadata"]["run_lease_owner_id"] = self.run_lease.owner_id
+        self._lease_heartbeat_task = asyncio.create_task(self._lease_heartbeat())
+        return lease.fence_token
+
+    async def _lease_heartbeat(self) -> None:
+        configurable = Configuration.from_runnable_config(self.config)
+        while self.run_fence_token is not None:
+            await asyncio.sleep(configurable.leader_heartbeat_seconds)
+            token = self.run_fence_token
+            if token is None:
+                return
+            try:
+                await self.run_lease.renew(expected_fence_token=token)
+            except FenceLostError:
+                self.cancellation_scope.request("lease_lost")
+                self.cancelled = True
+                return
+
+    async def release_run_lease(self) -> None:
+        """Stop heartbeating and release only this engine's current epoch."""
+        heartbeat = self._lease_heartbeat_task
+        self._lease_heartbeat_task = None
+        if heartbeat is not None and heartbeat is not asyncio.current_task():
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
+        token = self.run_fence_token
+        self.run_fence_token = None
+        if token is None:
+            return
+        try:
+            await self.run_lease.release(expected_fence_token=token)
+        except FenceLostError:
+            pass
 
     async def _publish_public(
         self,
@@ -145,8 +218,13 @@ class QueryEngine:
     async def _publish_public_cancelled(self) -> None:
         await self._publish_public(
             "run.cancelled",
-            payload={"status": "cancelled"},
-            dedupe_key="run:cancelled",
+            payload={
+                "status": "cancelled",
+                "termination_reason": "cancel_requested",
+                "result_status": "cancelled",
+                "permission_denial_count": len(self.permission_denials),
+            },
+            dedupe_key="run:terminal",
         )
 
     def _configure_context_store(self) -> None:
@@ -294,10 +372,21 @@ class QueryEngine:
             self.persistence_degraded = True
             self.context_store.mark_persistence_degraded(exc)
 
+    def _budget_gate(self) -> BudgetGate:
+        """Resolve the run-scoped budget gate from the current configuration."""
+        configurable = Configuration.from_runnable_config(self.config)
+        return BudgetGate.from_config(
+            configurable,
+            self.run_id,
+            started_at=self.started_at,
+        )
+
     def interrupt(self) -> None:
-        """Request cancellation before the next step starts."""
+        """Request cooperative cancellation of the active run."""
+        self.cancellation_scope.request("cancel_requested")
         self.cancelled = True
-        self.status = "cancelled"
+        if self.status not in {"completed", "failed", "cancelled"}:
+            self.status = "cancelling"
 
     async def submit_message(
         self,
@@ -381,11 +470,18 @@ class QueryEngine:
     async def _wait_for_human_action(self) -> dict[str, Any]:
         if self._pending_action_future is None:
             raise RuntimeError("No pending human action")
-        decision = await self._pending_action_future
-        self.pending_human_action = None
-        self._pending_action_future = None
-        self._pending_action_loop = None
-        return decision
+        future = self._pending_action_future
+        try:
+            return await self.cancellation_scope.run(
+                asyncio.shield(future),
+                stage="human_action",
+            )
+        finally:
+            if not future.done():
+                future.cancel()
+            self.pending_human_action = None
+            self._pending_action_future = None
+            self._pending_action_loop = None
 
     def handle_human_action(self, action_id: str, action: str, message: str = "") -> dict[str, Any]:
         """Resolve a pending plan or outline approval action."""
@@ -697,6 +793,7 @@ class QueryEngine:
         validate_client_messages(messages)
         self.config = _ensure_config(config, self.config)
         self.run_id = self.config["metadata"]["run_id"]
+        await self.acquire_run_lease()
         self._configure_context_store()
         self.status = "running"
         state: dict[str, Any] = {
@@ -722,6 +819,8 @@ class QueryEngine:
                     extra={
                         "owner_id": _config_user_id(self.config),
                         "config": self.context_store._safe_config(self.config),  # noqa: SLF001
+                        "coordination_schema_version": 1,
+                        "coordination_backend": "file_mailbox",
                     },
                 )
                 await self._persist_checkpoint("received", "summarize_messages")
@@ -735,6 +834,7 @@ class QueryEngine:
         """Replay a persisted Query run and continue from its stable checkpoint."""
         if self.context_store is None:
             raise JournalCorruptedError("run_context_persistence_disabled")
+        await self.acquire_run_lease()
         replay = self.context_store.replay()
         expected_owner = replay.manifest.owner_id
         current_owner = _config_user_id(self.config)
@@ -937,6 +1037,48 @@ class QueryEngine:
                             start_step=supervisor_step,
                         )
                     apply_update_to_state(state, supervisor_update)
+                    completion_action = str(
+                        state.get("completion_decision", {}).get("action", "")
+                    )
+                    if completion_action == CompletionDecision.TERMINATE.value:
+                        reason = str(
+                            state.get("completion_decision", {}).get(
+                                "reason", "insufficient_evidence"
+                            )
+                        )
+                        self.status = "failed"
+                        result = {
+                            "status": "error",
+                            "error_code": "insufficient_evidence",
+                            "termination_reason": reason,
+                            "completion": state.get("completion_decision", {}),
+                        }
+                        self.final_state = {**state, "result": result}
+                        await self._persist_update(
+                            channel="lead",
+                            stage="terminated",
+                            update={"completion_decision": state.get("completion_decision", {})},
+                        )
+                        await self._persist_checkpoint(
+                            "terminated",
+                            "terminated",
+                            status="failed",
+                        )
+                        await self._publish_public(
+                            "run.failed",
+                            stage="researching",
+                            payload={
+                                "status": "failed",
+                                "error_code": "insufficient_evidence",
+                                "message": "Research ended without accepted evidence.",
+                                "termination_reason": reason,
+                                "result_status": "error",
+                                "permission_denial_count": len(self.permission_denials),
+                            },
+                            dedupe_key="run:terminal",
+                        )
+                        yield self._event("run.failed", {"run_id": self.run_id, **result})
+                        return
                     await self._persist_update(
                         channel="lead",
                         stage="research_complete",
@@ -997,7 +1139,11 @@ class QueryEngine:
                     if self.context_store is not None:
                         state["research_brief"] = self.context_store.load_research_brief()
                     with recorder.start_span(name="node.final_report_generation", kind="agent", agent_role="lead"):
-                        report_update = await graph.final_report_generation(state, self.config)
+                        report_update = await self.cancellation_scope.run(
+                            graph.final_report_generation(state, self.config),
+                            stage="final_report_generation",
+                        )
+                    self.cancellation_scope.checkpoint("report_generated")
                     apply_update_to_state(state, report_update)
                     await self._persist_update(
                         channel="lead",
@@ -1028,7 +1174,10 @@ class QueryEngine:
                 if stage == "memory_extract_and_write":
                     with recorder.start_span(name="node.memory_extract_and_write", kind="agent", agent_role="lead"):
                         memory_cmd = coerce_command(
-                            await graph.memory_extract_and_write(state, self.config),
+                            await self.cancellation_scope.run(
+                                graph.memory_extract_and_write(state, self.config),
+                                stage="memory_extract_and_write",
+                            ),
                             default_goto=END,
                         )
                     apply_update_to_state(state, memory_cmd.update)
@@ -1042,6 +1191,30 @@ class QueryEngine:
 
                 async for event in self._finish_success(state, recorder, str(state.get("final_report", ""))):
                     yield event
+                return
+            except RunCancelled:
+                from open_deep_research.tasks.teammate_pool import (
+                    shutdown_teammate_pool,
+                )
+
+                try:
+                    await shutdown_teammate_pool(self.config)
+                except Exception:
+                    pass
+                self._clear_run_resources()
+                self.status = "cancelled"
+                await self._persist_checkpoint("cancelled", "cancelled", status="cancelled")
+                self.total_usage = recorder.finish_run(self.run_id, "cancelled")
+                self._cancelled_state(state)
+                await self._publish_public_cancelled()
+                yield self._event(
+                    "run.cancelled",
+                    {
+                        "run_id": self.run_id,
+                        "usage": self._usage_subset(self.total_usage),
+                        "metrics": self._metrics_subset(self.total_usage),
+                    },
+                )
                 return
             except Exception as exc:
                 from open_deep_research.tasks.teammate_pool import (
@@ -1084,14 +1257,17 @@ class QueryEngine:
                         dedupe_key=f"stage:{failed_stage}:failed",
                     )
                     await self._publish_public(
-                        "run.failed",
+                        "run.interrupted",
                         stage=failed_stage,
                         payload={
-                            "status": "failed",
-                            "error_code": "research_run_failed",
-                            "message": "The research run failed.",
+                            "status": "interrupted",
+                            "error_code": "research_run_interrupted",
+                            "message": "The research run was interrupted and can be resumed.",
+                            "termination_reason": "internal_error",
+                            "result_status": "error",
+                            "permission_denial_count": len(self.permission_denials),
                         },
-                        dedupe_key="run:failed",
+                        dedupe_key=f"run:interrupted:{self.run_id}",
                     )
                 except Exception:
                     pass
@@ -1131,6 +1307,8 @@ class QueryEngine:
                         "metrics": self._metrics_subset(self.total_usage),
                     },
                 )
+            finally:
+                await self.release_run_lease()
 
     async def _finish_success(
         self,
@@ -1141,13 +1319,28 @@ class QueryEngine:
         """Finish a successful run, persist terminal status, and emit its event."""
         from open_deep_research.tasks.teammate_pool import shutdown_teammate_pool
 
-        await shutdown_teammate_pool(self.config)
+        self.cancellation_scope.checkpoint("finish_success")
+        await self.cancellation_scope.run(
+            shutdown_teammate_pool(self.config),
+            stage="shutdown_teammate_pool",
+        )
+        self.cancellation_scope.checkpoint("finish_success")
         self._clear_run_resources()
         recorder.active_span().set_output(result_text)
         self.total_usage = recorder.finish_run(self.run_id, "success")
+        result_status = (
+            "partial"
+            if state.get("completion_decision", {}).get("action")
+            == CompletionDecision.COMPLETE_PARTIAL.value
+            else "success"
+        )
         result = {
-            "status": "success",
+            "status": result_status,
             "result": result_text,
+            "termination_reason": str(
+                state.get("completion_decision", {}).get("reason", "completed")
+            ),
+            "completion": state.get("completion_decision", {}),
             "usage": self._usage_subset(self.total_usage),
             "metrics": self._metrics_subset(self.total_usage),
             "permission_denials": self.permission_denials,
@@ -1172,8 +1365,16 @@ class QueryEngine:
         await self._publish_public(
             "run.completed",
             stage="finalizing",
-            payload={"status": "completed", "result_ref": f"/runs/{self.run_id}"},
-            dedupe_key="run:completed",
+            payload={
+                "status": "completed",
+                "result_ref": f"/runs/{self.run_id}",
+                "termination_reason": str(
+                    state.get("completion_decision", {}).get("reason", "completed")
+                ),
+                "result_status": result["status"],
+                "permission_denial_count": len(self.permission_denials),
+            },
+            dedupe_key="run:terminal",
         )
         yield self._event(
             "run.completed",
@@ -1208,11 +1409,13 @@ class QueryEngine:
                 self.context_store.mark_persistence_degraded(exc)
 
     async def _run_node(self, name: str, node: Any, state: dict[str, Any]) -> RuntimeCommand:
-        if self.cancelled:
-            raise RuntimeError("Run cancelled")
+        self.cancellation_scope.checkpoint(name)
         recorder = get_trace_recorder(self.config)
         with recorder.start_span(name=f"node.{name}", kind="agent", agent_role="lead"):
-            result = await node(state, self.config)
+            result = await self.cancellation_scope.run(
+                node(state, self.config),
+                stage=name,
+            )
         command = coerce_command(result)
         apply_update_to_state(state, command.update)
         record_type = "context_compacted" if "conversation_summary" in command.update else "state_delta"
@@ -1252,6 +1455,7 @@ class QueryEngine:
             "processed_mailbox_message_ids": list(
                 main_state.get("processed_mailbox_message_ids", [])
             ),
+            "research_artifact_refs": dict(main_state.get("research_artifact_refs", {})),
         }
         supervisor_state = {**base_state, **(restored_state or {})}
         # The authoritative brief always wins over journal/state caches.
@@ -1314,8 +1518,7 @@ class QueryEngine:
             messages: list[BaseMessage],
             turn: int,
         ) -> RuntimeCommand:
-            if self.cancelled:
-                raise RuntimeError("Run cancelled")
+            self.cancellation_scope.checkpoint("supervisor.tools")
             tool_state = {
                 **supervisor_state,
                 "supervisor_messages": list(messages),
@@ -1328,7 +1531,10 @@ class QueryEngine:
                 attributes={"iteration": turn},
             ):
                 return coerce_command(
-                    await graph._execute_supervisor_tools(tool_state, self.config),
+                    await self.cancellation_scope.run(
+                        graph._execute_supervisor_tools(tool_state, self.config),
+                        stage="supervisor.tools",
+                    ),
                     default_goto="supervisor",
                 )
 
@@ -1370,8 +1576,7 @@ class QueryEngine:
                 _next_turn: int,
                 _config: RunnableConfig,
             ) -> BeforeTurnHookResult | None:
-                if self.cancelled:
-                    raise RuntimeError("Run cancelled")
+                self.cancellation_scope.checkpoint("supervisor.before_turn")
                 prepared_state = {
                     **supervisor_state,
                     "supervisor_messages": list(messages),
@@ -1425,6 +1630,26 @@ class QueryEngine:
                 )
                 return BeforeTurnHookResult(replace_messages=replacement)
 
+            completion_policy = ResearchCompletionPolicy(
+                min_evidence=1,
+                min_sources=0,
+            )
+
+            def supervisor_completion_context(
+                *,
+                explicit_succeeded: bool = False,
+                explicit_failed: bool = False,
+                has_remaining_budget: bool = True,
+                exhausted_reason: str | None = None,
+            ):
+                return completion_policy_context(
+                    supervisor_state,
+                    explicit_completion_succeeded=explicit_succeeded,
+                    explicit_completion_failed=explicit_failed,
+                    has_remaining_budget=has_remaining_budget,
+                    exhausted_reason=exhausted_reason,
+                )
+
             async def run_tool_batch(
                 messages: list[BaseMessage],
                 _tool_calls: list[dict[str, Any]],
@@ -1435,10 +1660,39 @@ class QueryEngine:
                 command = await execute_supervisor_tools(messages, turn)
                 update = dict(command.update)
                 tool_messages = normalize_messages(update.pop("supervisor_messages", []))
+                projected_state = dict(supervisor_state)
+                apply_update_to_state(projected_state, update)
+                requested = any(call.get("name") == "ResearchComplete" for call in _tool_calls)
+                successful = requested and command.goto == END
+                decision = completion_policy.evaluate(completion_policy_context(
+                    projected_state,
+                    explicit_completion_succeeded=successful,
+                    explicit_completion_failed=requested and not successful,
+                    has_remaining_budget=turn < configurable.max_researcher_iterations,
+                    exhausted_reason="max_turns",
+                ))
+                decision_update = {
+                    "action": decision.action.value,
+                    "reason": decision.reason,
+                    "gaps": list(decision.gaps),
+                }
+                should_continue = decision.action is CompletionDecision.CONTINUE_WITH_GAPS
+                additional_messages = []
+                if should_continue and decision.gaps:
+                    additional_messages.append(HumanMessage(content=(
+                        "[Research Completion Policy] Continue research and resolve: "
+                        + ", ".join(decision.gaps)
+                    )))
                 return ToolResultsHookResult(
                     messages=tool_messages,
-                    updates=update,
-                    should_continue=command.goto != END,
+                    additional_messages=additional_messages,
+                    updates={**update, "completion_decision": decision_update},
+                    should_continue=should_continue,
+                    reason=(
+                        "completion_policy_satisfied"
+                        if not should_continue
+                        else None
+                    ),
                 )
 
             async def handle_no_tool_stop(
@@ -1446,14 +1700,44 @@ class QueryEngine:
                 _config: RunnableConfig,
             ) -> StopHookResult:
                 turn = int(supervisor_state.get("research_iterations", 0) or 0)
+                decision = completion_policy.evaluate(supervisor_completion_context(
+                    has_remaining_budget=turn < configurable.max_researcher_iterations,
+                    exhausted_reason="max_turns",
+                ))
+                if decision.action is CompletionDecision.CONTINUE_WITH_GAPS:
+                    return StopHookResult(
+                        should_continue=True,
+                        messages=[HumanMessage(content=(
+                            "[Research Completion Policy] Do not stop yet. "
+                            "Use research tools and resolve: "
+                            + ", ".join(decision.gaps)
+                        ))],
+                        updates={"completion_decision": {
+                            "action": decision.action.value,
+                            "reason": decision.reason,
+                            "gaps": list(decision.gaps),
+                        }},
+                        reason="stop_hook_blocked",
+                    )
                 command = await execute_supervisor_tools(messages, turn)
                 update = dict(command.update)
                 tool_messages = normalize_messages(update.pop("supervisor_messages", []))
                 return StopHookResult(
                     should_continue=command.goto != END,
                     messages=tool_messages,
-                    updates=update,
-                    reason="completed" if command.goto == END else "stop_hook_blocked",
+                    updates={
+                        **update,
+                        "completion_decision": {
+                            "action": decision.action.value,
+                            "reason": decision.reason,
+                            "gaps": list(decision.gaps),
+                        },
+                    },
+                    reason=(
+                        "completion_policy_satisfied"
+                        if command.goto == END
+                        else "stop_hook_blocked"
+                    ),
                 )
 
             completed_messages = normalize_messages(
@@ -1478,6 +1762,13 @@ class QueryEngine:
                 before_turn_hooks=[before_turn],
                 stop_hooks=[handle_no_tool_stop],
                 tool_batch_hook=run_tool_batch,
+                max_concurrent_tools=configurable.max_concurrent_tool_calls,
+                max_tool_batch_size=configurable.max_tool_batch_size,
+                tool_timeout_seconds=configurable.tool_call_timeout_seconds,
+                hook_timeout_seconds=configurable.hook_timeout_seconds,
+                model_timeout_seconds=configurable.model_call_timeout_seconds,
+                budget_gate=self._budget_gate(),
+                execution_namespace="supervisor",
             )):
                 if event.type == "query.model_event":
                     completed_turn = int(event.data["turn"])
@@ -1512,6 +1803,21 @@ class QueryEngine:
                     completed_turn = int(
                         event.data.get("transition", {}).get("turn", completed_turn)
                     )
+                    completion_reason = str(
+                        event.data.get("transition", {}).get("reason", "completed")
+                    )
+                    if completion_reason == "cancelled":
+                        raise RunCancelled("cancel_requested", "supervisor.query")
+                    if completion_reason in {"budget_exhausted", "deadline_exceeded"}:
+                        decision = completion_policy.evaluate(supervisor_completion_context(
+                            has_remaining_budget=False,
+                            exhausted_reason=completion_reason,
+                        ))
+                        supervisor_state["completion_decision"] = {
+                            "action": decision.action.value,
+                            "reason": decision.reason,
+                            "gaps": list(decision.gaps),
+                        }
                     if not terminal_tool_update_handled:
                         await commit_supervisor_update(
                             dict(event.data.get("updates", {})),
@@ -1537,8 +1843,16 @@ class QueryEngine:
                 "type": "override",
                 "value": supervisor_state.get("processed_mailbox_message_ids", []),
             },
+            "research_artifact_refs": {
+                "type": "override",
+                "value": dict(supervisor_state.get("research_artifact_refs", {})),
+            },
             "research_brief": supervisor_state.get("research_brief", main_state.get("research_brief", "")),
             "approved_research_plan": supervisor_state.get("approved_research_plan"),
+            "completion_decision": {
+                "type": "override",
+                "value": supervisor_state.get("completion_decision", {}),
+            },
             "human_feedback": {"type": "override", "value": list(self.human_feedback)},
         }
 
@@ -1604,9 +1918,9 @@ class ResearcherQueryEngine:
             agent_role="researcher",
             attributes={"research_topic": topic[:500]},
         ):
-            tools = await graph.get_all_tools(cfg)
+            all_tools = await graph.get_all_tools(cfg)
             tools = graph.filter_tools_by_permission(
-                tools,
+                all_tools,
                 graph.AgentRole.RESEARCHER,
                 cfg,
             )
@@ -1623,6 +1937,57 @@ class ResearcherQueryEngine:
                 runtime_messages.append(HumanMessage(content=memory_context))
             memory_prefix_count = len(runtime_messages)
             runtime_messages.extend(researcher_state["researcher_messages"])
+            completion_policy = ResearchCompletionPolicy(
+                min_evidence=1,
+                min_sources=0,
+            )
+
+            def researcher_completion_context(
+                *,
+                explicit_succeeded: bool = False,
+                explicit_failed: bool = False,
+                has_remaining_budget: bool = True,
+                exhausted_reason: str | None = None,
+            ):
+                return completion_policy_context(
+                    researcher_state,
+                    explicit_completion_succeeded=explicit_succeeded,
+                    explicit_completion_failed=explicit_failed,
+                    has_remaining_budget=has_remaining_budget,
+                    exhausted_reason=exhausted_reason,
+                    cancelled=bool(researcher_state.get("cancelled")),
+                )
+
+            async def handle_no_tool_stop(
+                _messages: list[BaseMessage],
+                _config: RunnableConfig,
+            ) -> StopHookResult:
+                decision = completion_policy.evaluate(researcher_completion_context())
+                researcher_state["completion_decision"] = {
+                    "action": decision.action.value,
+                    "reason": decision.reason,
+                    "gaps": list(decision.gaps),
+                }
+                should_continue = (
+                    decision.action is CompletionDecision.CONTINUE_WITH_GAPS
+                )
+                gap_message = HumanMessage(
+                    content=(
+                        "[Research Completion Policy] Research is not complete. "
+                        "Resolve these gaps before stopping: "
+                        + ", ".join(decision.gaps)
+                    )
+                ) if should_continue else None
+                return StopHookResult(
+                    should_continue=should_continue,
+                    messages=[gap_message] if gap_message is not None else [],
+                    updates={"completion_decision": researcher_state["completion_decision"]},
+                    reason=(
+                        "stop_hook_blocked"
+                        if should_continue
+                        else "completion_policy_satisfied"
+                    ),
+                )
 
             async def before_turn(
                 _messages: list[BaseMessage],
@@ -1720,13 +2085,70 @@ class ResearcherQueryEngine:
                 domain_updates = {
                     key: value
                     for key, value in batch_update.items()
-                    if key not in {"pending_tool_results", "research_complete_requested"}
+                    if key not in {
+                        "pending_tool_results",
+                        "research_complete_requested",
+                        "research_complete_succeeded",
+                    }
                 }
+                denial_types = {
+                    "permission_denied",
+                    "egress_domain_denied",
+                    "egress_domain_pending",
+                    "sensitive_tool_approval_required",
+                }
+                permission_denials = list(researcher_state.get("permission_denials", []))
+                seen_denials = {
+                    (item.get("tool_call_id"), item.get("reason_code"))
+                    for item in permission_denials
+                }
+                for call, outcome in zip(tool_calls, outcomes):
+                    error = getattr(outcome, "error", None)
+                    reason_code = getattr(getattr(error, "error_type", None), "value", None)
+                    key = (str(call.get("id", "")), reason_code)
+                    if reason_code not in denial_types or key in seen_denials:
+                        continue
+                    permission_denials.append({
+                        "tool_call_id": key[0],
+                        "tool_name": str(call.get("name", "")),
+                        "role": "researcher",
+                        "reason_code": reason_code,
+                        "turn": turn,
+                        "task_id": str(cfg.get("metadata", {}).get("task_id", "")) or None,
+                    })
+                    seen_denials.add(key)
+                if permission_denials:
+                    domain_updates["permission_denials"] = {
+                        "type": "override",
+                        "value": permission_denials,
+                    }
                 additional_messages: list[BaseMessage] = []
-                should_continue = not (
-                    turn >= configurable.max_react_tool_calls
-                    or batch_update["research_complete_requested"]
+                limit_reached = turn >= configurable.max_react_tool_calls
+                apply_update_to_state(researcher_state, domain_updates)
+                decision = completion_policy.evaluate(researcher_completion_context(
+                    explicit_succeeded=bool(
+                        batch_update["research_complete_succeeded"]
+                    ),
+                    explicit_failed=bool(
+                        batch_update["research_complete_requested"]
+                        and not batch_update["research_complete_succeeded"]
+                    ),
+                    has_remaining_budget=not limit_reached,
+                    exhausted_reason="max_turns" if limit_reached else None,
+                ))
+                domain_updates["completion_decision"] = {
+                    "action": decision.action.value,
+                    "reason": decision.reason,
+                    "gaps": list(decision.gaps),
+                }
+                should_continue = (
+                    decision.action is CompletionDecision.CONTINUE_WITH_GAPS
                 )
+                if should_continue and decision.gaps:
+                    additional_messages.append(HumanMessage(content=(
+                        "[Research Completion Policy] Continue research and resolve: "
+                        + ", ".join(decision.gaps)
+                    )))
 
                 if configurable.quality_evaluation_enabled:
                     assessment_state = {
@@ -1752,13 +2174,26 @@ class ResearcherQueryEngine:
                     assessment_update.pop("pending_tool_results", None)
                     assessment_update.pop("research_complete_requested", None)
                     domain_updates.update(assessment_update)
-                    should_continue = assessment.goto == "researcher"
+                    if assessment.goto == "researcher":
+                        should_continue = True
+                    elif decision.action is CompletionDecision.CONTINUE_WITH_GAPS:
+                        should_continue = True
 
                 return ToolResultsHookResult(
                     messages=tool_outputs,
                     additional_messages=additional_messages,
                     updates=domain_updates,
                     should_continue=should_continue,
+                    reason=(
+                        "completion_policy_satisfied"
+                        if decision.action in {
+                            CompletionDecision.COMPLETE,
+                            CompletionDecision.COMPLETE_PARTIAL,
+                        }
+                        else "max_turns"
+                        if decision.action is CompletionDecision.TERMINATE
+                        else None
+                    ),
                 )
 
             model_config = {
@@ -1776,6 +2211,7 @@ class ResearcherQueryEngine:
                 model=graph.configurable_model,
                 config=cfg,
                 tools=tools,
+                execution_tools=all_tools,
                 role=graph.AgentRole.RESEARCHER,
                 model_span_name="researcher.model",
                 model_config=model_config,
@@ -1786,7 +2222,23 @@ class ResearcherQueryEngine:
                     max_tool_result_chars=configurable.max_mcp_output_chars,
                 ),
                 before_turn_hooks=[before_turn],
+                stop_hooks=[handle_no_tool_stop],
                 tool_results_hook=after_tools,
+                max_concurrent_tools=configurable.max_concurrent_tool_calls,
+                max_tool_batch_size=configurable.max_tool_batch_size,
+                tool_timeout_seconds=configurable.tool_call_timeout_seconds,
+                hook_timeout_seconds=configurable.hook_timeout_seconds,
+                model_timeout_seconds=configurable.model_call_timeout_seconds,
+                budget_gate=BudgetGate.from_config(
+                    configurable,
+                    str(cfg.get("metadata", {}).get("run_id", "default")),
+                    started_at=cfg.get("metadata", {}).get("run_started_at"),
+                ),
+                execution_namespace=(
+                    f"researcher:{cfg.get('metadata', {}).get('task_id')}"
+                    if cfg.get("metadata", {}).get("task_id")
+                    else "researcher:standalone"
+                ),
             )):
                 updates = event.data.get("updates")
                 if updates:
@@ -1796,6 +2248,24 @@ class ResearcherQueryEngine:
                     completed_turn = int(
                         event.data.get("transition", {}).get("turn", completed_turn)
                     )
+                    if event.data.get("transition", {}).get("reason") == "cancelled":
+                        researcher_state["cancelled"] = True
+                    elif event.data.get("transition", {}).get("reason") in {
+                        "budget_exhausted",
+                        "deadline_exceeded",
+                    }:
+                        reason = str(event.data["transition"]["reason"])
+                        decision = completion_policy.evaluate(
+                            researcher_completion_context(
+                                has_remaining_budget=False,
+                                exhausted_reason=reason,
+                            )
+                        )
+                        researcher_state["completion_decision"] = {
+                            "action": decision.action.value,
+                            "reason": decision.reason,
+                            "gaps": list(decision.gaps),
+                        }
 
             # A control signal may arrive while the final model/tool call is in
             # flight.  The legacy step loop observed it before entering the
@@ -1844,4 +2314,3 @@ class ResearcherQueryEngine:
             update = await graph.compress_research(researcher_state, cfg)
             apply_update_to_state(researcher_state, update)
             return researcher_state
-        return researcher_state

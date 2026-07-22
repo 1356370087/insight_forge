@@ -97,6 +97,7 @@ REDUCER_KEYS = {
     "document_registry",
     "evidence_registry",
     "web_research_iterations",
+    "permission_denials",
 }
 
 def apply_update_to_state(state: dict[str, Any], update: Mapping[str, Any] | None) -> dict[str, Any]:
