@@ -137,6 +137,8 @@ class AgentState(AgentInputState, total=False):
     document_registry: Annotated[list[dict], override_reducer]
     evidence_registry: Annotated[list[dict], override_reducer]
     web_research_iterations: Annotated[list[dict], override_reducer]
+    completion_decision: dict
+    permission_denials: Annotated[list[dict], override_reducer]
 
 class SupervisorState(TypedDict, total=False):
     """State for the supervisor that manages research tasks."""
@@ -153,10 +155,13 @@ class SupervisorState(TypedDict, total=False):
     handoff_assessments: Annotated[list[dict], override_reducer]
     pending_mailbox_acks: Annotated[list[dict], override_reducer]
     processed_mailbox_message_ids: Annotated[list[str], override_reducer]
+    research_artifact_refs: dict
     candidate_registry: Annotated[list[dict], override_reducer]
     document_registry: Annotated[list[dict], override_reducer]
     evidence_registry: Annotated[list[dict], override_reducer]
     web_research_iterations: Annotated[list[dict], override_reducer]
+    completion_decision: dict
+    permission_denials: Annotated[list[dict], override_reducer]
 
 class ResearcherState(TypedDict, total=False):
     """State for individual researchers conducting research."""
@@ -169,7 +174,10 @@ class ResearcherState(TypedDict, total=False):
     memory_context: Optional[str]
     pending_tool_results: list[dict]
     research_complete_requested: bool
+    research_complete_succeeded: bool
     result_assessment: dict
+    completion_decision: dict
+    permission_denials: Annotated[list[dict], override_reducer]
     candidate_registry: Annotated[list[dict], override_reducer]
     document_registry: Annotated[list[dict], override_reducer]
     evidence_registry: Annotated[list[dict], override_reducer]

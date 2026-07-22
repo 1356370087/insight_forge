@@ -1479,10 +1479,10 @@ async def invoke_model_with_retry_observability(
 
     Replaces LangChain ``.with_retry`` so that retries and 429s land in the
     observability store. The retry budget defaults to
-    ``configurable.max_structured_output_retries`` (total attempts, matching
-    LangChain's ``stop_after_attempt``), and the backoff reuses the tool-retry
-    delay settings to avoid config sprawl. Non-retryable errors (e.g. schema
-    parse failures) and exhausted retries are surfaced unchanged.
+    ``configurable.model_transport_max_attempts`` (total attempts). Structured
+    output parsing and context recovery use independent counters. The backoff
+    reuses the tool-retry delay settings. Non-retryable and exhausted errors
+    are surfaced unchanged.
 
     The classification helper is imported lazily from ``tools.governance`` to
     avoid a circular import (governance imports observability at module level).
@@ -1493,7 +1493,7 @@ async def invoke_model_with_retry_observability(
     recorder = get_trace_recorder(config)
     configurable = recorder.configuration
     if max_attempts is None:
-        max_attempts = configurable.max_structured_output_retries
+        max_attempts = configurable.model_transport_max_attempts
     if base_delay is None:
         base_delay = configurable.tool_retry_base_delay
     if max_delay is None:

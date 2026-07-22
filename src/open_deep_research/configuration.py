@@ -116,6 +116,33 @@ class Configuration(BaseModel):
             }
         }
     )
+    model_transport_max_attempts: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Maximum attempts for retryable model transport failures.",
+    )
+    context_recovery_max_attempts: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Maximum reactive context recovery attempts per model stage.",
+    )
+    run_deadline_seconds: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Optional wall-clock deadline for one complete research run.",
+    )
+    max_run_model_calls: Optional[int] = Field(default=None, ge=1)
+    max_run_tool_calls: Optional[int] = Field(default=None, ge=1)
+    max_run_input_tokens: Optional[int] = Field(default=None, ge=1)
+    max_run_output_tokens: Optional[int] = Field(default=None, ge=1)
+    max_run_cost_micro_usd: Optional[int] = Field(default=None, ge=1)
+    max_concurrent_tool_calls: int = Field(default=8, ge=1, le=128)
+    max_tool_batch_size: int = Field(default=32, ge=1, le=512)
+    model_call_timeout_seconds: float = Field(default=180, gt=0)
+    tool_call_timeout_seconds: float = Field(default=120, gt=0)
+    hook_timeout_seconds: float = Field(default=120, gt=0)
     allow_clarification: bool = Field(
         default=True,
         metadata={
