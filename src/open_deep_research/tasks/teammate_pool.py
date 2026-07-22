@@ -81,12 +81,17 @@ class TeammatePool:
         self.execute_research = execute_research
         self.mailbox = get_mailbox(self.configurable, self.run_id)
         self.store = get_task_state_store(self.configurable)
+        metadata = config.get("metadata", {})
+        inherited_owner = metadata.get("run_lease_owner_id")
+        inherited_token = metadata.get("run_fence_token")
         self.lease = LeaderLeaseManager(
             runs_dir=self.configurable.runs_dir,
             run_id=self.run_id,
             lease_seconds=self.configurable.leader_lease_seconds,
             lock_timeout=self.configurable.mailbox_lock_timeout_seconds,
+            owner_id=str(inherited_owner) if inherited_owner else None,
         )
+        self._owns_lease_lifecycle = inherited_token is None
         self.root = Path(self.configurable.runs_dir).resolve() / self.run_id / "coordination"
         self.team_path = self.root / "team.json"
         self.team_lock_path = self.root / "team.lock"
@@ -94,6 +99,9 @@ class TeammatePool:
         self._runtimes: dict[str, _RuntimeTeammate] = {}
         self._dispatch_lock = asyncio.Lock()
         self._heartbeat_task: asyncio.Task[None] | None = None
+        self.fence_token: int | None = (
+            int(inherited_token) if inherited_token is not None else None
+        )
         self._started = False
         self._stopping = False
 
@@ -127,9 +135,15 @@ class TeammatePool:
         """Acquire run ownership and start the lease heartbeat."""
         if self._started:
             return
-        await self.lease.acquire()
+        if self.fence_token is None:
+            lease = await self.lease.acquire()
+            self.fence_token = lease.fence_token
+            self.config.setdefault("metadata", {})["run_fence_token"] = lease.fence_token
+        elif not await self.lease.is_owner(expected_fence_token=self.fence_token):
+            raise RuntimeError(f"Lost Lead lease for run {self.run_id}")
         self._started = True
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        if self._owns_lease_lifecycle:
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         await self._restore_teammates()
         await self._restore_pending_tasks()
 
@@ -153,7 +167,7 @@ class TeammatePool:
         while not self._stopping:
             await asyncio.sleep(self.configurable.leader_heartbeat_seconds)
             try:
-                await self.lease.renew()
+                await self.lease.renew(expected_fence_token=self.fence_token)
             except Exception as exc:  # noqa: BLE001 - lease loss is terminal for this owner
                 self._stopping = True
                 for record in self.registry.list(run_id=self.run_id):
@@ -407,6 +421,7 @@ class TeammatePool:
                 runs_dir=self.configurable.runs_dir,
                 run_id=self.run_id,
                 event_log_enabled=self.configurable.event_log_enabled,
+                fence_token=self.fence_token or 0,
             )
 
     async def shutdown(self, timeout_seconds: float = 10) -> None:
@@ -433,7 +448,9 @@ class TeammatePool:
             self._stopping = True
         if self._heartbeat_task is not None:
             self._heartbeat_task.cancel()
-        await self.lease.release()
+        if self._owns_lease_lifecycle and self.fence_token is not None:
+            await self.lease.release(expected_fence_token=self.fence_token)
+        self.fence_token = None
         get_domain_approval_registry().clear_run(self.run_id)
 
 

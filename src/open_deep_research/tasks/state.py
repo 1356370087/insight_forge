@@ -37,6 +37,7 @@ class TaskSnapshot(BaseModel):
     completed_at: Optional[float] = None
     updated_at: float = Field(default_factory=time.time)
     version: int = 1
+    fence_token: int = 0
     result: Optional[dict[str, Any]] = None
     error_message: Optional[str] = None
     pending_domain: Optional[str] = None
@@ -63,6 +64,7 @@ class TaskSnapshot(BaseModel):
         record: TaskRecord,
         *,
         version: int = 1,
+        fence_token: int = 0,
         updated_at: Optional[float] = None,
     ) -> TaskSnapshot:
         """Build a serializable snapshot from the live runtime record."""
@@ -82,6 +84,7 @@ class TaskSnapshot(BaseModel):
             completed_at=record.completed_at,
             updated_at=updated_at or time.time(),
             version=version,
+            fence_token=fence_token,
             result=record.result,
             error_message=record.error_message,
             pending_domain=record.pending_domain,
@@ -118,10 +121,19 @@ class TaskStateStore(ABC):
     async def upsert(self, snapshot: TaskSnapshot) -> TaskSnapshot:
         """Create or replace a task snapshot."""
 
-    async def update_from_record(self, record: TaskRecord) -> TaskSnapshot:
-        """Persist a runtime record with a monotonic version."""
+    async def update_from_record(
+        self,
+        record: TaskRecord,
+        *,
+        fence_token: int = 0,
+    ) -> TaskSnapshot:
+        """Persist a runtime record with a monotonic version and ownership epoch."""
         current = await self.get(record.task_id, run_id=record.run_id or "default")
-        snapshot = TaskSnapshot.from_record(record, version=(current.version + 1) if current else 1)
+        snapshot = TaskSnapshot.from_record(
+            record,
+            version=(current.version + 1) if current else 1,
+            fence_token=fence_token,
+        )
         return await self.upsert(snapshot)
 
     @abstractmethod
@@ -215,6 +227,8 @@ class FileTaskStateStore(TaskStateStore):
         with portalocker.Lock(str(lock_path), mode="a+b", timeout=self.lock_timeout_seconds):
             if path.exists():
                 current = TaskSnapshot.model_validate(read_json_file(path))
+                if snapshot.fence_token < current.fence_token:
+                    raise RuntimeError("stale_fence_token")
                 terminal_statuses = {
                     TaskStatus.COMPLETED,
                     TaskStatus.FAILED,

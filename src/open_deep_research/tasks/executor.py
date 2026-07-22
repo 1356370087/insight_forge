@@ -409,6 +409,7 @@ async def run_task_with_control(
     runs_dir: str = ".runs",
     run_id: str = "default",
     event_log_enabled: bool = True,
+    fence_token: int = 0,
 ) -> None:
     """Execute a research task with control-queue polling and checkpoint support."""
     configurable = Configuration.from_runnable_config(config)
@@ -468,6 +469,14 @@ async def run_task_with_control(
             "research_topic": task_record.research_topic,
             "tool_call_iterations": existing_checkpoint.tool_call_iterations,
             "memory_context": existing_checkpoint.memory_context or task_record.memory_context,
+            "next_step": existing_checkpoint.next_step,
+            "fence_token": existing_checkpoint.fence_token,
+            "committed_tool_call_ids": list(
+                existing_checkpoint.committed_tool_call_ids
+            ),
+            "artifact_refs": list(existing_checkpoint.artifact_refs),
+            "completion_decision": dict(existing_checkpoint.completion_decision),
+            "compressed_research": existing_checkpoint.compressed_research,
         }
         task_record.phase = (
             TaskPhase.COMPRESSING
@@ -495,6 +504,15 @@ async def run_task_with_control(
         cp = ResearcherCheckpoint(
             task_id=task_record.task_id,
             phase=phase,
+            next_step=str(researcher_state.get("next_step", "model")),
+            fence_token=fence_token,
+            committed_tool_call_ids=list(
+                researcher_state.get("committed_tool_call_ids", [])
+            ),
+            artifact_refs=list(researcher_state.get("artifact_refs", [])),
+            completion_decision=dict(
+                researcher_state.get("completion_decision", {})
+            ),
             messages_snapshot=messages_dicts,
             tool_call_iterations=researcher_state.get("tool_call_iterations", 0),
             research_topic=task_record.research_topic,
@@ -668,7 +686,10 @@ async def run_task_with_control(
             task_record.result_artifact_sha256 = digest
 
             if checkpoint_manager is not None:
-                checkpoint_manager.delete(task_record.task_id)
+                checkpoint_manager.delete(
+                    task_record.task_id,
+                    fence_token=fence_token,
+                )
 
             await _emit_state_change(
                 task_record,
