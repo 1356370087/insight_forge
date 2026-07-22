@@ -98,6 +98,14 @@ class ToolErrorType(str, Enum):
     egress_domain_denied = "egress_domain_denied"
     egress_domain_pending = "egress_domain_pending"
     sensitive_tool_approval_required = "sensitive_tool_approval_required"
+    runtime_missing_result = "runtime_missing_result"
+    runtime_duplicate_result = "runtime_duplicate_result"
+    runtime_hook_error = "runtime_hook_error"
+    task_capacity_exceeded = "task_capacity_exceeded"
+    cancelled = "cancelled"
+    deadline_exceeded = "deadline_exceeded"
+    budget_exhausted = "budget_exhausted"
+    internal_error = "internal_error"
     unknown = "unknown"
 
 
@@ -1117,10 +1125,21 @@ async def execute_governed_tool_call(
     # block inline (in-process) until a supervisor decision arrives.
     egress_err = await check_egress_domain(tool_call, tool, args, config)
     if egress_err is not None:
+        try:
+            egress_error = ToolError.model_validate_json(str(egress_err.content))
+        except (TypeError, ValueError):
+            egress_error = ToolError(
+                error_type=ToolErrorType.egress_domain_denied,
+                tool_name=name,
+                message="Tool egress policy denied this call.",
+            )
         get_trace_recorder(config).active_span().record_outcome(
-            error_type=ToolErrorType.egress_domain_denied.value,
+            error_type=egress_error.error_type.value,
         )
-        return GovernedToolCallResult(message=egress_err)
+        return GovernedToolCallResult(
+            message=egress_err,
+            error=egress_error,
+        )
 
     context = ToolContext(
         config=config,
