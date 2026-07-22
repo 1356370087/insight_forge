@@ -44,14 +44,34 @@ _SECRET_TEXT_RE = re.compile(
 )
 _PUBLIC_URL_RE = re.compile(r"https?://[^\s<>\]\[\"']+", re.IGNORECASE)
 
-_COMMON_KEYS = {"status", "error_code", "message", "recovered"}
+_COMMON_KEYS = {
+    "status",
+    "error_code",
+    "message",
+    "recovered",
+    "termination_reason",
+    "result_status",
+    "permission_denial_count",
+}
 _PAYLOAD_KEYS: dict[str, set[str]] = {
     "run.created": {"status"},
     "run.started": {"status", "recovered"},
     "run.resumed": {"status", "recovered"},
-    "run.completed": {"status", "result_ref"},
-    "run.failed": {"status", "error_code", "message"},
-    "run.cancelled": {"status"},
+    "run.interrupted": {
+        "status", "error_code", "message", "termination_reason", "result_status",
+        "permission_denial_count",
+    },
+    "run.completed": {
+        "status", "result_ref", "termination_reason", "result_status",
+        "permission_denial_count",
+    },
+    "run.failed": {
+        "status", "error_code", "message", "termination_reason", "result_status",
+        "permission_denial_count",
+    },
+    "run.cancelled": {
+        "status", "termination_reason", "result_status", "permission_denial_count",
+    },
     "stage.started": {"stage_id", "stage_index", "stage_count"},
     "stage.completed": {"stage_id", "stage_index", "stage_count"},
     "stage.failed": {"stage_id", "stage_index", "stage_count", "error_code", "message"},
@@ -320,7 +340,9 @@ class RunEventStore:
     def _read_records_unlocked(self, *, repair_tail: bool = True) -> list[PublicEvent]:
         if not self.path.exists():
             return []
-        raw_lines = self.path.read_bytes().splitlines()
+        content = self.path.read_bytes()
+        has_complete_tail = content.endswith(b"\n")
+        raw_lines = content.splitlines()
         records: list[PublicEvent] = []
         expected = 1
         for index, raw in enumerate(raw_lines):
@@ -329,7 +351,8 @@ class RunEventStore:
             try:
                 event = PublicEvent.model_validate_json(raw)
             except Exception as exc:
-                if repair_tail and index == len(raw_lines) - 1:
+                is_partial_tail = index == len(raw_lines) - 1 and not has_complete_tail
+                if repair_tail and is_partial_tail:
                     valid = b"\n".join(raw_lines[:index])
                     if valid:
                         valid += b"\n"
@@ -418,9 +441,23 @@ class RunEventStore:
         with portalocker.Lock(str(self.lock_path), mode="a+b", timeout=self.lock_timeout_seconds):
             records = self._read_records_unlocked()
             last, keys = self._load_index(records)
+            terminal = next(
+                (event for event in reversed(records) if event.type in TERMINAL_EVENT_TYPES),
+                None,
+            )
             if dedupe_key in keys:
                 sequence = keys[dedupe_key]
-                return next(event for event in records if event.sequence == sequence)
+                existing = next(event for event in records if event.sequence == sequence)
+                if existing.type != event_type and (
+                    existing.type in TERMINAL_EVENT_TYPES
+                    or event_type in TERMINAL_EVENT_TYPES
+                ):
+                    raise RuntimeError("terminal_event_conflict")
+                return existing
+            if terminal is not None:
+                if event_type in TERMINAL_EVENT_TYPES:
+                    raise RuntimeError("terminal_event_conflict")
+                raise RuntimeError("run_already_terminal")
             sequence = last + 1
             event = PublicEvent(
                 event_id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{self.run_id}:{dedupe_key}")),
@@ -469,6 +506,11 @@ class RunEventStore:
                 payload=payload or {},
                 dedupe_key=dedupe_key,
             )
+        except RuntimeError as exc:
+            if str(exc) in {"terminal_event_conflict", "run_already_terminal"}:
+                raise
+            self._mark_event_persistence_failed(exc)
+            raise
         except Exception as exc:
             self._mark_event_persistence_failed(exc)
             raise
