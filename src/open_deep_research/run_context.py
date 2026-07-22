@@ -9,6 +9,7 @@ import os
 import re
 import time
 import uuid
+from contextlib import contextmanager, nullcontext
 from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, Optional, TypeAlias
@@ -23,6 +24,9 @@ from langchain_core.messages import (
 )
 from langchain_core.messages.utils import count_tokens_approximately
 from pydantic import BaseModel, Field
+
+from open_deep_research.tasks.lease import FenceLostError, LeaderLease
+from open_deep_research.tasks.mailbox import read_json_file
 
 SCHEMA_VERSION = 1
 RecordType: TypeAlias = Literal[
@@ -93,6 +97,8 @@ class RunManifest(BaseModel):
     final_artifacts: dict[str, Any] = Field(default_factory=dict)
     coordination_schema_version: int = 0
     coordination_backend: str = "legacy"
+    fence_token: int = 0
+    fence_owner_id: Optional[str] = None
 
 
 class ReplayResult(BaseModel):
@@ -167,14 +173,65 @@ class RunContextStore:
         self.manifest_path = self.context_dir / "manifest.json"
         self.journal_lock_path = self.context_dir / "session_memory.lock"
         self.manifest_lock_path = self.context_dir / "manifest.lock"
+        self.lease_path = self.run_dir / "coordination" / "leader_lease.json"
+        self.lease_lock_path = self.run_dir / "coordination" / "leader_lease.lock"
         self.brief_path = self.context_dir / "research_brief.md"
         self.inline_content_max_chars = inline_content_max_chars
+        self._fence_token: int | None = None
+        self._fence_owner_id: str | None = None
         lock_key = str(self.context_dir)
         self._lock = self._locks.setdefault(lock_key, asyncio.Lock())
 
     @staticmethod
     def _safe_config(config: dict[str, Any]) -> dict[str, Any]:
         return _sanitize_config(config)
+
+    @contextmanager
+    def _fence_guard(self):
+        """Hold the lease lock while validating this store's ownership epoch."""
+        if self._fence_token is None or self._fence_owner_id is None:
+            if self.manifest_path.exists():
+                manifest = self.load_manifest()
+                if manifest.fence_token > 0:
+                    raise FenceLostError(f"Unfenced write rejected for run {self.run_id}")
+            yield
+            return
+
+        self.lease_lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with portalocker.Lock(str(self.lease_lock_path), mode="a+b", timeout=30):
+            try:
+                lease = LeaderLease.model_validate(read_json_file(self.lease_path))
+            except Exception as exc:
+                raise FenceLostError(f"Missing Lead lease for run {self.run_id}") from exc
+            if (
+                lease.owner_instance_id != self._fence_owner_id
+                or lease.fence_token != self._fence_token
+                or lease.lease_expires_at <= time.time()
+            ):
+                raise FenceLostError(f"Lost Lead lease for run {self.run_id}")
+            yield
+
+    def bind_fence_token(
+        self,
+        fence_token: int,
+        owner_id: str,
+        *,
+        advance_manifest: bool = True,
+    ) -> None:
+        """Bind writes to the exact live Lead ownership epoch."""
+        previous = (self._fence_token, self._fence_owner_id)
+        self._fence_token = int(fence_token)
+        self._fence_owner_id = str(owner_id)
+        try:
+            if advance_manifest and self.manifest_path.exists():
+                self._update_manifest(
+                    allow_fence_advance=True,
+                    fence_token=self._fence_token,
+                    fence_owner_id=self._fence_owner_id,
+                )
+        except Exception:
+            self._fence_token, self._fence_owner_id = previous
+            raise
 
     def initialize(self, owner_id: Optional[str], config: dict[str, Any]) -> RunManifest:
         """Create the run context and initial manifest if absent."""
@@ -190,8 +247,11 @@ class RunContextStore:
             config=self._safe_config(config),
             coordination_schema_version=1,
             coordination_backend="file_mailbox",
+            fence_token=self._fence_token or 0,
+            fence_owner_id=self._fence_owner_id,
         )
-        self._write_json_atomic_path(self.manifest_path, manifest.model_dump(mode="json"))
+        with self._fence_guard():
+            self._write_json_atomic_path(self.manifest_path, manifest.model_dump(mode="json"))
         return manifest
 
     def _resolve_artifact(self, relative_path: str) -> Path:
@@ -227,7 +287,8 @@ class RunContextStore:
     def write_text_atomic(self, relative_path: str, content: str) -> str:
         """Atomically write UTF-8 text and return its SHA-256."""
         target = self._resolve_artifact(relative_path)
-        self._write_bytes_atomic_path(target, content.encode("utf-8"))
+        with self._fence_guard():
+            self._write_bytes_atomic_path(target, content.encode("utf-8"))
         return _sha256_text(content)
 
     def write_json_atomic(self, relative_path: str, payload: Any) -> str:
@@ -296,31 +357,58 @@ class RunContextStore:
             self._write_json_atomic_path(self.manifest_path, manifest.model_dump(mode="json"))
         return manifest
 
-    def _update_manifest(self, **updates: Any) -> RunManifest:
+    def _update_manifest(
+        self,
+        *,
+        allow_failed_resume: bool = False,
+        allow_fence_advance: bool = False,
+        fence_already_held: bool = False,
+        **updates: Any,
+    ) -> RunManifest:
         fallback = self.load_manifest()
         self.context_dir.mkdir(parents=True, exist_ok=True)
-        with portalocker.Lock(str(self.manifest_lock_path), mode="a+b", timeout=30):
-            try:
-                manifest = RunManifest.model_validate_json(
-                    self.manifest_path.read_text(encoding="utf-8")
+        guard = nullcontext() if fence_already_held else self._fence_guard()
+        with guard:
+            with portalocker.Lock(str(self.manifest_lock_path), mode="a+b", timeout=30):
+                try:
+                    manifest = RunManifest.model_validate_json(
+                        self.manifest_path.read_text(encoding="utf-8")
+                    )
+                except Exception:
+                    manifest = fallback
+                if manifest.fence_token > 0:
+                    if self._fence_token is None or self._fence_owner_id is None:
+                        raise FenceLostError(f"Unfenced manifest write rejected for run {self.run_id}")
+                    if allow_fence_advance:
+                        if self._fence_token < manifest.fence_token:
+                            raise FenceLostError(f"Stale fence token for run {self.run_id}")
+                    elif (
+                        self._fence_token != manifest.fence_token
+                        or self._fence_owner_id != manifest.fence_owner_id
+                    ):
+                        raise FenceLostError(f"Stale fence token for run {self.run_id}")
+                for key, value in updates.items():
+                    if not hasattr(manifest, key):
+                        continue
+                    if key in {"last_journal_seq", "last_public_event_seq"}:
+                        value = max(int(getattr(manifest, key)), int(value))
+                    if key == "status" and manifest.status in {"completed", "cancelled"}:
+                        if value != manifest.status:
+                            continue
+                    if (
+                        key == "status"
+                        and manifest.status == "failed"
+                        and value != "failed"
+                        and not (allow_failed_resume and value == "running")
+                    ):
+                        continue
+                    setattr(manifest, key, value)
+                manifest.updated_at = time.time()
+                self._write_json_atomic_path(
+                    self.manifest_path,
+                    manifest.model_dump(mode="json"),
                 )
-            except Exception:
-                manifest = fallback
-            for key, value in updates.items():
-                if not hasattr(manifest, key):
-                    continue
-                if key in {"last_journal_seq", "last_public_event_seq"}:
-                    value = max(int(getattr(manifest, key)), int(value))
-                if key == "status" and manifest.status in {
-                    "completed",
-                    "failed",
-                    "cancelled",
-                } and value not in {manifest.status}:
-                    continue
-                setattr(manifest, key, value)
-            manifest.updated_at = time.time()
-            self._write_json_atomic_path(self.manifest_path, manifest.model_dump(mode="json"))
-            return manifest
+                return manifest
 
     async def _encode(self, value: Any, artifact_refs: list[str]) -> Any:
         if isinstance(value, BaseMessage):
@@ -417,39 +505,43 @@ class RunContextStore:
 
         def append_locked() -> SessionJournalRecord:
             self.context_dir.mkdir(parents=True, exist_ok=True)
-            with portalocker.Lock(
-                str(self.journal_lock_path),
-                mode="a+b",
-                timeout=30,
-            ):
-                manifest = self.load_manifest()
-                seq = max(
-                    manifest.last_journal_seq,
-                    len(self._read_records_unlocked()),
-                ) + 1
-                record = SessionJournalRecord(
-                    seq=seq,
-                    run_id=self.run_id,
-                    channel=channel,
-                    record_type=record_type,
-                    stage=stage,
-                    payload=encoded,
-                    artifact_refs=artifact_refs,
-                )
-                self.journal_path.parent.mkdir(parents=True, exist_ok=True)
-                data = (record.model_dump_json() + "\n").encode("utf-8")
-                fd = os.open(
-                    self.journal_path,
-                    os.O_APPEND | os.O_CREAT | os.O_WRONLY,
-                    0o600,
-                )
-                try:
-                    os.write(fd, data)
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-                self._update_manifest(last_journal_seq=seq)
-                return record
+            with self._fence_guard():
+                with portalocker.Lock(
+                    str(self.journal_lock_path),
+                    mode="a+b",
+                    timeout=30,
+                ):
+                    manifest = self.load_manifest()
+                    seq = max(
+                        manifest.last_journal_seq,
+                        len(self._read_records_unlocked()),
+                    ) + 1
+                    record = SessionJournalRecord(
+                        seq=seq,
+                        run_id=self.run_id,
+                        channel=channel,
+                        record_type=record_type,
+                        stage=stage,
+                        payload=encoded,
+                        artifact_refs=artifact_refs,
+                    )
+                    self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+                    data = (record.model_dump_json() + "\n").encode("utf-8")
+                    fd = os.open(
+                        self.journal_path,
+                        os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+                        0o600,
+                    )
+                    try:
+                        os.write(fd, data)
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
+                    self._update_manifest(
+                        fence_already_held=True,
+                        last_journal_seq=seq,
+                    )
+                    return record
 
         async with self._lock:
             return await asyncio.to_thread(append_locked)

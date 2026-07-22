@@ -12,6 +12,7 @@ import json
 import os
 import re
 import uuid
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Optional
@@ -321,7 +322,15 @@ def sanitize_public_payload(event_type: str, payload: dict[str, Any]) -> dict[st
 class RunEventStore:
     """Inter-process-safe append-only public event store for one run."""
 
-    def __init__(self, run_id: str, *, runs_dir: str = ".runs", lock_timeout_seconds: float = 30) -> None:
+    def __init__(
+        self,
+        run_id: str,
+        *,
+        runs_dir: str = ".runs",
+        lock_timeout_seconds: float = 30,
+        fence_token: int | None = None,
+        fence_owner_id: str | None = None,
+    ) -> None:
         """Initialize paths and the inter-process lock timeout."""
         if not _COMPONENT_RE.fullmatch(run_id) or ".." in run_id:
             raise ValueError("Invalid run_id")
@@ -331,6 +340,22 @@ class RunEventStore:
         self.index_path = self.run_dir / "public_events_index.json"
         self.lock_path = self.run_dir / "public_events.lock"
         self.lock_timeout_seconds = lock_timeout_seconds
+        self.fence_token = fence_token
+        self.fence_owner_id = fence_owner_id
+
+    def _fenced_context(self):
+        """Return a bound run context and lease guard for event commits."""
+        if self.fence_token is None or not self.fence_owner_id:
+            return None, nullcontext()
+        from open_deep_research.run_context import RunContextStore
+
+        context = RunContextStore(self.run_id, runs_dir=str(self.run_dir.parent))
+        context.bind_fence_token(
+            self.fence_token,
+            self.fence_owner_id,
+            advance_manifest=False,
+        )
+        return context, context._fence_guard()  # noqa: SLF001
 
     @property
     def exists(self) -> bool:
@@ -438,56 +463,81 @@ class RunEventStore:
         dedupe_key: str,
     ) -> PublicEvent:
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        with portalocker.Lock(str(self.lock_path), mode="a+b", timeout=self.lock_timeout_seconds):
-            records = self._read_records_unlocked()
-            last, keys = self._load_index(records)
-            terminal = next(
-                (event for event in reversed(records) if event.type in TERMINAL_EVENT_TYPES),
-                None,
-            )
-            if dedupe_key in keys:
-                sequence = keys[dedupe_key]
-                existing = next(event for event in records if event.sequence == sequence)
-                if existing.type != event_type and (
-                    existing.type in TERMINAL_EVENT_TYPES
-                    or event_type in TERMINAL_EVENT_TYPES
-                ):
-                    raise RuntimeError("terminal_event_conflict")
-                return existing
-            if terminal is not None:
-                if event_type in TERMINAL_EVENT_TYPES:
-                    raise RuntimeError("terminal_event_conflict")
-                raise RuntimeError("run_already_terminal")
-            sequence = last + 1
-            event = PublicEvent(
-                event_id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{self.run_id}:{dedupe_key}")),
-                sequence=sequence,
-                run_id=self.run_id,
-                type=event_type,
-                timestamp=utc_timestamp(),
-                stage=stage,
-                payload=sanitize_public_payload(event_type, payload),
-                dedupe_key=dedupe_key,
-            )
-            data = (event.model_dump_json() + "\n").encode("utf-8")
-            fd = os.open(self.path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
-            try:
-                os.write(fd, data)
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            keys[dedupe_key] = sequence
-            self._write_index(sequence, keys)
-            try:
-                from open_deep_research.run_context import RunContextStore
+        context, fence_guard = self._fenced_context()
+        with fence_guard:
+            with portalocker.Lock(
+                str(self.lock_path),
+                mode="a+b",
+                timeout=self.lock_timeout_seconds,
+            ):
+                records = self._read_records_unlocked()
+                last, keys = self._load_index(records)
+                terminal = next(
+                    (
+                        event
+                        for event in reversed(records)
+                        if event.type in TERMINAL_EVENT_TYPES
+                    ),
+                    None,
+                )
+                if dedupe_key in keys:
+                    sequence = keys[dedupe_key]
+                    existing = next(
+                        event for event in records if event.sequence == sequence
+                    )
+                    if existing.type != event_type and (
+                        existing.type in TERMINAL_EVENT_TYPES
+                        or event_type in TERMINAL_EVENT_TYPES
+                    ):
+                        raise RuntimeError("terminal_event_conflict")
+                    return existing
+                if terminal is not None:
+                    if event_type in TERMINAL_EVENT_TYPES:
+                        raise RuntimeError("terminal_event_conflict")
+                    raise RuntimeError("run_already_terminal")
+                sequence = last + 1
+                event = PublicEvent(
+                    event_id=str(
+                        uuid.uuid5(uuid.NAMESPACE_URL, f"{self.run_id}:{dedupe_key}")
+                    ),
+                    sequence=sequence,
+                    run_id=self.run_id,
+                    type=event_type,
+                    timestamp=utc_timestamp(),
+                    stage=stage,
+                    payload=sanitize_public_payload(event_type, payload),
+                    dedupe_key=dedupe_key,
+                )
+                data = (event.model_dump_json() + "\n").encode("utf-8")
+                fd = os.open(
+                    self.path,
+                    os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+                    0o600,
+                )
+                try:
+                    os.write(fd, data)
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                keys[dedupe_key] = sequence
+                self._write_index(sequence, keys)
+                try:
+                    if context is None:
+                        from open_deep_research.run_context import RunContextStore
 
-                context = RunContextStore(self.run_id, runs_dir=str(self.run_dir.parent))
-                if context.manifest_path.exists():
-                    context._update_manifest(last_public_event_seq=sequence)  # noqa: SLF001
-            except Exception:
-                # The event log remains authoritative; manifest is only a fast cache.
-                pass
-            return event
+                        context = RunContextStore(
+                            self.run_id,
+                            runs_dir=str(self.run_dir.parent),
+                        )
+                    if context.manifest_path.exists():
+                        context._update_manifest(  # noqa: SLF001
+                            fence_already_held=self.fence_token is not None,
+                            last_public_event_seq=sequence,
+                        )
+                except Exception:
+                    # The event log remains authoritative; manifest is only a fast cache.
+                    pass
+                return event
 
     async def append(
         self,
@@ -550,10 +600,18 @@ class RunEventPublisher:
 def event_store_from_config(config: RunnableConfig | dict[str, Any]) -> RunEventStore:
     """Build a run-scoped store from runtime configuration."""
     configurable = Configuration.from_runnable_config(config)
-    run_id = str((config.get("metadata") or {}).get("run_id", "default"))
+    metadata = config.get("metadata") or {}
+    run_id = str(metadata.get("run_id", "default"))
+    fence_token = metadata.get("run_fence_token")
     return RunEventStore(
         run_id,
         runs_dir=configurable.runs_dir,
+        fence_token=int(fence_token) if fence_token is not None else None,
+        fence_owner_id=(
+            str(metadata["run_lease_owner_id"])
+            if metadata.get("run_lease_owner_id")
+            else None
+        ),
     )
 
 
