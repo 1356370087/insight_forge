@@ -379,6 +379,16 @@ class TestMemoryTaskStateStore:
         completed = await store.collect_completed(run_id="run-1")
         assert [s.task_id for s in completed] == ["a"]
 
+    @pytest.mark.asyncio
+    async def test_rejects_stale_fence_epoch(self):
+        store = MemoryTaskStateStore()
+        record = TaskRecord(task_id="task-fence", research_topic="A", run_id="run-1")
+
+        await store.update_from_record(record, fence_token=2)
+
+        with pytest.raises(RuntimeError, match="stale_fence_token"):
+            await store.update_from_record(record, fence_token=1)
+
 
 # ---------------------------------------------------------------------------
 # Async Tools — tool model validation
@@ -1021,6 +1031,56 @@ class TestCheckpointManager:
 
 class TestControlledExecutor:
     """Regression tests for live update/cancel handling."""
+
+    @pytest.mark.asyncio
+    async def test_controlled_executor_persists_current_fence_token(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        from open_deep_research.tasks import executor
+        from open_deep_research.tasks.state import FileTaskStateStore
+
+        async def no_publish(*args, **kwargs):
+            del args, kwargs
+
+        monkeypatch.setattr(executor, "publish_task_update", no_publish)
+        registry = TaskRegistry()
+        record = registry.restore(
+            TaskRecord(
+                task_id="fenced-task",
+                run_id="fenced-run",
+                research_topic="topic",
+            )
+        )
+
+        async def research(_state, _config):
+            return {"compressed_research": "done", "raw_notes": [], "metrics": {}}
+
+        await executor.run_task_with_control(
+            record,
+            {
+                "configurable": {
+                    "runs_dir": str(tmp_path),
+                    "task_state_backend": "file",
+                    "event_log_enabled": False,
+                },
+                "metadata": {"run_id": "fenced-run", "run_fence_token": 7},
+            },
+            registry,
+            research,
+            runs_dir=str(tmp_path),
+            run_id="fenced-run",
+            event_log_enabled=False,
+            fence_token=7,
+        )
+
+        snapshot = await FileTaskStateStore(str(tmp_path)).get(
+            "fenced-task",
+            run_id="fenced-run",
+        )
+        assert snapshot is not None
+        assert snapshot.fence_token == 7
 
     @pytest.mark.asyncio
     async def test_update_interrupts_and_restarts_research(self, monkeypatch):

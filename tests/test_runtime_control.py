@@ -58,3 +58,21 @@ async def test_cancellation_scope_times_out_and_drains_work():
         await scope.run(work(), stage="hook", timeout_seconds=0.01)
 
     assert finalized.is_set()
+
+
+def test_completion_claim_rejects_late_cancellation():
+    scope = CancellationScope()
+
+    assert scope.claim_completion("finish_success") is True
+    assert scope.is_completed is True
+    assert scope.request("cancel_requested") is False
+    assert scope.is_cancelled is False
+
+
+def test_cancellation_wins_before_completion_claim():
+    scope = CancellationScope()
+
+    assert scope.request("cancel_requested") is True
+    with pytest.raises(RunCancelled, match="cancel_requested"):
+        scope.claim_completion("finish_success")
+    assert scope.is_completed is False

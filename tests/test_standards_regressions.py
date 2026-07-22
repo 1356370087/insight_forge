@@ -292,6 +292,12 @@ async def test_parallel_sync_handoffs_do_not_merge_raw_context_into_supervisor(
             "researcher_messages": [AIMessage(content=f"raw message for {topic}")],
             "compressed_research": f"compressed finding for {topic}",
             "raw_notes": [f"raw note for {topic}"],
+            "evidence_registry": [
+                {
+                    "evidence_id": f"evidence-{topic}",
+                    "source_url": f"https://example.test/{topic}",
+                }
+            ],
             "metrics": {"sources_read": 1},
         }
 
@@ -332,7 +338,62 @@ async def test_parallel_sync_handoffs_do_not_merge_raw_context_into_supervisor(
     assert all("compressed finding" in content for content in contents)
     assert all("raw message" not in content for content in contents)
     assert all("raw note" not in content for content in contents)
-    assert "raw_notes" not in command.update
+    assert len(command.update["evidence_registry"]) == 2
+    assert command.update["raw_notes"]
+
+
+@pytest.mark.asyncio
+async def test_sync_conduct_and_complete_same_batch_preserves_artifact_evidence(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    async def fake_ainvoke(_state, _config):
+        return {
+            "research_topic": "topic",
+            "researcher_messages": [],
+            "compressed_research": "supported finding",
+            "raw_notes": ["raw supporting note"],
+            "evidence_registry": [
+                {
+                    "evidence_id": "evidence-1",
+                    "source_url": "https://example.test/source",
+                }
+            ],
+            "metrics": {"sources_read": 1},
+        }
+
+    monkeypatch.setattr(deep_researcher.researcher_runtime, "ainvoke", fake_ainvoke)
+    state = {
+        "enable_async_research": False,
+        "supervisor_messages": [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "ConductResearch",
+                        "args": {"research_topic": "topic"},
+                        "id": "conduct-1",
+                    },
+                    {"name": "ResearchComplete", "args": {}, "id": "done-1"},
+                ],
+            )
+        ],
+    }
+
+    command = await deep_researcher._execute_supervisor_tools(
+        state,
+        {
+            "configurable": {
+                "runs_dir": str(tmp_path),
+                "quality_evaluation_enabled": False,
+            },
+            "metadata": {"run_id": "same-batch"},
+        },
+    )
+
+    assert command.goto == deep_researcher.END
+    assert command.update["evidence_registry"][0]["evidence_id"] == "evidence-1"
+    assert command.update["raw_notes"] == ["raw supporting note"]
 
 
 @pytest.mark.asyncio

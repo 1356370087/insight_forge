@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -7,6 +8,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from open_deep_research.agents import deep_researcher
 from open_deep_research.agents.query_engine import QueryEngine
+from open_deep_research.runtime_control import RunCancelled
 
 
 class FakeSupervisorModel:
@@ -88,6 +90,36 @@ async def test_supervisor_uses_unified_query_loop(monkeypatch) -> None:
     assert len(model.calls) == 2
     assert any(getattr(message, "name", None) == "think_tool" for message in messages)
     assert result["research_brief"] == "research brief"
+
+
+@pytest.mark.asyncio
+async def test_supervisor_model_call_is_cancelled_by_outer_engine(monkeypatch) -> None:
+    model_started = asyncio.Event()
+    model_drained = asyncio.Event()
+
+    class BlockingSupervisorModel(FakeSupervisorModel):
+        async def ainvoke(self, messages):
+            self.calls.append(list(messages))
+            model_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                model_drained.set()
+
+    engine = QueryEngine(_config(model_call_timeout_seconds=180))
+    monkeypatch.setattr(
+        deep_researcher,
+        "configurable_model",
+        BlockingSupervisorModel([]),
+    )
+    task = asyncio.create_task(engine._run_supervisor(_main_state(with_evidence=True)))
+    await asyncio.wait_for(model_started.wait(), 2)
+
+    engine.interrupt()
+
+    with pytest.raises(RunCancelled, match="cancel_requested"):
+        await asyncio.wait_for(task, 2)
+    assert model_drained.is_set()
 
 
 @pytest.mark.asyncio
@@ -181,3 +213,21 @@ async def test_supervisor_rejects_explicit_completion_without_evidence(monkeypat
     assert len(model.calls) == 2
     assert result["completion_decision"]["value"]["action"] == "complete"
     assert result["evidence_registry"]["value"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_supervisor_uses_compatibility_completion_policy(monkeypatch) -> None:
+    model = FakeSupervisorModel([
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "ResearchComplete", "args": {}, "id": "done-1"}],
+        )
+    ])
+    monkeypatch.setattr(deep_researcher, "configurable_model", model)
+
+    result = await QueryEngine(
+        _config(web_pipeline_mode="legacy")
+    )._run_supervisor(_main_state())
+
+    assert len(model.calls) == 1
+    assert result["completion_decision"]["value"]["action"] == "complete"

@@ -121,6 +121,7 @@ async def test_resume_skips_completed_outer_nodes(tmp_path, monkeypatch) -> None
     assert resumed_calls["supervisor"] == 1
     assert resumed_calls["report"] == 1
     assert completed["research_brief"] == "完整且不可压缩的研究目标。"
+    assert resumed.context_store.load_manifest().status == "completed"
 
 
 @pytest.mark.asyncio

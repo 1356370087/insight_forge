@@ -235,6 +235,7 @@ async def test_openai_web_search_retries_on_429(tmp_path, monkeypatch):
 async def test_get_all_tools_tags_sdk_search_as_search(tmp_path, monkeypatch):
     config = _config(tmp_path / "trace.sqlite3")
     config["configurable"]["browser_mcp_enabled"] = False
+    config["configurable"]["web_pipeline_mode"] = "legacy"
     tools = await get_all_tools(config)
     openai_tool = next(t for t in tools if getattr(t, "name", None) == "openai_web_search")
     assert get_tool_origin(openai_tool) is ToolOrigin.SEARCH

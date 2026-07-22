@@ -218,6 +218,45 @@ async def test_interrupt_wakes_hitl_without_human_action(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_success_terminal_claim_rejects_late_cancellation(monkeypatch):
+    await _install_basic_graph(monkeypatch)
+    engine = QueryEngine(
+        _config(
+            hitl_require_plan_approval=False,
+            web_pipeline_mode="legacy",
+        )
+    )
+    terminal_persist_started = asyncio.Event()
+    allow_terminal_persist = asyncio.Event()
+    original_persist_checkpoint = engine._persist_checkpoint
+
+    async def pause_terminal_persistence(*args, **kwargs):
+        if kwargs.get("status") == "completed":
+            terminal_persist_started.set()
+            await allow_terminal_persist.wait()
+        return await original_persist_checkpoint(*args, **kwargs)
+
+    monkeypatch.setattr(engine, "_persist_checkpoint", pause_terminal_persistence)
+    events: list[dict[str, Any]] = []
+
+    async def run():
+        async for event in engine.stream_message([HumanMessage(content="research")]):
+            events.append(event)
+
+    task = asyncio.create_task(run())
+    await asyncio.wait_for(terminal_persist_started.wait(), 10)
+    engine.interrupt()
+    allow_terminal_persist.set()
+    await asyncio.wait_for(task, 10)
+
+    assert engine.status == "completed"
+    assert engine.cancelled is False
+    assert engine.cancellation_scope.is_cancelled is False
+    assert sum(event["event"] == "run.completed" for event in events) == 1
+    assert not any(event["event"] == "run.cancelled" for event in events)
+
+
+@pytest.mark.asyncio
 async def test_hitl_outline_approval_pauses_before_final_report(monkeypatch):
     calls = await _install_basic_graph(monkeypatch, final_report="approved outline report")
     engine = QueryEngine(

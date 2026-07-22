@@ -3,13 +3,14 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool as lc_tool
 
 from open_deep_research.agents import deep_researcher
 from open_deep_research.agents.query_engine import ResearcherQueryEngine
 from open_deep_research.completion import CompletionDecision
 from open_deep_research.tasks import registry as task_registry
+from open_deep_research.tools import utils
 from open_deep_research.tools.adapters import adapt_langchain_tool
 from open_deep_research.tools.base import ToolOrigin
 from open_deep_research.tools.governance import (
@@ -175,6 +176,52 @@ async def test_failed_research_complete_is_not_a_successful_completion():
 
 
 @pytest.mark.asyncio
+async def test_structured_evidence_is_extracted_before_large_result_offload(
+    tmp_path,
+) -> None:
+    payload = {
+        "candidates": [{"candidate_id": "candidate-1"}],
+        "documents": [{"document_id": "document-1"}],
+        "evidence": [
+            {
+                "evidence_id": "evidence-1",
+                "source_url": "https://example.test/source",
+                "supporting_excerpt": "x" * 500,
+            }
+        ],
+        "gap_analysis": {"decision": "complete"},
+    }
+    call = {
+        "name": "web_research",
+        "args": {"objective": "test", "queries": ["test"]},
+        "id": "web-1",
+    }
+    outcome = GovernedToolCallResult(
+        message=ToolMessage(
+            content=deep_researcher.json.dumps(payload),
+            name="web_research",
+            tool_call_id="web-1",
+        )
+    )
+
+    messages, update = await deep_researcher.prepare_researcher_tool_outcomes(
+        [call],
+        [outcome],
+        {"web_research": utils.web_research},
+        _config(
+            runs_dir=str(tmp_path),
+            max_mcp_output_chars=256,
+            prompt_injection_protection_enabled=False,
+        ),
+    )
+
+    assert "artifact_ref" in str(messages[0].content)
+    assert update["candidate_registry"] == payload["candidates"]
+    assert update["document_registry"] == payload["documents"]
+    assert update["evidence_registry"] == payload["evidence"]
+
+
+@pytest.mark.asyncio
 async def test_no_tool_response_without_evidence_does_not_complete(monkeypatch) -> None:
     model = FakeResearchModel([
         AIMessage(content="I think this is done"),
@@ -207,6 +254,38 @@ async def test_no_tool_response_without_evidence_does_not_complete(monkeypatch) 
     })
 
     assert len(model.calls) == 3
+    assert result["completion_decision"]["action"] == CompletionDecision.COMPLETE.value
+
+
+@pytest.mark.asyncio
+async def test_legacy_researcher_uses_compatibility_completion_policy(
+    monkeypatch,
+) -> None:
+    model = FakeResearchModel([
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "ResearchComplete", "args": {}, "id": "done-1"}],
+        )
+    ])
+
+    async def fake_get_all_tools(_config):
+        return [*deep_researcher.build_supervisor_tools({})[-2:-1]]
+
+    async def fake_compress(_state, _config):
+        return {"compressed_research": "legacy result", "raw_notes": []}
+
+    monkeypatch.setattr(deep_researcher, "configurable_model", model)
+    monkeypatch.setattr(deep_researcher, "get_all_tools", fake_get_all_tools)
+    monkeypatch.setattr(deep_researcher, "compress_research", fake_compress)
+
+    result = await ResearcherQueryEngine(
+        _config(web_pipeline_mode="legacy")
+    ).ainvoke({
+        "researcher_messages": [HumanMessage(content="topic")],
+        "research_topic": "topic",
+    })
+
+    assert len(model.calls) == 1
     assert result["completion_decision"]["action"] == CompletionDecision.COMPLETE.value
 
 

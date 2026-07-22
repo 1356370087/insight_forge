@@ -18,6 +18,7 @@ from open_deep_research.agents.query import (
 )
 from open_deep_research.agents.tool_protocol import validate_tool_transcript
 from open_deep_research.budgets import BudgetGate, RunBudgetLedger, RunBudgetPolicy
+from open_deep_research.runtime_control import CancellationScope, RunCancelled
 from open_deep_research.tools.adapters import adapt_langchain_tool
 from open_deep_research.tools.base import ToolOrigin
 from open_deep_research.tools.governance import ToolErrorType
@@ -53,6 +54,42 @@ class FakeModel:
     async def ainvoke(self, messages):
         self.calls.append(messages)
         return self.responses.pop(0)
+
+
+@pytest.mark.asyncio
+async def test_query_cancels_an_inflight_model_call_without_waiting_for_timeout():
+    scope = CancellationScope()
+    model_started = asyncio.Event()
+    model_drained = asyncio.Event()
+
+    async def blocking_model(_messages):
+        model_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            model_drained.set()
+
+    async def consume_query():
+        return [
+            event
+            async for event in query(QueryParams(
+                messages=[HumanMessage(content="start")],
+                system_prompt="system",
+                model=FakeModel([]),
+                config=_config(),
+                call_model=blocking_model,
+                model_timeout_seconds=180,
+                cancellation_scope=scope,
+            ))
+        ]
+
+    task = asyncio.create_task(consume_query())
+    await asyncio.wait_for(model_started.wait(), 1)
+    scope.request("cancel_requested")
+
+    with pytest.raises(RunCancelled, match="cancel_requested"):
+        await asyncio.wait_for(task, 1)
+    assert model_drained.is_set()
 
 
 @pytest.mark.asyncio

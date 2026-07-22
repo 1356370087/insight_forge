@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import pymupdf
 import pytest
 
+from open_deep_research.configuration import Configuration
 from open_deep_research.quality import deterministic_tool_checks
 from open_deep_research.security.network import validate_connected_peer
 from open_deep_research.tools import utils
@@ -31,6 +32,10 @@ from open_deep_research.web.pipeline import (
     normalize_candidates,
     rank_candidates,
 )
+
+
+def test_default_web_pipeline_enforces_traceable_evidence() -> None:
+    assert Configuration().web_pipeline_mode == "enforced"
 
 
 def candidate(url: str, rank: int = 1, snippet: str = "research evidence") -> CandidateSource:
