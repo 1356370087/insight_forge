@@ -21,6 +21,7 @@ from open_deep_research.configuration import (
     Configuration,
     get_model_compatibility_kwargs,
 )
+from open_deep_research.evidence import eligible_evidence_records
 from open_deep_research.observability import (
     apply_helicone_config,
     get_trace_recorder,
@@ -122,7 +123,9 @@ class ReportContext:
         configurable = Configuration.from_runnable_config(config)
         evidence_sources: list[SourceRef] = []
         seen_urls: set[str] = set()
-        for record in state.get("evidence_registry", []):
+        for record in eligible_evidence_records(
+            state.get("evidence_registry", [])
+        ):
             url = str(record.get("source_url", ""))
             if not url or url in seen_urls:
                 continue

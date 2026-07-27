@@ -6,23 +6,19 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from open_deep_research.evidence import eligible_evidence_records
+
 
 def accepted_evidence(state: dict[str, Any]) -> list[dict[str, Any]]:
     """Return only structured evidence admitted to the current research state."""
-    accepted = [
-        item
-        for item in state.get("evidence_registry", [])
-        if isinstance(item, dict)
-    ]
+    accepted = eligible_evidence_records(state.get("evidence_registry", []))
     for output in state.get("completed_task_outputs", []):
         if not isinstance(output, dict):
             continue
         if output.get("admission_status") == "rejected":
             continue
         accepted.extend(
-            item
-            for item in output.get("evidence_registry", [])
-            if isinstance(item, dict)
+            eligible_evidence_records(output.get("evidence_registry", []))
         )
     return accepted
 
@@ -124,6 +120,14 @@ class ResearchCompletionPolicy:
             gaps.append("coverage_gaps")
 
         has_usable_evidence = context.evidence_count > 0
+        if context.explicit_completion_succeeded and not gaps:
+            # A terminal signal may legitimately arrive on the final available
+            # turn. Treat that completed work as success before projecting the
+            # simultaneously exhausted turn budget into a partial result.
+            return CompletionPolicyResult(
+                CompletionDecision.COMPLETE,
+                "explicit_completion",
+            )
         if not context.has_remaining_budget:
             return CompletionPolicyResult(
                 CompletionDecision.COMPLETE_PARTIAL
@@ -138,11 +142,6 @@ class ResearchCompletionPolicy:
                 CompletionDecision.CONTINUE_WITH_GAPS,
                 "completion_signal_failed",
                 tuple(gaps),
-            )
-        if context.explicit_completion_succeeded and not gaps:
-            return CompletionPolicyResult(
-                CompletionDecision.COMPLETE,
-                "explicit_completion",
             )
         if context.explicit_completion_succeeded:
             return CompletionPolicyResult(

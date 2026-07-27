@@ -4,6 +4,7 @@ from open_deep_research.completion import (
     CompletionDecision,
     CompletionPolicyContext,
     ResearchCompletionPolicy,
+    completion_policy_context,
 )
 
 
@@ -30,6 +31,24 @@ def test_completion_policy_completes_with_successful_signal_and_evidence():
     )
 
     assert decision.action == CompletionDecision.COMPLETE
+    assert decision.reason == "explicit_completion"
+
+
+def test_completion_policy_preserves_success_on_last_available_turn():
+    decision = ResearchCompletionPolicy(min_evidence=1, min_sources=1).evaluate(
+        CompletionPolicyContext(
+            explicit_completion_succeeded=True,
+            evidence_count=2,
+            independent_source_count=2,
+            has_remaining_budget=False,
+            exhausted_reason="max_turns",
+        )
+    )
+
+    assert decision.action == CompletionDecision.COMPLETE, (
+        "A successful completion signal with no research gaps must win over "
+        "simultaneous turn-budget exhaustion."
+    )
     assert decision.reason == "explicit_completion"
 
 
@@ -79,3 +98,25 @@ def test_completion_policy_rejects_completion_with_active_tasks_or_conflicts():
     assert decision.action == CompletionDecision.CONTINUE_WITH_GAPS
     assert "active_tasks" in decision.gaps
     assert "unresolved_conflicts" in decision.gaps
+
+
+def test_completion_policy_does_not_count_quarantined_evidence():
+    context = completion_policy_context(
+        {
+            "evidence_registry": [
+                {
+                    "evidence_id": "unsafe-1",
+                    "source_url": "https://unsafe.example/source",
+                    "security_status": "quarantined",
+                }
+            ]
+        },
+        explicit_completion_succeeded=True,
+    )
+
+    decision = ResearchCompletionPolicy().evaluate(context)
+
+    assert context.evidence_count == 0
+    assert context.independent_source_count == 0
+    assert decision.action == CompletionDecision.CONTINUE_WITH_GAPS
+    assert "accepted_evidence" in decision.gaps

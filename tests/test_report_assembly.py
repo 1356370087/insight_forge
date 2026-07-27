@@ -10,7 +10,11 @@ from langchain_core.runnables import RunnableConfig
 
 from open_deep_research.report import assembly as assembly_module
 from open_deep_research.report import build_report
-from open_deep_research.report.assembly import AssemblyResult, SectionedStrategy
+from open_deep_research.report.assembly import (
+    AssemblyResult,
+    ReportContext,
+    SectionedStrategy,
+)
 from open_deep_research.report.models import ReportOutline, SectionSpec, WrittenSection
 from open_deep_research.report.profiles import AssemblyMode, get_profile
 
@@ -69,6 +73,31 @@ def test_sectioned_profiles_are_sectioned():
 
 def test_literature_review_uses_bibtex_style():
     assert get_profile("literature_review").reference_style.value == "bibtex_like"
+
+
+def test_report_context_excludes_quarantined_evidence_sources():
+    context = ReportContext.from_state(
+        {
+            "evidence_registry": [
+                {
+                    "source_title": "Accepted",
+                    "source_url": "https://accepted.example/source",
+                    "security_status": "accepted",
+                },
+                {
+                    "source_title": "Quarantined",
+                    "source_url": "https://quarantined.example/source",
+                    "security_status": "quarantined",
+                },
+            ]
+        },
+        _config(),
+        get_profile("default"),
+    )
+
+    assert [source.url for source in context.sources] == [
+        "https://accepted.example/source"
+    ]
 
 
 @pytest.mark.asyncio
@@ -158,6 +187,35 @@ async def test_quality_enabled_report_rejects_state_without_accepted_evidence(mo
         "raw_notes": [],
         "completed_task_outputs": [],
         "evidence_registry": [],
+    }
+
+    with pytest.raises(RuntimeError, match="accepted research evidence"):
+        await build_report(state, _config(quality_evaluation_enabled=True))
+
+
+@pytest.mark.asyncio
+async def test_quality_enabled_report_rejects_quarantined_only_evidence(monkeypatch):
+    monkeypatch.setenv("QUALITY_EVALUATION_ENABLED", "true")
+
+    async def fake_assemble(_ctx):
+        return AssemblyResult(body_markdown="must not be generated")
+
+    monkeypatch.setattr("open_deep_research.report.orchestrator.assemble", fake_assemble)
+    state = {
+        "messages": [],
+        "research_brief": "research A",
+        "notes": ["untrusted finding https://quarantined.example/source"],
+        "raw_notes": ["untrusted finding https://quarantined.example/source"],
+        "completed_task_outputs": [],
+        "supervisor_messages": [
+            {"type": "tool", "name": "ConductResearch", "content": "done"}
+        ],
+        "evidence_registry": [
+            {
+                "source_url": "https://quarantined.example/source",
+                "security_status": "quarantined",
+            }
+        ],
     }
 
     with pytest.raises(RuntimeError, match="accepted research evidence"):

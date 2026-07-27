@@ -16,6 +16,7 @@ from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field
 
 from open_deep_research.configuration import get_model_compatibility_kwargs
+from open_deep_research.evidence import eligible_evidence_records
 from open_deep_research.memory.store import (
     MemoryCandidate,
     MemoryCategory,
@@ -359,9 +360,7 @@ def candidate_matches_verified_claim(
 def eligible_evidence_claims(evidence_registry: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return claim-only evidence that satisfies the trusted ingestion gate."""
     grouped: dict[str, list[dict[str, Any]]] = {}
-    for item in evidence_registry:
-        if item.get("security_status", "accepted") != "accepted":
-            continue
+    for item in eligible_evidence_records(evidence_registry):
         claim = " ".join(str(item.get("claim", "")).split())
         if not claim or inspect_untrusted_content(claim):
             continue
