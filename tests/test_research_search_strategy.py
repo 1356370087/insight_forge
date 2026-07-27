@@ -8,13 +8,20 @@ from open_deep_research.tasks.async_tools import StartResearchTask
 from open_deep_research.tools.utils import tavily_search
 
 
-def test_research_prompt_requires_progressive_search_strategy() -> None:
+def test_research_prompt_requires_progressive_search_within_task_contract() -> None:
     rendered = research_system_prompt.format(mcp_prompt="", date="July 7, 2026")
+    normalized = " ".join(rendered.split())
 
-    assert "1-3 short, broad queries" in rendered
-    assert "Map the information landscape" in rendered
-    assert "Add only the necessary dimension" in rendered
-    assert "remove constraints or rephrase it more broadly" in rendered
+    assert "Treat the delegated task contract as binding" in normalized
+    assert "If the task says to use only `fetch_url`, never call `web_research`" in normalized
+    assert "Start broad only when unconstrained" in normalized
+    assert "1-3 short, broad queries" in normalized
+    assert "Map the information landscape" in normalized
+    assert "Add only the necessary dimension" in normalized
+    assert (
+        "rephrase it more broadly without crossing any explicit tool, URL, source"
+        in normalized
+    )
 
 
 def test_research_prompt_is_search_backend_agnostic() -> None:

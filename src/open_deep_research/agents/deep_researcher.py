@@ -153,7 +153,6 @@ from open_deep_research.tools.utils import (
     get_notes_from_tool_calls,
     get_today_str,
     is_token_limit_exceeded,
-    remove_up_to_last_ai_message,
     think_tool,
 )
 
@@ -1116,7 +1115,7 @@ def build_supervisor_tools(state: SupervisorState) -> list[Tool]:
             start = min(input.offset, len(content))
             end = min(start + input.max_chars, len(content))
             truncated = end < len(content)
-            return ToolResult(output={
+            output: dict[str, Any] = {
                 "task_id": input.task_id,
                 "section": input.section,
                 "offset": start,
@@ -1124,14 +1123,73 @@ def build_supervisor_tools(state: SupervisorState) -> list[Tool]:
                 "truncated": truncated,
                 "next_offset": end if truncated else None,
                 "total_chars": len(content),
-            })
+                "artifact_ref": {
+                    "path": (
+                        f"context/artifacts/research_tasks/{input.task_id}.json"
+                    ),
+                    "sha256": input.artifact_sha256,
+                },
+            }
+            assessment_history = [
+                item
+                for item in state.get("handoff_assessments", [])
+                if isinstance(item, dict)
+                and str(item.get("tool_call_id", "")) == input.task_id
+            ]
+            latest_assessment = (
+                assessment_history[-1] if assessment_history else None
+            )
+            if (
+                configurable.quality_evaluation_enabled
+                and latest_assessment is not None
+                and latest_assessment.get("accepted") is False
+            ):
+                quality_handoff = dict(artifact)
+                selected_excerpt = json.dumps(
+                    {
+                        "section": input.section,
+                        "offset": start,
+                        "content": content[start:end],
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                )
+                quality_handoff["raw_notes"] = [
+                    (
+                        "Supervisor-selected excerpt from the SHA-verified "
+                        f"research artifact:\n{selected_excerpt}"
+                    ),
+                    *[
+                        str(note)
+                        for note in artifact.get("raw_notes", [])
+                    ],
+                ]
+                reassessment = await evaluate_subagent_handoff(
+                    str(artifact.get("research_topic", "")),
+                    quality_handoff,
+                    context.config,
+                )
+                output.update({
+                    "status": (
+                        "accepted_after_artifact_reassessment"
+                        if reassessment.accepted
+                        else "rejected_after_artifact_reassessment"
+                    ),
+                    "admission_status": (
+                        "accepted" if reassessment.accepted else "rejected"
+                    ),
+                    "reassessment": reassessment.model_dump(),
+                })
+            return ToolResult(output=output)
 
         read_artifact_tool = build_tool(
             name="ReadResearchArtifact",
             description=(
                 "Read a bounded section of a completed Researcher's persisted evidence. "
                 "Use the task id and SHA-256 returned by ConductResearch, and only call "
-                "this when the compressed findings are insufficient."
+                "this when the compressed findings are insufficient. Reading a previously "
+                "rejected artifact triggers a quality reassessment; read evidence_registry "
+                "to prioritize exact, source-located evidence for possible re-admission."
             ),
             input_schema=ReadResearchArtifact,
             call=read_artifact_call,
@@ -1297,6 +1355,29 @@ def build_supervisor_tool_registry(state: SupervisorState) -> dict[str, Tool]:
     return build_tool_registry(build_supervisor_tools(state))
 
 
+def _load_handoff_artifact_for_quality(
+    handoff: dict[str, Any],
+    *,
+    task_id: str,
+    run_id: str,
+    configurable: Configuration,
+) -> dict[str, Any]:
+    """Expand a compact handoff before judging its durable evidence trail."""
+    artifact_ref = handoff.get("artifact_ref")
+    if not isinstance(artifact_ref, dict) or not artifact_ref.get("sha256"):
+        return handoff
+    try:
+        return RunContextStore(
+            run_id,
+            runs_dir=configurable.runs_dir,
+        ).load_task_result(
+            task_id,
+            expected_sha256=str(artifact_ref["sha256"]),
+        )
+    except (FileNotFoundError, ValueError, json.JSONDecodeError):
+        return handoff
+
+
 async def _finalize_async_research_outputs(
     state: SupervisorState,
     config: RunnableConfig,
@@ -1316,8 +1397,16 @@ async def _finalize_async_research_outputs(
         task_id = str(output["task_id"])
         snapshot = await state_store.get(task_id, run_id=run_id)
         if configurable.quality_evaluation_enabled:
+            quality_handoff = _load_handoff_artifact_for_quality(
+                output,
+                task_id=task_id,
+                run_id=run_id,
+                configurable=configurable,
+            )
             assessment = await evaluate_subagent_handoff(
-                str(output.get("research_topic", "")), output, config
+                str(output.get("research_topic", "")),
+                quality_handoff,
+                config,
             )
             if snapshot is not None:
                 snapshot.admission_status = "accepted" if assessment.accepted else "rejected"
@@ -1684,7 +1773,17 @@ async def _execute_supervisor_tools(
         async def assess_handoff(call: dict[str, Any]):
             observation = outcomes_by_id[call["id"]].result.output
             topic = str(call.get("args", {}).get("research_topic", ""))
-            return call["id"], await evaluate_subagent_handoff(topic, observation, config)
+            quality_handoff = _load_handoff_artifact_for_quality(
+                observation,
+                task_id=str(call["id"]),
+                run_id=run_id,
+                configurable=configurable,
+            )
+            return call["id"], await evaluate_subagent_handoff(
+                topic,
+                quality_handoff,
+                config,
+            )
 
         assessment_semaphore = asyncio.Semaphore(
             configurable.max_concurrent_tool_calls
@@ -1696,6 +1795,50 @@ async def _execute_supervisor_tools(
 
         assessed = await asyncio.gather(*(assess_bounded(call) for call in assessable_calls))
         handoff_assessments = {call_id: assessment for call_id, assessment in assessed}
+
+    reassessment_updates: list[dict[str, Any]] = []
+    readmitted_artifacts: list[
+        tuple[str, dict[str, Any], dict[str, Any], str]
+    ] = []
+    for call in ordinary_calls:
+        if call["name"] != "ReadResearchArtifact":
+            continue
+        outcome = outcomes_by_id[call["id"]]
+        if outcome.error is not None or outcome.result is None:
+            continue
+        output = outcome.result.output
+        if not isinstance(output, dict):
+            continue
+        reassessment = output.get("reassessment")
+        task_id = str(output.get("task_id", ""))
+        if isinstance(reassessment, dict) and task_id:
+            reassessment_updates.append({
+                "tool_call_id": task_id,
+                "trigger_tool_call_id": str(call["id"]),
+                "trigger": "artifact_read_reassessment",
+                **reassessment,
+            })
+        if output.get("admission_status") != "accepted" or not task_id:
+            continue
+        artifact_ref = output.get("artifact_ref")
+        if (
+            not isinstance(artifact_ref, dict)
+            or not artifact_ref.get("sha256")
+        ):
+            continue
+        try:
+            artifact = RunContextStore(
+                run_id,
+                runs_dir=configurable.runs_dir,
+            ).load_task_result(
+                task_id,
+                expected_sha256=str(artifact_ref["sha256"]),
+            )
+        except (FileNotFoundError, ValueError, json.JSONDecodeError):
+            continue
+        readmitted_artifacts.append(
+            (task_id, artifact, dict(artifact_ref), str(call["id"]))
+        )
 
     completed_sync = 0
     failed_sync = 0
@@ -1772,6 +1915,33 @@ async def _execute_supervisor_tools(
                 dedupe_key=f"task:{call['id']}:findings",
             )
 
+    for task_id, artifact, _artifact_ref, trigger_call_id in readmitted_artifacts:
+        sources = extract_public_sources(
+            artifact,
+            limit=configurable.public_event_source_limit,
+        )
+        await publisher.publish(
+            "research.task.completed",
+            stage="researching",
+            payload={
+                "task_id": task_id,
+                "wave_id": "",
+                "mode": "sync",
+                "status": "completed",
+                "phase": "completed",
+                "admission_status": "accepted",
+                "reason_code": "quality_gate_reassessed",
+                "trigger_tool_call_id": trigger_call_id,
+                "source_count": len(sources),
+                "summary_status": "unavailable",
+                "message": (
+                    "Research evidence was admitted after a SHA-verified "
+                    "artifact reassessment."
+                ),
+            },
+            dedupe_key=f"task:{task_id}:admission:accepted",
+        )
+
     for overflow in overflow_conduct:
         await publisher.publish(
             "research.task.failed",
@@ -1810,11 +1980,19 @@ async def _execute_supervisor_tools(
         outcome = outcomes_by_id[call["id"]]
         assessment = handoff_assessments.get(call["id"])
         if assessment is not None and not assessment.accepted:
+            rejected_output = (
+                outcome.result.output
+                if outcome.result is not None
+                and isinstance(outcome.result.output, dict)
+                else {}
+            )
             tool_messages.append(
                 ToolMessage(
                     content=serialize_tool_output({
                         "status": "rejected_by_supervisor_quality_gate",
+                        "task_id": call["id"],
                         "research_topic": call.get("args", {}).get("research_topic", ""),
+                        "artifact_ref": rejected_output.get("artifact_ref", {}),
                         "assessment": assessment.model_dump(),
                     }),
                     name="ConductResearch",
@@ -1885,34 +2063,46 @@ async def _execute_supervisor_tools(
         outcome = outcomes_by_id[call["id"]]
         if call["name"] != "ConductResearch" or outcome.result is None:
             continue
+        observation = outcome.result.output
+        if not isinstance(observation, dict):
+            continue
+        artifact_ref = observation.get("artifact_ref")
+        if isinstance(artifact_ref, dict) and artifact_ref.get("sha256"):
+            research_artifact_refs[str(call["id"])] = dict(artifact_ref)
         assessment = handoff_assessments.get(call["id"])
         if assessment is not None and not assessment.accepted:
             continue
-        observation = outcome.result.output
-        if isinstance(observation, dict):
-            artifact_ref = observation.get("artifact_ref")
-            if isinstance(artifact_ref, dict) and artifact_ref.get("sha256"):
-                research_artifact_refs[str(call["id"])] = dict(artifact_ref)
-                try:
-                    observation = RunContextStore(
-                        run_id,
-                        runs_dir=configurable.runs_dir,
-                    ).load_task_result(
-                        str(call["id"]),
-                        expected_sha256=str(artifact_ref["sha256"]),
-                    )
-                except (FileNotFoundError, ValueError, json.JSONDecodeError):
-                    # Keep the compact handoff visible to the Supervisor, but do
-                    # not fabricate evidence when its durable artifact is absent
-                    # or fails integrity verification.
-                    observation = outcome.result.output
-            notes = observation.get("raw_notes", [])
-            if notes:
-                raw_notes.extend(str(note) for note in notes)
-            candidate_registry.extend(observation.get("candidate_registry", []))
-            document_registry.extend(observation.get("document_registry", []))
-            evidence_registry.extend(observation.get("evidence_registry", []))
-            research_iterations.extend(observation.get("web_research_iterations", []))
+        if isinstance(artifact_ref, dict) and artifact_ref.get("sha256"):
+            try:
+                observation = RunContextStore(
+                    run_id,
+                    runs_dir=configurable.runs_dir,
+                ).load_task_result(
+                    str(call["id"]),
+                    expected_sha256=str(artifact_ref["sha256"]),
+                )
+            except (FileNotFoundError, ValueError, json.JSONDecodeError):
+                # Keep the compact handoff visible to the Supervisor, but do
+                # not fabricate evidence when its durable artifact is absent
+                # or fails integrity verification.
+                observation = outcome.result.output
+        notes = observation.get("raw_notes", [])
+        if notes:
+            raw_notes.extend(str(note) for note in notes)
+        candidate_registry.extend(observation.get("candidate_registry", []))
+        document_registry.extend(observation.get("document_registry", []))
+        evidence_registry.extend(observation.get("evidence_registry", []))
+        research_iterations.extend(observation.get("web_research_iterations", []))
+
+    for task_id, observation, artifact_ref, _trigger_call_id in readmitted_artifacts:
+        research_artifact_refs[task_id] = artifact_ref
+        notes = observation.get("raw_notes", [])
+        if notes:
+            raw_notes.extend(str(note) for note in notes)
+        candidate_registry.extend(observation.get("candidate_registry", []))
+        document_registry.extend(observation.get("document_registry", []))
+        evidence_registry.extend(observation.get("evidence_registry", []))
+        research_iterations.extend(observation.get("web_research_iterations", []))
 
     pending_mailbox_acks: list[dict[str, Any]] = []
     if state.get("enable_async_research", False) and tool_messages:
@@ -1948,14 +2138,16 @@ async def _execute_supervisor_tools(
         update_payload["evidence_registry"] = evidence_registry
     if research_iterations:
         update_payload["web_research_iterations"] = research_iterations
-    if handoff_assessments:
-        update_payload["handoff_assessments"] = [
-            {
-                "tool_call_id": call_id,
-                **assessment.model_dump(),
-            }
-            for call_id, assessment in handoff_assessments.items()
-        ]
+    assessment_updates = [
+        {
+            "tool_call_id": call_id,
+            **assessment.model_dump(),
+        }
+        for call_id, assessment in handoff_assessments.items()
+    ]
+    assessment_updates.extend(reassessment_updates)
+    if assessment_updates:
+        update_payload["handoff_assessments"] = assessment_updates
     if pending_mailbox_acks:
         update_payload["pending_mailbox_acks"] = pending_mailbox_acks
         update_payload["processed_mailbox_message_ids"] = {
@@ -2388,6 +2580,7 @@ async def assess_research_results(
         state.get("research_topic", ""),
         evidence_pending,
         config,
+        evidence_registry=list(state.get("evidence_registry", [])),
     )
     assessment_json = assessment.model_dump_json()
     update = {
@@ -2406,6 +2599,182 @@ async def assess_research_results(
     if exceeded_iterations or assessment.decision == "complete":
         return Command(goto="compress_research", update=update)
     return Command(goto="researcher", update=update)
+
+
+_COMPRESSION_TOOL_CALL_MARKERS = (
+    "<｜｜dsml｜｜tool_calls",
+    "<|tool_calls|>",
+    "<tool_call",
+    "<invoke name=",
+    "<function=",
+)
+
+
+def _message_content_text(content: Any) -> str:
+    """Render model content blocks as plain text without Python repr noise."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        blocks: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                blocks.append(block)
+            elif isinstance(block, dict) and isinstance(block.get("text"), str):
+                blocks.append(block["text"])
+            elif isinstance(getattr(block, "text", None), str):
+                blocks.append(block.text)
+        return "".join(blocks)
+    return str(content)
+
+
+def _compression_output_is_invalid(response: BaseMessage) -> bool:
+    """Reject a researcher action accidentally emitted as a final synthesis."""
+    if getattr(response, "tool_calls", None):
+        return True
+    normalized = _message_content_text(response.content).strip().lower()
+    return not normalized or any(marker in normalized for marker in _COMPRESSION_TOOL_CALL_MARKERS)
+
+
+def _accepted_evidence_records(state: ResearcherState) -> list[dict[str, Any]]:
+    """Return structured evidence that is safe to use in compression."""
+    return [
+        dict(record)
+        for record in state.get("evidence_registry", [])
+        if str(record.get("security_status", "accepted")).lower()
+        not in {"quarantined", "rejected", "blocked"}
+    ]
+
+
+def _compression_evidence_text(state: ResearcherState, max_chars: int) -> str:
+    """Build an evidence-only compression input, excluding agent plans/actions."""
+    tool_messages = [
+        message
+        for message in state.get("researcher_messages", [])
+        if isinstance(message, ToolMessage)
+        and str(message.name or "") not in {"think_tool", "ResearchComplete"}
+    ]
+    documents = [
+        {
+            key: document.get(key)
+            for key in (
+                "document_id",
+                "title",
+                "final_url",
+                "canonical_url",
+                "published_at",
+                "source_authority",
+            )
+            if document.get(key) is not None
+        }
+        for document in state.get("document_registry", [])
+    ]
+    tool_results = [
+        {
+            "name": str(message.name or ""),
+            "content": _message_content_text(message.content),
+        }
+        for message in tool_messages
+    ]
+    sections = [
+        "Research topic:\n" + str(state.get("research_topic", "")),
+        "Structured evidence registry:\n"
+        + json.dumps(
+            _accepted_evidence_records(state),
+            ensure_ascii=False,
+            default=str,
+        ),
+        "Document registry:\n"
+        + json.dumps(documents, ensure_ascii=False, default=str),
+        "Protected tool evidence:\n"
+        + json.dumps(tool_results, ensure_ascii=False, default=str),
+    ]
+    return "\n\n".join(sections)[:max_chars]
+
+
+def _deterministic_compression_fallback(state: ResearcherState) -> str:
+    """Produce a traceable handoff when the compression model stays in tool mode."""
+    evidence = _accepted_evidence_records(state)
+    if not evidence:
+        return ""
+
+    source_numbers: dict[str, int] = {}
+    source_titles: dict[str, str] = {}
+    findings: list[str] = []
+    for record in evidence:
+        claim = str(record.get("claim") or "").strip()
+        source_url = str(record.get("source_url") or "").strip()
+        if not claim:
+            continue
+        citation = ""
+        if source_url:
+            if source_url not in source_numbers:
+                source_numbers[source_url] = len(source_numbers) + 1
+                source_titles[source_url] = str(record.get("source_title") or source_url)
+            citation = f" [{source_numbers[source_url]}]"
+        excerpt = str(record.get("supporting_excerpt") or "").strip()
+        excerpt_suffix = f" Supporting excerpt: {excerpt[:500]}" if excerpt else ""
+        findings.append(f"- {claim[:1500]}{citation}.{excerpt_suffix}")
+
+    if not findings:
+        return ""
+    sources = [
+        f"[{number}] {source_titles[url]}: {url}"
+        for url, number in source_numbers.items()
+    ]
+    return "\n".join([
+        "**List of Queries and Tool Calls Made**",
+        "Compression-model fallback assembled from the accepted structured evidence registry.",
+        "",
+        "**Fully Comprehensive Findings**",
+        *findings,
+        "",
+        "### Sources",
+        *sources,
+    ])
+
+
+def _compression_metrics(
+    state: ResearcherState,
+    config: RunnableConfig,
+) -> dict[str, int]:
+    """Calculate stable task metrics for either model or fallback compression."""
+    tool_messages = [
+        message
+        for message in state.get("researcher_messages", [])
+        if isinstance(message, ToolMessage)
+    ]
+    source_text = "\n".join(
+        _message_content_text(message.content)
+        for message in tool_messages
+    )
+    source_text += "\n" + "\n".join(
+        str(record.get("source_url") or "")
+        for record in state.get("evidence_registry", [])
+    )
+    source_urls = set(re.findall(r"https?://[^\s\]\)>'\"}]+", source_text))
+    metrics = {
+        "tool_calls": len(tool_messages),
+        "query_count": sum(
+            "search" in str(message.name or "").lower()
+            for message in tool_messages
+        ),
+        "sources_read": len(source_urls),
+        "citation_count": len(source_urls),
+    }
+    task_id = str(config.get("metadata", {}).get("task_id", ""))
+    if not task_id:
+        return metrics
+    record = get_task_registry().get(task_id)
+    expected_run_id = str(config.get("metadata", {}).get("run_id", "default"))
+    if record is not None and record.run_id == expected_run_id:
+        metrics.update({
+            "query_count": record.query_count,
+            "sources_read": record.source_count,
+            "citation_count": record.citation_count,
+            "retry_count": record.retry_count,
+        })
+    return metrics
+
 
 async def compress_research(state: ResearcherState, config: RunnableConfig):
     """Compress and synthesize research findings into a concise, structured summary.
@@ -2432,11 +2801,16 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
     }, config, span_name="researcher.compress", agent_role="researcher")
     synthesizer_model = configurable_model.with_config(compression_model_config)
     
-    # Step 2: Prepare messages for compression
-    researcher_messages = list(state.get("researcher_messages", []))
-
-    # Add instruction to switch from research mode to compression mode
-    researcher_messages.append(HumanMessage(content=compress_research_simple_human_message))
+    # Step 2: Prepare an evidence-only input. Replaying the complete researcher
+    # dialogue can cause tool-oriented models to continue the agent loop instead
+    # of synthesizing the already collected evidence.
+    compression_evidence = _compression_evidence_text(
+        state,
+        configurable.max_content_length,
+    )
+    raw_notes_content = compression_evidence
+    metrics = _compression_metrics(state, config)
+    retry_instruction = ""
     
     # Step 3: Attempt compression with retry logic for token limit issues
     synthesis_attempts = 0
@@ -2447,58 +2821,35 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
         try:
             # Create system prompt focused on compression task
             compression_prompt = compress_research_system_prompt.format(date=get_today_str())
-            messages = [SystemMessage(content=compression_prompt)] + researcher_messages
+            messages = [
+                SystemMessage(content=compression_prompt),
+                HumanMessage(content=(
+                    compress_research_simple_human_message
+                    + retry_instruction
+                    + "\n\n<ResearchEvidence>\n"
+                    + compression_evidence
+                    + "\n</ResearchEvidence>"
+                )),
+            ]
             
             # Execute compression
-            response = await invoke_model_with_retry_observability(
-                synthesizer_model,
-                messages,
-                config,
-                span_name="researcher.compress",
-                agent_role="researcher",
-                model_name=configurable.compression_model,
-            )
-            
-            # Extract raw notes from all tool and AI messages
-            raw_notes_content = "\n".join([
-                str(message.content) 
-                for message in filter_messages(researcher_messages, include_types=["tool", "ai"])
-            ])
-            
-            # Return successful compression result
-            tool_messages = [
-                message
-                for message in researcher_messages
-                if isinstance(message, ToolMessage)
-            ]
-            source_urls = set(
-                re.findall(
-                    r"https?://[^\s\]\)>'\"}]+",
-                    "\n".join(str(message.content) for message in tool_messages),
-                )
-            )
-            metrics = {
-                "tool_calls": len(tool_messages),
-                "query_count": sum(
-                    "search" in str(message.name or "").lower()
-                    for message in tool_messages
+            response = await asyncio.wait_for(
+                invoke_model_with_retry_observability(
+                    synthesizer_model,
+                    messages,
+                    config,
+                    span_name="researcher.compress",
+                    agent_role="researcher",
+                    model_name=configurable.compression_model,
                 ),
-                "sources_read": len(source_urls),
-                "citation_count": len(source_urls),
-            }
-            task_id = str(config.get("metadata", {}).get("task_id", ""))
-            if task_id:
-                record = get_task_registry().get(task_id)
-                expected_run_id = str(config.get("metadata", {}).get("run_id", "default"))
-                if record is not None and record.run_id == expected_run_id:
-                    metrics.update({
-                        "query_count": record.query_count,
-                        "sources_read": record.source_count,
-                        "citation_count": record.citation_count,
-                        "retry_count": record.retry_count,
-                    })
+                timeout=configurable.model_call_timeout_seconds,
+            )
+            if _compression_output_is_invalid(response):
+                raise ValueError(
+                    "compression_model_returned_tool_call_instead_of_summary"
+                )
             return {
-                "compressed_research": str(response.content),
+                "compressed_research": _message_content_text(response.content),
                 "raw_notes": [raw_notes_content],
                 "metrics": metrics,
             }
@@ -2524,12 +2875,26 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
             
             # Handle token limit exceeded by removing older messages
             if is_token_limit_exceeded(e, configurable.compression_model):
-                researcher_messages = remove_up_to_last_ai_message(researcher_messages)
+                reduced_length = max(1000, int(len(compression_evidence) * 0.8))
+                compression_evidence = compression_evidence[:reduced_length]
                 continue
-            
-            # For other errors, continue retrying
+            retry_instruction = (
+                "\n\nA previous compression attempt returned an action, tool call, "
+                "or invalid output. Do not continue research. Return the finished "
+                "evidence synthesis now."
+            )
             continue
-    
+
+    fallback = _deterministic_compression_fallback(state)
+    if fallback:
+        get_trace_recorder(config).active_span().record_outcome(
+            error_type="compression_model_fallback",
+        )
+        return {
+            "compressed_research": fallback,
+            "raw_notes": [raw_notes_content],
+            "metrics": metrics,
+        }
     raise RuntimeError("research_compression_failed_after_retries") from last_error
 
 async def final_report_generation(state: AgentState, config: RunnableConfig):
