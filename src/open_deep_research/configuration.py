@@ -142,6 +142,14 @@ class Configuration(BaseModel):
     max_tool_batch_size: int = Field(default=32, ge=1, le=512)
     model_call_timeout_seconds: float = Field(default=180, gt=0)
     tool_call_timeout_seconds: float = Field(default=120, gt=0)
+    research_tool_call_timeout_seconds: float = Field(
+        default=300,
+        gt=0,
+        description=(
+            "Timeout for researcher tools that may include search, fetching, reranking, "
+            "and evidence extraction."
+        ),
+    )
     hook_timeout_seconds: float = Field(default=120, gt=0)
     allow_clarification: bool = Field(
         default=True,
@@ -974,16 +982,25 @@ class Configuration(BaseModel):
     )
     quality_evaluation_model: str = Field(
         default="openai:qwen3.7-plus",
-        description="OpenAI-compatible Qwen model used by the runtime quality gates.",
+        description=(
+            "Provider:model identifier used by runtime quality gates, for example "
+            "openai:qwen3.7-plus or anthropic:claude-sonnet-4-5."
+        ),
     )
     quality_evaluation_model_max_tokens: int = Field(default=2048, ge=256)
     quality_evaluation_base_url: Optional[str] = Field(
-        default="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        description="OpenAI-compatible DashScope endpoint for the quality model.",
+        default=None,
+        description=(
+            "Optional provider endpoint override. DashScope Qwen falls back to its "
+            "public OpenAI-compatible endpoint when this is unset."
+        ),
     )
     quality_evaluation_fail_open: bool = Field(
         default=True,
-        description="Allow research to continue if the quality evaluator is unavailable.",
+        description=(
+            "Continue on evaluator transport or parsing failures; deterministic "
+            "evidence admission checks still apply."
+        ),
     )
     quality_evaluation_min_score: int = Field(default=3, ge=1, le=5)
     quality_evaluation_min_sources: int = Field(default=2, ge=0, le=20)
@@ -1346,6 +1363,30 @@ class Configuration(BaseModel):
         if isinstance(value, str):
             return [item.strip() for item in value.split(",") if item.strip()]
         return value
+
+    @field_validator(
+        "supervisor_tool_whitelist",
+        "researcher_tool_whitelist",
+        "supervisor_blocked_origins",
+        "researcher_blocked_origins",
+        mode="before",
+    )
+    @classmethod
+    def parse_optional_tool_policy_list(cls, value: Any) -> list[str] | None:
+        """Accept JSON arrays or comma-separated tool policy environment values."""
+        if value is None or value == "":
+            return None
+        if isinstance(value, str):
+            if value.lstrip().startswith("["):
+                parsed = json.loads(value)
+                if not isinstance(parsed, list):
+                    raise ValueError("tool policy JSON must be an array")
+                value = parsed
+            else:
+                value = value.split(",")
+        if not isinstance(value, list | tuple | set):
+            raise ValueError("tool policy must be a list or comma-separated string")
+        return [str(item).strip() for item in value if str(item).strip()]
 
     @field_validator("mcp_config", "browser_mcp_config", mode="before")
     @classmethod
