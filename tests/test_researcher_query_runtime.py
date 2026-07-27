@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -28,6 +29,19 @@ async def _research_echo_impl(text: str) -> str:
 
 research_echo = adapt_langchain_tool(
     _research_echo_impl,
+    origin=ToolOrigin.SEARCH,
+)
+
+
+@lc_tool("slow_research_echo")
+async def _slow_research_echo_impl(text: str) -> str:
+    """Return research evidence after a short realistic delay."""
+    await asyncio.sleep(0.05)
+    return f"slow-evidence:{text}"
+
+
+slow_research_echo = adapt_langchain_tool(
+    _slow_research_echo_impl,
     origin=ToolOrigin.SEARCH,
 )
 
@@ -108,6 +122,49 @@ async def test_researcher_engine_uses_unified_query_loop(monkeypatch) -> None:
     assert result["tool_call_iterations"] == 2
     assert any("evidence:fact" in note for note in result["raw_notes"])
     assert len(model.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_researcher_tools_use_dedicated_long_timeout(monkeypatch) -> None:
+    model = FakeResearchModel([
+        AIMessage(
+            content="",
+            tool_calls=[{
+                "name": "slow_research_echo",
+                "args": {"text": "fact"},
+                "id": "slow-tool-1",
+            }],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "ResearchComplete", "args": {}, "id": "done-1"}],
+        ),
+    ])
+
+    async def fake_get_all_tools(_config):
+        return [slow_research_echo, *deep_researcher.build_supervisor_tools({})[-2:-1]]
+
+    async def fake_compress(state, _config):
+        contents = [str(message.content) for message in state["researcher_messages"]]
+        return {
+            "compressed_research": "compressed",
+            "raw_notes": contents,
+        }
+
+    monkeypatch.setattr(deep_researcher, "configurable_model", model)
+    monkeypatch.setattr(deep_researcher, "get_all_tools", fake_get_all_tools)
+    monkeypatch.setattr(deep_researcher, "compress_research", fake_compress)
+
+    result = await ResearcherQueryEngine(_config(
+        tool_call_timeout_seconds=0.01,
+        research_tool_call_timeout_seconds=1,
+    )).ainvoke({
+        "researcher_messages": [HumanMessage(content="topic")],
+        "research_topic": "topic",
+        "evidence_registry": [{"id": "ev-1", "source_url": "https://example.com"}],
+    })
+
+    assert any("slow-evidence:fact" in note for note in result["raw_notes"])
 
 
 @pytest.mark.asyncio

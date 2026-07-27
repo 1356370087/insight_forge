@@ -8,6 +8,10 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from open_deep_research.agents import deep_researcher
 from open_deep_research.agents.query_engine import QueryEngine
+from open_deep_research.completion import accepted_evidence
+from open_deep_research.quality import HandoffAssessment
+from open_deep_research.run_context import RunContextStore
+from open_deep_research.runtime import apply_update_to_state
 from open_deep_research.runtime_control import RunCancelled
 
 
@@ -90,6 +94,90 @@ async def test_supervisor_uses_unified_query_loop(monkeypatch) -> None:
     assert len(model.calls) == 2
     assert any(getattr(message, "name", None) == "think_tool" for message in messages)
     assert result["research_brief"] == "research brief"
+
+
+@pytest.mark.asyncio
+async def test_supervisor_preserves_research_complete_on_last_allowed_turn(
+    monkeypatch,
+) -> None:
+    model = FakeSupervisorModel([
+        AIMessage(
+            content="",
+            tool_calls=[{
+                "name": "think_tool",
+                "args": {"reflection": "first coverage check"},
+                "id": "think-1",
+            }],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[{
+                "name": "think_tool",
+                "args": {"reflection": "final coverage check"},
+                "id": "think-2",
+            }],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "ResearchComplete", "args": {}, "id": "done-1"}],
+        ),
+    ])
+    monkeypatch.setattr(deep_researcher, "configurable_model", model)
+
+    result = await QueryEngine(
+        _config(max_researcher_iterations=3)
+    )._run_supervisor(_main_state(with_evidence=True))
+
+    assert len(model.calls) == 3
+    assert result["completion_decision"]["value"] == {
+        "action": "complete",
+        "reason": "explicit_completion",
+        "gaps": [],
+    }, (
+        "ResearchComplete succeeded on the final legal turn, so max_turns "
+        "must not downgrade the run to complete_partial."
+    )
+
+
+@pytest.mark.asyncio
+async def test_supervisor_research_batch_uses_task_timeout_not_hook_timeout(
+    monkeypatch,
+) -> None:
+    model = FakeSupervisorModel([
+        AIMessage(
+            content="",
+            tool_calls=[{
+                "name": "think_tool",
+                "args": {"reflection": "check coverage"},
+                "id": "think-1",
+            }],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "ResearchComplete", "args": {}, "id": "done-1"}],
+        ),
+    ])
+    original = deep_researcher._execute_supervisor_tools
+
+    async def slow_supervisor_batch(state, config):
+        await asyncio.sleep(0.05)
+        return await original(state, config)
+
+    monkeypatch.setattr(deep_researcher, "configurable_model", model)
+    monkeypatch.setattr(
+        deep_researcher,
+        "_execute_supervisor_tools",
+        slow_supervisor_batch,
+    )
+
+    result = await QueryEngine(_config(
+        hook_timeout_seconds=0.01,
+        task_timeout_seconds=1,
+    ))._run_supervisor(_main_state(with_evidence=True))
+
+    messages = result["supervisor_messages"]["value"]
+    assert len(model.calls) == 2
+    assert not any("runtime_hook_error" in str(message.content) for message in messages)
 
 
 @pytest.mark.asyncio
@@ -213,6 +301,128 @@ async def test_supervisor_rejects_explicit_completion_without_evidence(monkeypat
     assert len(model.calls) == 2
     assert result["completion_decision"]["value"]["action"] == "complete"
     assert result["evidence_registry"]["value"]
+
+
+@pytest.mark.asyncio
+async def test_supervisor_can_readmit_rejected_artifact_after_verified_read(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("QUALITY_EVALUATION_ENABLED", "true")
+    run_id = "supervisor-readmission"
+    task_id = "research-1"
+    artifact = {
+        "schema_version": 1,
+        "task_id": task_id,
+        "research_topic": "Verify the official standard.",
+        "compressed_research": "Official evidence was collected.",
+        "researcher_messages": [],
+        "raw_notes": ["Official evidence from the persisted artifact."],
+        "candidate_registry": [],
+        "document_registry": [],
+        "evidence_registry": [
+            {
+                "evidence_id": "ev-readmitted",
+                "claim": "The official standard defines the requirement.",
+                "supporting_excerpt": (
+                    "The official standard defines the requirement."
+                ),
+                "source_url": "https://official.example/standard",
+                "security_status": "accepted",
+            }
+        ],
+        "web_research_iterations": [],
+        "result_assessment": {},
+        "metrics": {"sources_read": 1},
+    }
+    store = RunContextStore(run_id, runs_dir=str(tmp_path))
+    digest = store.persist_task_result(task_id, artifact)
+    artifact_ref = {
+        "path": f"context/artifacts/research_tasks/{task_id}.json",
+        "sha256": digest,
+        "available_sections": ["raw_notes", "evidence_registry"],
+    }
+    assessments = [
+        HandoffAssessment(
+            accepted=False,
+            relevance=4,
+            source_quality=5,
+            evidence_coverage=2,
+            groundedness=2,
+            missing_information=["Inspect the exact persisted excerpt."],
+            reason="The compact handoff is insufficient.",
+        ),
+        HandoffAssessment(
+            accepted=True,
+            relevance=5,
+            source_quality=5,
+            evidence_coverage=5,
+            groundedness=5,
+            reason="The verified artifact excerpt resolves the gap.",
+        ),
+    ]
+    assessment_calls: list[dict[str, Any]] = []
+
+    async def fake_evaluate_handoff(
+        research_topic: str,
+        handoff: dict[str, Any],
+        _config: dict[str, Any],
+    ) -> HandoffAssessment:
+        assessment_calls.append({
+            "research_topic": research_topic,
+            "handoff": handoff,
+        })
+        return assessments[len(assessment_calls) - 1]
+
+    monkeypatch.setattr(
+        deep_researcher,
+        "evaluate_subagent_handoff",
+        fake_evaluate_handoff,
+    )
+    state = _main_state()
+    state["research_artifact_refs"] = {task_id: artifact_ref}
+    config = _config(
+        quality_evaluation_enabled=True,
+        runs_dir=str(tmp_path),
+    )
+    config["metadata"]["run_id"] = run_id
+
+    async def execute_turn(tool_call: dict[str, Any]) -> None:
+        state["supervisor_messages"].append(
+            AIMessage(content="", tool_calls=[tool_call])
+        )
+        command = await deep_researcher._execute_supervisor_tools(state, config)
+        apply_update_to_state(state, command.update)
+
+    await execute_turn({
+        "name": "think_tool",
+        "args": {"reflection": "plan one bounded task"},
+        "id": "think-1",
+    })
+    await execute_turn({
+        "name": "ConductResearch",
+        "args": {
+            "research_topic": "Verify the official standard.",
+            "display_title": "Official standard",
+        },
+        "id": task_id,
+    })
+    assert not accepted_evidence(state)
+    await execute_turn({
+        "name": "ReadResearchArtifact",
+        "args": {
+            "task_id": task_id,
+            "artifact_sha256": digest,
+            "section": "evidence_registry",
+        },
+        "id": "read-1",
+    })
+
+    assert len(assessment_calls) == 2
+    assert accepted_evidence(state)[0]["evidence_id"] == "ev-readmitted"
+    assert "accepted_after_artifact_reassessment" in str(
+        state["supervisor_messages"][-1].content
+    )
 
 
 @pytest.mark.asyncio

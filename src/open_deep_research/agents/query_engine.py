@@ -1825,7 +1825,11 @@ class QueryEngine:
                 max_tool_batch_size=configurable.max_tool_batch_size,
                 tool_timeout_seconds=configurable.tool_call_timeout_seconds,
                 hook_timeout_seconds=configurable.hook_timeout_seconds,
+                tool_batch_timeout_seconds=configurable.task_timeout_seconds,
                 model_timeout_seconds=configurable.model_call_timeout_seconds,
+                model_transport_max_attempts=(
+                    configurable.model_transport_max_attempts
+                ),
                 budget_gate=self._budget_gate(),
                 execution_namespace="supervisor",
                 cancellation_scope=self.cancellation_scope,
@@ -1868,7 +1872,11 @@ class QueryEngine:
                     )
                     if completion_reason == "cancelled":
                         raise RunCancelled("cancel_requested", "supervisor.query")
-                    if completion_reason in {"budget_exhausted", "deadline_exceeded"}:
+                    if completion_reason in {
+                        "budget_exhausted",
+                        "deadline_exceeded",
+                        "model_timeout",
+                    }:
                         decision = completion_policy.evaluate(supervisor_completion_context(
                             has_remaining_budget=False,
                             exhausted_reason=completion_reason,
@@ -2288,9 +2296,12 @@ class ResearcherQueryEngine:
                 tool_results_hook=after_tools,
                 max_concurrent_tools=configurable.max_concurrent_tool_calls,
                 max_tool_batch_size=configurable.max_tool_batch_size,
-                tool_timeout_seconds=configurable.tool_call_timeout_seconds,
+                tool_timeout_seconds=configurable.research_tool_call_timeout_seconds,
                 hook_timeout_seconds=configurable.hook_timeout_seconds,
                 model_timeout_seconds=configurable.model_call_timeout_seconds,
+                model_transport_max_attempts=(
+                    configurable.model_transport_max_attempts
+                ),
                 budget_gate=BudgetGate.from_config(
                     configurable,
                     str(cfg.get("metadata", {}).get("run_id", "default")),
@@ -2315,6 +2326,7 @@ class ResearcherQueryEngine:
                     elif event.data.get("transition", {}).get("reason") in {
                         "budget_exhausted",
                         "deadline_exceeded",
+                        "model_timeout",
                     }:
                         reason = str(event.data["transition"]["reason"])
                         decision = completion_policy.evaluate(

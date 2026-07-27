@@ -222,6 +222,44 @@ async def test_tool_batch_hook_can_own_execution_and_complete():
 
 
 @pytest.mark.asyncio
+async def test_tool_batch_hook_can_use_a_longer_timeout_than_control_hooks():
+    model = FakeModel([
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "echo_tool", "args": {"text": "hi"}, "id": "tc1"}],
+        ),
+    ])
+
+    async def slow_batch_hook(_messages, tool_calls, _tools, _turn, _config):
+        await asyncio.sleep(0.05)
+        return ToolResultsHookResult(
+            messages=[ToolMessage(
+                content="slow batch completed",
+                name="echo_tool",
+                tool_call_id=tool_calls[0]["id"],
+            )],
+            should_continue=False,
+        )
+
+    events = [
+        event
+        async for event in query(QueryParams(
+            messages=[HumanMessage(content="start")],
+            system_prompt=None,
+            model=model,
+            tools=[echo_tool],
+            config=_config(),
+            tool_batch_hook=slow_batch_hook,
+            hook_timeout_seconds=0.01,
+            tool_batch_timeout_seconds=0.2,
+        ))
+    ]
+
+    result_event = next(event for event in events if event.type == "query.tool_result")
+    assert result_event.data["messages"][0].content == "slow batch completed"
+
+
+@pytest.mark.asyncio
 async def test_stop_hook_can_complete_with_updates():
     model = FakeModel([AIMessage(content="done")])
 
@@ -764,6 +802,70 @@ async def test_query_stops_on_run_deadline(tmp_path):
     assert len(model.calls) == 0
     assert events[-1].type == "query.completed"
     assert events[-1].data["transition"]["reason"] == "deadline_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_query_retries_a_model_call_timeout_without_claiming_run_deadline():
+    calls = 0
+
+    async def flaky_model(_messages):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            await asyncio.Event().wait()
+        return AIMessage(content="recovered")
+
+    events = [
+        event
+        async for event in query(QueryParams(
+            messages=[HumanMessage(content="start")],
+            system_prompt=None,
+            model=FakeModel([]),
+            config=_config(),
+            call_model=flaky_model,
+            model_timeout_seconds=0.01,
+            model_transport_max_attempts=2,
+        ))
+    ]
+
+    retry = next(event for event in events if event.type == "query.model_retry")
+    assert retry.data == {
+        "turn": 1,
+        "attempt": 1,
+        "max_attempts": 2,
+        "reason": "model_timeout",
+        "timeout_seconds": 0.01,
+    }
+    assert calls == 2
+    assert events[-1].data["transition"]["reason"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_query_reports_model_timeout_after_bounded_attempts():
+    calls = 0
+
+    async def blocking_model(_messages):
+        nonlocal calls
+        calls += 1
+        await asyncio.Event().wait()
+
+    events = [
+        event
+        async for event in query(QueryParams(
+            messages=[HumanMessage(content="start")],
+            system_prompt=None,
+            model=FakeModel([]),
+            config=_config(),
+            call_model=blocking_model,
+            model_timeout_seconds=0.01,
+            model_transport_max_attempts=2,
+        ))
+    ]
+
+    assert calls == 2
+    assert sum(event.type == "query.model_retry" for event in events) == 1
+    assert events[-1].type == "query.completed"
+    assert events[-1].data["transition"]["reason"] == "model_timeout"
 
 
 @pytest.mark.asyncio

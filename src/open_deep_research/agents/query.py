@@ -58,6 +58,7 @@ TransitionReason = Literal[
     "completion_policy_satisfied",
     "budget_exhausted",
     "deadline_exceeded",
+    "model_timeout",
     "completed",
 ]
 
@@ -173,7 +174,9 @@ class QueryParams:
     max_tool_batch_size: int | None = None
     tool_timeout_seconds: float | None = None
     hook_timeout_seconds: float | None = None
+    tool_batch_timeout_seconds: float | None = None
     model_timeout_seconds: float | None = None
+    model_transport_max_attempts: int = 1
     budget_gate: Any = None
     execution_namespace: str | None = None
     cancellation_scope: CancellationScope | None = None
@@ -190,8 +193,11 @@ def prepare_messages_for_query(
         if isinstance(projected[boundary], ToolMessage):
             pending_ids: set[str] = set()
             cursor = boundary
-            while cursor < len(projected) and isinstance(projected[cursor], ToolMessage):
-                pending_ids.add(projected[cursor].tool_call_id)
+            while cursor < len(projected):
+                pending_message = projected[cursor]
+                if not isinstance(pending_message, ToolMessage):
+                    break
+                pending_ids.add(pending_message.tool_call_id)
                 cursor += 1
             for index in range(boundary - 1, -1, -1):
                 message = projected[index]
@@ -226,11 +232,17 @@ def prepare_messages_for_query(
 async def _default_call_model(params: QueryParams, messages: list[BaseMessage]) -> BaseMessage:
     model = params.model
     if params.tools and hasattr(model, "bind_tools"):
-        model = model.bind_tools(
-            await tools_to_model_definitions(
+        if params.max_tool_description_chars is None:
+            model_tool_definitions = await tools_to_model_definitions(
+                list(params.tools)
+            )
+        else:
+            model_tool_definitions = await tools_to_model_definitions(
                 list(params.tools),
                 max_description_chars=params.max_tool_description_chars,
             )
+        model = model.bind_tools(
+            model_tool_definitions
         )
     model_config = apply_helicone_config(
         params.model_config,
@@ -276,6 +288,11 @@ async def query(params: QueryParams) -> AsyncIterator[QueryEvent]:
 
         if params.hook_timeout_seconds is not None and params.hook_timeout_seconds <= 0:
             raise ValueError("hook_timeout_seconds must be greater than zero")
+        if (
+            params.tool_batch_timeout_seconds is not None
+            and params.tool_batch_timeout_seconds <= 0
+        ):
+            raise ValueError("tool_batch_timeout_seconds must be greater than zero")
         if params.tool_timeout_seconds is not None and params.tool_timeout_seconds <= 0:
             raise ValueError("tool_timeout_seconds must be greater than zero")
         before_turn_hooks = params.before_turn_hooks
@@ -349,75 +366,108 @@ async def query(params: QueryParams) -> AsyncIterator[QueryEvent]:
             params.config.get("metadata", {}).get("task_id")
             or params.role.value
         )
-        model_op_key = f"model:{execution_namespace}:{params.role.value}:{turn}"
         model_name = str(params.model_config.get("model", ""))
-        if budget_gate is not None and budget_gate.enabled:
-            estimated_input = count_tokens_approximately(request_messages)
-            estimated_output = int(params.model_config.get("max_tokens") or 0)
+        model_stage = f"{params.role.value}.model"
+        if params.cancellation_scope is not None:
+            params.cancellation_scope.checkpoint(model_stage)
+        max_model_attempts = max(1, params.model_transport_max_attempts)
+        response: BaseMessage | None = None
+        successful_model_op_key = ""
+        for model_attempt in range(1, max_model_attempts + 1):
+            base_model_op_key = (
+                f"model:{execution_namespace}:{params.role.value}:{turn}"
+            )
+            model_op_key = (
+                base_model_op_key
+                if model_attempt == 1
+                else f"{base_model_op_key}:retry:{model_attempt}"
+            )
+            if budget_gate is not None and budget_gate.enabled:
+                estimated_input = count_tokens_approximately(request_messages)
+                estimated_output = int(params.model_config.get("max_tokens") or 0)
+                try:
+                    budget_gate.reserve_model_call(
+                        model_op_key,
+                        estimated_input_tokens=estimated_input,
+                        estimated_output_tokens=estimated_output,
+                        model_name=model_name,
+                    )
+                except DeadlineExceeded:
+                    transition = QueryTransition(reason="deadline_exceeded", turn=turn)
+                    yield QueryEvent(
+                        "query.completed",
+                        {"transition": transition.__dict__, "messages": messages},
+                    )
+                    return
+                except BudgetExhausted:
+                    transition = QueryTransition(reason="budget_exhausted", turn=turn)
+                    yield QueryEvent(
+                        "query.completed",
+                        {
+                            "transition": transition.__dict__,
+                            "messages": messages,
+                            "budget_exhausted": True,
+                        },
+                    )
+                    return
+            if params.call_model:
+                with recorder.start_span(
+                    name=params.model_span_name,
+                    kind="llm",
+                    agent_role=params.role.value,
+                    attributes={
+                        "custom_call_model": True,
+                        "attempt": model_attempt,
+                        "max_attempts": max_model_attempts,
+                    },
+                    input_payload=request_messages,
+                ):
+                    model_call = params.call_model(request_messages)
+            else:
+                model_call = _default_call_model(params, request_messages)
             try:
-                budget_gate.reserve_model_call(
-                    model_op_key,
-                    estimated_input_tokens=estimated_input,
-                    estimated_output_tokens=estimated_output,
-                    model_name=model_name,
-                )
-            except DeadlineExceeded:
-                transition = QueryTransition(reason="deadline_exceeded", turn=turn)
+                if params.cancellation_scope is not None:
+                    response = await params.cancellation_scope.run(
+                        model_call,
+                        stage=model_stage,
+                        timeout_seconds=params.model_timeout_seconds,
+                    )
+                else:
+                    response = await (
+                        asyncio.wait_for(
+                            model_call,
+                            timeout=params.model_timeout_seconds,
+                        )
+                        if params.model_timeout_seconds is not None
+                        else model_call
+                    )
+            except TimeoutError:
+                if model_attempt < max_model_attempts:
+                    yield QueryEvent(
+                        "query.model_retry",
+                        {
+                            "turn": turn,
+                            "attempt": model_attempt,
+                            "max_attempts": max_model_attempts,
+                            "reason": "model_timeout",
+                            "timeout_seconds": params.model_timeout_seconds,
+                        },
+                    )
+                    continue
+                transition = QueryTransition(reason="model_timeout", turn=turn)
                 yield QueryEvent(
                     "query.completed",
                     {"transition": transition.__dict__, "messages": messages},
                 )
                 return
-            except BudgetExhausted:
-                transition = QueryTransition(reason="budget_exhausted", turn=turn)
-                yield QueryEvent(
-                    "query.completed",
-                    {
-                        "transition": transition.__dict__,
-                        "messages": messages,
-                        "budget_exhausted": True,
-                    },
-                )
-                return
-        model_stage = f"{params.role.value}.model"
-        if params.cancellation_scope is not None:
-            params.cancellation_scope.checkpoint(model_stage)
-        if params.call_model:
-            with recorder.start_span(
-                name=params.model_span_name,
-                kind="llm",
-                agent_role=params.role.value,
-                attributes={"custom_call_model": True},
-                input_payload=request_messages,
-            ):
-                model_call = params.call_model(request_messages)
-        else:
-            model_call = _default_call_model(params, request_messages)
-        try:
-            if params.cancellation_scope is not None:
-                response = await params.cancellation_scope.run(
-                    model_call,
-                    stage=model_stage,
-                    timeout_seconds=params.model_timeout_seconds,
-                )
-            else:
-                response = await (
-                    asyncio.wait_for(model_call, timeout=params.model_timeout_seconds)
-                    if params.model_timeout_seconds is not None
-                    else model_call
-                )
-        except TimeoutError:
-            transition = QueryTransition(reason="deadline_exceeded", turn=turn)
-            yield QueryEvent(
-                "query.completed",
-                {"transition": transition.__dict__, "messages": messages},
-            )
-            return
+            successful_model_op_key = model_op_key
+            break
+        assert response is not None
         if budget_gate is not None and budget_gate.ledger is not None:
             usage = TokenUsage.from_response(response)
             try:
                 budget_gate.settle_model_call(
-                    model_op_key,
+                    successful_model_op_key,
                     input_tokens=usage.input_tokens,
                     output_tokens=usage.output_tokens,
                     model_name=model_name,
@@ -494,6 +544,11 @@ async def query(params: QueryParams) -> AsyncIterator[QueryEvent]:
         batch_cancelled = False
         try:
             if params.tool_batch_hook is not None:
+                batch_timeout = (
+                    params.tool_batch_timeout_seconds
+                    if params.tool_batch_timeout_seconds is not None
+                    else params.hook_timeout_seconds
+                )
                 batch_hook_call = params.tool_batch_hook(
                     messages,
                     tool_calls,
@@ -504,9 +559,9 @@ async def query(params: QueryParams) -> AsyncIterator[QueryEvent]:
                 tool_results_result = await (
                     asyncio.wait_for(
                         batch_hook_call,
-                        timeout=params.hook_timeout_seconds,
+                        timeout=batch_timeout,
                     )
-                    if params.hook_timeout_seconds is not None
+                    if batch_timeout is not None
                     else batch_hook_call
                 )
             else:
@@ -634,11 +689,12 @@ async def query(params: QueryParams) -> AsyncIterator[QueryEvent]:
                 detail={"error_type": type(exc).__name__},
             ))
 
-        candidate_messages = (
-            list(tool_results_result.messages)
-            if tool_results_result is not None and tool_results_result.messages is not None
-            else [outcome.message for outcome in outcomes]
-        )
+        candidate_messages: list[BaseMessage]
+        if tool_results_result is not None and tool_results_result.messages is not None:
+            candidate_messages = list(tool_results_result.messages)
+        else:
+            candidate_messages = []
+            candidate_messages.extend(outcome.message for outcome in outcomes)
         missing_error_type = (
             ToolErrorType.cancelled
             if batch_cancelled
