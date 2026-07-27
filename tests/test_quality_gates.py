@@ -9,6 +9,7 @@ from open_deep_research.quality import (
     TOOL_RESULT_EVALUATION_PROMPT,
     ToolResultAssessment,
     _build_quality_model,
+    _normalize_quality_payload,
     deterministic_handoff_checks,
     deterministic_tool_checks,
 )
@@ -58,6 +59,33 @@ def test_deterministic_tool_checks_require_traceable_search_sources() -> None:
     assert failed["failures"] == ["insufficient_traceable_sources"]
 
 
+def test_deterministic_tool_checks_use_cumulative_evidence_sources() -> None:
+    checks = deterministic_tool_checks(
+        [{
+            "name": "web_research",
+            "content": (
+                '{"documents":[{"final_url":"https://a.example/paper"}],'
+                '"evidence":[{"source_url":"https://a.example/paper"}]}'
+            ),
+            "error": False,
+        }],
+        min_sources=2,
+        evidence_registry=[
+            {
+                "source_url": "https://a.example/paper",
+                "security_status": "accepted",
+            },
+            {
+                "source_url": "https://b.example/repository",
+                "security_status": "accepted",
+            },
+        ],
+    )
+
+    assert checks["passed"] is True
+    assert checks["source_count"] == 2
+
+
 def test_deterministic_handoff_checks_reject_short_unsourced_output() -> None:
     checks = deterministic_handoff_checks(
         {"compressed_research": "too short", "raw_notes": []},
@@ -80,6 +108,30 @@ def test_compact_handoff_can_report_source_count_without_raw_notes() -> None:
 
     assert checks["passed"] is True
     assert checks["source_count"] == 3
+
+
+def test_quality_payload_normalizes_cross_provider_score_variations() -> None:
+    normalized = _normalize_quality_payload({
+        "decision": " Continue ",
+        "relevance": "5",
+        "source_quality": 6,
+        "evidence_coverage": 0,
+        "corroboration": 3.6,
+        "unresolved_conflicts": None,
+        "missing_information": [],
+        "suggested_queries": None,
+        "reason": "Useful but incomplete.",
+    })
+
+    assessment = ToolResultAssessment.model_validate(normalized)
+
+    assert assessment.decision == "continue"
+    assert assessment.relevance == 5
+    assert assessment.source_quality == 5
+    assert assessment.evidence_coverage == 1
+    assert assessment.corroboration == 4
+    assert assessment.unresolved_conflicts == []
+    assert assessment.suggested_queries == []
 
 
 def test_final_notes_include_only_accepted_research_handoffs() -> None:
@@ -115,7 +167,10 @@ def test_final_notes_include_only_accepted_research_handoffs() -> None:
 
 @pytest.mark.asyncio
 async def test_assessment_node_routes_retry_back_to_researcher(monkeypatch) -> None:
+    captured: dict = {}
+
     async def fake_evaluate(*_args, **_kwargs):
+        captured["evidence_registry"] = _kwargs["evidence_registry"]
         return ToolResultAssessment(
             decision="retry",
             relevance=4,
@@ -136,6 +191,10 @@ async def test_assessment_node_routes_retry_back_to_researcher(monkeypatch) -> N
             "content": "Evidence https://a.example and https://b.example",
             "error": False,
         }],
+        "evidence_registry": [{
+            "claim": "Cumulative evidence",
+            "source_url": "https://a.example",
+        }],
     }
 
     command = await deep_researcher.assess_research_results(
@@ -146,6 +205,7 @@ async def test_assessment_node_routes_retry_back_to_researcher(monkeypatch) -> N
     assert command.goto == "researcher"
     assert command.update["result_assessment"]["decision"] == "retry"
     assert "assessment JSON" in command.update["researcher_messages"][0].content
+    assert captured["evidence_registry"] == state["evidence_registry"]
 
 
 @pytest.mark.asyncio
