@@ -9,6 +9,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
@@ -34,6 +35,8 @@ from open_deep_research.security.inputs import (
     validate_http_metadata,
 )
 from security.auth import apply_user_to_config, get_current_user
+
+load_dotenv()
 
 
 class RunRequest(BaseModel):
