@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 from typing import Any
@@ -11,6 +12,9 @@ from langchain_core.messages import AIMessage, ToolMessage
 
 from open_deep_research.agents import deep_researcher
 from open_deep_research.agents.query_engine import QueryEngine
+from open_deep_research.configuration import Configuration
+from open_deep_research.quality import HandoffAssessment
+from open_deep_research.run_context import RunContextStore
 from open_deep_research.state import ConductResearch
 from open_deep_research.tools import utils
 from open_deep_research.tools.base import (
@@ -343,6 +347,85 @@ async def test_parallel_sync_handoffs_do_not_merge_raw_context_into_supervisor(
 
 
 @pytest.mark.asyncio
+async def test_rejected_sync_handoff_keeps_artifact_ref_without_admitting_evidence(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    async def fake_ainvoke(_state, _config):
+        return {
+            "research_topic": "topic",
+            "researcher_messages": [],
+            "compressed_research": "A rejected but inspectable research handoff. " * 20,
+            "raw_notes": ["raw evidence remains quarantined from shared notes"],
+            "evidence_registry": [
+                {
+                    "evidence_id": "rejected-evidence",
+                    "source_url": "https://example.test/source",
+                }
+            ],
+            "metrics": {"sources_read": 1},
+        }
+
+    async def reject_handoff(*_args, **_kwargs):
+        return HandoffAssessment(
+            accepted=False,
+            relevance=4,
+            source_quality=2,
+            evidence_coverage=2,
+            groundedness=2,
+            missing_information=["primary source excerpt"],
+            follow_up_tasks=["inspect the persisted evidence"],
+            reason="The handoff requires source-level inspection.",
+        )
+
+    monkeypatch.setattr(deep_researcher.researcher_runtime, "ainvoke", fake_ainvoke)
+    monkeypatch.setattr(
+        deep_researcher,
+        "evaluate_subagent_handoff",
+        reject_handoff,
+    )
+    task_id = "conduct-rejected"
+    command = await deep_researcher._execute_supervisor_tools(
+        {
+            "enable_async_research": False,
+            "supervisor_messages": [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "ConductResearch",
+                            "args": {"research_topic": "topic"},
+                            "id": task_id,
+                        }
+                    ],
+                )
+            ],
+        },
+        {
+            "configurable": {
+                "runs_dir": str(tmp_path),
+                "quality_evaluation_enabled": True,
+            },
+            "metadata": {"run_id": "rejected-artifact"},
+        },
+    )
+
+    payload = json.loads(command.update["supervisor_messages"][0].content)
+    artifact_ref = payload["artifact_ref"]
+    assert payload["task_id"] == task_id
+    assert len(artifact_ref["sha256"]) == 64
+    assert command.update["research_artifact_refs"][task_id] == artifact_ref
+    assert "evidence_registry" not in command.update
+    assert "raw_notes" not in command.update
+
+    artifact = RunContextStore(
+        "rejected-artifact",
+        runs_dir=str(tmp_path),
+    ).load_task_result(task_id, expected_sha256=artifact_ref["sha256"])
+    assert artifact["evidence_registry"][0]["evidence_id"] == "rejected-evidence"
+
+
+@pytest.mark.asyncio
 async def test_sync_conduct_and_complete_same_batch_preserves_artifact_evidence(
     monkeypatch,
     tmp_path,
@@ -489,6 +572,190 @@ async def test_compression_does_not_reemit_accumulated_registry_lists(
         "web_research_iterations",
     ):
         assert key not in update
+
+
+@pytest.mark.asyncio
+async def test_compression_retries_tool_mode_and_excludes_agent_plans(
+    monkeypatch,
+) -> None:
+    captured_messages: list[list] = []
+    responses = iter([
+        AIMessage(content=(
+            "<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke "
+            'name="web_research"></｜｜DSML｜｜invoke>'
+        )),
+        AIMessage(content=(
+            "The primary paper defines an atomic-fact precision metric [1].\n\n"
+            "### Sources\n[1] Paper: https://primary.example/paper"
+        )),
+    ])
+
+    async def fake_invoke(_model, messages, *_args, **_kwargs):
+        captured_messages.append(messages)
+        return next(responses)
+
+    monkeypatch.setattr(
+        deep_researcher,
+        "invoke_model_with_retry_observability",
+        fake_invoke,
+    )
+    update = await deep_researcher.compress_research(
+        {
+            "research_topic": "Explain the metric from primary sources.",
+            "researcher_messages": [
+                AIMessage(content="AGENT_PLAN_SENTINEL: search one more time"),
+                ToolMessage(
+                    content=(
+                        '{"claim":"TOOL_EVIDENCE_SENTINEL",'
+                        '"url":"https://primary.example/paper"}'
+                    ),
+                    name="web_research",
+                    tool_call_id="search-1",
+                ),
+            ],
+            "evidence_registry": [{
+                "claim": "The metric measures atomic factual precision.",
+                "source_title": "Primary paper",
+                "source_url": "https://primary.example/paper",
+                "supporting_excerpt": "Each generation is broken into atomic facts.",
+                "security_status": "accepted",
+            }],
+        },
+        {
+            "configurable": {"compression_model": "openai:deepseek-v4-flash"},
+            "metadata": {"run_id": "compression-tool-mode-test"},
+        },
+    )
+
+    assert len(captured_messages) == 2
+    assert all(
+        "AGENT_PLAN_SENTINEL" not in messages[-1].content
+        for messages in captured_messages
+    )
+    assert "TOOL_EVIDENCE_SENTINEL" in captured_messages[0][-1].content
+    assert "primary paper defines" in update["compressed_research"]
+    assert "AGENT_PLAN_SENTINEL" not in update["raw_notes"][0]
+
+
+@pytest.mark.asyncio
+async def test_compression_falls_back_to_structured_evidence(
+    monkeypatch,
+) -> None:
+    attempts = 0
+
+    async def fake_invoke(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        return AIMessage(content=(
+            "<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke "
+            'name="fetch_url"></｜｜DSML｜｜invoke>'
+        ))
+
+    monkeypatch.setattr(
+        deep_researcher,
+        "invoke_model_with_retry_observability",
+        fake_invoke,
+    )
+    update = await deep_researcher.compress_research(
+        {
+            "research_topic": "Explain the metric.",
+            "researcher_messages": [],
+            "evidence_registry": [{
+                "claim": "The primary method decomposes text into atomic facts.",
+                "source_title": "Original paper",
+                "source_url": "https://primary.example/paper",
+                "supporting_excerpt": "Atomic facts are individually verified.",
+                "security_status": "accepted",
+            }],
+        },
+        {
+            "configurable": {"compression_model": "openai:deepseek-v4-flash"},
+            "metadata": {"run_id": "compression-fallback-test"},
+        },
+    )
+
+    assert attempts == 3
+    assert "decomposes text into atomic facts" in update["compressed_research"]
+    assert "https://primary.example/paper" in update["compressed_research"]
+
+
+@pytest.mark.asyncio
+async def test_compression_applies_model_call_timeout(
+    monkeypatch,
+) -> None:
+    attempts = 0
+
+    async def never_returns(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        deep_researcher,
+        "invoke_model_with_retry_observability",
+        never_returns,
+    )
+    update = await deep_researcher.compress_research(
+        {
+            "research_topic": "Explain the metric.",
+            "researcher_messages": [],
+            "evidence_registry": [{
+                "claim": "The metric validates atomic facts.",
+                "source_title": "Original paper",
+                "source_url": "https://primary.example/paper",
+                "supporting_excerpt": "Atomic facts are individually verified.",
+                "security_status": "accepted",
+            }],
+        },
+        {
+            "configurable": {
+                "compression_model": "openai:deepseek-v4-flash",
+                "model_call_timeout_seconds": 0.01,
+            },
+            "metadata": {"run_id": "compression-timeout-test"},
+        },
+    )
+
+    assert attempts == 3
+    assert "validates atomic facts" in update["compressed_research"]
+
+
+def test_quality_handoff_loads_full_durable_artifact(tmp_path) -> None:
+    run_id = "quality-artifact-run"
+    task_id = "research-task-1"
+    artifact = {
+        "task_id": task_id,
+        "research_topic": "Primary-source research",
+        "compressed_research": "Detailed finding. " * 30,
+        "raw_notes": ["Direct evidence from the original paper."],
+        "evidence_registry": [{
+            "claim": "Supported claim",
+            "source_url": "https://primary.example/paper",
+        }],
+        "metrics": {"sources_read": 2},
+    }
+    store = RunContextStore(run_id, runs_dir=str(tmp_path))
+    digest = store.persist_task_result(task_id, artifact)
+    compact_handoff = {
+        "task_id": task_id,
+        "research_topic": artifact["research_topic"],
+        "compressed_research": artifact["compressed_research"],
+        "artifact_ref": {
+            "path": f"context/artifacts/research_tasks/{task_id}.json",
+            "sha256": digest,
+        },
+        "metrics": artifact["metrics"],
+    }
+
+    expanded = deep_researcher._load_handoff_artifact_for_quality(
+        compact_handoff,
+        task_id=task_id,
+        run_id=run_id,
+        configurable=Configuration(runs_dir=str(tmp_path)),
+    )
+
+    assert expanded["raw_notes"] == artifact["raw_notes"]
+    assert expanded["evidence_registry"] == artifact["evidence_registry"]
 
 
 class _RobotsResponse:
