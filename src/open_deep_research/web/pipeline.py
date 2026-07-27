@@ -40,8 +40,50 @@ from open_deep_research.web.models import (
 
 TRACKING_PARAMS = {"gclid", "fbclid", "dclid", "msclkid", "mc_cid", "mc_eid"}
 WORD_RE = re.compile(r"[\w\u3400-\u9fff]{2,}", re.UNICODE)
-SENTENCE_RE = re.compile(r"(?<=[。！？.!?])\s+|\n+")
+SENTENCE_RE = re.compile(r"(?<=[。！？.!?])\s+")
+EVIDENCE_BLOCK_RE = re.compile(r"\n\s*\n+")
+COMPLETE_SENTENCE_RE = re.compile(r"[。！？.!?](?:[\"'”’)\]}`*_]+)?$")
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
+EVIDENCE_STOPWORDS = frozenset({
+    "a",
+    "after",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "been",
+    "before",
+    "by",
+    "extract",
+    "find",
+    "for",
+    "format",
+    "from",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "of",
+    "on",
+    "or",
+    "pep",
+    "read",
+    "rule",
+    "section",
+    "specifically",
+    "that",
+    "the",
+    "their",
+    "this",
+    "to",
+    "verify",
+    "was",
+    "were",
+    "with",
+})
 JS_SHELL_MARKERS = (
     "enable javascript",
     "javascript is required",
@@ -175,6 +217,24 @@ def normalize_candidates(candidates: list[CandidateSource], limit: int) -> list[
 
 def _terms(text: str) -> set[str]:
     return {match.group(0).lower() for match in WORD_RE.finditer(text or "")}
+
+
+def _evidence_terms(text: str) -> set[str]:
+    """Return content-bearing terms for evidence coverage selection."""
+    normalized: set[str] = set()
+    for term in _terms(text):
+        if term.isdigit() or term in EVIDENCE_STOPWORDS:
+            continue
+        if (
+            term.isascii()
+            and len(term) > 4
+            and term.endswith("s")
+            and not term.endswith(("ss", "us", "is"))
+        ):
+            term = term[:-1]
+        if term not in EVIDENCE_STOPWORDS:
+            normalized.add(term)
+    return normalized
 
 
 def _heuristic_authority(candidate: CandidateSource) -> float:
@@ -581,38 +641,139 @@ def select_chunks(objective: str, chunks: list[DocumentChunk], limit: int) -> li
     return [item[2] for item in scored[:limit]]
 
 
+def _safe_evidence_sentences(text: str) -> list[str]:
+    """Keep factual sentences while quarantining local and cross-sentence attacks."""
+    candidates: list[str] = []
+    for block in EVIDENCE_BLOCK_RE.split(text):
+        normalized_block = " ".join(
+            line.strip(" -*\t")
+            for line in block.splitlines()
+            if line.strip(" -*\t")
+        )
+        candidates.extend(
+            sentence
+            for raw_sentence in SENTENCE_RE.split(normalized_block)
+            if (sentence := " ".join(raw_sentence.split()).strip())
+        )
+
+    blocked = {
+        index
+        for index, sentence in enumerate(candidates)
+        if inspect_untrusted_content(sentence)
+    }
+    for index in range(len(candidates) - 1):
+        if index in blocked or index + 1 in blocked:
+            continue
+        if inspect_untrusted_content(
+            f"{candidates[index]} {candidates[index + 1]}"
+        ):
+            blocked.update({index, index + 1})
+    return [
+        sentence
+        for index, sentence in enumerate(candidates)
+        if index not in blocked and 40 <= len(sentence) <= 1000
+    ]
+
+
+def _select_evidence_sentences(
+    objective: str,
+    sentences: list[str],
+    *,
+    limit: int = 3,
+) -> list[str]:
+    """Select relevant sentences while rewarding new objective dimensions."""
+    objective_terms = _evidence_terms(objective)
+    remaining_terms = set(objective_terms)
+    candidates = [
+        (index, sentence, _evidence_terms(sentence) & objective_terms)
+        for index, sentence in enumerate(sentences)
+    ]
+    if not objective_terms or not any(item[2] for item in candidates):
+        return sentences[:limit]
+    selected: list[str] = []
+    while candidates and len(selected) < limit:
+        best = max(
+            candidates,
+            key=lambda item: (
+                len(item[2] & remaining_terms),
+                len(item[2]),
+                -len(item[1]),
+                -item[0],
+            ),
+        )
+        candidates.remove(best)
+        selected.append(best[1])
+        remaining_terms.difference_update(best[2])
+    return selected
+
+
 def evidence_from_chunks(
     objective: str,
     document_by_id: dict[str, ExtractedDocument],
     chunks: list[DocumentChunk],
 ) -> list[EvidenceRecord]:
     """Create bounded claim evidence while quarantining instruction-shaped chunks."""
-    objective_terms = _terms(objective)
     evidence: list[EvidenceRecord] = []
     for chunk in chunks:
-        if inspect_untrusted_content(chunk.text):
-            continue
-        sentences = [line.strip(" -*\t") for line in SENTENCE_RE.split(chunk.text) if len(line.strip()) >= 40]
-        sentences.sort(key=lambda line: len(objective_terms & _terms(line)), reverse=True)
-        excerpt = (sentences[0] if sentences else chunk.text[:800]).strip()[:1000]
-        if not excerpt:
-            continue
+        sentences = _safe_evidence_sentences(chunk.text)
         document = document_by_id[chunk.document_id]
         locator = f"page {chunk.page}" if chunk.page else f"chars {chunk.start_offset}-{chunk.end_offset}"
-        evidence.append(
-            EvidenceRecord(
-                evidence_id=stable_id("ev", f"{chunk.chunk_id}:{excerpt}"),
-                claim=excerpt,
-                supporting_excerpt=excerpt,
-                document_id=document.document_id,
-                chunk_id=chunk.chunk_id,
-                locator=locator,
-                source_url=document.final_url,
-                source_title=document.title,
-                confidence=0.7,
+        for excerpt in _select_evidence_sentences(objective, sentences):
+            evidence.append(
+                EvidenceRecord(
+                    evidence_id=stable_id("ev", f"{chunk.chunk_id}:{excerpt}"),
+                    claim=excerpt,
+                    supporting_excerpt=excerpt,
+                    document_id=document.document_id,
+                    chunk_id=chunk.chunk_id,
+                    locator=locator,
+                    source_url=document.final_url,
+                    source_title=document.title,
+                    confidence=0.7,
+                )
             )
-        )
     return evidence
+
+
+def _complete_model_evidence(record: EvidenceRecord) -> bool:
+    """Reject model claims backed only by a heading or truncated line fragment."""
+    claim = " ".join(record.claim.split()).strip()
+    excerpt = " ".join(record.supporting_excerpt.split()).strip()
+    if (
+        not claim
+        or not 40 <= len(excerpt) <= 1000
+        or not COMPLETE_SENTENCE_RE.search(excerpt)
+        or inspect_untrusted_content(excerpt)
+    ):
+        return False
+    if claim.casefold() == excerpt.casefold():
+        return True
+    if excerpt.casefold() in claim.casefold():
+        return len(excerpt) / max(1, len(claim)) >= 0.6
+    claim_terms = _terms(claim)
+    if not claim_terms:
+        return False
+    return len(claim_terms & _terms(excerpt)) / len(claim_terms) >= 0.5
+
+
+def merge_evidence_records(
+    primary: list[EvidenceRecord],
+    deterministic: list[EvidenceRecord],
+) -> list[EvidenceRecord]:
+    """Keep model claims while filling omitted chunk facts with grounded evidence."""
+    merged: list[EvidenceRecord] = []
+    seen: set[tuple[str, str]] = set()
+    grounded_primary = [
+        record for record in primary if _complete_model_evidence(record)
+    ]
+    for record in [*grounded_primary, *deterministic]:
+        excerpt_key = " ".join(record.supporting_excerpt.split()).casefold()
+        key = (record.source_url, excerpt_key)
+        if not excerpt_key or key in seen:
+            continue
+        seen.add(key)
+        merged.append(record)
+    return merged
 
 
 def analyze_gaps(
@@ -869,15 +1030,24 @@ class WebResearchPipeline:
             request.objective, all_chunks, self.settings.max_chunks_per_iteration
         )
         document_by_id = {document.document_id: document for document in unique_documents}
+        deterministic_evidence = evidence_from_chunks(
+            request.objective,
+            document_by_id,
+            selected_chunks,
+        )
         if self.evidence_extractor:
             try:
-                evidence = await self.evidence_extractor(
+                model_evidence = await self.evidence_extractor(
                     request.objective, document_by_id, selected_chunks
                 )
             except Exception:  # noqa: BLE001 - deterministic evidence is the safe fallback
-                evidence = evidence_from_chunks(request.objective, document_by_id, selected_chunks)
+                model_evidence = []
+            evidence = merge_evidence_records(
+                model_evidence,
+                deterministic_evidence,
+            )
         else:
-            evidence = evidence_from_chunks(request.objective, document_by_id, selected_chunks)
+            evidence = deterministic_evidence
         authority_by_candidate = {
             item.candidate.candidate_id: item.authority for item in ranked
         }

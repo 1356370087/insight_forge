@@ -24,6 +24,7 @@ from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool as lc_tool
 
+from open_deep_research.configuration import Configuration
 from open_deep_research.state import ConductResearch, ResearchComplete
 from open_deep_research.tasks.registry import TaskStatus
 from open_deep_research.tools.adapters import adapt_langchain_tool
@@ -233,6 +234,23 @@ class TestWhitelistFiltering:
         allowed = resolve_allowed_tools(AgentRole.RESEARCHER, config, {"tavily_search", "think_tool"})
         # Assert
         assert allowed == {"tavily_search"}  # stale name dropped
+
+    def test_tool_whitelist_env_accepts_comma_separated_values(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.setenv(
+            "RESEARCHER_TOOL_WHITELIST",
+            "fetch_url, think_tool, ResearchComplete",
+        )
+
+        configurable = Configuration.from_runnable_config({"configurable": {}})
+
+        assert configurable.researcher_tool_whitelist == [
+            "fetch_url",
+            "think_tool",
+            "ResearchComplete",
+        ]
 
     def test_resolve_allowed_supervisor_uses_supervisor_whitelist(self):
         # Arrange
