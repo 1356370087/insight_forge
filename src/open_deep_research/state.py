@@ -133,6 +133,9 @@ class AgentState(AgentInputState, total=False):
     sources: Annotated[list[dict], override_reducer]
     # Deterministically derived report requirements used by both writer and Judge.
     coverage_checklist: Annotated[list[str], override_reducer]
+    # Versioned, data-minimized inputs retained for offline evaluation after
+    # transient notes and full task outputs are cleared.
+    evaluation_snapshot: dict
     candidate_registry: Annotated[list[dict], override_reducer]
     document_registry: Annotated[list[dict], override_reducer]
     evidence_registry: Annotated[list[dict], override_reducer]

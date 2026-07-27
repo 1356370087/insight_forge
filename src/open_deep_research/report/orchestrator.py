@@ -12,20 +12,24 @@ Contract preserved for backward compatibility:
 * ``messages`` carries the writer AIMessage; terminal writer failures propagate.
 * ``notes`` and ``completed_task_outputs`` are cleared via the override reducer,
   exactly as before.
-* For the default profile (markdown, one-shot) no extra state/SSE keys are
-  produced — the output is identical to the original node.
+* Every successful report stores a data-minimized ``evaluation_snapshot`` before
+  transient evidence is released.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from typing import Optional
 
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 
 from open_deep_research.configuration import Configuration
+from open_deep_research.evaluation import build_evaluation_snapshot
+from open_deep_research.evidence import eligible_evidence_records
 from open_deep_research.observability import get_trace_recorder
+from open_deep_research.run_context import RunContextStore
 from open_deep_research.security.content import sanitize_report_markdown
 
 from .assembly import ReportContext, assemble
@@ -87,6 +91,39 @@ def _research_was_attempted(state: dict) -> bool:
     return False
 
 
+def _load_researcher_task_artifacts(
+    state: dict,
+    config: RunnableConfig,
+    cfg: Configuration,
+) -> list[dict]:
+    """Load integrity-checked task artifacts for the minimized evaluation view."""
+    refs = state.get("research_artifact_refs", {})
+    if (
+        isinstance(refs, dict)
+        and refs.get("type") == "override"
+        and isinstance(refs.get("value"), dict)
+    ):
+        refs = refs["value"]
+    if not isinstance(refs, Mapping) or not refs:
+        return []
+    run_id = str(config.get("metadata", {}).get("run_id", "default"))
+    store = RunContextStore(run_id, runs_dir=cfg.runs_dir)
+    artifacts: list[dict] = []
+    for task_id, raw_ref in list(refs.items())[:50]:
+        if not isinstance(raw_ref, Mapping) or not raw_ref.get("sha256"):
+            continue
+        try:
+            artifact = store.load_task_result(
+                str(task_id),
+                expected_sha256=str(raw_ref["sha256"]),
+            )
+        except (FileNotFoundError, ValueError):
+            continue
+        artifact.setdefault("task_id", str(task_id))
+        artifacts.append(artifact)
+    return artifacts
+
+
 async def build_report(state: dict, config: RunnableConfig) -> dict:
     """Build the final report product from collected research state.
 
@@ -99,8 +136,9 @@ async def build_report(state: dict, config: RunnableConfig) -> dict:
 
     Returns:
         The state update dict (``final_report``, ``messages``, cleared notes),
-        plus ``report_artifacts`` only when a non-markdown format is produced,
-        and ``sources`` only when non-default reference handling runs.
+        plus ``evaluation_snapshot`` for deterministic offline scoring,
+        ``report_artifacts`` only when a non-markdown format is produced, and
+        ``sources`` only when non-default reference handling runs.
     """
     cfg = Configuration.from_runnable_config(config)
     accepted_notes = [
@@ -108,12 +146,22 @@ async def build_report(state: dict, config: RunnableConfig) -> dict:
         for note in state.get("notes", [])
         if "rejected_by_supervisor_quality_gate" not in str(note)
     ]
-    has_accepted_evidence = bool(
-        accepted_notes
-        or state.get("raw_notes")
-        or state.get("completed_task_outputs")
-        or state.get("evidence_registry")
-    )
+    evidence_registry = state.get("evidence_registry", [])
+    if (
+        isinstance(evidence_registry, dict)
+        and evidence_registry.get("type") == "override"
+    ):
+        evidence_registry = evidence_registry.get("value", [])
+    if isinstance(evidence_registry, list) and evidence_registry:
+        has_accepted_evidence = bool(
+            eligible_evidence_records(evidence_registry)
+        )
+    else:
+        has_accepted_evidence = bool(
+            accepted_notes
+            or state.get("raw_notes")
+            or state.get("completed_task_outputs")
+        )
     if (
         cfg.quality_evaluation_enabled
         and _research_was_attempted(state)
@@ -128,6 +176,16 @@ async def build_report(state: dict, config: RunnableConfig) -> dict:
 
     ctx = ReportContext.from_state(state, config, profile)
     coverage_checklist = derive_state_coverage_checklist(state)
+    researcher_task_artifacts = _load_researcher_task_artifacts(
+        state,
+        config,
+        cfg,
+    )
+    evaluation_snapshot = build_evaluation_snapshot(
+        state,
+        coverage_checklist=coverage_checklist,
+        researcher_task_artifacts=researcher_task_artifacts,
+    )
     if cfg.quality_evaluation_enabled and not ctx.sources:
         raw_evidence = "\n".join(
             str(note)
@@ -226,6 +284,10 @@ async def build_report(state: dict, config: RunnableConfig) -> dict:
             [result.message]
             if result.message is not None and str(result.message.content) == markdown
             else [AIMessage(content=markdown)]
+        ),
+        "evaluation_snapshot": evaluation_snapshot.model_dump(
+            mode="json",
+            exclude_none=True,
         ),
         **_cleared_state(),
         "coverage_checklist": {

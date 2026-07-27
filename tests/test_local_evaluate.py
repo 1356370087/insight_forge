@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from open_deep_research.configuration import Configuration
 from open_deep_research.report.coverage import (
     derive_coverage_checklist,
@@ -10,6 +12,7 @@ from open_deep_research.report.coverage import (
 )
 from open_deep_research.sandbox.policy import allowed_domains
 from open_deep_research.tools.utils import get_model_connection_kwargs
+from tests import run_local_evaluate
 from tests.run_local_evaluate import (
     aggregate_score,
     assess_quality,
@@ -17,6 +20,8 @@ from tests.run_local_evaluate import (
     build_run_config,
     reconcile_judge_metrics,
     recover_persisted_evidence,
+    refresh_quality_existing,
+    rescore_existing,
 )
 
 
@@ -24,6 +29,19 @@ def test_local_evaluation_defaults_to_one_question() -> None:
     args = build_argument_parser().parse_args([])
 
     assert args.question_limit == 1
+    assert args.question is None
+
+
+def test_local_evaluation_accepts_one_custom_question() -> None:
+    args = build_argument_parser().parse_args([
+        "--question",
+        "Compare three citation evaluation methods.",
+        "--question-title",
+        "Citation methods",
+    ])
+
+    assert args.question == "Compare three citation evaluation methods."
+    assert args.question_title == "Citation methods"
 
 
 def test_local_evaluation_uses_read_only_search_network_mode(monkeypatch) -> None:
@@ -38,6 +56,21 @@ def test_local_evaluation_uses_read_only_search_network_mode(monkeypatch) -> Non
         encoding="utf-8"
     )
     assert "WEB_PIPELINE_MODE=enforced" in env_example
+    assert "WEB_RERANK_MODEL=openai:deepseek-v4-flash\n" in env_example
+    assert "WEB_EVIDENCE_MODEL=openai:deepseek-v4-flash\n" in env_example
+
+
+def test_local_evaluation_web_models_follow_valid_summarization_model(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SUMMARIZATION_MODEL", "openai:deepseek-v4-flash")
+    monkeypatch.delenv("WEB_RERANK_MODEL", raising=False)
+    monkeypatch.delenv("WEB_EVIDENCE_MODEL", raising=False)
+
+    config = build_run_config()["configurable"]
+
+    assert config["web_rerank_model"] == "openai:deepseek-v4-flash"
+    assert config["web_evidence_model"] == "openai:deepseek-v4-flash"
 
 
 def test_deepseek_research_models_use_deepseek_credentials_and_endpoint(
@@ -118,12 +151,21 @@ def test_quality_assessment_cannot_average_away_missing_grounding() -> None:
 
 def test_local_run_disables_clarification(monkeypatch) -> None:
     monkeypatch.setenv("ALLOW_CLARIFICATION", "true")
+    monkeypatch.setenv("ENABLE_MEMORY", "true")
+    monkeypatch.setenv("WEB_PIPELINE_MODE", "legacy")
+    monkeypatch.setenv("SANDBOX_NETWORK_MODE", "full")
 
     config = build_run_config()
 
     assert config["configurable"]["allow_clarification"] is False
     assert config["configurable"]["web_pipeline_mode"] == "enforced"
     assert config["metadata"]["evaluation_mode"] == "local"
+    with run_local_evaluate.evaluation_runtime_environment():
+        resolved = Configuration.from_runnable_config(config)
+        assert resolved.allow_clarification is False
+        assert resolved.enable_memory is False
+        assert resolved.web_pipeline_mode == "enforced"
+        assert resolved.sandbox_network_mode == "allow-search-only"
 
 
 def test_local_run_uses_fresh_isolated_context() -> None:
@@ -141,6 +183,17 @@ def test_recover_persisted_evidence_reads_latest_update(monkeypatch) -> None:
     records = [
         {"payload": {"update": {"notes": ["old"]}}},
         {"payload": {"update": {"notes": ["new"], "raw_notes": ["evidence"]}}},
+        {
+            "payload": {
+                "update": {
+                    "evaluation_snapshot": {
+                        "schema_version": "1.0",
+                        "evidence_registry": [{"evidence_id": "ev-1"}],
+                        "tool_trace": {"completed_task_metrics": [{"task_id": "task-1"}]},
+                    }
+                }
+            }
+        },
         {"payload": {"update": {"notes": {"type": "override", "value": []}}}},
     ]
     monkeypatch.setattr(
@@ -150,9 +203,100 @@ def test_recover_persisted_evidence_reads_latest_update(monkeypatch) -> None:
     )
 
     assert recover_persisted_evidence("run-1") == {
-        "notes": ["new"],
+        "notes": [],
         "raw_notes": ["evidence"],
+        "evaluation_snapshot": {
+            "schema_version": "1.0",
+            "evidence_registry": [{"evidence_id": "ev-1"}],
+            "tool_trace": {"completed_task_metrics": [{"task_id": "task-1"}]},
+        },
     }
+
+
+@pytest.mark.asyncio
+async def test_rescore_writes_derived_artifact_without_mutating_source(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "result.json"
+    source_payload = {
+        "id": "question-1",
+        "title": "Question 1",
+        "question": "Research claim A",
+        "status": "success",
+        "final_report": "Supported report.",
+        "research_elapsed_seconds": 1.0,
+        "evaluation_elapsed_seconds": 2.0,
+        "metrics": [],
+        "configuration": {},
+        "run_result": {"status": "success"},
+    }
+    source.write_text(
+        json.dumps(source_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    original_bytes = source.read_bytes()
+
+    async def fake_evaluate_state(_inputs, _state):
+        return [
+            {
+                "evaluator": "relevance",
+                "key": "relevance_score",
+                "score": 0.8,
+                "comment": "rescored",
+                "status": "scored",
+            }
+        ]
+
+    monkeypatch.setattr(
+        run_local_evaluate,
+        "evaluate_state",
+        fake_evaluate_state,
+    )
+
+    derived_path = await rescore_existing(source)
+
+    assert isinstance(derived_path, Path)
+    assert derived_path != source
+    assert source.read_bytes() == original_bytes
+    assert derived_path.exists()
+    derived = json.loads(derived_path.read_text(encoding="utf-8"))
+    assert derived["metrics"][0]["comment"] == "rescored"
+    assert derived["rescore_provenance"]["source_artifact"] == str(source.resolve())
+    assert derived["rescore_provenance"]["source_sha256"]
+
+
+def test_quality_refresh_writes_derived_artifact_without_mutating_source(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "result.json"
+    source_payload = {
+        "id": "question-1",
+        "title": "Question 1",
+        "question": "Research claim A",
+        "status": "success",
+        "final_report": "Supported report.",
+        "research_elapsed_seconds": 1.0,
+        "evaluation_elapsed_seconds": 2.0,
+        "aggregate_score": 0.8,
+        "metrics": [],
+    }
+    source.write_text(
+        json.dumps(source_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    original_bytes = source.read_bytes()
+
+    derived_path = refresh_quality_existing(source)
+
+    assert derived_path != source
+    assert source.read_bytes() == original_bytes
+    derived = json.loads(derived_path.read_text(encoding="utf-8"))
+    assert derived["quality_grade"] == "failed"
+    assert derived["quality_refresh_provenance"]["source_artifact"] == str(
+        source.resolve()
+    )
+    assert derived["quality_refresh_provenance"]["source_sha256"]
 
 
 def test_coverage_checklist_preserves_explicit_deliverables() -> None:

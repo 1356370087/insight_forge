@@ -4,18 +4,26 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import statistics
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from dotenv import load_dotenv
 
 from open_deep_research.agents.query_engine import QueryEngine
+from open_deep_research.evaluation import (
+    EvaluationMetric,
+    JudgeConfig,
+    MetricStatus,
+    normalize_evaluator_metric,
+)
 from tests.evaluators import (
     eval_completeness,
     eval_evidence_integrity,
@@ -94,6 +102,9 @@ def _env_int(name: str, default: int) -> int:
 def build_run_config() -> dict[str, Any]:
     """Build the same QueryEngine configuration for every local question."""
     run_id = str(uuid.uuid4())
+    default_model = "openai:deepseek-v4-flash"
+    summarization_model = os.getenv("SUMMARIZATION_MODEL", default_model)
+    research_model = os.getenv("RESEARCH_MODEL", default_model)
     configurable = {
         "thread_id": run_id,
         # Evaluations must not recall or write cross-run long-term memory.
@@ -110,15 +121,15 @@ def build_run_config() -> dict[str, Any]:
         # arbitrary shell/MCP egress remains outside this policy.
         "sandbox_network_mode": "allow-search-only",
         "web_min_source_authority": float(os.getenv("WEB_MIN_SOURCE_AUTHORITY", "0.65")),
-        "web_rerank_model": os.getenv("WEB_RERANK_MODEL", "openai:deepseek-v4-flash[1m]"),
-        "web_evidence_model": os.getenv("WEB_EVIDENCE_MODEL", "openai:deepseek-v4-flash[1m]"),
-        "summarization_model": os.getenv("SUMMARIZATION_MODEL", "openai:deepseek-v4-flash[1m]"),
+        "web_rerank_model": os.getenv("WEB_RERANK_MODEL", summarization_model),
+        "web_evidence_model": os.getenv("WEB_EVIDENCE_MODEL", summarization_model),
+        "summarization_model": summarization_model,
         "summarization_model_max_tokens": _env_int("SUMMARIZATION_MODEL_MAX_TOKENS", 8192),
-        "research_model": os.getenv("RESEARCH_MODEL", "openai:deepseek-v4-flash[1m]"),
+        "research_model": research_model,
         "research_model_max_tokens": _env_int("RESEARCH_MODEL_MAX_TOKENS", 10000),
-        "compression_model": os.getenv("COMPRESSION_MODEL", "openai:deepseek-v4-flash[1m]"),
+        "compression_model": os.getenv("COMPRESSION_MODEL", research_model),
         "compression_model_max_tokens": _env_int("COMPRESSION_MODEL_MAX_TOKENS", 10000),
-        "final_report_model": os.getenv("FINAL_REPORT_MODEL", "openai:deepseek-v4-flash[1m]"),
+        "final_report_model": os.getenv("FINAL_REPORT_MODEL", research_model),
         "final_report_model_max_tokens": _env_int("FINAL_REPORT_MODEL_MAX_TOKENS", 10000),
     }
     return {
@@ -130,22 +141,33 @@ def build_run_config() -> dict[str, Any]:
     }
 
 
+@contextmanager
+def evaluation_runtime_environment() -> Iterator[None]:
+    """Lock isolation settings that must beat project-level environment defaults."""
+    overrides = {
+        "ALLOW_CLARIFICATION": "false",
+        "ENABLE_MEMORY": "false",
+        "SANDBOX_NETWORK_MODE": "allow-search-only",
+        "WEB_PIPELINE_MODE": "enforced",
+    }
+    previous = {name: os.environ.get(name) for name in overrides}
+    os.environ.update(overrides)
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 def _flatten_evaluation_result(
     evaluator_name: str,
     result: dict[str, Any] | list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     items = result if isinstance(result, list) else [result]
-    flattened = []
-    for item in items:
-        not_scored = str(item.get("comment", "")).startswith("Not scored:")
-        flattened.append({
-            "evaluator": evaluator_name,
-            "key": item["key"],
-            "score": None if not_scored else item.get("score"),
-            "comment": item.get("comment", ""),
-            "status": "not_scored" if not_scored else "scored",
-        })
-    return flattened
+    return [normalize_evaluator_metric(evaluator_name, item) for item in items]
 
 
 async def evaluate_state(inputs: dict[str, Any], state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -157,22 +179,22 @@ async def evaluate_state(inputs: dict[str, Any], state: dict[str, Any]) -> list[
             metrics.extend(_flatten_evaluation_result(evaluator_name, result))
         except Exception as exc:  # noqa: BLE001 - preserve the remaining local evaluation
             metrics.append(
-                {
-                    "evaluator": evaluator_name,
-                    "key": f"{evaluator_name}_score",
-                    "score": None,
-                    "comment": f"Evaluator failed: {exc}",
-                    "status": "error",
-                }
+                EvaluationMetric(
+                    evaluator=evaluator_name,
+                    key=f"{evaluator_name}_score",
+                    score=None,
+                    comment=f"Evaluator failed: {exc}",
+                    status=MetricStatus.EVALUATOR_ERROR,
+                ).model_dump(mode="json", exclude_none=False)
             )
     metrics.append(
-        {
-            "evaluator": "correctness",
-            "key": "correctness_score",
-            "score": None,
-            "comment": "Not scored because this local dataset has no independent golden answer.",
-            "status": "not_scored",
-        }
+        EvaluationMetric(
+            evaluator="correctness",
+            key="correctness_score",
+            score=None,
+            comment="Not scored because this local dataset has no independent golden answer.",
+            status=MetricStatus.NOT_SCORED,
+        ).model_dump(mode="json", exclude_none=False)
     )
     return reconcile_judge_metrics(metrics)
 
@@ -256,9 +278,14 @@ def assess_quality(metrics: list[dict[str, Any]], *, aggregate: float | None) ->
         "judge_consistency_score",
     )
     failures = [
-        f"{metric['key']} evaluator error"
+        f"{metric['key']} {metric.get('status')}"
         for metric in metrics
-        if metric.get("status") == "error"
+        if metric.get("status")
+        in {
+            "error",
+            MetricStatus.EVALUATOR_ERROR.value,
+            MetricStatus.RUN_FAILED.value,
+        }
     ]
     critical_scores: dict[str, float] = {}
     for key in critical_keys:
@@ -311,10 +338,25 @@ def _write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(_json_safe(payload), ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _write_new_json(path: Path, payload: Any) -> None:
+    """Create a derived artifact without replacing any existing file."""
+    serialized = json.dumps(_json_safe(payload), ensure_ascii=False, indent=2)
+    with path.open("x", encoding="utf-8") as stream:
+        stream.write(serialized)
+
+
 def recover_persisted_evidence(run_id: str) -> dict[str, Any]:
-    """Recover the latest evidence fields from a persisted QueryEngine journal."""
+    """Replay evaluation fields using the same append/override state semantics."""
     journal = ROOT / ".runs" / run_id / "context" / "session_memory.jsonl"
     recovered: dict[str, Any] = {}
+    reduced_list_fields = {
+        "notes",
+        "raw_notes",
+        "completed_task_outputs",
+        "supervisor_messages",
+        "coverage_checklist",
+        "evidence_registry",
+    }
     for line in journal.read_text(encoding="utf-8").splitlines():
         update = json.loads(line).get("payload", {}).get("update", {})
         for key in (
@@ -325,37 +367,107 @@ def recover_persisted_evidence(run_id: str) -> dict[str, Any]:
             "supervisor_messages",
             "coverage_checklist",
             "evidence_registry",
+            "evaluation_snapshot",
         ):
             if key not in update:
                 continue
             value = update[key]
             if isinstance(value, dict) and value.get("type") == "override":
-                value = value.get("value")
-            if value or key not in recovered:
+                recovered[key] = value.get("value")
+            elif key in reduced_list_fields and isinstance(value, list):
+                current = recovered.get(key, [])
+                recovered[key] = [
+                    *(current if isinstance(current, list) else []),
+                    *value,
+                ]
+            else:
                 recovered[key] = value
     return recovered
 
 
-async def rescore_existing(path: Path, run_id: str | None = None) -> dict[str, Any]:
-    """Repair Judge metrics for a completed local result without rerunning research."""
-    result = json.loads(path.read_text(encoding="utf-8"))
+def _default_derived_path(source: Path, label: str) -> Path:
+    timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-%f")
+    return source.with_name(f"{source.stem}.{label}-{timestamp}.json")
+
+
+def _supported_snapshot(result: dict[str, Any]) -> dict[str, Any] | None:
+    snapshot = result.get("evaluation_snapshot")
+    if isinstance(snapshot, dict) and snapshot.get("schema_version") == "1.0":
+        return snapshot
+    return None
+
+
+def _minimize_persisted_runtime_fields(result: dict[str, Any]) -> None:
+    """Drop transient runtime payloads once a versioned snapshot is available."""
+    if _supported_snapshot(result) is None:
+        return
+    for key in (
+        "raw_notes",
+        "notes",
+        "completed_task_outputs",
+        "supervisor_messages",
+        "evidence_registry",
+    ):
+        result.pop(key, None)
+
+
+def _write_derived_result(
+    source: Path,
+    destination: Path,
+    result: dict[str, Any],
+) -> Path:
+    """Persist a JSON/Markdown derivative while refusing every overwrite."""
+    if destination.resolve() == source.resolve():
+        raise ValueError("Derived output must differ from the source artifact")
+    if destination.suffix.lower() != ".json":
+        raise ValueError("Derived output must use a .json extension")
+    markdown_path = destination.with_suffix(".md")
+    if destination.exists() or markdown_path.exists():
+        raise FileExistsError(
+            f"Derived output already exists: {destination} or {markdown_path}"
+        )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    _write_new_json(destination, result)
+    with markdown_path.open("x", encoding="utf-8") as stream:
+        stream.write(_render_question_markdown(result))
+    return destination
+
+
+async def rescore_existing(
+    path: Path,
+    run_id: str | None = None,
+    *,
+    output_path: Path | None = None,
+) -> Path:
+    """Write a derived Judge artifact without mutating the completed research run."""
+    source_bytes = path.read_bytes()
+    result = json.loads(source_bytes)
     if run_id:
         recovered = recover_persisted_evidence(run_id)
         for key, value in recovered.items():
-            if value:
-                result[key] = value
+            result[key] = value
         result["run_id"] = run_id
+    snapshot = _supported_snapshot(result)
     state = {
         "final_report": result.get("final_report", ""),
-        "research_brief": result.get("research_brief", ""),
+        "research_brief": (
+            snapshot.get("research_brief")
+            if snapshot is not None
+            else result.get("research_brief", "")
+        ),
         "raw_notes": result.get("raw_notes", []),
         "notes": result.get("notes", []),
         "completed_task_outputs": result.get("completed_task_outputs", []),
         "supervisor_messages": result.get("supervisor_messages", []),
         "result": result.get("run_result", {}),
         "evaluation_metadata": result.get("configuration", {}),
-        "coverage_checklist": result.get("coverage_checklist", []),
+        "coverage_checklist": (
+            snapshot.get("coverage_checklist", [])
+            if snapshot is not None
+            else result.get("coverage_checklist", [])
+        ),
         "evidence_registry": result.get("evidence_registry", []),
+        "evaluation_snapshot": snapshot,
     }
     inputs = {"messages": [{"role": "user", "content": result["question"]}]}
     started = time.perf_counter()
@@ -363,9 +475,35 @@ async def rescore_existing(path: Path, run_id: str | None = None) -> dict[str, A
     result["evaluation_elapsed_seconds"] = time.perf_counter() - started
     result["aggregate_score"] = aggregate_score(result["metrics"])
     apply_quality_assessment(result)
-    _write_json(path, result)
-    path.with_suffix(".md").write_text(_render_question_markdown(result), encoding="utf-8")
-    return result
+    result["rescore_provenance"] = {
+        "source_artifact": str(path.resolve()),
+        "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
+        "rescored_at": datetime.now().astimezone().isoformat(),
+        "run_id": run_id or result.get("run_id"),
+        "evaluation_model": JudgeConfig.from_env().model_spec,
+    }
+    _minimize_persisted_runtime_fields(result)
+    destination = output_path or _default_derived_path(path, "rescore")
+    return _write_derived_result(path, destination, result)
+
+
+def refresh_quality_existing(
+    path: Path,
+    *,
+    output_path: Path | None = None,
+) -> Path:
+    """Recompute deterministic quality gates into a new immutable artifact."""
+    source_bytes = path.read_bytes()
+    result = json.loads(source_bytes)
+    apply_quality_assessment(result)
+    result["quality_refresh_provenance"] = {
+        "source_artifact": str(path.resolve()),
+        "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
+        "refreshed_at": datetime.now().astimezone().isoformat(),
+    }
+    _minimize_persisted_runtime_fields(result)
+    destination = output_path or _default_derived_path(path, "quality-refresh")
+    return _write_derived_result(path, destination, result)
 
 
 def _render_question_markdown(result: dict[str, Any]) -> str:
@@ -449,15 +587,19 @@ async def run_question(
     total: int = 1,
 ) -> dict[str, Any]:
     """Run one complete research-and-evaluate cycle and checkpoint it."""
-    config = build_run_config()
     inputs = {"messages": [{"role": "user", "content": question["question"]}]}
-    engine = QueryEngine(config)
     print(f"[{index}/{total}] Research started: {question['title']}", flush=True)  # noqa: T201
     research_started = time.perf_counter()
-    try:
-        state = await engine.submit_message(inputs["messages"], config)
-    except Exception as exc:  # noqa: BLE001 - save a durable failed result
-        state = {"result": {"status": "error", "error": str(exc)}, "final_report": ""}
+    with evaluation_runtime_environment():
+        config = build_run_config()
+        engine = QueryEngine(config)
+        try:
+            state = await engine.submit_message(inputs["messages"], config)
+        except Exception as exc:  # noqa: BLE001 - save a durable failed result
+            state = {
+                "result": {"status": "error", "error": str(exc)},
+                "final_report": "",
+            }
     research_elapsed = time.perf_counter() - research_started
     state["evaluation_metadata"] = {
         key: config["configurable"][key]
@@ -490,9 +632,11 @@ async def run_question(
         "completed_task_outputs": state.get("completed_task_outputs", []),
         "supervisor_messages": state.get("supervisor_messages", []),
         "evidence_registry": state.get("evidence_registry", []),
+        "evaluation_snapshot": state.get("evaluation_snapshot"),
         "configuration": config["configurable"],
         "coverage_checklist": state.get("coverage_checklist", []),
     }
+    _minimize_persisted_runtime_fields(result)
     apply_quality_assessment(result)
     stem = f"{index:02d}_{question['id']}"
     _write_json(output_dir / f"{stem}.json", result)
@@ -506,9 +650,28 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, help="Directory for local JSON and Markdown results")
     parser.add_argument("--question-limit", type=int, default=1, choices=range(1, 6))
+    parser.add_argument(
+        "--question",
+        help="Run one caller-supplied research question instead of the built-in evaluation set",
+    )
+    parser.add_argument(
+        "--question-title",
+        default="自定义研究主题",
+        help="Display title used with --question",
+    )
     parser.add_argument("--resume", action="store_true", help="Reuse per-question result files that already exist")
     parser.add_argument("--rescore-json", type=Path, help="Re-run only the judges for one existing result")
+    parser.add_argument(
+        "--rescore-output",
+        type=Path,
+        help="Optional new JSON path for a rescore artifact; existing files are refused",
+    )
     parser.add_argument("--refresh-quality-json", type=Path, help="Recompute only aggregate quality gates")
+    parser.add_argument(
+        "--refresh-quality-output",
+        type=Path,
+        help="Optional new JSON path for refreshed quality gates; existing files are refused",
+    )
     parser.add_argument("--run-id", help="Persisted run ID used to recover evidence while rescoring")
     return parser
 
@@ -518,26 +681,35 @@ async def main() -> Path:
     args = build_argument_parser().parse_args()
 
     if args.rescore_json:
-        await rescore_existing(args.rescore_json, args.run_id)
-        print(f"Rescored local result: {args.rescore_json}", flush=True)  # noqa: T201
-        return args.rescore_json.parent
-    if args.refresh_quality_json:
-        result = json.loads(args.refresh_quality_json.read_text(encoding="utf-8"))
-        apply_quality_assessment(result)
-        _write_json(args.refresh_quality_json, result)
-        args.refresh_quality_json.with_suffix(".md").write_text(
-            _render_question_markdown(result),
-            encoding="utf-8",
+        output_path = await rescore_existing(
+            args.rescore_json,
+            args.run_id,
+            output_path=args.rescore_output,
         )
-        print(f"Refreshed quality gates: {args.refresh_quality_json}", flush=True)  # noqa: T201
-        return args.refresh_quality_json.parent
+        print(f"Rescored local result: {output_path}", flush=True)  # noqa: T201
+        return output_path.parent
+    if args.refresh_quality_json:
+        output_path = refresh_quality_existing(
+            args.refresh_quality_json,
+            output_path=args.refresh_quality_output,
+        )
+        print(f"Refreshed quality gates: {output_path}", flush=True)  # noqa: T201
+        return output_path.parent
 
     timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
     output_dir = args.output_dir or DEFAULT_RESULTS_ROOT / timestamp
     output_dir.mkdir(parents=True, exist_ok=True)
     started_at = datetime.now().astimezone().isoformat()
     results: list[dict[str, Any]] = []
-    questions = LOCAL_QUESTIONS[: args.question_limit]
+    questions = (
+        [{
+            "id": "custom-research",
+            "title": args.question_title,
+            "question": args.question,
+        }]
+        if args.question
+        else LOCAL_QUESTIONS[: args.question_limit]
+    )
     for index, question in enumerate(questions, 1):
         existing_path = output_dir / f"{index:02d}_{question['id']}.json"
         if args.resume and existing_path.exists():
@@ -549,7 +721,7 @@ async def main() -> Path:
     metadata = {
         "started_at": started_at,
         "completed_at": datetime.now().astimezone().isoformat(),
-        "evaluation_model": os.getenv("EVALUATION_MODEL", "deepseek-v4-flash[1m]"),
+        "evaluation_model": JudgeConfig.from_env().model_spec,
         "langsmith_used": False,
         "question_count": len(results),
     }

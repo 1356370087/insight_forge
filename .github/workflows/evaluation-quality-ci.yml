@@ -1,0 +1,106 @@
+name: Evaluation Quality CI
+
+on:
+  push:
+    paths:
+      - "src/open_deep_research/evaluation/**"
+      - "src/open_deep_research/evidence.py"
+      - "src/open_deep_research/completion.py"
+      - "src/open_deep_research/memory/policy.py"
+      - "src/open_deep_research/report/**"
+      - "src/open_deep_research/state.py"
+      - "tests/evaluators.py"
+      - "tests/extract_langsmith_data.py"
+      - "tests/run_local_evaluate.py"
+      - "tests/test_advanced_memory.py"
+      - "tests/test_benchmark_export.py"
+      - "tests/test_completion_policy.py"
+      - "tests/test_evaluators_compat.py"
+      - "tests/test_judge_factory.py"
+      - "tests/test_local_evaluate.py"
+      - "tests/test_report_assembly.py"
+      - "tests/test_report_default_parity.py"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/evaluation-quality-ci.yml"
+  pull_request:
+    paths:
+      - "src/open_deep_research/evaluation/**"
+      - "src/open_deep_research/evidence.py"
+      - "src/open_deep_research/completion.py"
+      - "src/open_deep_research/memory/policy.py"
+      - "src/open_deep_research/report/**"
+      - "src/open_deep_research/state.py"
+      - "tests/evaluators.py"
+      - "tests/extract_langsmith_data.py"
+      - "tests/run_local_evaluate.py"
+      - "tests/test_advanced_memory.py"
+      - "tests/test_benchmark_export.py"
+      - "tests/test_completion_policy.py"
+      - "tests/test_evaluators_compat.py"
+      - "tests/test_judge_factory.py"
+      - "tests/test_local_evaluate.py"
+      - "tests/test_report_assembly.py"
+      - "tests/test_report_default_parity.py"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/evaluation-quality-ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  evaluation-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install locked dependencies
+        run: uv sync --frozen
+      - name: Lint evaluation changes
+        run: >-
+          uv run ruff check
+          src/open_deep_research/evaluation
+          src/open_deep_research/evidence.py
+          src/open_deep_research/completion.py
+          src/open_deep_research/memory/policy.py
+          src/open_deep_research/report/assembly.py
+          src/open_deep_research/report/orchestrator.py
+          src/open_deep_research/state.py
+          tests/evaluators.py
+          tests/extract_langsmith_data.py
+          tests/run_local_evaluate.py
+          tests/test_advanced_memory.py
+          tests/test_benchmark_export.py
+          tests/test_completion_policy.py
+          tests/test_evaluators_compat.py
+          tests/test_judge_factory.py
+          tests/test_local_evaluate.py
+          tests/test_report_assembly.py
+          tests/test_report_default_parity.py
+      - name: Type-check stable evaluation contracts
+        env:
+          MYPYPATH: src
+        run: >-
+          uv run mypy
+          --explicit-package-bases
+          --follow-imports=skip
+          --ignore-missing-imports
+          src/open_deep_research/evaluation
+          src/open_deep_research/evidence.py
+      - name: Run evaluation contract tests
+        run: >-
+          uv run pytest -q
+          tests/test_advanced_memory.py
+          tests/test_benchmark_export.py
+          tests/test_completion_policy.py
+          tests/test_evaluators_compat.py
+          tests/test_judge_factory.py
+          tests/test_local_evaluate.py
+          tests/test_report_assembly.py
+          tests/test_report_default_parity.py
