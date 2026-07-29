@@ -717,11 +717,11 @@ class TestHandleCancelResearchTask:
     @pytest.mark.asyncio
     async def test_cancel_waiting_task_preserves_sibling_approvals(self):
         from open_deep_research.tasks.async_tools import handle_cancel_research_task
-        from open_deep_research.tasks.registry import TaskRegistry, TaskStatus
         from open_deep_research.tasks.domain_approvals import (
             get_domain_approval_registry,
             reset_domain_approval_registry,
         )
+        from open_deep_research.tasks.registry import TaskRegistry, TaskStatus
 
         reset_domain_approval_registry()
         registry = TaskRegistry()
@@ -760,8 +760,10 @@ class TestHandleApproveResearchDomain:
     @pytest.mark.asyncio
     async def test_approve_waiting_task_resolves_and_resumes(self):
         from open_deep_research.tasks.async_tools import handle_approve_research_domain
+        from open_deep_research.tasks.domain_approvals import (
+            get_domain_approval_registry,
+        )
         from open_deep_research.tasks.registry import TaskRegistry, TaskStatus
-        from open_deep_research.tasks.domain_approvals import get_domain_approval_registry
 
         registry = TaskRegistry()
         r = registry.create("topic", run_id="run-x")
@@ -794,8 +796,10 @@ class TestHandleApproveResearchDomain:
     @pytest.mark.asyncio
     async def test_deny_waiting_task(self):
         from open_deep_research.tasks.async_tools import handle_approve_research_domain
+        from open_deep_research.tasks.domain_approvals import (
+            get_domain_approval_registry,
+        )
         from open_deep_research.tasks.registry import TaskRegistry, TaskStatus
-        from open_deep_research.tasks.domain_approvals import get_domain_approval_registry
 
         registry = TaskRegistry()
         r = registry.create("topic", run_id="run-x")
@@ -849,7 +853,9 @@ class TestHandleApproveResearchDomain:
         assert "not found" in result.content
 
     def test_format_snapshot_waiting_branch(self):
-        from open_deep_research.tasks.async_tools import format_task_snapshot_for_context
+        from open_deep_research.tasks.async_tools import (
+            format_task_snapshot_for_context,
+        )
 
         record = TaskRecord(task_id="t1", run_id="run-x", research_topic="topic")
         record.status = TaskStatus.WAITING_FOR_CONFIRMATION
@@ -971,7 +977,10 @@ class TestCheckpointManager:
     def test_save_and_load(self):
         import tempfile
 
-        from open_deep_research.tasks.recovery import CheckpointManager, ResearcherCheckpoint
+        from open_deep_research.tasks.recovery import (
+            CheckpointManager,
+            ResearcherCheckpoint,
+        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             mgr = CheckpointManager(runs_dir=tmpdir, run_id="run-1")
@@ -1000,7 +1009,10 @@ class TestCheckpointManager:
         import os
         import tempfile
 
-        from open_deep_research.tasks.recovery import CheckpointManager, ResearcherCheckpoint
+        from open_deep_research.tasks.recovery import (
+            CheckpointManager,
+            ResearcherCheckpoint,
+        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             mgr = CheckpointManager(runs_dir=tmpdir, run_id="run-3")

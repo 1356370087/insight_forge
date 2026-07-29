@@ -7,12 +7,9 @@ event emission.
 
 import json
 import os
-import tempfile
-from pathlib import Path
 
 import pytest
 
-from open_deep_research.tasks.events import EventType, ResearchEvent
 from open_deep_research.memory.store import (
     MemoryCandidate,
     MemoryCategory,
@@ -21,7 +18,7 @@ from open_deep_research.memory.store import (
     RetrievedMemory,
     create_memory_store,
 )
-
+from open_deep_research.tasks.events import EventType, ResearchEvent
 
 # ---------------------------------------------------------------------------
 # Data model tests
@@ -434,6 +431,7 @@ class TestPlatformMem0StoreSignature:
 
     def test_add_passes_messages_as_first_positional(self, monkeypatch):
         import asyncio
+
         from open_deep_research.memory.store import MemoryCategory, PlatformMem0Store
 
         store = PlatformMem0Store.__new__(PlatformMem0Store)
@@ -472,6 +470,7 @@ class TestPlatformMem0StoreSignature:
 
     def test_add_normalises_result(self, monkeypatch):
         import asyncio
+
         from open_deep_research.memory.store import MemoryCategory, PlatformMem0Store
 
         store = PlatformMem0Store.__new__(PlatformMem0Store)
@@ -490,6 +489,7 @@ class TestOSSMem0StoreSignature:
 
     def test_search_merges_user_id_into_filters(self, monkeypatch):
         import asyncio
+
         from open_deep_research.memory.store import OSSMem0Store
 
         store = OSSMem0Store.__new__(OSSMem0Store)
@@ -508,6 +508,7 @@ class TestOSSMem0StoreSignature:
 
     def test_search_merges_extra_filters(self, monkeypatch):
         import asyncio
+
         from open_deep_research.memory.store import OSSMem0Store
 
         store = OSSMem0Store.__new__(OSSMem0Store)
@@ -526,6 +527,7 @@ class TestOSSMem0StoreSignature:
 
     def test_add_passes_messages_and_user_id_correctly(self, monkeypatch):
         import asyncio
+
         from open_deep_research.memory.store import MemoryCategory, OSSMem0Store
 
         store = OSSMem0Store.__new__(OSSMem0Store)
