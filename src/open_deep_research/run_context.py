@@ -60,6 +60,10 @@ class ResearchBriefPersistenceError(RunContextError):
     """Raised when the authoritative research brief cannot be persisted."""
 
 
+class RunConfigurationError(RunContextError):
+    """Raised when a persisted run cannot safely use supplied configuration."""
+
+
 class SessionJournalRecord(BaseModel):
     """One append-only Query session journal record."""
 
@@ -93,6 +97,14 @@ class RunManifest(BaseModel):
     persistence_error: Optional[str] = None
     recovered_from_degraded_persistence: bool = False
     config: dict[str, Any] = Field(default_factory=dict)
+    config_fingerprint: Optional[str] = None
+    quality_policy_version: Optional[str] = None
+    quality_evaluation_epoch: Optional[str] = None
+    quality_evaluation_rigor: Optional[str] = None
+    quality_rigor_policy: dict[str, Any] = Field(default_factory=dict)
+    quality_configuration_warnings: list[dict[str, Any]] = Field(
+        default_factory=list
+    )
     result: Optional[dict[str, Any]] = None
     final_artifacts: dict[str, Any] = Field(default_factory=dict)
     coordination_schema_version: int = 0
@@ -240,11 +252,22 @@ class RunContextStore:
         (self.context_dir / "artifacts" / "research_tasks").mkdir(parents=True, exist_ok=True)
         if self.manifest_path.exists():
             return self.load_manifest()
+        metadata = config.get("metadata", {})
         manifest = RunManifest(
             run_id=self.run_id,
             owner_id=owner_id,
             status="running",
             config=self._safe_config(config),
+            config_fingerprint=metadata.get("run_config_fingerprint"),
+            quality_policy_version=metadata.get("quality_policy_version"),
+            quality_evaluation_epoch=metadata.get("quality_evaluation_epoch"),
+            quality_evaluation_rigor=(
+                metadata.get("quality_rigor_policy", {}).get("rigor")
+            ),
+            quality_rigor_policy=metadata.get("quality_rigor_policy", {}),
+            quality_configuration_warnings=metadata.get(
+                "quality_configuration_warnings", []
+            ),
             coordination_schema_version=1,
             coordination_backend="file_mailbox",
             fence_token=self._fence_token or 0,

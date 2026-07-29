@@ -142,6 +142,12 @@ class AgentState(AgentInputState, total=False):
     web_research_iterations: Annotated[list[dict], override_reducer]
     completion_decision: dict
     permission_denials: Annotated[list[dict], override_reducer]
+    # Quality-gate state promoted from the supervisor so recovery and resume
+    # paths use the same persisted assessment history and artifact references.
+    handoff_assessments: Annotated[list[dict], override_reducer]
+    research_artifact_refs: dict
+    quality_gate: dict
+    recoverable_artifacts: Annotated[list[dict], override_reducer]
 
 class SupervisorState(TypedDict, total=False):
     """State for the supervisor that manages research tasks."""

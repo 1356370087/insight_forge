@@ -6,6 +6,7 @@ import pytest
 from langchain_core.messages import HumanMessage
 
 from open_deep_research.agents.query_engine import QueryEngine
+from open_deep_research.configuration import freeze_run_config
 from open_deep_research.run_context import RunContextStore
 from open_deep_research.tasks.lease import FenceLostError, LeaderLeaseManager
 
@@ -238,7 +239,10 @@ async def test_stream_resume_does_not_acquire_lease_when_owner_validation_fails(
 ):
     run_id = "resume-owner-mismatch"
     store = RunContextStore(run_id, runs_dir=str(tmp_path))
-    store.initialize("expected-owner", _engine_config(tmp_path, run_id))
+    store.initialize(
+        "expected-owner",
+        freeze_run_config(_engine_config(tmp_path, run_id)),
+    )
     engine = QueryEngine.load(
         run_id,
         runs_dir=str(tmp_path),

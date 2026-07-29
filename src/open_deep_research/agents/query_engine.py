@@ -36,16 +36,27 @@ from open_deep_research.completion import (
     ResearchCompletionPolicy,
     completion_policy_context,
 )
-from open_deep_research.configuration import Configuration
+from open_deep_research.configuration import (
+    QUALITY_POLICY_VERSION,
+    RUN_CONFIG_FROZEN_FIELDS,
+    Configuration,
+    freeze_run_config,
+)
+from open_deep_research.evaluation import build_evaluation_snapshot
+from open_deep_research.evidence import eligible_evidence_records
 from open_deep_research.observability import get_trace_recorder
 from open_deep_research.public_events import (
     PUBLIC_STAGES,
     event_publisher_from_config,
     extract_public_sources,
 )
+from open_deep_research.quality import evaluate_subagent_handoff
+from open_deep_research.report.coverage import derive_state_coverage_checklist
+from open_deep_research.report.recovery import build_evidence_recovery_report
 from open_deep_research.run_context import (
     JournalCorruptedError,
     ResearchBriefPersistenceError,
+    RunConfigurationError,
     RunContextStore,
 )
 from open_deep_research.runtime import (
@@ -61,6 +72,7 @@ from open_deep_research.tasks.lease import (
     FenceLostError,
     LeaderLeaseManager,
 )
+from open_deep_research.tool_taxonomy import classify_tool_name
 
 
 def _ensure_config(config: RunnableConfig | None, fallback: RunnableConfig | None = None) -> RunnableConfig:
@@ -303,6 +315,7 @@ class QueryEngine:
         *,
         runs_dir: str = ".runs",
         config: RunnableConfig | None = None,
+        legacy_migration: bool = False,
     ) -> QueryEngine:
         """Load a persisted run shell for explicit recovery."""
         bootstrap_store = RunContextStore(run_id, runs_dir=runs_dir)
@@ -320,20 +333,105 @@ class QueryEngine:
             for key, value in persisted.get("metadata", {}).items()
             if value != "[REDACTED]"
         }
+        supplied_configurable = dict((config or {}).get("configurable", {}))
+        supplied_metadata = dict((config or {}).get("metadata", {}))
+        frozen = persisted_metadata.get("runtime_config_frozen") is True
+        if not frozen:
+            if not legacy_migration:
+                raise RunConfigurationError("legacy_run_config_not_frozen")
+            missing = sorted(
+                set(RUN_CONFIG_FROZEN_FIELDS) - set(supplied_configurable)
+            )
+            if missing:
+                raise RunConfigurationError(
+                    "legacy_migration_requires_full_config:"
+                    + ",".join(missing)
+                )
+            migration_config: RunnableConfig = {
+                "configurable": {
+                    **supplied_configurable,
+                    "thread_id": run_id,
+                    "runs_dir": runs_dir,
+                },
+                "metadata": {
+                    **supplied_metadata,
+                    "run_id": run_id,
+                    "legacy_config_migration": True,
+                },
+            }
+            return cls(
+                freeze_run_config(
+                    migration_config,
+                    prefer_configurable=True,
+                )
+            )
+
+        persisted_run_config: RunnableConfig = {
+            "configurable": dict(persisted_configurable),
+            "metadata": dict(persisted_metadata),
+        }
+        try:
+            persisted_run_config = freeze_run_config(persisted_run_config)
+        except ValueError as exc:
+            raise JournalCorruptedError(str(exc)) from exc
+        if (
+            manifest.config_fingerprint
+            and manifest.config_fingerprint
+            != persisted_run_config["metadata"].get("run_config_fingerprint")
+        ):
+            raise JournalCorruptedError("run_config_fingerprint_mismatch")
+
+        explicitly_frozen = set(supplied_configurable).intersection(
+            RUN_CONFIG_FROZEN_FIELDS
+        )
+        if explicitly_frozen:
+            expected = Configuration.from_runnable_config(persisted_run_config)
+            candidate_config: RunnableConfig = {
+                "configurable": {
+                    **persisted_run_config["configurable"],
+                    **supplied_configurable,
+                },
+                "metadata": dict(persisted_run_config["metadata"]),
+            }
+            candidate = Configuration.from_runnable_config(candidate_config)
+            conflicts = sorted(
+                field_name
+                for field_name in explicitly_frozen
+                if getattr(expected, field_name) != getattr(candidate, field_name)
+            )
+            if conflicts:
+                raise RunConfigurationError(
+                    "run_config_mismatch:" + ",".join(conflicts)
+                )
+
+        protected_metadata = {
+            "runtime_config_frozen",
+            "run_config_schema_version",
+            "run_config_fingerprint",
+            "quality_policy_version",
+            "quality_evaluation_epoch",
+            "quality_rigor_policy",
+            "quality_configuration_warnings",
+        }
         supplied: RunnableConfig = {
             "configurable": {
                 **persisted_configurable,
-                **((config or {}).get("configurable", {})),
+                **supplied_configurable,
                 "thread_id": run_id,
                 "runs_dir": runs_dir,
             },
             "metadata": {
                 **persisted_metadata,
-                **((config or {}).get("metadata", {})),
+                **supplied_metadata,
+                **{
+                    key: value
+                    for key, value in persisted_metadata.items()
+                    if key in protected_metadata
+                },
                 "run_id": run_id,
             },
         }
-        engine = cls(supplied)
+        engine = cls(freeze_run_config(supplied))
         if engine.context_store is None:
             raise JournalCorruptedError("run_context_persistence_disabled")
         return engine
@@ -838,7 +936,7 @@ class QueryEngine:
         validate_client_messages(messages)
         if self.run_fence_token is not None:
             raise RuntimeError("run_already_active")
-        self.config = _ensure_config(config, self.config)
+        self.config = freeze_run_config(_ensure_config(config, self.config))
         self.run_id = self.config["metadata"]["run_id"]
         self._configure_run_lease()
         self._configure_context_store()
@@ -900,6 +998,65 @@ class QueryEngine:
             self._validate_resume_manifest(replay.manifest)
             self.persistence_degraded = replay.manifest.persistence_degraded
             state = replay.state
+            resume_stage = replay.manifest.next_stage
+            if self.config.get("metadata", {}).get("legacy_config_migration"):
+                await self._migrate_legacy_quality_artifacts(state)
+                for field_name in (
+                    "notes",
+                    "raw_notes",
+                    "candidate_registry",
+                    "document_registry",
+                    "evidence_registry",
+                    "web_research_iterations",
+                    "completed_task_outputs",
+                    "handoff_assessments",
+                    "completion_decision",
+                    "result_assessment",
+                    "quality_gate",
+                ):
+                    if field_name in state:
+                        replay.supervisor_state[field_name] = state[field_name]
+                await self._persist_update(
+                    channel="lead",
+                    stage="legacy_config_migrated",
+                    update=self._legacy_migration_state_update(state),
+                    extra={
+                        "quality_evaluation_epoch": self.config.get(
+                            "metadata", {}
+                        ).get("quality_evaluation_epoch"),
+                    },
+                )
+                resume_stage = "supervisor.supervisor"
+                await self._persist_checkpoint(
+                    "legacy_config_migrated",
+                    resume_stage,
+                )
+                if not self.persistence_degraded:
+                    self.config.get("metadata", {}).pop(
+                        "legacy_config_migration",
+                        None,
+                    )
+                self.context_store._update_manifest(  # noqa: SLF001
+                    config=self.context_store._safe_config(self.config),  # noqa: SLF001
+                    config_fingerprint=self.config.get("metadata", {}).get(
+                        "run_config_fingerprint"
+                    ),
+                    quality_policy_version=self.config.get("metadata", {}).get(
+                        "quality_policy_version"
+                    ),
+                    quality_evaluation_epoch=self.config.get("metadata", {}).get(
+                        "quality_evaluation_epoch"
+                    ),
+                    quality_evaluation_rigor=self.config.get(
+                        "metadata", {}
+                    ).get("quality_rigor_policy", {}).get("rigor"),
+                    quality_rigor_policy=self.config.get(
+                        "metadata", {}
+                    ).get("quality_rigor_policy", {}),
+                    quality_configuration_warnings=self.config.get(
+                        "metadata", {}
+                    ).get("quality_configuration_warnings", []),
+                )
             self.messages = list(state.get("messages", []))
             self.human_feedback = list(state.get("human_feedback", []))
             self._feedback_cursor = len(self.human_feedback)
@@ -922,7 +1079,7 @@ class QueryEngine:
                 self.context_store.mark_persistence_degraded(exc)
             async for event in self._stream_execution(
                 state,
-                replay.manifest.next_stage,
+                resume_stage,
                 restored_supervisor_state=replay.supervisor_state or None,
                 recovered=True,
             ):
@@ -1097,53 +1254,205 @@ class QueryEngine:
                             start_step=supervisor_step,
                         )
                     apply_update_to_state(state, supervisor_update)
-                    completion_action = str(
-                        state.get("completion_decision", {}).get("action", "")
-                    )
-                    if completion_action == CompletionDecision.TERMINATE.value:
-                        reason = str(
-                            state.get("completion_decision", {}).get(
-                                "reason", "insufficient_evidence"
-                            )
-                        )
-                        self.status = "failed"
-                        result = {
-                            "status": "error",
-                            "error_code": "insufficient_evidence",
-                            "termination_reason": reason,
-                            "completion": state.get("completion_decision", {}),
-                        }
-                        self.final_state = {**state, "result": result}
-                        await self._persist_update(
-                            channel="lead",
-                            stage="terminated",
-                            update={"completion_decision": state.get("completion_decision", {})},
-                        )
-                        await self._persist_checkpoint(
-                            "terminated",
-                            "terminated",
-                            status="failed",
-                        )
-                        await self._publish_public(
-                            "run.failed",
-                            stage="researching",
-                            payload={
-                                "status": "failed",
-                                "error_code": "insufficient_evidence",
-                                "message": "Research ended without accepted evidence.",
-                                "termination_reason": reason,
-                                "result_status": "error",
-                                "permission_denial_count": len(self.permission_denials),
-                            },
-                            dedupe_key="run:terminal",
-                        )
-                        yield self._event("run.failed", {"run_id": self.run_id, **result})
-                        return
                     await self._persist_update(
                         channel="lead",
                         stage="research_complete",
                         update=supervisor_update,
                     )
+                    completion_action = str(
+                        state.get("completion_decision", {}).get("action", "")
+                    )
+                    if completion_action == CompletionDecision.TERMINATE.value:
+                        gaps = list(
+                            state.get("completion_decision", {}).get("gaps", [])
+                        )
+                        recovery = {"mode": "failed", "artifact_refs": []}
+                        if "accepted_evidence" in gaps:
+                            recovery = await self._recover_quality_gate_termination(
+                                state
+                            )
+                            await self._persist_update(
+                                channel="lead",
+                                stage="quality_gate_reassessed",
+                                update=self._quality_recovery_state_update(state),
+                            )
+                        if recovery["mode"] == "accepted":
+                            for task_id in recovery.get(
+                                "accepted_task_ids", []
+                            ):
+                                await self._publish_public(
+                                    "research.task.completed",
+                                    stage="researching",
+                                    payload={
+                                        "task_id": task_id,
+                                        "wave_id": "",
+                                        "mode": "sync",
+                                        "status": "completed",
+                                        "phase": "completed",
+                                        "admission_status": "accepted",
+                                        "reason_code": "quality_gate_reassessed",
+                                        "source_count": len(
+                                            eligible_evidence_records(
+                                                state.get(
+                                                    "evidence_registry", []
+                                                )
+                                            )
+                                        ),
+                                        "summary_status": "unavailable",
+                                        "message": (
+                                            "Research evidence was admitted after "
+                                            "automatic SHA-verified reassessment."
+                                        ),
+                                    },
+                                    dedupe_key=(
+                                        f"task:{task_id}:admission:accepted"
+                                    ),
+                                )
+                            completion_action = CompletionDecision.COMPLETE.value
+                        elif recovery["mode"] == "partial":
+                            report_text = str(state.get("final_report", ""))
+                            await self._publish_public(
+                                "system.warning",
+                                stage="researching",
+                                payload={
+                                    "warning_code": "quality_gate_recovery",
+                                    "message": (
+                                        "The quality gate rejected the full handoff; "
+                                        "a deterministic accepted-evidence report "
+                                        "was recovered."
+                                    ),
+                                },
+                                dedupe_key="quality-gate:recovery-warning",
+                            )
+                            await self._public_stage_event(
+                                "researching", "completed"
+                            )
+                            await self._public_stage_event(
+                                "synthesizing", "started"
+                            )
+                            await self._public_stage_event(
+                                "synthesizing", "completed"
+                            )
+                            await self._public_stage_event("writing", "started")
+                            await self._publish_public(
+                                "report.started",
+                                stage="writing",
+                                payload={"status": "running"},
+                                dedupe_key="report:started",
+                            )
+                            await self._write_optional_text_artifact(
+                                "report_generated",
+                                "final_report.md",
+                                report_text,
+                            )
+                            await self._persist_checkpoint(
+                                "report_generated", "completed"
+                            )
+                            await self._publish_public(
+                                "report.completed",
+                                stage="writing",
+                                payload={
+                                    "status": "completed",
+                                    "result_ref": f"/runs/{self.run_id}",
+                                    "sha256": hashlib.sha256(
+                                        report_text.encode("utf-8")
+                                    ).hexdigest(),
+                                    "length": len(report_text),
+                                },
+                                dedupe_key="report:completed",
+                            )
+                            yield self._event(
+                                "report.completed", {"run_id": self.run_id}
+                            )
+                            await self._public_stage_event(
+                                "writing", "completed"
+                            )
+                            await self._public_stage_event(
+                                "finalizing", "started"
+                            )
+                            await self._public_stage_event(
+                                "finalizing", "completed"
+                            )
+                            async for event in self._finish_success(
+                                state,
+                                recorder,
+                                report_text,
+                            ):
+                                yield event
+                            return
+                        else:
+                            reason = str(
+                                state.get("completion_decision", {}).get(
+                                    "reason", "insufficient_evidence"
+                                )
+                            )
+                            self.status = "failed"
+                            result = {
+                                "status": "failed",
+                                "error_code": "insufficient_evidence",
+                                "termination_reason": reason,
+                                "completion": state.get(
+                                    "completion_decision", {}
+                                ),
+                                "quality_gate": state.get(
+                                    "quality_gate",
+                                    self._quality_gate_payload(
+                                        "failed",
+                                        reason_codes=[
+                                            "no_eligible_evidence"
+                                        ],
+                                    ),
+                                ),
+                                "recoverable_artifacts": recovery.get(
+                                    "artifact_refs", []
+                                ),
+                            }
+                            self.final_state = {**state, "result": result}
+                            await self._persist_update(
+                                channel="lead",
+                                stage="terminated",
+                                update={
+                                    "completion_decision": state.get(
+                                        "completion_decision", {}
+                                    ),
+                                    "quality_gate": result["quality_gate"],
+                                    "recoverable_artifacts": result[
+                                        "recoverable_artifacts"
+                                    ],
+                                },
+                            )
+                            await self._persist_checkpoint(
+                                "terminated",
+                                "terminated",
+                                status="failed",
+                            )
+                            if self.context_store is not None:
+                                self.context_store._update_manifest(  # noqa: SLF001
+                                    status="failed",
+                                    result=result,
+                                )
+                            await self._publish_public(
+                                "run.failed",
+                                stage="researching",
+                                payload={
+                                    "status": "failed",
+                                    "error_code": "insufficient_evidence",
+                                    "message": (
+                                        "Research ended without eligible "
+                                        "accepted evidence."
+                                    ),
+                                    "termination_reason": reason,
+                                    "result_status": "failed",
+                                    "permission_denial_count": len(
+                                        self.permission_denials
+                                    ),
+                                },
+                                dedupe_key="run:terminal",
+                            )
+                            yield self._event(
+                                "run.failed", {"run_id": self.run_id, **result}
+                            )
+                            return
                     state["human_feedback"] = list(self.human_feedback)
                     await self._persist_task_outputs(state)
                     await self._persist_checkpoint("research_complete", "outline_approval")
@@ -1367,6 +1676,494 @@ class QueryEngine:
                         "metrics": self._metrics_subset(self.total_usage),
                     },
                 )
+    async def _migrate_legacy_quality_artifacts(
+        self,
+        state: dict[str, Any],
+    ) -> None:
+        """Re-evaluate legacy SHA artifacts under the newly pinned epoch."""
+        state["result_assessment"] = {}
+        state["evaluation_snapshot"] = {}
+        state["quality_gate"] = {}
+        state["completion_decision"] = {}
+        state["final_report"] = ""
+        state["report_outline"] = ""
+        state["report_artifacts"] = {}
+        state["sources"] = []
+        state["coverage_checklist"] = []
+        configurable = Configuration.from_runnable_config(self.config)
+        if not configurable.quality_evaluation_enabled:
+            state["handoff_assessments"] = []
+            return
+
+        for field_name in (
+            "notes",
+            "raw_notes",
+            "candidate_registry",
+            "document_registry",
+            "evidence_registry",
+            "web_research_iterations",
+            "completed_task_outputs",
+        ):
+            state[field_name] = []
+
+        raw_refs = state.get("research_artifact_refs", {})
+        if isinstance(raw_refs, dict) and raw_refs.get("type") == "override":
+            raw_refs = raw_refs.get("value", {})
+        assessments: list[dict[str, Any]] = []
+        if not isinstance(raw_refs, dict) or self.context_store is None:
+            state["handoff_assessments"] = assessments
+            return
+
+        metadata = self.config.get("metadata", {})
+        for task_id, raw_ref in raw_refs.items():
+            if not isinstance(raw_ref, dict) or not raw_ref.get("sha256"):
+                assessments.append(
+                    {
+                        "tool_call_id": str(task_id),
+                        "trigger": "legacy_migration_reassessment",
+                        "accepted": False,
+                        "reason": "artifact_reference_invalid",
+                        "evaluator_error": "artifact_reference_invalid",
+                        "evaluator_model": configurable.quality_evaluation_model,
+                        "policy_version": metadata.get(
+                            "quality_policy_version", QUALITY_POLICY_VERSION
+                        ),
+                        "evaluation_epoch": metadata.get(
+                            "quality_evaluation_epoch", "legacy-unpinned"
+                        ),
+                        "quality_rigor": metadata.get(
+                            "quality_rigor_policy", {}
+                        ).get("rigor", configurable.quality_evaluation_rigor.value),
+                        "quality_thresholds": dict(
+                            metadata.get("quality_rigor_policy", {})
+                        ),
+                    }
+                )
+                continue
+            artifact_ref = {
+                "task_id": str(task_id),
+                "path": str(
+                    raw_ref.get("path")
+                    or f"context/artifacts/research_tasks/{task_id}.json"
+                ),
+                "sha256": str(raw_ref["sha256"]),
+            }
+            try:
+                artifact = self.context_store.load_task_result(
+                    str(task_id),
+                    expected_sha256=artifact_ref["sha256"],
+                )
+            except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+                assessments.append(
+                    {
+                        "tool_call_id": str(task_id),
+                        "trigger": "legacy_migration_reassessment",
+                        "artifact_sha256": artifact_ref["sha256"],
+                        "accepted": False,
+                        "reason": "artifact_integrity_failed",
+                        "evaluator_error": str(exc),
+                        "evaluator_model": configurable.quality_evaluation_model,
+                        "policy_version": metadata.get(
+                            "quality_policy_version", QUALITY_POLICY_VERSION
+                        ),
+                        "evaluation_epoch": metadata.get(
+                            "quality_evaluation_epoch", "legacy-unpinned"
+                        ),
+                        "quality_rigor": metadata.get(
+                            "quality_rigor_policy", {}
+                        ).get("rigor", configurable.quality_evaluation_rigor.value),
+                        "quality_thresholds": dict(
+                            metadata.get("quality_rigor_policy", {})
+                        ),
+                    }
+                )
+                continue
+            topic = str(
+                artifact.get("research_topic")
+                or artifact.get("topic")
+                or state.get("research_brief", "")
+            )
+            assessment = await evaluate_subagent_handoff(
+                topic,
+                artifact,
+                self.config,
+            )
+            record = {
+                "tool_call_id": str(task_id),
+                "trigger": "legacy_migration_reassessment",
+                "artifact_sha256": artifact_ref["sha256"],
+                **assessment.model_dump(mode="json"),
+            }
+            assessments.append(record)
+            if assessment.accepted:
+                self._merge_admitted_artifact(
+                    state,
+                    str(task_id),
+                    artifact,
+                    artifact_ref,
+                )
+        state["handoff_assessments"] = assessments
+
+    @staticmethod
+    def _legacy_migration_state_update(
+        state: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Build a reducer-safe journal update for legacy re-evaluation."""
+        list_fields = (
+            "notes",
+            "raw_notes",
+            "candidate_registry",
+            "document_registry",
+            "evidence_registry",
+            "web_research_iterations",
+            "completed_task_outputs",
+            "handoff_assessments",
+            "sources",
+            "coverage_checklist",
+        )
+        update: dict[str, Any] = {
+            field_name: {
+                "type": "override",
+                "value": list(state.get(field_name, [])),
+            }
+            for field_name in list_fields
+            if field_name in state
+        }
+        update["completion_decision"] = {
+            "type": "override",
+            "value": {},
+        }
+        update["result_assessment"] = {
+            "type": "override",
+            "value": {},
+        }
+        update["evaluation_snapshot"] = {
+            "type": "override",
+            "value": {},
+        }
+        update["quality_gate"] = {
+            "type": "override",
+            "value": {},
+        }
+        update["final_report"] = ""
+        update["report_outline"] = ""
+        update["report_artifacts"] = {}
+        return update
+
+    @staticmethod
+    def _extend_unique(target: list[Any], values: list[Any]) -> None:
+        """Append JSON-native values without duplicating existing state."""
+        for value in values:
+            if value not in target:
+                target.append(value)
+
+    def _quality_gate_payload(
+        self,
+        status: str,
+        *,
+        reason_codes: list[str] | None = None,
+        assessment_refs: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        configurable = Configuration.from_runnable_config(self.config)
+        metadata = self.config.get("metadata", {})
+        return {
+            "status": status,
+            "evaluator_model": configurable.quality_evaluation_model,
+            "policy_version": metadata.get(
+                "quality_policy_version", QUALITY_POLICY_VERSION
+            ),
+            "evaluation_epoch": metadata.get(
+                "quality_evaluation_epoch", "legacy-unpinned"
+            ),
+            "reason_codes": list(dict.fromkeys(reason_codes or [])),
+            "assessment_refs": assessment_refs or [],
+            "quality_rigor": metadata.get(
+                "quality_rigor_policy", {}
+            ).get("rigor", configurable.quality_evaluation_rigor.value),
+            "quality_thresholds": dict(
+                metadata.get("quality_rigor_policy", {})
+            ),
+        }
+
+    def _merge_admitted_artifact(
+        self,
+        state: dict[str, Any],
+        task_id: str,
+        artifact: dict[str, Any],
+        artifact_ref: dict[str, Any],
+    ) -> None:
+        """Merge a SHA-verified, newly admitted handoff into report state."""
+        compressed = str(artifact.get("compressed_research", "")).strip()
+        notes = list(state.get("notes", []))
+        if compressed and compressed not in notes:
+            notes.append(compressed)
+        state["notes"] = notes
+        for field_name in (
+            "raw_notes",
+            "candidate_registry",
+            "document_registry",
+            "evidence_registry",
+            "web_research_iterations",
+        ):
+            current = list(state.get(field_name, []))
+            incoming = artifact.get(field_name, [])
+            if isinstance(incoming, list):
+                self._extend_unique(current, incoming)
+            state[field_name] = current
+        outputs = list(state.get("completed_task_outputs", []))
+        admitted_output = {
+            **artifact,
+            "task_id": task_id,
+            "artifact_ref": artifact_ref,
+            "admission_status": "accepted",
+        }
+        self._extend_unique(outputs, [admitted_output])
+        state["completed_task_outputs"] = outputs
+
+    async def _recover_quality_gate_termination(
+        self,
+        state: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Reassess rejected artifacts once, then recover safe evidence if needed."""
+        configurable = Configuration.from_runnable_config(self.config)
+        raw_refs = state.get("research_artifact_refs", {})
+        if (
+            isinstance(raw_refs, dict)
+            and raw_refs.get("type") == "override"
+        ):
+            raw_refs = raw_refs.get("value", {})
+        if (
+            not configurable.quality_evaluation_enabled
+            or not isinstance(raw_refs, dict)
+            or not raw_refs
+            or self.context_store is None
+        ):
+            return {"mode": "failed", "artifact_refs": []}
+
+        assessment_history = [
+            item
+            for item in state.get("handoff_assessments", [])
+            if isinstance(item, dict)
+        ]
+        latest_by_task: dict[str, dict[str, Any]] = {}
+        for assessment in assessment_history:
+            task_id = str(assessment.get("tool_call_id", ""))
+            if task_id:
+                latest_by_task[task_id] = assessment
+
+        verified_artifacts: list[dict[str, Any]] = []
+        verified_refs: list[dict[str, Any]] = []
+        # Recovery conclusions must come from an artifact whose digest was
+        # verified in this recovery pass, never from ambient/reduced state.
+        recovered_evidence: list[dict[str, Any]] = []
+        admitted_task_ids: list[str] = []
+        rejection_reasons: list[str] = []
+        reason_codes: list[str] = []
+        new_assessments: list[dict[str, Any]] = []
+
+        for task_id, raw_ref in raw_refs.items():
+            if not isinstance(raw_ref, dict) or not raw_ref.get("sha256"):
+                reason_codes.append("artifact_reference_invalid")
+                continue
+            artifact_ref = {
+                "task_id": str(task_id),
+                "path": str(
+                    raw_ref.get("path")
+                    or f"context/artifacts/research_tasks/{task_id}.json"
+                ),
+                "sha256": str(raw_ref["sha256"]),
+            }
+            try:
+                artifact = self.context_store.load_task_result(
+                    str(task_id),
+                    expected_sha256=artifact_ref["sha256"],
+                )
+            except (
+                FileNotFoundError,
+                ValueError,
+                UnicodeError,
+                json.JSONDecodeError,
+            ):
+                reason_codes.append("artifact_integrity_failed")
+                continue
+            artifact["task_id"] = str(task_id)
+            artifact["artifact_ref"] = artifact_ref
+            verified_artifacts.append(artifact)
+            verified_refs.append(artifact_ref)
+            self._extend_unique(
+                recovered_evidence,
+                eligible_evidence_records(
+                    artifact.get("evidence_registry", [])
+                ),
+            )
+
+            latest = latest_by_task.get(str(task_id))
+            already_reassessed = bool(
+                latest
+                and latest.get("trigger")
+                in {
+                    "artifact_read_reassessment",
+                    "automatic_termination_reassessment",
+                    "legacy_migration_reassessment",
+                }
+                and str(latest.get("artifact_sha256", artifact_ref["sha256"]))
+                == artifact_ref["sha256"]
+            )
+            if latest and latest.get("accepted") is True:
+                self._merge_admitted_artifact(
+                    state,
+                    str(task_id),
+                    artifact,
+                    artifact_ref,
+                )
+                admitted_task_ids.append(str(task_id))
+                continue
+            if already_reassessed and latest is not None:
+                rejection_reasons.append(
+                    str(latest.get("reason") or "artifact_reassessment_rejected")
+                )
+                continue
+
+            topic = str(
+                artifact.get("research_topic")
+                or artifact.get("topic")
+                or state.get("research_brief", "")
+            )
+            reassessment = await evaluate_subagent_handoff(
+                topic,
+                artifact,
+                self.config,
+            )
+            record = {
+                "tool_call_id": str(task_id),
+                "trigger": "automatic_termination_reassessment",
+                "artifact_sha256": artifact_ref["sha256"],
+                **reassessment.model_dump(mode="json"),
+            }
+            new_assessments.append(record)
+            latest_by_task[str(task_id)] = record
+            if reassessment.accepted:
+                self._merge_admitted_artifact(
+                    state,
+                    str(task_id),
+                    artifact,
+                    artifact_ref,
+                )
+                admitted_task_ids.append(str(task_id))
+            else:
+                reason_codes.append("handoff_reassessment_rejected")
+                rejection_reasons.append(reassessment.reason)
+                rejection_reasons.extend(reassessment.missing_information)
+                rejection_reasons.extend(reassessment.unsupported_claims)
+                if reassessment.evaluator_error:
+                    reason_codes.append("quality_evaluator_error")
+
+        if new_assessments:
+            assessment_history.extend(new_assessments)
+            state["handoff_assessments"] = assessment_history
+        assessment_refs = [
+            {
+                "task_id": ref["task_id"],
+                "artifact_sha256": ref["sha256"],
+                "evaluation_epoch": self.config.get("metadata", {}).get(
+                    "quality_evaluation_epoch", "legacy-unpinned"
+                ),
+            }
+            for ref in verified_refs
+        ]
+
+        if admitted_task_ids:
+            state["completion_decision"] = {
+                "action": CompletionDecision.COMPLETE.value,
+                "reason": "quality_gate_reassessed",
+                "gaps": [],
+            }
+            state["quality_gate"] = self._quality_gate_payload(
+                "passed",
+                reason_codes=["quality_gate_reassessed"],
+                assessment_refs=assessment_refs,
+            )
+            return {
+                "mode": "accepted",
+                "accepted_task_ids": admitted_task_ids,
+                "artifact_refs": verified_refs,
+            }
+
+        if recovered_evidence:
+            completion = state.get("completion_decision", {})
+            gaps = [str(item) for item in completion.get("gaps", [])]
+            state["evidence_registry"] = recovered_evidence
+            state["completion_decision"] = {
+                "action": CompletionDecision.COMPLETE_PARTIAL.value,
+                "reason": "quality_gate_recovery",
+                "gaps": gaps,
+            }
+            state["quality_gate"] = self._quality_gate_payload(
+                "degraded",
+                reason_codes=[
+                    "quality_gate_recovery",
+                    *(reason_codes or ["handoff_rejected"]),
+                ],
+                assessment_refs=assessment_refs,
+            )
+            state["final_report"] = build_evidence_recovery_report(
+                recovered_evidence,
+                gaps=gaps,
+                rejection_reasons=rejection_reasons,
+                artifact_refs=verified_refs,
+            )
+            state["coverage_checklist"] = derive_state_coverage_checklist(state)
+            state["evaluation_snapshot"] = build_evaluation_snapshot(
+                state,
+                coverage_checklist=state["coverage_checklist"],
+                researcher_task_artifacts=verified_artifacts,
+            ).model_dump(mode="json")
+            return {
+                "mode": "partial",
+                "artifact_refs": verified_refs,
+            }
+
+        state["quality_gate"] = self._quality_gate_payload(
+            "failed",
+            reason_codes=reason_codes or ["no_eligible_evidence"],
+            assessment_refs=assessment_refs,
+        )
+        return {"mode": "failed", "artifact_refs": verified_refs}
+
+    def _quality_recovery_state_update(
+        self,
+        state: dict[str, Any],
+    ) -> dict[str, Any]:
+        fields = (
+            "notes",
+            "raw_notes",
+            "candidate_registry",
+            "document_registry",
+            "evidence_registry",
+            "web_research_iterations",
+            "completed_task_outputs",
+            "handoff_assessments",
+            "coverage_checklist",
+        )
+        update: dict[str, Any] = {
+            field_name: {
+                "type": "override",
+                "value": list(state.get(field_name, [])),
+            }
+            for field_name in fields
+            if field_name in state
+        }
+        update["completion_decision"] = {
+            "type": "override",
+            "value": dict(state.get("completion_decision", {})),
+        }
+        update["quality_gate"] = dict(state.get("quality_gate", {}))
+        if state.get("final_report"):
+            update["final_report"] = str(state["final_report"])
+        if state.get("evaluation_snapshot"):
+            update["evaluation_snapshot"] = state["evaluation_snapshot"]
+        return update
+
     async def _finish_success(
         self,
         state: dict[str, Any],
@@ -1391,6 +2188,37 @@ class QueryEngine:
             == CompletionDecision.COMPLETE_PARTIAL.value
             else "success"
         )
+        configurable = Configuration.from_runnable_config(self.config)
+        if configurable.quality_evaluation_enabled and not state.get(
+            "quality_gate"
+        ):
+            assessments = [
+                item
+                for item in state.get("handoff_assessments", [])
+                if isinstance(item, dict)
+            ]
+            reason_codes: list[str] = []
+            if any(item.get("evaluator_error") for item in assessments):
+                reason_codes.append("quality_evaluator_error")
+            if any(item.get("accepted") is False for item in assessments):
+                reason_codes.append("handoff_rejected")
+            state["quality_gate"] = self._quality_gate_payload(
+                "degraded" if reason_codes else "passed",
+                reason_codes=reason_codes,
+                assessment_refs=[
+                    {
+                        "task_id": str(item.get("tool_call_id", "")),
+                        "evaluator_model": str(
+                            item.get("evaluator_model", "")
+                        ),
+                        "evaluation_epoch": str(
+                            item.get("evaluation_epoch", "")
+                        ),
+                    }
+                    for item in assessments
+                    if item.get("tool_call_id")
+                ],
+            )
         result = {
             "status": result_status,
             "result": result_text,
@@ -1403,6 +2231,8 @@ class QueryEngine:
             "permission_denials": self.permission_denials,
             "persistence_degraded": self.persistence_degraded,
         }
+        if state.get("quality_gate"):
+            result["quality_gate"] = state["quality_gate"]
         report_artifacts = state.get("report_artifacts")
         if report_artifacts:
             result["artifacts"] = report_artifacts
@@ -1413,7 +2243,14 @@ class QueryEngine:
             try:
                 self.context_store._update_manifest(  # noqa: SLF001
                     status="completed",
-                    result={"status": "success"},
+                    result={
+                        "status": result_status,
+                        **(
+                            {"quality_gate": result["quality_gate"]}
+                            if result.get("quality_gate")
+                            else {}
+                        ),
+                    },
                     final_artifacts={"final_report": "final_report.md"} if state.get("final_report") else {},
                 )
             except Exception as exc:  # noqa: BLE001
@@ -1437,7 +2274,7 @@ class QueryEngine:
             "run.completed",
             {
                 "run_id": self.run_id,
-                "status": "success",
+                "status": result_status,
                 "result": result,
                 "usage": self._usage_subset(self.total_usage),
                 "metrics": self._metrics_subset(self.total_usage),
@@ -1513,6 +2350,9 @@ class QueryEngine:
                 main_state.get("processed_mailbox_message_ids", [])
             ),
             "research_artifact_refs": dict(main_state.get("research_artifact_refs", {})),
+            "handoff_assessments": list(
+                main_state.get("handoff_assessments", [])
+            ),
         }
         supervisor_state = {**base_state, **(restored_state or {})}
         # The authoritative brief always wins over journal/state caches.
@@ -1915,6 +2755,10 @@ class QueryEngine:
                 "type": "override",
                 "value": dict(supervisor_state.get("research_artifact_refs", {})),
             },
+            "handoff_assessments": {
+                "type": "override",
+                "value": list(supervisor_state.get("handoff_assessments", [])),
+            },
             "research_brief": supervisor_state.get("research_brief", main_state.get("research_brief", "")),
             "approved_research_plan": supervisor_state.get("approved_research_plan"),
             "completion_decision": {
@@ -2123,13 +2967,9 @@ class ResearcherQueryEngine:
                     publisher = event_publisher_from_config(cfg)
                     categories: set[str] = set()
                     for call in tool_calls:
-                        name = str(call.get("name", "")).lower()
-                        if "search" in name:
-                            categories.add("search")
-                        elif any(token in name for token in ("fetch", "browse", "read", "open")):
-                            categories.add("fetch")
-                        else:
-                            categories.add("mcp")
+                        categories.add(
+                            classify_tool_name(str(call.get("name", "")))
+                        )
                     await publisher.publish(
                         "research.task.progress",
                         stage="researching",
