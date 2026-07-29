@@ -402,7 +402,9 @@ def test_completeness_ignores_duplicate_and_unknown_requirement_ids(monkeypatch)
     assert "1/" in result["comment"]
 
 
-def test_completeness_prefers_snapshot_brief_and_coverage(monkeypatch) -> None:
+def test_completeness_prefers_original_user_coverage_and_snapshot_brief(
+    monkeypatch,
+) -> None:
     captured: list[dict[str, Any]] = []
 
     class CaptureRunner:
@@ -442,7 +444,8 @@ def test_completeness_prefers_snapshot_brief_and_coverage(monkeypatch) -> None:
 
     payload = captured[1]["content"]
     assert "authoritative snapshot brief" in payload
-    assert "authoritative snapshot requirement" in payload
+    assert '"requirement": "Research claim A"' in payload
+    assert "authoritative snapshot requirement" not in payload
     assert "stale mutable brief" not in payload
     assert "stale mutable requirement" not in payload
 

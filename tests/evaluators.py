@@ -17,6 +17,10 @@ from open_deep_research.evaluation import (
     build_judge_model,
     langsmith_metric,
 )
+from open_deep_research.evaluation.execution import (
+    content_coverage_requirements,
+    evaluate_execution_compliance,
+)
 from open_deep_research.evidence import eligible_evidence_records
 from open_deep_research.report.coverage import derive_coverage_checklist
 from tests.prompts import (
@@ -97,6 +101,14 @@ def _run_failed(key: str, reason: str) -> dict[str, Any]:
         key,
         status=MetricStatus.RUN_FAILED,
         comment=f"Run failed: {reason}",
+    )
+
+
+def _evaluator_error(key: str, reason: str) -> dict[str, Any]:
+    return langsmith_metric(
+        key,
+        status=MetricStatus.EVALUATOR_ERROR,
+        comment=f"Evaluator error: {reason}",
     )
 
 
@@ -551,13 +563,11 @@ def eval_completeness(inputs: dict, outputs: dict) -> dict[str, Any]:
     )
     if not isinstance(persisted_checklist, list):
         persisted_checklist = []
-    coverage_checklist = list(
-        dict.fromkeys(
-            [
-                *derive_coverage_checklist(user_question),
-                *[str(item) for item in persisted_checklist],
-            ]
-        )
+    original_requirements = derive_coverage_checklist(user_question)
+    if not original_requirements:
+        original_requirements = [str(item) for item in persisted_checklist]
+    coverage_checklist = content_coverage_requirements(
+        list(dict.fromkeys(original_requirements))
     )[:20]
     indexed_requirements = [
         {"requirement_id": f"COV-{index:02d}", "requirement": requirement}
@@ -771,4 +781,33 @@ def eval_tool_efficiency(inputs: dict, outputs: dict) -> dict[str, Any]:
         "tool_efficiency_score",
         (result.tool_selection_score + result.call_efficiency_score) / 10,
         result.reasoning,
+    )
+
+
+def eval_execution_compliance(
+    inputs: dict,
+    outputs: dict,
+) -> dict[str, Any] | list[dict[str, Any]]:
+    """Evaluate explicit workflow constraints from the trusted execution trace."""
+    snapshot = _evaluation_snapshot(outputs)
+    trace = _extract_tool_trace(outputs)
+    evidence_registry = (
+        snapshot.get("evidence_registry", [])
+        if snapshot is not None
+        else outputs.get("evidence_registry", [])
+    )
+    result = evaluate_execution_compliance(
+        _format_input_query(inputs),
+        trace,
+        evidence_registry if isinstance(evidence_registry, list) else [],
+    )
+    if not result.applicable:
+        return []
+    comment = json.dumps(result.model_dump(mode="json"), ensure_ascii=False)
+    if result.status == "evaluator_error":
+        return _evaluator_error("execution_compliance_score", comment)
+    return _scored(
+        "execution_compliance_score",
+        result.score or 0.0,
+        comment,
     )

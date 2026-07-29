@@ -348,6 +348,9 @@ An incomplete report:
 - Identify any points that are not covered by the report
 - Identify any points that are not covered by the research brief
 - Identify any points that are not covered by the user's question
+- Judge only content that a reader should see in the final report. Do not require the report
+  to prove internal tool calls, task counts, execution order, or forbidden-tool compliance;
+  those workflow constraints are evaluated separately from the trusted tool trace.
 </Instruction>
 
 Return a checklist assessment for every supplied requirement_id with status covered, partial,

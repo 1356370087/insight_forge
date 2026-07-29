@@ -6,7 +6,7 @@ import re
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _SPACE_RE = re.compile(r"\s+")
-_CLAUSE_RE = re.compile(r"[。；;\n]+|(?<=\S)，(?=(?:并|以及|同时|结合|区分|说明|提出|给出|评估|比较))")
+_CLAUSE_RE = re.compile(r"[。；;\n]+|(?<=\S)，(?=并|以及|同时|结合|区分|说明|提出|给出|评估|比较)")
 _LIST_RE = re.compile(r"[、,，]+")
 _LEADING_RE = re.compile(
     r"^(?:截至\S+?[，,]\s*)?(?:请|需要|应当|应如何|报告应)?(?:重点)?(?:覆盖|比较|评估|分析|说明|区分|提出|给出)?\s*"
@@ -64,7 +64,7 @@ def derive_state_coverage_checklist(
             content = getattr(message, "content", "")
         if role in {"user", "human"} and content:
             source_texts.append(str(content))
-    if state.get("research_brief"):
+    if not source_texts and state.get("research_brief"):
         source_texts.append(str(state["research_brief"]))
 
     requirements: list[str] = []

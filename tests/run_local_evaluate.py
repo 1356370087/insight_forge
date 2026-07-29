@@ -24,9 +24,15 @@ from open_deep_research.evaluation import (
     MetricStatus,
     normalize_evaluator_metric,
 )
+from open_deep_research.quality_policy import (
+    QualityEvaluationRigor,
+    get_quality_rigor_policy,
+    rigor_from_legacy_min_score,
+)
 from tests.evaluators import (
     eval_completeness,
     eval_evidence_integrity,
+    eval_execution_compliance,
     eval_overall_quality,
     eval_relevance,
     eval_structure,
@@ -91,6 +97,7 @@ LOCAL_EVALUATORS: list[tuple[str, Evaluator]] = [
     ("structure", eval_structure),
     ("evidence_integrity", eval_evidence_integrity),
     ("completeness", eval_completeness),
+    ("execution_compliance", eval_execution_compliance),
     ("tool_efficiency", eval_tool_efficiency),
 ]
 
@@ -261,13 +268,23 @@ def aggregate_score(metrics: list[dict[str, Any]]) -> float | None:
         for metric in metrics
         if metric.get("status") == "scored"
         and metric.get("score") is not None
-        and metric.get("key") not in {"factual_accuracy_score", "source_authority_score"}
+        and metric.get("key") not in {
+            "execution_compliance_score",
+            "factual_accuracy_score",
+            "source_authority_score",
+        }
     ]
     return statistics.fmean(scores) if scores else None
 
 
-def assess_quality(metrics: list[dict[str, Any]], *, aggregate: float | None) -> dict[str, Any]:
+def assess_quality(
+    metrics: list[dict[str, Any]],
+    *,
+    aggregate: float | None,
+    rigor: QualityEvaluationRigor | str = QualityEvaluationRigor.BALANCED,
+) -> dict[str, Any]:
     """Apply non-compensatory evidence gates before assigning a quality grade."""
+    policy = get_quality_rigor_policy(rigor)
     by_key = {metric["key"]: metric for metric in metrics}
     critical_keys = (
         "source_quality_score",
@@ -277,7 +294,7 @@ def assess_quality(metrics: list[dict[str, Any]], *, aggregate: float | None) ->
         "completeness_score",
         "judge_consistency_score",
     )
-    failures = [
+    hard_failures = [
         f"{metric['key']} {metric.get('status')}"
         for metric in metrics
         if metric.get("status")
@@ -291,14 +308,22 @@ def assess_quality(metrics: list[dict[str, Any]], *, aggregate: float | None) ->
     for key in critical_keys:
         metric = by_key.get(key)
         if metric is None or metric.get("status") != "scored" or metric.get("score") is None:
-            failures.append(f"{key} not scored")
+            hard_failures.append(f"{key} not scored")
             continue
         score = float(metric["score"])
         critical_scores[key] = score
-        if score < 0.5:
-            failures.append(f"{key} below 0.50")
 
-    if aggregate is None or failures:
+    execution_metric = by_key.get("execution_compliance_score")
+    if execution_metric is not None:
+        if (
+            execution_metric.get("status") != "scored"
+            or execution_metric.get("score") is None
+        ):
+            hard_failures.append("execution_compliance_score evaluator error")
+        elif float(execution_metric["score"]) < 1.0:
+            hard_failures.append("execution_compliance_score failed")
+
+    if aggregate is None or hard_failures:
         grade = "failed"
     elif aggregate >= 0.85 and all(score >= 0.8 for score in critical_scores.values()):
         grade = "excellent"
@@ -306,27 +331,132 @@ def assess_quality(metrics: list[dict[str, Any]], *, aggregate: float | None) ->
         grade = "good"
     else:
         grade = "needs_improvement"
-        for key, score in critical_scores.items():
-            if score < 0.7:
-                failures.append(f"{key} below 0.70 quality target")
-        if aggregate < 0.75:
-            failures.append("aggregate_score below 0.75 quality target")
+    policy_failures: list[str] = []
+    for key, score in critical_scores.items():
+        if score < policy.outer_critical_floor:
+            policy_failures.append(
+                f"{key} below {policy.outer_critical_floor:.2f} "
+                f"{policy.rigor.value} target"
+            )
+    if aggregate is None:
+        policy_failures.append("aggregate_score unavailable")
+    elif aggregate < policy.outer_aggregate_floor:
+        policy_failures.append(
+            f"aggregate_score below {policy.outer_aggregate_floor:.2f} "
+            f"{policy.rigor.value} target"
+        )
+    failures = [*hard_failures, *policy_failures]
     return {
         "grade": grade,
-        "passed": grade in {"excellent", "good"},
+        "passed": not failures,
         "failures": failures,
+        "quality_rigor": policy.rigor.value,
+        "quality_thresholds": policy.as_dict(),
     }
 
 
-def apply_quality_assessment(result: dict[str, Any]) -> dict[str, Any]:
+def _quality_rigor_from_result(
+    result: dict[str, Any],
+) -> QualityEvaluationRigor:
+    """Resolve the immutable run rigor, including legacy result artifacts."""
+    run_result = result.get("run_result", {})
+    runtime_gate = (
+        run_result.get("quality_gate", {})
+        if isinstance(run_result, dict)
+        else {}
+    )
+    if isinstance(runtime_gate, dict) and runtime_gate.get("quality_rigor"):
+        return QualityEvaluationRigor(str(runtime_gate["quality_rigor"]))
+    configuration = result.get("configuration", {})
+    if isinstance(configuration, dict):
+        if configuration.get("quality_evaluation_rigor"):
+            return QualityEvaluationRigor(
+                str(configuration["quality_evaluation_rigor"])
+            )
+        if configuration.get("quality_evaluation_min_score") is not None:
+            return rigor_from_legacy_min_score(
+                configuration["quality_evaluation_min_score"]
+            )
+    return QualityEvaluationRigor.BALANCED
+
+
+def _coerce_quality_rigor(
+    value: QualityEvaluationRigor | str,
+) -> QualityEvaluationRigor:
+    """Normalize enum and string callers without leaking Enum repr strings."""
+    return (
+        value
+        if isinstance(value, QualityEvaluationRigor)
+        else QualityEvaluationRigor(str(value))
+    )
+
+
+def apply_quality_assessment(
+    result: dict[str, Any],
+    *,
+    quality_rigor: QualityEvaluationRigor | str | None = None,
+) -> dict[str, Any]:
     """Attach the quality gate outcome to a local question result."""
+    original_status = result.get("status")
+    original_report = result.get("final_report")
+    resolved_rigor = (
+        _coerce_quality_rigor(quality_rigor)
+        if quality_rigor is not None
+        else _quality_rigor_from_result(result)
+    )
     assessment = assess_quality(
         result.get("metrics", []),
         aggregate=result.get("aggregate_score"),
+        rigor=resolved_rigor,
     )
     result["quality_grade"] = assessment["grade"]
     result["quality_gate_passed"] = assessment["passed"]
     result["quality_gate_failures"] = assessment["failures"]
+    run_result = result.get("run_result", {})
+    runtime_gate = (
+        run_result.get("quality_gate", {})
+        if isinstance(run_result, dict)
+        else {}
+    )
+    if not runtime_gate and isinstance(result.get("quality_gate"), dict):
+        runtime_gate = result["quality_gate"].get("runtime", {})
+    runtime_status = (
+        str(runtime_gate.get("status", ""))
+        if isinstance(runtime_gate, dict)
+        else ""
+    )
+    if runtime_status == "failed":
+        gate_status = "failed"
+    elif assessment["passed"]:
+        gate_status = "degraded" if runtime_status == "degraded" else "passed"
+    else:
+        gate_status = "failed"
+    reason_codes = list(assessment["failures"])
+    if isinstance(runtime_gate, dict):
+        reason_codes.extend(
+            str(item) for item in runtime_gate.get("reason_codes", [])
+        )
+    result["quality_gate"] = {
+        "status": gate_status,
+        "evaluator_model": JudgeConfig.from_env().model_spec,
+        "policy_version": "offline-quality-gate-v3",
+        "quality_rigor": assessment["quality_rigor"],
+        "quality_thresholds": assessment["quality_thresholds"],
+        "reason_codes": list(dict.fromkeys(reason_codes)),
+        "assessment_refs": [
+            {
+                "key": str(metric.get("key", "")),
+                "status": str(metric.get("status", "")),
+            }
+            for metric in result.get("metrics", [])
+            if isinstance(metric, dict) and metric.get("key")
+        ],
+        **({"runtime": runtime_gate} if runtime_gate else {}),
+    }
+    # The Judge annotates quality only. It is never allowed to retract a
+    # completed research product or rewrite its terminal result status.
+    result["status"] = original_status
+    result["final_report"] = original_report
     return result
 
 
@@ -438,6 +568,7 @@ async def rescore_existing(
     run_id: str | None = None,
     *,
     output_path: Path | None = None,
+    quality_rigor: QualityEvaluationRigor | str | None = None,
 ) -> Path:
     """Write a derived Judge artifact without mutating the completed research run."""
     source_bytes = path.read_bytes()
@@ -474,13 +605,25 @@ async def rescore_existing(
     result["metrics"] = await evaluate_state(inputs, state)
     result["evaluation_elapsed_seconds"] = time.perf_counter() - started
     result["aggregate_score"] = aggregate_score(result["metrics"])
-    apply_quality_assessment(result)
+    if quality_rigor is not None:
+        resolved_requested_rigor = _coerce_quality_rigor(quality_rigor)
+        configuration = dict(result.get("configuration", {}))
+        configuration.pop("quality_evaluation_min_score", None)
+        configuration["quality_evaluation_rigor"] = (
+            resolved_requested_rigor.value
+        )
+        result["configuration"] = configuration
+    apply_quality_assessment(result, quality_rigor=quality_rigor)
+    resolved_rigor = result["quality_gate"]["quality_rigor"]
     result["rescore_provenance"] = {
         "source_artifact": str(path.resolve()),
         "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
         "rescored_at": datetime.now().astimezone().isoformat(),
         "run_id": run_id or result.get("run_id"),
         "evaluation_model": JudgeConfig.from_env().model_spec,
+        "quality_policy_version": "offline-quality-gate-v3",
+        "quality_rigor": resolved_rigor,
+        "quality_evaluation_epoch": str(uuid.uuid4()),
     }
     _minimize_persisted_runtime_fields(result)
     destination = output_path or _default_derived_path(path, "rescore")
@@ -491,15 +634,55 @@ def refresh_quality_existing(
     path: Path,
     *,
     output_path: Path | None = None,
+    quality_rigor: QualityEvaluationRigor | str | None = None,
 ) -> Path:
     """Recompute deterministic quality gates into a new immutable artifact."""
     source_bytes = path.read_bytes()
     result = json.loads(source_bytes)
-    apply_quality_assessment(result)
+    refreshed_metrics: list[str] = []
+    snapshot = _supported_snapshot(result)
+    if snapshot is not None:
+        inputs = {
+            "messages": [
+                {"role": "user", "content": str(result.get("question", ""))}
+            ]
+        }
+        outputs = {
+            "final_report": result.get("final_report", ""),
+            "result": result.get("run_result", {}),
+            "evaluation_metadata": result.get("configuration", {}),
+            "evaluation_snapshot": snapshot,
+            "evidence_registry": result.get("evidence_registry", []),
+        }
+        execution_result = eval_execution_compliance(inputs, outputs)
+        execution_metrics = _flatten_evaluation_result(
+            "execution_compliance",
+            execution_result,
+        )
+        result["metrics"] = [
+            metric
+            for metric in result.get("metrics", [])
+            if metric.get("key") != "execution_compliance_score"
+        ] + execution_metrics
+        result["aggregate_score"] = aggregate_score(result["metrics"])
+        refreshed_metrics.append("execution_compliance_score")
+    if quality_rigor is not None:
+        resolved_requested_rigor = _coerce_quality_rigor(quality_rigor)
+        configuration = dict(result.get("configuration", {}))
+        configuration.pop("quality_evaluation_min_score", None)
+        configuration["quality_evaluation_rigor"] = (
+            resolved_requested_rigor.value
+        )
+        result["configuration"] = configuration
+    apply_quality_assessment(result, quality_rigor=quality_rigor)
     result["quality_refresh_provenance"] = {
         "source_artifact": str(path.resolve()),
         "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
         "refreshed_at": datetime.now().astimezone().isoformat(),
+        "deterministic_metrics": refreshed_metrics,
+        "quality_policy_version": "offline-quality-gate-v3",
+        "quality_rigor": result["quality_gate"]["quality_rigor"],
+        "quality_evaluation_epoch": str(uuid.uuid4()),
     }
     _minimize_persisted_runtime_fields(result)
     destination = output_path or _default_derived_path(path, "quality-refresh")
@@ -601,8 +784,9 @@ async def run_question(
                 "final_report": "",
             }
     research_elapsed = time.perf_counter() - research_started
+    effective_config = engine.config.get("configurable", config["configurable"])
     state["evaluation_metadata"] = {
-        key: config["configurable"][key]
+        key: effective_config[key]
         for key in (
             "search_api",
             "max_concurrent_research_units",
@@ -615,7 +799,15 @@ async def run_question(
     metrics = await evaluate_state(inputs, state)
     evaluation_elapsed = time.perf_counter() - evaluation_started
     run_result = state.get("result", {})
-    status = "success" if state.get("final_report") and run_result.get("status") != "error" else "failed"
+    if state.get("final_report"):
+        runtime_status = str(run_result.get("status", "success"))
+        status = (
+            runtime_status
+            if runtime_status in {"success", "partial"}
+            else "failed"
+        )
+    else:
+        status = "failed"
     result = {
         **question,
         "status": status,
@@ -633,7 +825,7 @@ async def run_question(
         "supervisor_messages": state.get("supervisor_messages", []),
         "evidence_registry": state.get("evidence_registry", []),
         "evaluation_snapshot": state.get("evaluation_snapshot"),
-        "configuration": config["configurable"],
+        "configuration": effective_config,
         "coverage_checklist": state.get("coverage_checklist", []),
     }
     _minimize_persisted_runtime_fields(result)
@@ -673,6 +865,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Optional new JSON path for refreshed quality gates; existing files are refused",
     )
     parser.add_argument("--run-id", help="Persisted run ID used to recover evidence while rescoring")
+    parser.add_argument(
+        "--quality-rigor",
+        choices=[item.value for item in QualityEvaluationRigor],
+        help=(
+            "Create the derived rescore/refresh artifact under this quality "
+            "rigor; the source run remains immutable."
+        ),
+    )
     return parser
 
 
@@ -685,6 +885,7 @@ async def main() -> Path:
             args.rescore_json,
             args.run_id,
             output_path=args.rescore_output,
+            quality_rigor=args.quality_rigor,
         )
         print(f"Rescored local result: {output_path}", flush=True)  # noqa: T201
         return output_path.parent
@@ -692,6 +893,7 @@ async def main() -> Path:
         output_path = refresh_quality_existing(
             args.refresh_quality_json,
             output_path=args.refresh_quality_output,
+            quality_rigor=args.quality_rigor,
         )
         print(f"Refreshed quality gates: {output_path}", flush=True)  # noqa: T201
         return output_path.parent
