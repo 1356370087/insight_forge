@@ -5,20 +5,26 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import date
 from typing import Any, Literal
 
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
-from open_deep_research.configuration import Configuration
+from open_deep_research.configuration import QUALITY_POLICY_VERSION, Configuration
 from open_deep_research.observability import (
     get_trace_recorder,
     invoke_model_with_retry_observability,
 )
+from open_deep_research.quality_policy import (
+    QualityRigorPolicy,
+    get_run_quality_rigor_policy,
+    scores_meet_runtime_policy,
+)
+from open_deep_research.tool_taxonomy import classify_tool_name
 
 _URL_RE = re.compile(r"https?://[^\s\]\[()<>\"']+", re.IGNORECASE)
 _ERROR_MARKERS = ('"error_type"', '"error":', "error:", "tool execution failed")
@@ -51,6 +57,13 @@ class ToolResultAssessment(BaseModel):
     reason: str
     deterministic_checks: dict[str, Any] = Field(default_factory=dict)
     evaluator_error: str | None = None
+    protocol_errors: list[str] = Field(default_factory=list)
+    protocol_repair_count: int = Field(default=0, ge=0)
+    evaluator_model: str = ""
+    policy_version: str = ""
+    evaluation_epoch: str = ""
+    quality_rigor: str = ""
+    quality_thresholds: dict[str, Any] = Field(default_factory=dict)
 
 
 class HandoffAssessment(BaseModel):
@@ -67,6 +80,22 @@ class HandoffAssessment(BaseModel):
     reason: str
     deterministic_checks: dict[str, Any] = Field(default_factory=dict)
     evaluator_error: str | None = None
+    protocol_errors: list[str] = Field(default_factory=list)
+    protocol_repair_count: int = Field(default=0, ge=0)
+    evaluator_model: str = ""
+    policy_version: str = ""
+    evaluation_epoch: str = ""
+    quality_rigor: str = ""
+    quality_thresholds: dict[str, Any] = Field(default_factory=dict)
+
+
+class QualityProtocolError(ValueError):
+    """Raised after a quality model repeats a contradictory decision."""
+
+    def __init__(self, errors: list[str]):
+        """Initialize the error with stable machine-readable reason codes."""
+        self.errors = list(errors)
+        super().__init__("quality_protocol_error:" + ",".join(self.errors))
 
 
 TOOL_RESULT_EVALUATION_PROMPT = """You are a strict research quality evaluator.
@@ -75,6 +104,20 @@ Return exactly one JSON object and no surrounding text. The JSON object must con
 decision (continue, retry, or complete), relevance, source_quality, evidence_coverage,
 corroboration (integer scores from 1 to 5), unresolved_conflicts, missing_information,
 suggested_queries (arrays of strings), and reason (string).
+
+Use these provider-independent scoring anchors for every dimension:
+- 1 = the requirement is not satisfied
+- 2 = the requirement is only partially satisfied
+- 3 = the generally acceptable level is satisfied
+- 4 = the requirement is strongly satisfied
+- 5 = the requirement is fully satisfied
+
+The payload supplies quality_rigor and approval_thresholds. Score independently using the
+anchors above, then apply both runtime_dimension_floor and runtime_average_floor. The decision
+and details must agree. `complete` requires the score thresholds,
+deterministic_checks.passed=true, and no missing information or unresolved conflict. `retry`
+or `continue` requires at least one concrete missing item, conflict, suggested next query, or
+deterministic failure. Never return retry/continue while also saying everything is complete.
 
 Evaluate whether the current tool results together with cumulative_evidence answer the research
 topic, use credible and sufficiently independent sources, expose conflicts, and identify the most
@@ -131,6 +174,20 @@ Return exactly one JSON object and no surrounding text. The JSON object must con
 accepted (boolean), relevance, source_quality, evidence_coverage, groundedness (integer scores
 from 1 to 5), missing_information, unsupported_claims, follow_up_tasks (arrays of strings), and
 reason (string).
+
+Use these provider-independent scoring anchors for every dimension:
+- 1 = the requirement is not satisfied
+- 2 = the requirement is only partially satisfied
+- 3 = the generally acceptable level is satisfied
+- 4 = the requirement is strongly satisfied
+- 5 = the requirement is fully satisfied
+
+The payload supplies quality_rigor and approval_thresholds. Score independently using the
+anchors above, then apply both runtime_dimension_floor and runtime_average_floor. The
+acceptance flag and details must agree. accepted=true requires the score thresholds,
+deterministic_checks.passed=true, and no missing information or unsupported claim.
+accepted=false requires at least one concrete missing item, unsupported claim, follow-up task,
+or deterministic failure reason.
 
 Accept only a handoff that addresses its assigned topic, preserves traceable sources, contains
 enough evidence for downstream synthesis, and does not present major unsupported claims.
@@ -266,32 +323,77 @@ async def _evaluate_json(
     config: RunnableConfig,
     *,
     span_name: str,
+    protocol_validator: Callable[[BaseModel], list[str]] | None = None,
 ) -> BaseModel:
     configurable = Configuration.from_runnable_config(config)
     model = _build_quality_model(configurable, config)
-    response = await invoke_model_with_retry_observability(
-        model,
-        [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content="Evaluate this JSON research payload:\n" + json.dumps(payload, ensure_ascii=False)),
-        ],
-        config,
-        span_name=span_name,
-        agent_role="quality_evaluator",
-        model_name=configurable.quality_evaluation_model,
-    )
-    response_text = _content_text(response.content)
-    try:
-        response_payload = json.loads(response_text)
-    except json.JSONDecodeError:
-        object_start = response_text.find("{")
-        object_end = response_text.rfind("}")
-        if object_start < 0 or object_end <= object_start:
-            raise
-        response_payload = json.loads(response_text[object_start : object_end + 1])
-    if not isinstance(response_payload, dict):
-        raise ValueError("Quality evaluator must return one JSON object")
-    return schema.model_validate(_normalize_quality_payload(response_payload))
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(
+            content="Evaluate this JSON research payload:\n"
+            + json.dumps(payload, ensure_ascii=False)
+        ),
+    ]
+    encountered_protocol_errors: list[str] = []
+    for attempt in range(2):
+        response = await invoke_model_with_retry_observability(
+            model,
+            messages,
+            config,
+            span_name=(
+                span_name if attempt == 0 else f"{span_name}.protocol_repair"
+            ),
+            agent_role="quality_evaluator",
+            model_name=configurable.quality_evaluation_model,
+        )
+        response_text = _content_text(response.content)
+        try:
+            response_payload = json.loads(response_text)
+        except json.JSONDecodeError:
+            object_start = response_text.find("{")
+            object_end = response_text.rfind("}")
+            if object_start < 0 or object_end <= object_start:
+                raise
+            response_payload = json.loads(
+                response_text[object_start : object_end + 1]
+            )
+        if not isinstance(response_payload, dict):
+            raise ValueError("Quality evaluator must return one JSON object")
+        result = schema.model_validate(
+            _normalize_quality_payload(response_payload)
+        )
+        protocol_errors = (
+            protocol_validator(result) if protocol_validator else []
+        )
+        if not protocol_errors:
+            if hasattr(result, "protocol_repair_count"):
+                setattr(result, "protocol_repair_count", attempt)
+            if hasattr(result, "protocol_errors"):
+                setattr(
+                    result,
+                    "protocol_errors",
+                    list(dict.fromkeys(encountered_protocol_errors)),
+                )
+            return result
+        encountered_protocol_errors.extend(protocol_errors)
+        if attempt == 1:
+            raise QualityProtocolError(
+                list(dict.fromkeys(encountered_protocol_errors))
+            )
+        messages.extend(
+            [
+                AIMessage(content=response_text[:8000]),
+                HumanMessage(
+                    content=(
+                        "Your JSON violates the quality decision protocol. "
+                        "Correct the contradictions and return one replacement JSON "
+                        "object only. Protocol errors: "
+                        + json.dumps(protocol_errors, ensure_ascii=False)
+                    )
+                ),
+            ]
+        )
+    raise AssertionError("quality protocol repair loop exhausted")
 
 
 def _normalize_quality_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -486,7 +588,10 @@ def deterministic_tool_checks(
         if any(item.get("name") in {"web_research", "fetch_url"} for item in evidence)
         else len(set(_URL_RE.findall(combined)).union(fetched_source_urls))
     )
-    search_used = any("search" in str(item.get("name", "")).lower() for item in evidence)
+    search_used = any(
+        classify_tool_name(str(item.get("name", ""))) == "search"
+        for item in evidence
+    )
     failures: list[str] = []
     if not evidence or not any(contents):
         failures.append("no_nonempty_evidence")
@@ -512,7 +617,26 @@ def deterministic_handoff_checks(
     """Reject empty handoffs and handoffs without enough traceable sources."""
     compressed = str(handoff.get("compressed_research", "")).strip()
     raw_notes = "\n".join(str(note) for note in handoff.get("raw_notes", []))
-    traced_source_count = len(set(_URL_RE.findall(f"{compressed}\n{raw_notes}")))
+    accepted_evidence = [
+        record
+        for record in handoff.get("evidence_registry", [])
+        if isinstance(record, Mapping)
+        and str(record.get("security_status", "accepted")).lower()
+        not in _REJECTED_EVIDENCE_STATUSES
+    ]
+    structured_text = "\n".join(
+        f"{record.get('claim', '')}\n{record.get('supporting_excerpt', '')}"
+        for record in accepted_evidence
+    )
+    traced_source_count = len(
+        set(
+            _URL_RE.findall(f"{compressed}\n{raw_notes}")
+        ).union(
+            str(record.get("source_url"))
+            for record in accepted_evidence
+            if record.get("source_url")
+        )
+    )
     metrics = handoff.get("metrics", {})
     try:
         reported_source_count = int(metrics.get("sources_read", 0))
@@ -520,11 +644,129 @@ def deterministic_handoff_checks(
         reported_source_count = 0
     source_count = max(traced_source_count, reported_source_count)
     failures: list[str] = []
-    if len(compressed) < 200:
+    if len(compressed) < 200 and len(structured_text) < 200:
         failures.append("handoff_too_short")
     if source_count < min_sources:
         failures.append("insufficient_traceable_sources")
     return {"passed": not failures, "failures": failures, "source_count": source_count}
+
+
+def _tool_protocol_errors(
+    result: ToolResultAssessment,
+    *,
+    checks: dict[str, Any],
+    policy: QualityRigorPolicy,
+) -> list[str]:
+    """Return semantic contradictions in one tool-result Judge response."""
+    scores = (
+        result.relevance,
+        result.source_quality,
+        result.evidence_coverage,
+        result.corroboration,
+    )
+    gaps = [
+        *result.unresolved_conflicts,
+        *result.missing_information,
+        *result.suggested_queries,
+    ]
+    deterministic_failures = list(checks.get("failures", []))
+    errors: list[str] = []
+    if result.decision == "complete":
+        if min(scores) < policy.runtime_dimension_floor:
+            errors.append("complete_score_below_dimension_floor")
+        if sum(scores) / len(scores) < policy.runtime_average_floor:
+            errors.append("complete_score_below_average_floor")
+        if not checks.get("passed"):
+            errors.append("complete_failed_deterministic_checks")
+        if result.unresolved_conflicts or result.missing_information:
+            errors.append("complete_contains_unresolved_gaps")
+        if result.suggested_queries:
+            errors.append("complete_contains_follow_up_action")
+    elif not gaps and not deterministic_failures:
+        errors.append("retry_or_continue_requires_gap_or_action")
+    return errors
+
+
+def _handoff_protocol_errors(
+    result: HandoffAssessment,
+    *,
+    checks: dict[str, Any],
+    policy: QualityRigorPolicy,
+) -> list[str]:
+    """Return semantic contradictions in one handoff Judge response."""
+    scores = (
+        result.relevance,
+        result.source_quality,
+        result.evidence_coverage,
+        result.groundedness,
+    )
+    gaps = [
+        *result.missing_information,
+        *result.unsupported_claims,
+        *result.follow_up_tasks,
+    ]
+    deterministic_failures = list(checks.get("failures", []))
+    errors: list[str] = []
+    if result.accepted:
+        if min(scores) < policy.runtime_dimension_floor:
+            errors.append("accepted_score_below_dimension_floor")
+        if sum(scores) / len(scores) < policy.runtime_average_floor:
+            errors.append("accepted_score_below_average_floor")
+        if not checks.get("passed"):
+            errors.append("accepted_failed_deterministic_checks")
+        if result.missing_information or result.unsupported_claims:
+            errors.append("accepted_contains_unresolved_gaps")
+        if result.follow_up_tasks:
+            errors.append("accepted_contains_follow_up_action")
+    elif not gaps and not deterministic_failures:
+        errors.append("rejected_requires_gap_or_failure_reason")
+    return errors
+
+
+def _protocol_errors_from_exception(exc: Exception) -> list[str]:
+    if isinstance(exc, QualityProtocolError):
+        return list(exc.errors)
+    return []
+
+
+def _attach_quality_provenance(
+    result: ToolResultAssessment | HandoffAssessment,
+    configurable: Configuration,
+    config: RunnableConfig,
+) -> None:
+    """Attach non-secret model/policy provenance to every persisted assessment."""
+    metadata = config.get("metadata", {})
+    result.evaluator_model = configurable.quality_evaluation_model
+    result.policy_version = str(
+        metadata.get("quality_policy_version") or QUALITY_POLICY_VERSION
+    )
+    result.evaluation_epoch = str(
+        metadata.get("quality_evaluation_epoch")
+        or metadata.get("run_id")
+        or "legacy-unpinned"
+    )
+    policy = _quality_policy(configurable, config)
+    result.quality_rigor = policy.rigor.value
+    result.quality_thresholds = policy.as_dict()
+
+
+def _quality_policy(
+    configurable: Configuration,
+    config: RunnableConfig,
+) -> QualityRigorPolicy:
+    """Resolve current thresholds while preserving frozen v2 run semantics."""
+    configurable_values = config.get("configurable", {})
+    return get_run_quality_rigor_policy(
+        configurable.quality_evaluation_rigor,
+        policy_version=str(
+            config.get("metadata", {}).get(
+                "quality_policy_version", QUALITY_POLICY_VERSION
+            )
+        ),
+        legacy_min_score=configurable_values.get(
+            "quality_evaluation_min_score"
+        ),
+    )
 
 
 async def evaluate_tool_results(
@@ -536,6 +778,7 @@ async def evaluate_tool_results(
 ) -> ToolResultAssessment:
     """Evaluate one tool batch and apply deterministic overrides."""
     configurable = Configuration.from_runnable_config(config)
+    policy = _quality_policy(configurable, config)
     checks = deterministic_tool_checks(
         tool_results,
         min_sources=configurable.quality_evaluation_min_sources,
@@ -555,12 +798,15 @@ async def evaluate_tool_results(
     )
     payload = {
         "runtime_current_date": date.today().isoformat(),
+        "quality_rigor": policy.rigor.value,
+        "approval_thresholds": policy.as_dict(),
         "cumulative_evidence": cumulative_evidence,
         "cumulative_evidence_stats": evidence_stats,
         "research_topic": research_topic,
         "tool_results": bounded_tool_results,
         "deterministic_checks": checks,
     }
+    evaluator_failed = False
     try:
         result = await _evaluate_json(
             ToolResultAssessment,
@@ -568,24 +814,61 @@ async def evaluate_tool_results(
             payload,
             config,
             span_name="researcher.evaluate_tool_results",
+            protocol_validator=lambda candidate: _tool_protocol_errors(
+                ToolResultAssessment.model_validate(candidate),
+                checks=checks,
+                policy=policy,
+            ),
         )
         result = ToolResultAssessment.model_validate(result)
     except Exception as exc:  # noqa: BLE001 - configurable evaluator fail-open boundary
-        if not configurable.quality_evaluation_fail_open:
-            raise
-        result = ToolResultAssessment(
-            decision="continue",
-            relevance=3,
-            source_quality=3,
-            evidence_coverage=3,
-            corroboration=3,
-            reason="Quality evaluator unavailable; continuing under fail-open policy.",
-            evaluator_error=str(exc),
-        )
+        evaluator_failed = True
+        protocol_errors = _protocol_errors_from_exception(exc)
+        if configurable.quality_evaluation_fail_open:
+            result = ToolResultAssessment(
+                decision="continue",
+                relevance=3,
+                source_quality=3,
+                evidence_coverage=3,
+                corroboration=3,
+                reason=(
+                    "Quality evaluator unavailable; continuing under "
+                    "fail-open policy."
+                ),
+                evaluator_error=str(exc),
+                protocol_errors=protocol_errors,
+            )
+        else:
+            result = ToolResultAssessment(
+                decision="complete",
+                relevance=1,
+                source_quality=1,
+                evidence_coverage=1,
+                corroboration=1,
+                missing_information=["quality_evaluator_unavailable"],
+                reason=(
+                    "Quality evaluator failed under fail-closed policy; stop "
+                    "research spending and persist the artifact for Supervisor "
+                    "reassessment or deterministic recovery."
+                ),
+                evaluator_error=str(exc),
+                protocol_errors=protocol_errors,
+            )
     result.deterministic_checks = checks
     scores = (result.relevance, result.source_quality, result.evidence_coverage, result.corroboration)
-    if not checks["passed"] or min(scores) < configurable.quality_evaluation_min_score:
-        result.decision = "retry"
+    fail_open_fallback = (
+        evaluator_failed and configurable.quality_evaluation_fail_open
+    )
+    if not checks["passed"] or (
+        not fail_open_fallback
+        and not scores_meet_runtime_policy(scores, policy)
+    ):
+        if not (
+            evaluator_failed
+            and not configurable.quality_evaluation_fail_open
+        ):
+            result.decision = "retry"
+    _attach_quality_provenance(result, configurable, config)
     _record_quality_scores("tool_result", result, config)
     return result
 
@@ -597,6 +880,7 @@ async def evaluate_subagent_handoff(
 ) -> HandoffAssessment:
     """Run the Supervisor handoff gate over one completed subagent result."""
     configurable = Configuration.from_runnable_config(config)
+    policy = _quality_policy(configurable, config)
     checks = deterministic_handoff_checks(
         handoff,
         min_sources=configurable.quality_evaluation_min_sources,
@@ -620,6 +904,8 @@ async def evaluate_subagent_handoff(
     ]
     payload = {
         "runtime_current_date": date.today().isoformat(),
+        "quality_rigor": policy.rigor.value,
+        "approval_thresholds": policy.as_dict(),
         "research_topic": research_topic,
         "compressed_research": compressed_research,
         "evidence_registry": evidence_registry,
@@ -627,6 +913,7 @@ async def evaluate_subagent_handoff(
         "raw_notes": raw_notes,
         "deterministic_checks": checks,
     }
+    evaluator_failed = False
     try:
         result = await _evaluate_json(
             HandoffAssessment,
@@ -634,23 +921,56 @@ async def evaluate_subagent_handoff(
             payload,
             config,
             span_name="supervisor.evaluate_handoff",
+            protocol_validator=lambda candidate: _handoff_protocol_errors(
+                HandoffAssessment.model_validate(candidate),
+                checks=checks,
+                policy=policy,
+            ),
         )
         result = HandoffAssessment.model_validate(result)
     except Exception as exc:  # noqa: BLE001 - configurable evaluator fail-open boundary
-        if not configurable.quality_evaluation_fail_open:
-            raise
-        result = HandoffAssessment(
-            accepted=True,
-            relevance=3,
-            source_quality=3,
-            evidence_coverage=3,
-            groundedness=3,
-            reason="Quality evaluator unavailable; accepting under fail-open policy.",
-            evaluator_error=str(exc),
-        )
+        evaluator_failed = True
+        protocol_errors = _protocol_errors_from_exception(exc)
+        if configurable.quality_evaluation_fail_open:
+            result = HandoffAssessment(
+                accepted=True,
+                relevance=3,
+                source_quality=3,
+                evidence_coverage=3,
+                groundedness=3,
+                reason=(
+                    "Quality evaluator unavailable; accepting under fail-open "
+                    "policy."
+                ),
+                evaluator_error=str(exc),
+                protocol_errors=protocol_errors,
+            )
+        else:
+            result = HandoffAssessment(
+                accepted=False,
+                relevance=1,
+                source_quality=1,
+                evidence_coverage=1,
+                groundedness=1,
+                missing_information=["quality_evaluator_unavailable"],
+                follow_up_tasks=["reassess_sha_verified_artifact"],
+                reason=(
+                    "Quality evaluator failed under fail-closed policy; the "
+                    "handoff is retained but not admitted."
+                ),
+                evaluator_error=str(exc),
+                protocol_errors=protocol_errors,
+            )
     result.deterministic_checks = checks
     scores = (result.relevance, result.source_quality, result.evidence_coverage, result.groundedness)
-    if not checks["passed"] or min(scores) < configurable.quality_evaluation_min_score:
+    fail_open_fallback = (
+        evaluator_failed and configurable.quality_evaluation_fail_open
+    )
+    if not checks["passed"] or (
+        not fail_open_fallback
+        and not scores_meet_runtime_policy(scores, policy)
+    ):
         result.accepted = False
+    _attach_quality_provenance(result, configurable, config)
     _record_quality_scores("handoff", result, config)
     return result

@@ -44,6 +44,7 @@ def _quality_env() -> dict[str, str]:
             "QUALITY_EVALUATION_MODEL",
             "QUALITY_EVALUATION_BASE_URL",
             "QUALITY_EVALUATION_FAIL_OPEN",
+            "QUALITY_EVALUATION_RIGOR",
             "QUALITY_EVALUATION_MIN_SCORE",
             "QUALITY_EVALUATION_MIN_SOURCES",
         )
@@ -83,7 +84,16 @@ class TestDashScopeQualityEvaluationConfiguration:
         assert model and model.strip() == model
         assert values["QUALITY_EVALUATION_ENABLED"].lower() in {"true", "false"}
         assert values["QUALITY_EVALUATION_FAIL_OPEN"].lower() in {"true", "false"}
-        assert 1 <= int(values["QUALITY_EVALUATION_MIN_SCORE"]) <= 5
+        if values["QUALITY_EVALUATION_RIGOR"]:
+            assert values["QUALITY_EVALUATION_RIGOR"] in {
+                "very_relaxed",
+                "relaxed",
+                "balanced",
+                "strict",
+                "very_strict",
+            }
+        else:
+            assert 1 <= int(values["QUALITY_EVALUATION_MIN_SCORE"]) <= 5
         assert int(values["QUALITY_EVALUATION_MIN_SOURCES"]) >= 0
         _assert_dashscope_base_url(values["QUALITY_EVALUATION_BASE_URL"])
 
@@ -446,7 +456,7 @@ class TestQualityEvaluationProviderIsolation:
             }],
             {
                 "configurable": {
-                    "quality_evaluation_min_score": 3,
+                    "quality_evaluation_rigor": "balanced",
                     "quality_evaluation_min_sources": 1,
                 }
             },

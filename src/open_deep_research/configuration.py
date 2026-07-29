@@ -1,12 +1,74 @@
 """Configuration management for the Open Deep Research system."""
 
+import hashlib
 import json
 import os
+import uuid
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
 
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+from open_deep_research.quality_policy import (
+    QualityEvaluationRigor,
+    get_quality_rigor_policy,
+    rigor_from_legacy_min_score,
+)
+
+RUN_CONFIG_SCHEMA_VERSION = 2
+QUALITY_POLICY_VERSION = "quality-gate-v3"
+RUN_CONFIG_FROZEN_FIELDS = (
+    "max_structured_output_retries",
+    "model_transport_max_attempts",
+    "context_recovery_max_attempts",
+    "run_deadline_seconds",
+    "max_run_model_calls",
+    "max_run_tool_calls",
+    "max_run_input_tokens",
+    "max_run_output_tokens",
+    "max_run_cost_micro_usd",
+    "max_concurrent_tool_calls",
+    "max_tool_batch_size",
+    "model_call_timeout_seconds",
+    "tool_call_timeout_seconds",
+    "research_tool_call_timeout_seconds",
+    "hook_timeout_seconds",
+    "max_concurrent_research_units",
+    "search_api",
+    "max_researcher_iterations",
+    "max_react_tool_calls",
+    "summarization_model",
+    "summarization_model_max_tokens",
+    "research_model",
+    "research_model_max_tokens",
+    "compression_model",
+    "compression_model_max_tokens",
+    "final_report_model",
+    "final_report_model_max_tokens",
+    "web_pipeline_mode",
+    "web_rerank_model",
+    "web_evidence_model",
+    "message_summary_model",
+    "message_summary_model_max_tokens",
+    "quality_evaluation_enabled",
+    "quality_evaluation_model",
+    "quality_evaluation_model_max_tokens",
+    "quality_evaluation_base_url",
+    "quality_evaluation_fail_open",
+    "quality_evaluation_rigor",
+    "quality_evaluation_min_sources",
+    "quality_evaluation_max_input_chars",
+    "sandbox_network_mode",
+    "task_timeout_seconds",
+    "sandbox_timeout_seconds",
+)
+RUN_CONFIG_FROZEN_FIELDS_V1 = tuple(
+    "quality_evaluation_min_score"
+    if field_name == "quality_evaluation_rigor"
+    else field_name
+    for field_name in RUN_CONFIG_FROZEN_FIELDS
+)
 
 
 class SearchAPI(Enum):
@@ -16,6 +78,53 @@ class SearchAPI(Enum):
     OPENAI = "openai"
     TAVILY = "tavily"
     NONE = "none"
+
+
+def _resolve_quality_rigor(
+    config: RunnableConfig,
+    *,
+    prefer_configurable: bool = False,
+) -> tuple[QualityEvaluationRigor, dict[str, Any] | None]:
+    """Resolve the new rigor option and migrate the removed score option."""
+    configurable = config.get("configurable", {})
+    metadata = config.get("metadata", {})
+    frozen = metadata.get("runtime_config_frozen") is True
+    configured_rigor = configurable.get("quality_evaluation_rigor")
+    configured_legacy = configurable.get("quality_evaluation_min_score")
+
+    if frozen or prefer_configurable:
+        explicit_rigor = configured_rigor
+        legacy_score = configured_legacy
+    else:
+        explicit_rigor = os.environ.get(
+            "QUALITY_EVALUATION_RIGOR", configured_rigor
+        )
+        legacy_score = os.environ.get(
+            "QUALITY_EVALUATION_MIN_SCORE", configured_legacy
+        )
+
+    if explicit_rigor is not None and str(explicit_rigor).strip():
+        rigor = (
+            explicit_rigor
+            if isinstance(explicit_rigor, QualityEvaluationRigor)
+            else QualityEvaluationRigor(str(explicit_rigor).strip().lower())
+        )
+        warning = (
+            {
+                "code": "legacy_quality_min_score_ignored",
+                "resolved_rigor": rigor.value,
+            }
+            if legacy_score is not None and str(legacy_score).strip()
+            else None
+        )
+        return rigor, warning
+    if legacy_score is not None and str(legacy_score).strip():
+        rigor = rigor_from_legacy_min_score(legacy_score)
+        return rigor, {
+            "code": "legacy_quality_min_score_mapped",
+            "resolved_rigor": rigor.value,
+        }
+    return QualityEvaluationRigor.BALANCED, None
 
 
 def get_model_compatibility_kwargs(model_name: str) -> dict[str, Any]:
@@ -1002,7 +1111,27 @@ class Configuration(BaseModel):
             "evidence admission checks still apply."
         ),
     )
-    quality_evaluation_min_score: int = Field(default=3, ge=1, le=5)
+    quality_evaluation_rigor: QualityEvaluationRigor = Field(
+        default=QualityEvaluationRigor.BALANCED,
+        description=(
+            "Semantic approval rigor for runtime and offline quality Judges. "
+            "Safety, execution compliance, and evidence integrity remain hard gates."
+        ),
+        metadata={
+            "x_oap_ui_config": {
+                "type": "select",
+                "default": "balanced",
+                "options": [
+                    {"label": "极宽松", "value": "very_relaxed"},
+                    {"label": "宽松", "value": "relaxed"},
+                    {"label": "均衡", "value": "balanced"},
+                    {"label": "严格", "value": "strict"},
+                    {"label": "极严格", "value": "very_strict"},
+                ],
+                "description": "质量审批严格程度；默认使用均衡模式。",
+            }
+        },
+    )
     quality_evaluation_min_sources: int = Field(default=2, ge=0, le=20)
     quality_evaluation_max_input_chars: int = Field(default=30000, ge=1000)
     # File-backed Query session context
@@ -1452,11 +1581,23 @@ class Configuration(BaseModel):
     ) -> "Configuration":
         """Create a Configuration instance from a RunnableConfig."""
         configurable = config.get("configurable", {}) if config else {}
+        metadata = config.get("metadata", {}) if config else {}
+        frozen = metadata.get("runtime_config_frozen") is True
         field_names = list(cls.model_fields.keys())
         values: dict[str, Any] = {
-            field_name: os.environ.get(field_name.upper(), configurable.get(field_name))
+            field_name: (
+                configurable.get(field_name)
+                if frozen
+                and field_name in RUN_CONFIG_FROZEN_FIELDS
+                and field_name in configurable
+                else os.environ.get(
+                    field_name.upper(), configurable.get(field_name)
+                )
+            )
             for field_name in field_names
         }
+        rigor, _warning = _resolve_quality_rigor(config or {})
+        values["quality_evaluation_rigor"] = rigor
         # Explicit env-var overrides for fields with non-standard env names
         if os.environ.get("MEM0_PROVIDER") and "memory_provider" not in (configurable or {}):
             values["memory_provider"] = os.environ["MEM0_PROVIDER"]
@@ -1468,3 +1609,121 @@ class Configuration(BaseModel):
         """Pydantic configuration."""
         
         arbitrary_types_allowed = True
+
+
+def frozen_run_config_values(config: RunnableConfig) -> dict[str, Any]:
+    """Return the canonical, non-secret values covered by the run contract."""
+    configurable = config.get("configurable", {})
+    schema_version = int(
+        config.get("metadata", {}).get(
+            "run_config_schema_version", RUN_CONFIG_SCHEMA_VERSION
+        )
+    )
+    frozen_fields = (
+        RUN_CONFIG_FROZEN_FIELDS_V1
+        if schema_version == 1
+        else RUN_CONFIG_FROZEN_FIELDS
+    )
+    return {
+        field_name: configurable[field_name]
+        for field_name in frozen_fields
+        if field_name in configurable
+    }
+
+
+def run_config_fingerprint(config: RunnableConfig) -> str:
+    """Hash the frozen run contract without credential-bearing configuration."""
+    payload = {
+        "schema_version": int(
+            config.get("metadata", {}).get(
+                "run_config_schema_version", RUN_CONFIG_SCHEMA_VERSION
+            )
+        ),
+        "policy_version": str(
+            config.get("metadata", {}).get(
+                "quality_policy_version", QUALITY_POLICY_VERSION
+            )
+        ),
+        "config": frozen_run_config_values(config),
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def freeze_run_config(
+    config: RunnableConfig,
+    *,
+    prefer_configurable: bool = False,
+) -> RunnableConfig:
+    """Resolve and pin model, policy, timeout, and budget values for one run."""
+    frozen: RunnableConfig = {
+        **config,
+        "configurable": dict(config.get("configurable", {})),
+        "metadata": dict(config.get("metadata", {})),
+    }
+    metadata = frozen["metadata"]
+    if metadata.get("runtime_config_frozen") is True:
+        schema_version = int(
+            metadata.get("run_config_schema_version", 1)
+        )
+        frozen_fields = (
+            RUN_CONFIG_FROZEN_FIELDS_V1
+            if schema_version == 1
+            else RUN_CONFIG_FROZEN_FIELDS
+        )
+        missing = [
+            field_name
+            for field_name in frozen_fields
+            if field_name not in frozen["configurable"]
+        ]
+        if missing:
+            raise ValueError(
+                "frozen_run_config_incomplete:" + ",".join(sorted(missing))
+            )
+        expected = str(metadata.get("run_config_fingerprint") or "")
+        actual = run_config_fingerprint(frozen)
+        if expected and expected != actual:
+            raise ValueError("run_config_fingerprint_mismatch")
+        metadata["run_config_fingerprint"] = actual
+        return frozen
+
+    rigor, warning = _resolve_quality_rigor(
+        frozen,
+        prefer_configurable=prefer_configurable,
+    )
+    if prefer_configurable:
+        configured_values = dict(frozen["configurable"])
+        configured_values.pop("quality_evaluation_min_score", None)
+        configured_values["quality_evaluation_rigor"] = rigor
+        resolved_config = Configuration(**configured_values)
+    else:
+        resolved_config = Configuration.from_runnable_config(frozen)
+    resolved = resolved_config.model_dump(mode="json")
+    for field_name in RUN_CONFIG_FROZEN_FIELDS:
+        frozen["configurable"][field_name] = resolved[field_name]
+    frozen["configurable"].pop("quality_evaluation_min_score", None)
+    if warning:
+        warnings = list(metadata.get("quality_configuration_warnings", []))
+        if warning not in warnings:
+            warnings.append(warning)
+        metadata["quality_configuration_warnings"] = warnings
+    rigor_policy = get_quality_rigor_policy(rigor)
+    metadata.update(
+        {
+            "runtime_config_frozen": True,
+            "run_config_schema_version": RUN_CONFIG_SCHEMA_VERSION,
+            "quality_policy_version": QUALITY_POLICY_VERSION,
+            "quality_rigor_policy": rigor_policy.as_dict(),
+            "quality_evaluation_epoch": str(
+                metadata.get("quality_evaluation_epoch") or uuid.uuid4()
+            ),
+        }
+    )
+    metadata["run_config_fingerprint"] = run_config_fingerprint(frozen)
+    return frozen

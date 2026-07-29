@@ -1,5 +1,8 @@
 """Tests for Qwen JSON runtime quality gates."""
 
+import json
+from types import SimpleNamespace
+
 import pytest
 from langchain_core.messages import ToolMessage
 
@@ -12,6 +15,8 @@ from open_deep_research.quality import (
     _normalize_quality_payload,
     deterministic_handoff_checks,
     deterministic_tool_checks,
+    evaluate_subagent_handoff,
+    evaluate_tool_results,
 )
 from open_deep_research.tools.utils import get_notes_from_tool_calls
 
@@ -237,3 +242,173 @@ async def test_assessment_node_routes_complete_to_compression(monkeypatch) -> No
     )
 
     assert command.goto == "compress_research"
+
+
+def _protocol_config(*, fail_open: bool) -> dict:
+    return {
+        "configurable": {
+            "quality_evaluation_model": "openai:qwen3.7-max",
+            "quality_evaluation_fail_open": fail_open,
+            "quality_evaluation_min_score": 3,
+            "quality_evaluation_min_sources": 2,
+        },
+        "metadata": {
+            "runtime_config_frozen": True,
+            "run_id": "quality-protocol-test",
+            "quality_policy_version": "quality-gate-v2",
+            "quality_evaluation_epoch": "epoch-17",
+        },
+    }
+
+
+def _traceable_results() -> list[dict]:
+    return [{
+        "name": "tavily_search",
+        "content": "https://a.example/source https://b.example/source",
+        "error": False,
+    }]
+
+
+def _contradictory_retry() -> dict:
+    return {
+        "decision": "retry",
+        "relevance": 5,
+        "source_quality": 5,
+        "evidence_coverage": 5,
+        "corroboration": 5,
+        "unresolved_conflicts": [],
+        "missing_information": [],
+        "suggested_queries": [],
+        "reason": "Everything is fully complete; no more work is needed.",
+    }
+
+
+@pytest.mark.asyncio
+async def test_contradictory_retry_is_repaired_once(monkeypatch) -> None:
+    responses = [
+        _contradictory_retry(),
+        {
+            **_contradictory_retry(),
+            "decision": "complete",
+            "reason": "All requirements are satisfied.",
+        },
+    ]
+    calls: list[list] = []
+
+    async def fake_invoke(_model, messages, *_args, **_kwargs):
+        calls.append(messages)
+        return SimpleNamespace(content=json.dumps(responses.pop(0)))
+
+    monkeypatch.setattr(
+        "open_deep_research.quality._build_quality_model",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "open_deep_research.quality.invoke_model_with_retry_observability",
+        fake_invoke,
+    )
+
+    result = await evaluate_tool_results(
+        "Synthetic topic",
+        _traceable_results(),
+        _protocol_config(fail_open=False),
+    )
+
+    assert result.decision == "complete"
+    assert result.protocol_repair_count == 1
+    assert len(calls) == 2
+    assert "retry_or_continue_requires_gap_or_action" in calls[1][-1].content
+    assert result.evaluator_model == "openai:qwen3.7-max"
+    assert result.policy_version == "quality-gate-v2"
+    assert result.evaluation_epoch == "epoch-17"
+
+
+@pytest.mark.asyncio
+async def test_second_protocol_contradiction_uses_fail_open(monkeypatch) -> None:
+    async def fake_invoke(*_args, **_kwargs):
+        return SimpleNamespace(content=json.dumps(_contradictory_retry()))
+
+    monkeypatch.setattr(
+        "open_deep_research.quality._build_quality_model",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "open_deep_research.quality.invoke_model_with_retry_observability",
+        fake_invoke,
+    )
+
+    result = await evaluate_tool_results(
+        "Synthetic topic",
+        _traceable_results(),
+        _protocol_config(fail_open=True),
+    )
+
+    assert result.decision == "continue"
+    assert result.evaluator_error.startswith("quality_protocol_error:")
+    assert result.protocol_errors == [
+        "retry_or_continue_requires_gap_or_action"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_second_protocol_contradiction_fail_closed_stops_spending(
+    monkeypatch,
+) -> None:
+    async def fake_invoke(*_args, **_kwargs):
+        return SimpleNamespace(content=json.dumps(_contradictory_retry()))
+
+    monkeypatch.setattr(
+        "open_deep_research.quality._build_quality_model",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "open_deep_research.quality.invoke_model_with_retry_observability",
+        fake_invoke,
+    )
+
+    result = await evaluate_tool_results(
+        "Synthetic topic",
+        _traceable_results(),
+        _protocol_config(fail_open=False),
+    )
+
+    assert result.decision == "complete"
+    assert result.missing_information == ["quality_evaluator_unavailable"]
+    assert result.evaluator_error.startswith("quality_protocol_error:")
+
+
+@pytest.mark.asyncio
+async def test_handoff_timeout_fail_closed_returns_structured_rejection(
+    monkeypatch,
+) -> None:
+    async def fake_invoke(*_args, **_kwargs):
+        raise TimeoutError("judge timed out")
+
+    monkeypatch.setattr(
+        "open_deep_research.quality._build_quality_model",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "open_deep_research.quality.invoke_model_with_retry_observability",
+        fake_invoke,
+    )
+    handoff = {
+        "compressed_research": (
+            "Detailed evidence from https://a.example/source and "
+            "https://b.example/source. "
+        )
+        * 6,
+        "raw_notes": [],
+    }
+
+    result = await evaluate_subagent_handoff(
+        "Synthetic topic",
+        handoff,
+        _protocol_config(fail_open=False),
+    )
+
+    assert result.accepted is False
+    assert result.missing_information == ["quality_evaluator_unavailable"]
+    assert result.follow_up_tasks == ["reassess_sha_verified_artifact"]
+    assert result.evaluator_error == "judge timed out"
+    assert result.evaluator_model == "openai:qwen3.7-max"

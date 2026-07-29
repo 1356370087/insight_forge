@@ -2547,7 +2547,7 @@ async def assess_research_results(
     state: ResearcherState,
     config: RunnableConfig,
 ) -> Command[Literal["researcher", "compress_research"]]:
-    """Force a Qwen JSON quality decision between tool execution and routing."""
+    """Apply a provider-neutral JSON quality decision before routing."""
     configurable = Configuration.from_runnable_config(config)
     pending = list(state.get("pending_tool_results", []))
     complete_requested = state.get("research_complete_requested", False)
