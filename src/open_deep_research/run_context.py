@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field
 from open_deep_research.tasks.lease import FenceLostError, LeaderLease
 from open_deep_research.tasks.mailbox import read_json_file
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 RecordType: TypeAlias = Literal[
     "message_delta",
     "state_delta",
@@ -36,6 +36,7 @@ RecordType: TypeAlias = Literal[
     "context_compacted",
     "artifact_committed",
     "run_status",
+    "query_state",
 ]
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SECRET_KEY_RE = re.compile(
@@ -118,6 +119,7 @@ class ReplayResult(BaseModel):
 
     state: dict[str, Any] = Field(default_factory=dict)
     supervisor_state: dict[str, Any] = Field(default_factory=dict)
+    query_states: dict[str, dict[str, Any]] = Field(default_factory=dict)
     manifest: RunManifest
     records: list[SessionJournalRecord] = Field(default_factory=list)
 
@@ -351,7 +353,10 @@ class RunContextStore:
         records = self._read_records()
         if not records:
             raise JournalCorruptedError("manifest_corrupted")
-        manifest = RunManifest(run_id=self.run_id)
+        manifest = RunManifest(
+            run_id=self.run_id,
+            schema_version=records[0].schema_version,
+        )
         for record in records:
             payload = record.payload
             if record.seq == 1:
@@ -593,6 +598,36 @@ class RunContextStore:
         )
         return record
 
+    async def save_query_state(
+        self,
+        state: Any,
+        *,
+        channel: Literal["lead", "supervisor"] = "supervisor",
+    ) -> SessionJournalRecord:
+        """Append one durable inner-loop state checkpoint."""
+        snapshot = state.to_snapshot()
+        # Preserve BaseMessage objects until the journal encoder so oversized
+        # content continues to use the existing artifact spillover path.
+        snapshot["messages"] = list(state.messages)
+        if (
+            state.pending_tool_batch is not None
+            and snapshot.get("pending_tool_batch") is not None
+        ):
+            snapshot["pending_tool_batch"]["committed_results"] = list(
+                state.pending_tool_batch.committed_results
+            )
+        return await self.append(
+            channel=channel,
+            record_type="query_state",
+            stage=f"query.{state.phase.value}",
+            payload={
+                "state_key": state.state_key,
+                "revision": state.revision,
+                "transition_reason": state.transition_reason,
+                "state": snapshot,
+            },
+        )
+
     def mark_persistence_degraded(self, error: Exception | str) -> None:
         """Best-effort mark that recovery is only guaranteed to the last fsync."""
         try:
@@ -669,6 +704,7 @@ class RunContextStore:
         records = self._read_records()
         state: dict[str, Any] = {}
         supervisor_state: dict[str, Any] = {}
+        query_states: dict[str, dict[str, Any]] = {}
         last_stage = manifest.last_stable_stage
         next_stage = manifest.next_stage
         for record in records:
@@ -681,6 +717,15 @@ class RunContextStore:
             elif record.record_type == "stage_checkpoint":
                 last_stage = record.stage
                 next_stage = str(payload.get("next_stage", next_stage))
+            elif record.record_type == "query_state":
+                state_key = str(payload.get("state_key", ""))
+                query_state = payload.get("state")
+                if state_key and isinstance(query_state, dict):
+                    previous = query_states.get(state_key)
+                    if previous is None or int(
+                        query_state.get("revision", 0)
+                    ) >= int(previous.get("revision", 0)):
+                        query_states[state_key] = query_state
         manifest.last_stable_stage = last_stage
         manifest.next_stage = next_stage
         manifest.last_journal_seq = records[-1].seq if records else 0
@@ -689,6 +734,7 @@ class RunContextStore:
         return ReplayResult(
             state=state,
             supervisor_state=supervisor_state,
+            query_states=query_states,
             manifest=manifest,
             records=records,
         )

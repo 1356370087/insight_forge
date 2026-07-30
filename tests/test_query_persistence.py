@@ -12,7 +12,10 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from open_deep_research.agents.query_engine import QueryEngine
 from open_deep_research.configuration import (
     RUN_CONFIG_FROZEN_FIELDS,
+    RUN_CONFIG_FROZEN_FIELDS_V3,
     Configuration,
+    freeze_run_config,
+    run_config_fingerprint,
 )
 from open_deep_research.quality import HandoffAssessment
 from open_deep_research.run_context import (
@@ -35,6 +38,32 @@ def _config(tmp_path, run_id: str, **overrides: Any) -> dict[str, Any]:
         },
         "metadata": {"run_id": run_id, "owner": "user-1"},
     }
+
+
+def test_v3_frozen_run_does_not_require_v4_quality_fields() -> None:
+    all_values = Configuration().model_dump(mode="json")
+    v3_values = {
+        field_name: all_values[field_name]
+        for field_name in RUN_CONFIG_FROZEN_FIELDS_V3
+    }
+    config = {
+        "configurable": v3_values,
+        "metadata": {
+            "runtime_config_frozen": True,
+            "run_config_schema_version": 3,
+            "quality_policy_version": "quality-gate-v3",
+        },
+    }
+    config["metadata"]["run_config_fingerprint"] = run_config_fingerprint(
+        config
+    )
+
+    restored = freeze_run_config(config)
+
+    assert restored["metadata"]["quality_policy_version"] == "quality-gate-v3"
+    assert "quality_risk_mode" not in restored["configurable"]
+    assert "quality_caveat_admission_enabled" not in restored["configurable"]
+    assert "quality_gap_recovery_max_attempts" not in restored["configurable"]
 
 
 def _install_graph(monkeypatch, *, supervisor_error: Exception | None = None) -> dict[str, int]:
@@ -154,7 +183,7 @@ async def test_resume_uses_frozen_models_after_environment_switch(
     serialized_manifest = manifest.model_dump_json()
 
     assert manifest.config_fingerprint
-    assert manifest.quality_policy_version == "quality-gate-v3"
+    assert manifest.quality_policy_version == "quality-gate-v4"
     assert manifest.quality_evaluation_epoch
     assert manifest.quality_evaluation_rigor == "strict"
     assert manifest.quality_rigor_policy["runtime_average_floor"] == 4.0
@@ -408,6 +437,30 @@ def test_resume_api_maps_frozen_config_conflict_to_409(monkeypatch) -> None:
 
     assert response.status_code == 409
     assert response.json()["detail"] == "run_not_recoverable"
+
+
+def test_resume_api_maps_legacy_schema_to_specific_409(monkeypatch) -> None:
+    from open_deep_research import server
+    from security.auth import get_current_user
+
+    def reject_legacy_schema(*_args, **_kwargs):
+        raise RunConfigurationError("run_schema_not_resumable")
+
+    monkeypatch.setattr(server.QueryEngine, "load", reject_legacy_schema)
+    server._runs.clear()
+    server.app.dependency_overrides[get_current_user] = lambda: {
+        "identity": "user-1",
+        "permissions": [],
+    }
+    client = TestClient(server.app, raise_server_exceptions=False)
+    try:
+        response = client.post("/runs/legacy-schema/resume", json={})
+    finally:
+        server.app.dependency_overrides.clear()
+        server._runs.clear()
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "run_schema_not_resumable"
 
 
 @pytest.mark.asyncio

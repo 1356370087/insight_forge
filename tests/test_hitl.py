@@ -18,6 +18,7 @@ def _config(**configurable: Any) -> dict[str, Any]:
     return {
         "configurable": {
             "event_log_enabled": False,
+            "query_session_persistence_enabled": False,
             "search_api": "none",
             "runs_dir": tempfile.mkdtemp(prefix="open-deep-research-hitl-"),
             **configurable,

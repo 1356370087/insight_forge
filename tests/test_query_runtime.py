@@ -16,6 +16,11 @@ from open_deep_research.agents.query import (
     prepare_messages_for_query,
     query,
 )
+from open_deep_research.agents.query_state import (
+    InMemoryQueryCheckpointSink,
+    QueryPhase,
+    TerminalReason,
+)
 from open_deep_research.agents.tool_protocol import validate_tool_transcript
 from open_deep_research.budgets import BudgetGate, RunBudgetLedger, RunBudgetPolicy
 from open_deep_research.runtime_control import CancellationScope, RunCancelled
@@ -90,6 +95,31 @@ async def test_query_cancels_an_inflight_model_call_without_waiting_for_timeout(
     with pytest.raises(RunCancelled, match="cancel_requested"):
         await asyncio.wait_for(task, 1)
     assert model_drained.is_set()
+
+
+@pytest.mark.asyncio
+async def test_query_persists_terminal_before_propagating_model_cancellation():
+    sink = InMemoryQueryCheckpointSink()
+
+    async def cancelled_model(_messages):
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        async for _event in query(QueryParams(
+            messages=[HumanMessage(content="start")],
+            system_prompt="system",
+            model=FakeModel([]),
+            config=_config(),
+            call_model=cancelled_model,
+            checkpoint_sink=sink,
+        )):
+            pass
+
+    terminal = sink.states[-1]
+    assert terminal.phase is QueryPhase.TERMINAL
+    assert terminal.terminal is not None
+    assert terminal.terminal.reason is TerminalReason.CANCELLED
+    assert terminal.pending_tool_batch is None
 
 
 @pytest.mark.asyncio
@@ -470,21 +500,35 @@ async def test_query_closes_batch_before_propagating_cancellation():
     async def cancelled_hook(*_args):
         raise asyncio.CancelledError
 
-    events: list[Any] = []
-    async for event in query(QueryParams(
-        messages=[HumanMessage(content="start")],
-        system_prompt=None,
-        model=model,
-        tools=[echo_tool],
-        config=_config(),
-        tool_batch_hook=cancelled_hook,
-    )):
-        events.append(event)
+    sink = InMemoryQueryCheckpointSink()
+    with pytest.raises(asyncio.CancelledError):
+        async for _event in query(QueryParams(
+            messages=[HumanMessage(content="start")],
+            system_prompt=None,
+            model=model,
+            tools=[echo_tool],
+            config=_config(),
+            tool_batch_hook=cancelled_hook,
+            checkpoint_sink=sink,
+        )):
+            pass
 
-    result_event = next(event for event in events if event.type == "query.tool_result")
-    assert [message.tool_call_id for message in result_event.data["messages"]] == ["tc1", "tc2"]
-    assert all("cancelled" in str(message.content) for message in result_event.data["messages"])
-    assert events[-1].data["transition"]["reason"] == "cancelled"
+    terminal = sink.states[-1]
+    assert terminal.phase is QueryPhase.TERMINAL
+    assert terminal.terminal is not None
+    assert terminal.terminal.reason is TerminalReason.CANCELLED
+    assert terminal.pending_tool_batch is None
+    assert terminal.pending_query_event is not None
+    assert terminal.pending_query_event.event_type == "query.tool_result"
+    assert [
+        message.tool_call_id
+        for message in terminal.pending_query_event.messages
+    ] == ["tc1", "tc2"]
+    assert all(
+        "cancelled" in str(message.content)
+        for message in terminal.pending_query_event.messages
+    )
+    validate_tool_transcript(list(terminal.messages))
 
 
 @pytest.mark.asyncio
@@ -619,7 +663,11 @@ async def test_query_bounds_tool_concurrency():
         active -= 1
         return text
 
-    slow_echo = adapt_langchain_tool(slow_echo_impl, origin=ToolOrigin.SYSTEM)
+    slow_echo = adapt_langchain_tool(
+        slow_echo_impl,
+        origin=ToolOrigin.SYSTEM,
+        concurrency_safe=True,
+    )
     model = FakeModel([
         AIMessage(
             content="",
