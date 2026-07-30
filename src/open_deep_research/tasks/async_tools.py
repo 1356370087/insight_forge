@@ -66,6 +66,13 @@ class StartResearchTask(BaseModel):
             "begin with short, broad queries and narrow them based on evidence."
         ),
     )
+    requirement_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Coverage requirement IDs owned by this task. For quality-gate-v4 "
+            "runs every ID must exist in the user coverage contract."
+        ),
+    )
     display_title: Optional[str] = Field(
         default=None,
         max_length=160,
@@ -340,6 +347,8 @@ async def handle_start_research_task(
     launch_task: LaunchTaskFn,
     event_writer: Optional[JSONLEventWriter] = None,
     memory_context: Optional[str] = None,
+    coverage_contract: Optional[dict[str, Any]] = None,
+    research_risk_profile: Optional[dict[str, Any]] = None,
 ) -> ToolMessage:
     """Create a task record, spawn a background researcher, and return the task_id."""
     configurable = Configuration.from_runnable_config(config)
@@ -374,6 +383,11 @@ async def handle_start_research_task(
         )
 
     research_topic = tool_call["args"]["research_topic"]
+    requirement_ids = [
+        str(item)
+        for item in tool_call.get("args", {}).get("requirement_ids", [])
+        if str(item).strip()
+    ]
     display_title = public_display_title(
         str(tool_call.get("args", {}).get("display_title") or research_topic)
     )
@@ -385,6 +399,9 @@ async def handle_start_research_task(
         display_title=display_title,
         wave_id=wave_id,
         plan_task_id=tool_call["id"],
+        requirement_ids=requirement_ids,
+        coverage_contract=dict(coverage_contract or {}),
+        research_risk_profile=dict(research_risk_profile or {}),
     )
     _trace_run_id, trace_parent_span_id = current_span_ids()
     record.trace_parent_span_id = trace_parent_span_id

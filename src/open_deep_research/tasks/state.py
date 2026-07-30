@@ -32,6 +32,9 @@ class TaskSnapshot(BaseModel):
     display_title: str = ""
     wave_id: str = ""
     plan_task_id: str = ""
+    requirement_ids: list[str] = Field(default_factory=list)
+    coverage_contract: dict[str, Any] = Field(default_factory=dict)
+    research_risk_profile: dict[str, Any] = Field(default_factory=dict)
     created_at: float = Field(default_factory=time.time)
     started_at: Optional[float] = None
     completed_at: Optional[float] = None
@@ -79,6 +82,9 @@ class TaskSnapshot(BaseModel):
             display_title=record.display_title,
             wave_id=record.wave_id,
             plan_task_id=record.plan_task_id,
+            requirement_ids=list(record.requirement_ids),
+            coverage_contract=dict(record.coverage_contract),
+            research_risk_profile=dict(record.research_risk_profile),
             created_at=record.created_at,
             started_at=record.started_at,
             completed_at=record.completed_at,

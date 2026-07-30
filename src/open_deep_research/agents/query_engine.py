@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from langchain_core.messages import (
     BaseMessage,
@@ -22,6 +23,7 @@ from langchain_core.messages import (
 )
 from langchain_core.runnables import RunnableConfig
 
+from open_deep_research.agents.model_recovery import ModelCandidate
 from open_deep_research.agents.query import (
     BeforeTurnHookResult,
     ContextPolicy,
@@ -29,6 +31,15 @@ from open_deep_research.agents.query import (
     StopHookResult,
     ToolResultsHookResult,
     query,
+)
+from open_deep_research.agents.query_checkpoint import (
+    CallbackQueryCheckpointSink,
+    RunContextQueryCheckpointSink,
+)
+from open_deep_research.agents.query_state import (
+    QualityRecoveryState,
+    QueryCheckpointSink,
+    QueryLoopState,
 )
 from open_deep_research.budgets import BudgetGate
 from open_deep_research.completion import (
@@ -43,16 +54,29 @@ from open_deep_research.configuration import (
     freeze_run_config,
 )
 from open_deep_research.evaluation import build_evaluation_snapshot
-from open_deep_research.evidence import eligible_evidence_records
+from open_deep_research.evidence import (
+    eligible_evidence_records,
+    source_scoped_evidence_records,
+)
 from open_deep_research.observability import get_trace_recorder
 from open_deep_research.public_events import (
     PUBLIC_STAGES,
     event_publisher_from_config,
     extract_public_sources,
 )
-from open_deep_research.quality import evaluate_subagent_handoff
+from open_deep_research.quality import (
+    HandoffAssessment,
+    evaluate_subagent_handoff,
+)
+from open_deep_research.quality_contract import (
+    AdmissionStatus,
+    ResearchRiskProfile,
+    merge_coverage_ledger,
+)
 from open_deep_research.report.coverage import derive_state_coverage_checklist
-from open_deep_research.report.recovery import build_evidence_recovery_report
+from open_deep_research.report.evidence_synthesis import (
+    build_evidence_limited_report,
+)
 from open_deep_research.run_context import (
     JournalCorruptedError,
     ResearchBriefPersistenceError,
@@ -73,6 +97,7 @@ from open_deep_research.tasks.lease import (
     LeaderLeaseManager,
 )
 from open_deep_research.tool_taxonomy import classify_tool_name
+from open_deep_research.tools.governance import GovernedToolCallResult
 
 
 def _ensure_config(config: RunnableConfig | None, fallback: RunnableConfig | None = None) -> RunnableConfig:
@@ -89,6 +114,114 @@ def _ensure_config(config: RunnableConfig | None, fallback: RunnableConfig | Non
 def _message_text(messages: list[Any]) -> str:
     normalized = [m for m in normalize_messages(messages) if isinstance(m, BaseMessage)]
     return get_buffer_string(normalized)
+
+
+def _evidence_limited_coverage_map(
+    *,
+    authoritative_ledger: dict[str, Any],
+    latest_assessments: dict[str, dict[str, Any]],
+    verified_artifacts: list[dict[str, Any]],
+    eligible_evidence: list[dict[str, Any]],
+    contract_requirement_ids: set[str],
+) -> dict[str, dict[str, Any]]:
+    """Build a non-authoritative map used only by partial report synthesis."""
+    eligible_ids = {
+        str(record.get("evidence_id", ""))
+        for record in eligible_evidence
+        if record.get("evidence_id")
+    }
+    artifact_by_task = {
+        str(artifact.get("task_id", "")): artifact
+        for artifact in verified_artifacts
+        if artifact.get("task_id")
+    }
+    result: dict[str, dict[str, Any]] = {}
+
+    def merge_entry(
+        requirement_id: str,
+        *,
+        status: str,
+        evidence_ids: list[str],
+        task_ids: list[str],
+        caveats: list[str],
+    ) -> None:
+        if (
+            requirement_id not in contract_requirement_ids
+            or status not in {"supported", "partial"}
+        ):
+            return
+        safe_evidence_ids = [
+            evidence_id
+            for evidence_id in evidence_ids
+            if evidence_id in eligible_ids
+        ]
+        if not safe_evidence_ids:
+            return
+        current = result.setdefault(
+            requirement_id,
+            {
+                "status": "partial",
+                "evidence_ids": [],
+                "task_ids": [],
+                "caveats": [],
+            },
+        )
+        if status == "supported":
+            current["status"] = "supported"
+        current["evidence_ids"] = list(
+            dict.fromkeys([*current["evidence_ids"], *safe_evidence_ids])
+        )
+        current["task_ids"] = list(
+            dict.fromkeys([*current["task_ids"], *task_ids])
+        )
+        current["caveats"] = list(
+            dict.fromkeys([*current["caveats"], *caveats])
+        )
+
+    for requirement_id, entry in authoritative_ledger.items():
+        if not isinstance(entry, dict):
+            continue
+        merge_entry(
+            str(requirement_id),
+            status=str(entry.get("status", "")),
+            evidence_ids=[
+                str(item) for item in entry.get("evidence_ids", [])
+            ],
+            task_ids=[str(item) for item in entry.get("task_ids", [])],
+            caveats=[str(item) for item in entry.get("caveats", [])],
+        )
+
+    for task_id, assessment in latest_assessments.items():
+        artifact = artifact_by_task.get(task_id)
+        if (
+            not isinstance(artifact, dict)
+            or int(artifact.get("schema_version", 1)) < 2
+            or not artifact.get("coverage_contract")
+        ):
+            continue
+        owned_requirement_ids = {
+            str(item) for item in artifact.get("requirement_ids", [])
+        }
+        assessment_caveats = [
+            str(item) for item in assessment.get("caveats", [])
+        ]
+        for coverage in assessment.get("requirement_coverage", []):
+            if not isinstance(coverage, dict):
+                continue
+            requirement_id = str(coverage.get("requirement_id", ""))
+            if requirement_id not in owned_requirement_ids:
+                continue
+            merge_entry(
+                requirement_id,
+                status=str(coverage.get("status", "")),
+                evidence_ids=[
+                    str(item) for item in coverage.get("evidence_ids", [])
+                ],
+                task_ids=[task_id],
+                caveats=assessment_caveats,
+            )
+    return result
+
 
 def _config_user_id(config: RunnableConfig) -> str | None:
     metadata = config.get("metadata", {})
@@ -128,6 +261,7 @@ class QueryEngine:
         self._pending_action_future: asyncio.Future[dict[str, Any]] | None = None
         self._pending_action_loop: asyncio.AbstractEventLoop | None = None
         self.final_state: dict[str, Any] | None = None
+        self._restored_query_states: dict[str, dict[str, Any]] = {}
         self.context_store: RunContextStore | None = None
         self.persistence_degraded = False
         self.run_fence_token: int | None = None
@@ -320,6 +454,8 @@ class QueryEngine:
         """Load a persisted run shell for explicit recovery."""
         bootstrap_store = RunContextStore(run_id, runs_dir=runs_dir)
         manifest = bootstrap_store.load_manifest()
+        if int(manifest.schema_version) < 2:
+            raise RunConfigurationError("run_schema_not_resumable")
         if manifest.coordination_backend != "file_mailbox":
             raise JournalCorruptedError("legacy_coordination_backend_not_resumable")
         persisted = manifest.config
@@ -938,6 +1074,7 @@ class QueryEngine:
             raise RuntimeError("run_already_active")
         self.config = freeze_run_config(_ensure_config(config, self.config))
         self.run_id = self.config["metadata"]["run_id"]
+        self._restored_query_states = {}
         self._configure_run_lease()
         self._configure_context_store()
         self.status = "running"
@@ -998,6 +1135,7 @@ class QueryEngine:
             self._validate_resume_manifest(replay.manifest)
             self.persistence_degraded = replay.manifest.persistence_degraded
             state = replay.state
+            self._restored_query_states = dict(replay.query_states)
             resume_stage = replay.manifest.next_stage
             if self.config.get("metadata", {}).get("legacy_config_migration"):
                 await self._migrate_legacy_quality_artifacts(state)
@@ -1170,6 +1308,19 @@ class QueryEngine:
                         except Exception as exc:
                             raise ResearchBriefPersistenceError("research_brief_persistence_failed") from exc
                         await self._persist_artifact_event("research_brief_written", "research_brief.md", digest)
+                        coverage_contract = state.get("coverage_contract")
+                        if isinstance(coverage_contract, dict):
+                            coverage_digest = (
+                                self.context_store.write_json_atomic(
+                                    "coverage_contract.json",
+                                    coverage_contract,
+                                )
+                            )
+                            await self._persist_artifact_event(
+                                "coverage_contract_written",
+                                "coverage_contract.json",
+                                coverage_digest,
+                            )
                     await self._persist_checkpoint("research_brief_written", "plan_approval")
                     yield self._event("lead.message", {"stage": "write_research_brief"})
                     await self._public_stage_event("preparing", "completed")
@@ -1787,6 +1938,23 @@ class QueryEngine:
                 topic,
                 artifact,
                 self.config,
+                **(
+                    {
+                        "coverage_contract": artifact["coverage_contract"],
+                        "requirement_ids": list(
+                            artifact.get("requirement_ids", [])
+                        ),
+                        "risk_profile": (
+                            ResearchRiskProfile.model_validate(
+                                artifact.get("research_risk_profile")
+                                or state.get("research_risk_profile")
+                                or {"level": "standard"}
+                            )
+                        ),
+                    }
+                    if artifact.get("coverage_contract")
+                    else {}
+                ),
             )
             record = {
                 "tool_call_id": str(task_id),
@@ -1796,11 +1964,22 @@ class QueryEngine:
             }
             assessments.append(record)
             if assessment.accepted:
+                admission_status = (
+                    assessment.admission_status.value
+                    if assessment.admission_status is not None
+                    else AdmissionStatus.ACCEPTED.value
+                )
                 self._merge_admitted_artifact(
                     state,
                     str(task_id),
                     artifact,
                     artifact_ref,
+                    admission_status=admission_status,
+                )
+                state["coverage_ledger"] = merge_coverage_ledger(
+                    dict(state.get("coverage_ledger", {})),
+                    task_id=str(task_id),
+                    assessment=assessment,
                 )
         state["handoff_assessments"] = assessments
 
@@ -1891,6 +2070,8 @@ class QueryEngine:
         task_id: str,
         artifact: dict[str, Any],
         artifact_ref: dict[str, Any],
+        *,
+        admission_status: str = AdmissionStatus.ACCEPTED.value,
     ) -> None:
         """Merge a SHA-verified, newly admitted handoff into report state."""
         compressed = str(artifact.get("compressed_research", "")).strip()
@@ -1915,7 +2096,7 @@ class QueryEngine:
             **artifact,
             "task_id": task_id,
             "artifact_ref": artifact_ref,
-            "admission_status": "accepted",
+            "admission_status": admission_status,
         }
         self._extend_unique(outputs, [admitted_output])
         state["completed_task_outputs"] = outputs
@@ -1957,6 +2138,7 @@ class QueryEngine:
         # verified in this recovery pass, never from ambient/reduced state.
         recovered_evidence: list[dict[str, Any]] = []
         admitted_task_ids: list[str] = []
+        caveat_task_ids: list[str] = []
         rejection_reasons: list[str] = []
         reason_codes: list[str] = []
         new_assessments: list[dict[str, Any]] = []
@@ -2010,13 +2192,28 @@ class QueryEngine:
                 == artifact_ref["sha256"]
             )
             if latest and latest.get("accepted") is True:
+                admission_status = str(
+                    latest.get("admission_status")
+                    or AdmissionStatus.ACCEPTED.value
+                )
                 self._merge_admitted_artifact(
                     state,
                     str(task_id),
                     artifact,
                     artifact_ref,
+                    admission_status=admission_status,
+                )
+                state["coverage_ledger"] = merge_coverage_ledger(
+                    dict(state.get("coverage_ledger", {})),
+                    task_id=str(task_id),
+                    assessment=HandoffAssessment.model_validate(latest),
                 )
                 admitted_task_ids.append(str(task_id))
+                if (
+                    admission_status
+                    == AdmissionStatus.ACCEPTED_WITH_CAVEATS.value
+                ):
+                    caveat_task_ids.append(str(task_id))
                 continue
             if already_reassessed and latest is not None:
                 rejection_reasons.append(
@@ -2033,6 +2230,23 @@ class QueryEngine:
                 topic,
                 artifact,
                 self.config,
+                **(
+                    {
+                        "coverage_contract": artifact["coverage_contract"],
+                        "requirement_ids": list(
+                            artifact.get("requirement_ids", [])
+                        ),
+                        "risk_profile": (
+                            ResearchRiskProfile.model_validate(
+                                artifact.get("research_risk_profile")
+                                or state.get("research_risk_profile")
+                                or {"level": "standard"}
+                            )
+                        ),
+                    }
+                    if artifact.get("coverage_contract")
+                    else {}
+                ),
             )
             record = {
                 "tool_call_id": str(task_id),
@@ -2043,13 +2257,29 @@ class QueryEngine:
             new_assessments.append(record)
             latest_by_task[str(task_id)] = record
             if reassessment.accepted:
+                admission_status = (
+                    reassessment.admission_status.value
+                    if reassessment.admission_status is not None
+                    else AdmissionStatus.ACCEPTED.value
+                )
                 self._merge_admitted_artifact(
                     state,
                     str(task_id),
                     artifact,
                     artifact_ref,
+                    admission_status=admission_status,
+                )
+                state["coverage_ledger"] = merge_coverage_ledger(
+                    dict(state.get("coverage_ledger", {})),
+                    task_id=str(task_id),
+                    assessment=reassessment,
                 )
                 admitted_task_ids.append(str(task_id))
+                if (
+                    admission_status
+                    == AdmissionStatus.ACCEPTED_WITH_CAVEATS.value
+                ):
+                    caveat_task_ids.append(str(task_id))
             else:
                 reason_codes.append("handoff_reassessment_rejected")
                 rejection_reasons.append(reassessment.reason)
@@ -2073,19 +2303,57 @@ class QueryEngine:
         ]
 
         if admitted_task_ids:
+            coverage_contract = state.get("coverage_contract")
+            contract_requirements = (
+                coverage_contract.get("requirements", [])
+                if isinstance(coverage_contract, dict)
+                else []
+            )
+            coverage_ledger = dict(state.get("coverage_ledger", {}))
+            uncovered_requirement_ids = [
+                str(requirement.get("requirement_id", ""))
+                for requirement in contract_requirements
+                if requirement.get("requirement_id")
+                and coverage_ledger.get(
+                    str(requirement.get("requirement_id")),
+                    {},
+                ).get("status")
+                != "supported"
+            ]
             state["completion_decision"] = {
-                "action": CompletionDecision.COMPLETE.value,
-                "reason": "quality_gate_reassessed",
-                "gaps": [],
+                "action": (
+                    CompletionDecision.COMPLETE_PARTIAL.value
+                    if uncovered_requirement_ids
+                    else CompletionDecision.COMPLETE.value
+                ),
+                "reason": (
+                    "coverage_requirements_incomplete"
+                    if uncovered_requirement_ids
+                    else "quality_gate_reassessed"
+                ),
+                "gaps": uncovered_requirement_ids,
             }
             state["quality_gate"] = self._quality_gate_payload(
-                "passed",
-                reason_codes=["quality_gate_reassessed"],
+                (
+                    "passed_with_caveats"
+                    if caveat_task_ids
+                    else "passed"
+                ),
+                reason_codes=[
+                    "quality_gate_reassessed",
+                    *(
+                        ["handoff_accepted_with_caveats"]
+                        if caveat_task_ids
+                        else []
+                    ),
+                ],
                 assessment_refs=assessment_refs,
             )
             return {
                 "mode": "accepted",
                 "accepted_task_ids": admitted_task_ids,
+                "caveat_task_ids": caveat_task_ids,
+                "uncovered_requirement_ids": uncovered_requirement_ids,
                 "artifact_refs": verified_refs,
             }
 
@@ -2106,11 +2374,60 @@ class QueryEngine:
                 ],
                 assessment_refs=assessment_refs,
             )
-            state["final_report"] = build_evidence_recovery_report(
+            coverage_contract = state.get("coverage_contract")
+            contract_requirements = (
+                coverage_contract.get("requirements", [])
+                if isinstance(coverage_contract, dict)
+                else []
+            )
+            contract_requirement_ids = {
+                str(requirement.get("requirement_id", ""))
+                for requirement in contract_requirements
+                if isinstance(requirement, dict)
+                and requirement.get("requirement_id")
+            }
+            source_scoped_recovered_evidence = (
+                source_scoped_evidence_records(
+                    recovered_evidence,
+                    coverage_contract,
+                )
+            )
+            coverage_ledger = _evidence_limited_coverage_map(
+                authoritative_ledger=dict(
+                    state.get("coverage_ledger", {})
+                ),
+                latest_assessments=latest_by_task,
+                verified_artifacts=verified_artifacts,
+                eligible_evidence=source_scoped_recovered_evidence,
+                contract_requirement_ids=contract_requirement_ids,
+            )
+            uncovered_requirement_ids = [
+                str(requirement.get("requirement_id", ""))
+                for requirement in contract_requirements
+                if isinstance(requirement, dict)
+                and requirement.get("requirement_id")
+                and coverage_ledger.get(
+                    str(requirement.get("requirement_id")),
+                    {},
+                ).get("status")
+                != "supported"
+            ]
+            caveats = [
+                str(caveat)
+                for assessment in assessment_history
+                if isinstance(assessment, dict)
+                for caveat in assessment.get("caveats", [])
+                if str(caveat).strip()
+            ]
+            state["final_report"] = await build_evidence_limited_report(
                 recovered_evidence,
-                gaps=gaps,
+                coverage_contract=coverage_contract,
+                coverage_ledger=coverage_ledger,
+                caveats=caveats,
+                uncovered_requirement_ids=uncovered_requirement_ids,
                 rejection_reasons=rejection_reasons,
                 artifact_refs=verified_refs,
+                config=self.config,
             )
             state["coverage_checklist"] = derive_state_coverage_checklist(state)
             state["evaluation_snapshot"] = build_evaluation_snapshot(
@@ -2158,6 +2475,10 @@ class QueryEngine:
             "value": dict(state.get("completion_decision", {})),
         }
         update["quality_gate"] = dict(state.get("quality_gate", {}))
+        if "coverage_ledger" in state:
+            update["coverage_ledger"] = dict(
+                state.get("coverage_ledger", {})
+            )
         if state.get("final_report"):
             update["final_report"] = str(state["final_report"])
         if state.get("evaluation_snapshot"):
@@ -2202,8 +2523,17 @@ class QueryEngine:
                 reason_codes.append("quality_evaluator_error")
             if any(item.get("accepted") is False for item in assessments):
                 reason_codes.append("handoff_rejected")
+            has_caveat_admission = any(
+                item.get("admission_status")
+                == AdmissionStatus.ACCEPTED_WITH_CAVEATS.value
+                for item in assessments
+            )
+            quality_status = "degraded" if reason_codes else "passed"
+            if has_caveat_admission and not reason_codes:
+                quality_status = "passed_with_caveats"
+                reason_codes.append("handoff_accepted_with_caveats")
             state["quality_gate"] = self._quality_gate_payload(
-                "degraded" if reason_codes else "passed",
+                quality_status,
                 reason_codes=reason_codes,
                 assessment_refs=[
                     {
@@ -2335,6 +2665,15 @@ class QueryEngine:
         base_state: dict[str, Any] = {
             "supervisor_messages": list(main_state.get("supervisor_messages", [])),
             "research_brief": main_state.get("research_brief", ""),
+            "coverage_contract": dict(
+                main_state.get("coverage_contract", {})
+            ),
+            "coverage_ledger": dict(
+                main_state.get("coverage_ledger", {})
+            ),
+            "research_risk_profile": dict(
+                main_state.get("research_risk_profile", {})
+            ),
             "notes": list(main_state.get("notes", [])),
             "research_iterations": 0,
             "raw_notes": list(main_state.get("raw_notes", [])),
@@ -2353,6 +2692,9 @@ class QueryEngine:
             "handoff_assessments": list(
                 main_state.get("handoff_assessments", [])
             ),
+            "applied_query_event_ids": list(
+                main_state.get("applied_query_event_ids", [])
+            ),
         }
         supervisor_state = {**base_state, **(restored_state or {})}
         # The authoritative brief always wins over journal/state caches.
@@ -2369,14 +2711,48 @@ class QueryEngine:
                         "value": supervisor_state["supervisor_messages"],
                     },
                     "research_brief": supervisor_state["research_brief"],
+                    "coverage_contract": dict(
+                        supervisor_state.get("coverage_contract", {})
+                    ),
+                    "coverage_ledger": dict(
+                        supervisor_state.get("coverage_ledger", {})
+                    ),
+                    "research_risk_profile": dict(
+                        supervisor_state.get(
+                            "research_risk_profile",
+                            {},
+                        )
+                    ),
                     "research_iterations": 0,
                     "enable_async_research": supervisor_state["enable_async_research"],
                     "memory_context": supervisor_state.get("memory_context"),
                     "approved_research_plan": supervisor_state.get("approved_research_plan"),
+                    "applied_query_event_ids": {
+                        "type": "override",
+                        "value": list(
+                            supervisor_state.get(
+                                "applied_query_event_ids",
+                                [],
+                            )
+                        ),
+                    },
                 },
             )
         recorder = get_trace_recorder(self.config)
         configurable = Configuration.from_runnable_config(self.config)
+        restored_query_state = None
+        restored_query_payload = self._restored_query_states.get(
+            "supervisor"
+        )
+        if restored_query_payload is not None:
+            restored_query_state = QueryLoopState.from_snapshot(
+                restored_query_payload
+            )
+        checkpoint_sink = (
+            RunContextQueryCheckpointSink(self.context_store)
+            if self.context_store is not None
+            else None
+        )
 
         async def commit_supervisor_update(
             update: dict[str, Any],
@@ -2414,6 +2790,15 @@ class QueryEngine:
         async def execute_supervisor_tools(
             messages: list[BaseMessage],
             turn: int,
+            *,
+            committed_outcomes: dict[
+                str,
+                GovernedToolCallResult,
+            ] | None = None,
+            on_committed: Callable[
+                [dict[str, Any], GovernedToolCallResult],
+                Awaitable[None],
+            ] | None = None,
         ) -> RuntimeCommand:
             self.cancellation_scope.checkpoint("supervisor.tools")
             tool_state = {
@@ -2427,15 +2812,41 @@ class QueryEngine:
                 agent_role="supervisor",
                 attributes={"iteration": turn},
             ):
+                supervisor_tool_executor = (
+                    graph._execute_supervisor_tools
+                )
+                supports_durable_commit = (
+                    "committed_outcomes"
+                    in inspect.signature(
+                        supervisor_tool_executor
+                    ).parameters
+                )
+                execution = (
+                    supervisor_tool_executor(
+                        tool_state,
+                        self.config,
+                        committed_outcomes=committed_outcomes,
+                        on_committed=on_committed,
+                    )
+                    if supports_durable_commit
+                    else supervisor_tool_executor(
+                        tool_state,
+                        self.config,
+                    )
+                )
                 return coerce_command(
                     await self.cancellation_scope.run(
-                        graph._execute_supervisor_tools(tool_state, self.config),
+                        execution,
                         stage="supervisor.tools",
                     ),
                     default_goto="supervisor",
                 )
 
         next_step = END if start_step == END else start_step
+        if restored_query_state is not None:
+            # The inner checkpoint is more precise than the outer legacy
+            # supervisor/model boundary and owns pending-tool recovery.
+            next_step = "supervisor"
         if next_step == "supervisor_tools":
             restored_messages = normalize_messages(
                 list(supervisor_state.get("supervisor_messages", []))
@@ -2467,6 +2878,34 @@ class QueryEngine:
                 "tags": ["langsmith:nostream"],
                 **graph.get_model_compatibility_kwargs(configurable.research_model),
             }
+            model_candidates = [
+                ModelCandidate(
+                    model_id=configurable.research_model,
+                    model=graph.configurable_model,
+                    model_config=model_config,
+                )
+            ]
+            for fallback_model in configurable.model_fallbacks.get(
+                "supervisor", []
+            ):
+                if fallback_model == configurable.research_model:
+                    continue
+                model_candidates.append(ModelCandidate(
+                    model_id=fallback_model,
+                    model=graph.configurable_model,
+                    model_config={
+                        "model": fallback_model,
+                        "max_tokens": configurable.research_model_max_tokens,
+                        **graph.get_model_connection_kwargs(
+                            fallback_model,
+                            self.config,
+                        ),
+                        "tags": ["langsmith:nostream"],
+                        **graph.get_model_compatibility_kwargs(
+                            fallback_model
+                        ),
+                    },
+                ))
 
             async def before_turn(
                 messages: list[BaseMessage],
@@ -2555,8 +2994,21 @@ class QueryEngine:
                 _tools_by_name: dict[str, Any],
                 turn: int,
                 _config: RunnableConfig,
+                committed_outcomes: dict[
+                    str,
+                    GovernedToolCallResult,
+                ],
+                on_committed: Callable[
+                    [dict[str, Any], GovernedToolCallResult],
+                    Awaitable[None],
+                ],
             ) -> ToolResultsHookResult:
-                command = await execute_supervisor_tools(messages, turn)
+                command = await execute_supervisor_tools(
+                    messages,
+                    turn,
+                    committed_outcomes=committed_outcomes,
+                    on_committed=on_committed,
+                )
                 update = dict(command.update)
                 tool_messages = normalize_messages(update.pop("supervisor_messages", []))
                 projected_state = dict(supervisor_state)
@@ -2576,7 +3028,7 @@ class QueryEngine:
                     "gaps": list(decision.gaps),
                 }
                 should_continue = decision.action is CompletionDecision.CONTINUE_WITH_GAPS
-                additional_messages = []
+                additional_messages: list[BaseMessage] = []
                 if should_continue and decision.gaps:
                     additional_messages.append(HumanMessage(content=(
                         "[Research Completion Policy] Continue research and resolve: "
@@ -2660,12 +3112,22 @@ class QueryEngine:
                 ),
                 before_turn_hooks=[before_turn],
                 stop_hooks=[handle_no_tool_stop],
-                tool_batch_hook=run_tool_batch,
+                durable_tool_batch_hook=run_tool_batch,
                 max_concurrent_tools=configurable.max_concurrent_tool_calls,
                 max_tool_batch_size=configurable.max_tool_batch_size,
                 tool_timeout_seconds=configurable.tool_call_timeout_seconds,
                 hook_timeout_seconds=configurable.hook_timeout_seconds,
-                tool_batch_timeout_seconds=configurable.task_timeout_seconds,
+                # task_timeout_seconds is a per-Researcher deadline. The batch
+                # needs additional bounded time to assess and summarize the
+                # successfully completed handoffs after a sibling times out.
+                tool_batch_timeout_seconds=(
+                    configurable.task_timeout_seconds
+                    + (
+                        configurable.model_call_timeout_seconds
+                        * configurable.model_transport_max_attempts
+                    )
+                    + configurable.hook_timeout_seconds
+                ),
                 model_timeout_seconds=configurable.model_call_timeout_seconds,
                 model_transport_max_attempts=(
                     configurable.model_transport_max_attempts
@@ -2673,6 +3135,28 @@ class QueryEngine:
                 budget_gate=self._budget_gate(),
                 execution_namespace="supervisor",
                 cancellation_scope=self.cancellation_scope,
+                initial_state=restored_query_state,
+                state_key="supervisor",
+                checkpoint_sink=checkpoint_sink,
+                acknowledged_event_ids=tuple(
+                    supervisor_state.get(
+                        "applied_query_event_ids",
+                        [],
+                    )
+                ),
+                model_candidates=model_candidates,
+                context_recovery_max_attempts=(
+                    configurable.context_recovery_max_attempts
+                ),
+                output_token_escalation_enabled=(
+                    configurable.output_token_escalation_enabled
+                ),
+                output_continuation_max_attempts=(
+                    configurable.output_continuation_max_attempts
+                ),
+                model_max_output_tokens_overrides=(
+                    configurable.model_max_output_tokens_overrides
+                ),
             )):
                 if event.type == "query.model_event":
                     completed_turn = int(event.data["turn"])
@@ -2686,6 +3170,18 @@ class QueryEngine:
                         goto="supervisor_tools",
                     )
                 elif event.type == "query.tool_result":
+                    event_id = str(event.data.get("event_id") or "")
+                    applied_event_ids = list(
+                        supervisor_state.get(
+                            "applied_query_event_ids",
+                            [],
+                        )
+                    )
+                    if event_id and event_id in applied_event_ids:
+                        terminal_tool_update_handled = not bool(
+                            event.data.get("should_continue", True)
+                        )
+                        continue
                     event_update = dict(event.data.get("updates", {}))
                     tool_messages = [
                         *event.data.get("messages", []),
@@ -2693,6 +3189,11 @@ class QueryEngine:
                     ]
                     if tool_messages:
                         event_update["supervisor_messages"] = tool_messages
+                    if event_id:
+                        event_update["applied_query_event_ids"] = {
+                            "type": "override",
+                            "value": [*applied_event_ids, event_id],
+                        }
                     should_continue = bool(event.data.get("should_continue", True))
                     await commit_supervisor_update(
                         event_update,
@@ -2700,6 +3201,34 @@ class QueryEngine:
                         goto="supervisor" if should_continue else END,
                     )
                     terminal_tool_update_handled = not should_continue
+                elif event.type == "query.transition":
+                    event_id = str(event.data.get("event_id") or "")
+                    applied_event_ids = list(
+                        supervisor_state.get(
+                            "applied_query_event_ids",
+                            [],
+                        )
+                    )
+                    if event_id and event_id in applied_event_ids:
+                        continue
+                    event_update = dict(event.data.get("updates", {}))
+                    transition_messages = list(
+                        event.data.get("messages", [])
+                    )
+                    if transition_messages:
+                        event_update["supervisor_messages"] = (
+                            transition_messages
+                        )
+                    if event_id:
+                        event_update["applied_query_event_ids"] = {
+                            "type": "override",
+                            "value": [*applied_event_ids, event_id],
+                        }
+                    await commit_supervisor_update(
+                        event_update,
+                        step="supervisor_stop_governance",
+                        goto="supervisor",
+                    )
                 elif event.type == "query.completed":
                     completed_messages = normalize_messages(
                         list(event.data.get("messages", completed_messages))
@@ -2716,6 +3245,10 @@ class QueryEngine:
                         "budget_exhausted",
                         "deadline_exceeded",
                         "model_timeout",
+                        "prompt_too_long",
+                        "output_recovery_exhausted",
+                        "model_error",
+                        "hook_stopped",
                     }:
                         decision = completion_policy.evaluate(supervisor_completion_context(
                             has_remaining_budget=False,
@@ -2727,11 +3260,35 @@ class QueryEngine:
                             "gaps": list(decision.gaps),
                         }
                     if not terminal_tool_update_handled:
-                        await commit_supervisor_update(
-                            dict(event.data.get("updates", {})),
-                            step="supervisor_tools",
-                            goto=END,
+                        event_id = str(event.data.get("event_id") or "")
+                        applied_event_ids = list(
+                            supervisor_state.get(
+                                "applied_query_event_ids",
+                                [],
+                            )
                         )
+                        if (
+                            not event_id
+                            or event_id not in applied_event_ids
+                        ):
+                            completion_update = dict(
+                                event.data.get("updates", {})
+                            )
+                            if event_id:
+                                completion_update[
+                                    "applied_query_event_ids"
+                                ] = {
+                                    "type": "override",
+                                    "value": [
+                                        *applied_event_ids,
+                                        event_id,
+                                    ],
+                                }
+                            await commit_supervisor_update(
+                                completion_update,
+                                step="supervisor_tools",
+                                goto=END,
+                            )
 
             supervisor_state["supervisor_messages"] = completed_messages
             supervisor_state["research_iterations"] = completed_turn
@@ -2760,10 +3317,37 @@ class QueryEngine:
                 "value": list(supervisor_state.get("handoff_assessments", [])),
             },
             "research_brief": supervisor_state.get("research_brief", main_state.get("research_brief", "")),
+            "coverage_contract": dict(
+                supervisor_state.get(
+                    "coverage_contract",
+                    main_state.get("coverage_contract", {}),
+                )
+            ),
+            "coverage_ledger": dict(
+                supervisor_state.get(
+                    "coverage_ledger",
+                    main_state.get("coverage_ledger", {}),
+                )
+            ),
+            "research_risk_profile": dict(
+                supervisor_state.get(
+                    "research_risk_profile",
+                    main_state.get("research_risk_profile", {}),
+                )
+            ),
             "approved_research_plan": supervisor_state.get("approved_research_plan"),
             "completion_decision": {
                 "type": "override",
                 "value": supervisor_state.get("completion_decision", {}),
+            },
+            "applied_query_event_ids": {
+                "type": "override",
+                "value": list(
+                    supervisor_state.get(
+                        "applied_query_event_ids",
+                        [],
+                    )
+                ),
             },
             "human_feedback": {"type": "override", "value": list(self.human_feedback)},
         }
@@ -2849,6 +3433,7 @@ class ResearcherQueryEngine:
                 runtime_messages.append(HumanMessage(content=memory_context))
             memory_prefix_count = len(runtime_messages)
             runtime_messages.extend(researcher_state["researcher_messages"])
+            quality_recovery_state = QualityRecoveryState()
             completion_policy = ResearchCompletionPolicy(
                 min_evidence=(
                     1 if configurable.web_pipeline_mode == "enforced" else 0
@@ -2908,6 +3493,14 @@ class ResearcherQueryEngine:
                 _next_turn: int,
                 _config: RunnableConfig,
             ) -> BeforeTurnHookResult | None:
+                if (
+                    _next_turn > configurable.max_react_tool_calls
+                    and not quality_recovery_state.active
+                ):
+                    return BeforeTurnHookResult(
+                        should_stop=True,
+                        reason="max_turns",
+                    )
                 task_id = str(cfg.get("metadata", {}).get("task_id", ""))
                 if not task_id:
                     return None
@@ -2942,6 +3535,7 @@ class ResearcherQueryEngine:
                 turn: int,
                 _config: RunnableConfig,
             ) -> ToolResultsHookResult:
+                nonlocal quality_recovery_state
                 tool_outputs, batch_update = await graph.prepare_researcher_tool_outcomes(
                     tool_calls,
                     outcomes,
@@ -3089,11 +3683,115 @@ class ResearcherQueryEngine:
                     elif decision.action is CompletionDecision.CONTINUE_WITH_GAPS:
                         should_continue = True
 
+                    if "result_assessment" in assessment_update:
+                        current_assessment = assessment_update[
+                            "result_assessment"
+                        ]
+                    else:
+                        current_assessment = researcher_state.get(
+                            "result_assessment",
+                            {},
+                        )
+                    assessment_payload = (
+                        current_assessment
+                        if isinstance(current_assessment, dict)
+                        else {}
+                    )
+                    missing_information = [
+                        str(item)
+                        for item in assessment_payload.get(
+                            "missing_information",
+                            [],
+                        )
+                        if str(item).strip()
+                    ]
+                    suggested_queries = [
+                        str(item)
+                        for item in assessment_payload.get(
+                            "suggested_queries",
+                            [],
+                        )
+                        if str(item).strip()
+                    ]
+                    owned_requirement_ids = [
+                        str(item)
+                        for item in researcher_state.get(
+                            "requirement_ids",
+                            [],
+                        )
+                        if str(item).strip()
+                    ]
+                    recovery_budget = (
+                        configurable.quality_gap_recovery_max_attempts
+                    )
+                    recovery_is_actionable = (
+                        limit_reached
+                        and assessment_payload.get("decision") != "complete"
+                        and bool(missing_information)
+                        and bool(suggested_queries)
+                        and bool(owned_requirement_ids)
+                        and not bool(researcher_state.get("cancelled"))
+                        and quality_recovery_state.attempts
+                        < recovery_budget
+                    )
+                    if recovery_is_actionable:
+                        quality_recovery_state = QualityRecoveryState(
+                            attempts=quality_recovery_state.attempts + 1,
+                            active=True,
+                            target_requirement_ids=tuple(
+                                owned_requirement_ids
+                            ),
+                            triggering_assessment_revision=None,
+                        )
+                        evidence_summary = [
+                            {
+                                "evidence_id": str(
+                                    item.get("evidence_id", "")
+                                ),
+                                "claim": str(item.get("claim", ""))[:500],
+                            }
+                            for item in eligible_evidence_records(
+                                researcher_state
+                            )[:8]
+                        ]
+                        recovery_instruction = {
+                            "requirement_ids": owned_requirement_ids,
+                            "missing_information": missing_information,
+                            "suggested_queries": suggested_queries,
+                            "existing_evidence_summary": evidence_summary,
+                        }
+                        additional_messages = [HumanMessage(content=(
+                            "[Quality Gap Recovery] This is the single "
+                            "bounded recovery round. Search only for the "
+                            "listed user requirements and gaps, then stop. "
+                            "Do not expand the task scope.\n"
+                            + json.dumps(
+                                recovery_instruction,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            )
+                        ))]
+                        should_continue = True
+                    elif quality_recovery_state.active:
+                        quality_recovery_state = QualityRecoveryState(
+                            attempts=quality_recovery_state.attempts,
+                            active=False,
+                            target_requirement_ids=(
+                                quality_recovery_state
+                                .target_requirement_ids
+                            ),
+                            triggering_assessment_revision=(
+                                quality_recovery_state
+                                .triggering_assessment_revision
+                            ),
+                        )
+
                 return ToolResultsHookResult(
-                    messages=tool_outputs,
+                    messages=cast(list[BaseMessage], tool_outputs),
                     additional_messages=additional_messages,
                     updates=domain_updates,
                     should_continue=should_continue,
+                    quality_recovery=quality_recovery_state,
                     reason=(
                         "completion_policy_satisfied"
                         if decision.action in {
@@ -3113,6 +3811,96 @@ class ResearcherQueryEngine:
                 "tags": ["langsmith:nostream"],
                 **graph.get_model_compatibility_kwargs(configurable.research_model),
             }
+            task_id = str(cfg.get("metadata", {}).get("task_id") or "")
+            researcher_state_key = (
+                f"researcher:{task_id}"
+                if task_id
+                else "researcher:standalone"
+            )
+            restored_query_state = None
+            query_state_payload = researcher_state.get(
+                "query_state_snapshot"
+            )
+            if isinstance(query_state_payload, dict):
+                restored_query_state = QueryLoopState.from_snapshot(
+                    query_state_payload
+                )
+            checkpoint_callback = researcher_state.get(
+                "_query_checkpoint_callback"
+            )
+            researcher_checkpoint_sink: QueryCheckpointSink | None = (
+                CallbackQueryCheckpointSink(checkpoint_callback)
+                if callable(checkpoint_callback)
+                else None
+            )
+            if (
+                researcher_checkpoint_sink is None
+                and configurable.query_session_persistence_enabled
+                and cfg.get("metadata", {}).get("run_fence_token")
+                is not None
+                and cfg.get("metadata", {}).get("run_lease_owner_id")
+            ):
+                run_store = graph._bind_run_context_fence(  # noqa: SLF001
+                    RunContextStore(
+                        str(
+                            cfg.get("metadata", {}).get(
+                                "run_id", "default"
+                            )
+                        ),
+                        runs_dir=configurable.runs_dir,
+                        inline_content_max_chars=(
+                            configurable
+                            .query_journal_inline_content_max_chars
+                        ),
+                    ),
+                    cfg,
+                )
+                if run_store.manifest_path.exists():
+                    if restored_query_state is None:
+                        stored_payload = run_store.replay().query_states.get(
+                            researcher_state_key
+                        )
+                        if stored_payload is not None:
+                            restored_query_state = (
+                                QueryLoopState.from_snapshot(
+                                    stored_payload
+                                )
+                            )
+                    researcher_checkpoint_sink = (
+                        RunContextQueryCheckpointSink(run_store)
+                    )
+            if restored_query_state is not None:
+                quality_recovery_state = (
+                    restored_query_state.quality_recovery
+                )
+            model_candidates = [
+                ModelCandidate(
+                    model_id=configurable.research_model,
+                    model=graph.configurable_model,
+                    model_config=model_config,
+                )
+            ]
+            for fallback_model in configurable.model_fallbacks.get(
+                "researcher", []
+            ):
+                if fallback_model == configurable.research_model:
+                    continue
+                model_candidates.append(ModelCandidate(
+                    model_id=fallback_model,
+                    model=graph.configurable_model,
+                    model_config={
+                        "model": fallback_model,
+                        "max_tokens": configurable.research_model_max_tokens,
+                        **graph.get_model_connection_kwargs(
+                            fallback_model,
+                            cfg,
+                        ),
+                        "tags": ["langsmith:nostream"],
+                        **graph.get_model_compatibility_kwargs(
+                            fallback_model
+                        ),
+                    },
+                ))
             completed_messages = runtime_messages
             completed_turn = int(researcher_state.get("tool_call_iterations", 0) or 0)
             async for event in query(QueryParams(
@@ -3125,7 +3913,10 @@ class ResearcherQueryEngine:
                 role=graph.AgentRole.RESEARCHER,
                 model_span_name="researcher.model",
                 model_config=model_config,
-                max_turns=configurable.max_react_tool_calls,
+                max_turns=(
+                    configurable.max_react_tool_calls
+                    + configurable.quality_gap_recovery_max_attempts
+                ),
                 initial_turn=completed_turn,
                 max_tool_description_chars=configurable.max_mcp_description_chars,
                 context_policy=ContextPolicy(
@@ -3148,14 +3939,55 @@ class ResearcherQueryEngine:
                     started_at=cfg.get("metadata", {}).get("run_started_at"),
                 ),
                 execution_namespace=(
-                    f"researcher:{cfg.get('metadata', {}).get('task_id')}"
-                    if cfg.get("metadata", {}).get("task_id")
-                    else "researcher:standalone"
+                    researcher_state_key
+                ),
+                initial_state=restored_query_state,
+                state_key=researcher_state_key,
+                checkpoint_sink=researcher_checkpoint_sink,
+                acknowledged_event_ids=tuple(
+                    researcher_state.get(
+                        "applied_query_event_ids",
+                        [],
+                    )
+                ),
+                model_candidates=model_candidates,
+                context_recovery_max_attempts=(
+                    configurable.context_recovery_max_attempts
+                ),
+                output_token_escalation_enabled=(
+                    configurable.output_token_escalation_enabled
+                ),
+                output_continuation_max_attempts=(
+                    configurable.output_continuation_max_attempts
+                ),
+                model_max_output_tokens_overrides=(
+                    configurable.model_max_output_tokens_overrides
                 ),
             )):
+                event_id = str(event.data.get("event_id") or "")
+                applied_event_ids = list(
+                    researcher_state.get(
+                        "applied_query_event_ids",
+                        [],
+                    )
+                )
+                event_already_applied = (
+                    bool(event_id) and event_id in applied_event_ids
+                )
                 updates = event.data.get("updates")
-                if updates:
+                if updates and not event_already_applied:
                     apply_update_to_state(researcher_state, updates)
+                if event_id and not event_already_applied:
+                    researcher_state["applied_query_event_ids"] = [
+                        *applied_event_ids,
+                        event_id,
+                    ]
+                if event.type == "query.state_changed":
+                    query_state = event.data.get("state")
+                    if isinstance(query_state, QueryLoopState):
+                        researcher_state["query_state_snapshot"] = (
+                            query_state.to_snapshot()
+                        )
                 if event.type == "query.completed":
                     completed_messages = list(event.data.get("messages", runtime_messages))
                     completed_turn = int(

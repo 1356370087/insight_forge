@@ -31,7 +31,7 @@ class ResearcherCheckpoint:
 
     task_id: str
     phase: str  # "researching" | "compressing" | "completed"
-    schema_version: int = 2
+    schema_version: int = 4
     next_step: str = "model"
     fence_token: int = 0
     committed_tool_call_ids: list[str] = field(default_factory=list)
@@ -46,6 +46,21 @@ class ResearcherCheckpoint:
     run_id: str = ""
     user_id: Optional[str] = None
     memory_context: Optional[str] = None
+    query_state: Optional[dict[str, Any]] = None
+    requirement_ids: list[str] = field(default_factory=list)
+    coverage_contract: dict[str, Any] = field(default_factory=dict)
+    research_risk_profile: dict[str, Any] = field(default_factory=dict)
+    raw_notes: list[str] = field(default_factory=list)
+    pending_tool_results: list[dict[str, Any]] = field(default_factory=list)
+    research_complete_requested: bool = False
+    research_complete_succeeded: bool = False
+    result_assessment: dict[str, Any] = field(default_factory=dict)
+    permission_denials: list[dict[str, Any]] = field(default_factory=list)
+    candidate_registry: list[dict[str, Any]] = field(default_factory=list)
+    document_registry: list[dict[str, Any]] = field(default_factory=list)
+    evidence_registry: list[dict[str, Any]] = field(default_factory=list)
+    web_research_iterations: list[dict[str, Any]] = field(default_factory=list)
+    applied_query_event_ids: list[str] = field(default_factory=list)
     timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
@@ -68,6 +83,21 @@ class ResearcherCheckpoint:
             "run_id": self.run_id,
             "user_id": self.user_id,
             "memory_context": self.memory_context,
+            "query_state": self.query_state,
+            "requirement_ids": list(self.requirement_ids),
+            "coverage_contract": dict(self.coverage_contract),
+            "research_risk_profile": dict(self.research_risk_profile),
+            "raw_notes": list(self.raw_notes),
+            "pending_tool_results": list(self.pending_tool_results),
+            "research_complete_requested": self.research_complete_requested,
+            "research_complete_succeeded": self.research_complete_succeeded,
+            "result_assessment": dict(self.result_assessment),
+            "permission_denials": list(self.permission_denials),
+            "candidate_registry": list(self.candidate_registry),
+            "document_registry": list(self.document_registry),
+            "evidence_registry": list(self.evidence_registry),
+            "web_research_iterations": list(self.web_research_iterations),
+            "applied_query_event_ids": list(self.applied_query_event_ids),
             "timestamp": self.timestamp,
         }
 
@@ -92,6 +122,27 @@ class ResearcherCheckpoint:
             run_id=data.get("run_id", ""),
             user_id=data.get("user_id"),
             memory_context=data.get("memory_context"),
+            query_state=data.get("query_state"),
+            requirement_ids=data.get("requirement_ids", []),
+            coverage_contract=data.get("coverage_contract", {}),
+            research_risk_profile=data.get("research_risk_profile", {}),
+            raw_notes=data.get("raw_notes", []),
+            pending_tool_results=data.get("pending_tool_results", []),
+            research_complete_requested=data.get(
+                "research_complete_requested",
+                False,
+            ),
+            research_complete_succeeded=data.get(
+                "research_complete_succeeded",
+                False,
+            ),
+            result_assessment=data.get("result_assessment", {}),
+            permission_denials=data.get("permission_denials", []),
+            candidate_registry=data.get("candidate_registry", []),
+            document_registry=data.get("document_registry", []),
+            evidence_registry=data.get("evidence_registry", []),
+            web_research_iterations=data.get("web_research_iterations", []),
+            applied_query_event_ids=data.get("applied_query_event_ids", []),
             timestamp=data.get("timestamp", time.time()),
         )
 

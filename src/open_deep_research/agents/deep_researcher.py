@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import time
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, Literal, cast
 
 from langchain.chat_models import init_chat_model
@@ -21,6 +22,10 @@ from langchain_core.messages import (
 from langchain_core.messages.utils import count_tokens_approximately
 from langchain_core.runnables import RunnableConfig
 
+from open_deep_research.agents.model_recovery import (
+    invoke_with_output_recovery,
+    resolve_model_max_output_tokens,
+)
 from open_deep_research.agents.query_engine import QueryEngine, ResearcherQueryEngine
 from open_deep_research.agents.research_context import offload_tool_message
 from open_deep_research.configuration import (
@@ -71,6 +76,14 @@ from open_deep_research.public_events import (
 from open_deep_research.quality import (
     evaluate_subagent_handoff,
     evaluate_tool_results,
+)
+from open_deep_research.quality_contract import (
+    AdmissionStatus,
+    ResearchCoverageContract,
+    ResearchRiskProfile,
+    build_research_coverage_contract,
+    classify_research_risk,
+    merge_coverage_ledger,
 )
 from open_deep_research.run_context import RunContextStore
 from open_deep_research.runtime import (
@@ -665,7 +678,6 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
         agent_role="lead",
         model_name=configurable.research_model,
     )
-    
     # Step 4: Route based on clarification analysis
     if response.need_clarification:
         # End with clarifying question for user
@@ -679,6 +691,26 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
             goto="write_research_brief", 
             update={"messages": [AIMessage(content=response.verification)]}
         )
+
+
+def _render_supervisor_coverage_contract(
+    contract: ResearchCoverageContract,
+) -> str:
+    """Render the only legal hard requirements for Supervisor delegation."""
+    requirements = "\n".join(
+        f"{requirement.requirement_id}: {requirement.text}"
+        for requirement in contract.requirements
+    )
+    return (
+        "<User Coverage Contract>\n"
+        "The entries below are the only hard user coverage requirements. "
+        "Every ConductResearch or StartResearchTask call must select one or "
+        "more requirement_ids exactly from this list. The research brief and "
+        "task descriptions are advisory: they may refine how to investigate "
+        "these requirements, but they must not create new hard requirements.\n"
+        f"{requirements}\n"
+        "</User Coverage Contract>"
+    )
 
 
 async def write_research_brief(state: AgentState, config: RunnableConfig) -> Command[Literal["research_supervisor"]]:
@@ -731,6 +763,15 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
         agent_role="lead",
         model_name=configurable.research_model,
     )
+    coverage_contract = build_research_coverage_contract(
+        state.get("messages", []),
+        advisory_dimensions=[response.research_brief],
+    )
+    risk_profile = classify_research_risk(
+        message_history,
+        mode=configurable.quality_risk_mode,
+        skills=configurable.skills or (),
+    )
 
     # Step 3: Initialize supervisor with research brief and instructions
     if configurable.enable_async_research:
@@ -747,7 +788,12 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
             max_researcher_iterations=configurable.max_researcher_iterations,
             max_react_tool_calls=configurable.max_react_tool_calls,
         )
-    supervisor_context: list[BaseMessage] = [SystemMessage(content=supervisor_system_prompt)]
+    supervisor_context: list[BaseMessage] = [
+        SystemMessage(content=supervisor_system_prompt),
+        HumanMessage(
+            content=_render_supervisor_coverage_contract(coverage_contract)
+        ),
+    ]
     if memory_context:
         supervisor_context.append(HumanMessage(content=memory_context))
     supervisor_context.append(HumanMessage(content=response.research_brief))
@@ -756,6 +802,9 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
         goto="research_supervisor",
         update={
             "research_brief": response.research_brief,
+            "coverage_contract": coverage_contract.model_dump(mode="json"),
+            "coverage_ledger": {},
+            "research_risk_profile": risk_profile.model_dump(mode="json"),
             "supervisor_messages": {
                 "type": "override",
                 "value": [
@@ -966,6 +1015,18 @@ def _protect_web_pipeline_output(
 
 def build_supervisor_tools(state: SupervisorState) -> list[Tool]:
     """Build fully executable supervisor tools with runtime dependencies injected."""
+    coverage_payload = state.get("coverage_contract")
+    coverage_contract = (
+        ResearchCoverageContract.model_validate(coverage_payload)
+        if isinstance(coverage_payload, dict) and coverage_payload
+        else None
+    )
+    risk_payload = state.get("research_risk_profile")
+    risk_profile = (
+        ResearchRiskProfile.model_validate(risk_payload)
+        if isinstance(risk_payload, dict) and risk_payload
+        else ResearchRiskProfile(level="standard")
+    )
 
     async def complete_call(input, context, on_progress=None):
         del input, context, on_progress
@@ -986,6 +1047,36 @@ def build_supervisor_tools(state: SupervisorState) -> list[Tool]:
             configurable = Configuration.from_runnable_config(context.config)
             run_id = str(context.config.get("metadata", {}).get("run_id", "default"))
             task_id = context.tool_call_id
+            requirement_ids = list(
+                dict.fromkeys(str(item) for item in input.requirement_ids)
+            )
+            if (
+                coverage_contract is not None
+                and str(
+                    context.config.get("metadata", {}).get(
+                        "quality_policy_version",
+                        "",
+                    )
+                )
+                == "quality-gate-v4"
+            ):
+                known_requirement_ids = set(
+                    coverage_contract.requirement_ids()
+                )
+                if not requirement_ids:
+                    raise ValueError(
+                        "coverage_requirement_ids_required"
+                    )
+                unknown_requirement_ids = [
+                    item
+                    for item in requirement_ids
+                    if item not in known_requirement_ids
+                ]
+                if unknown_requirement_ids:
+                    raise ValueError(
+                        "unknown_coverage_requirement_ids:"
+                        + ",".join(unknown_requirement_ids)
+                    )
             researcher_config = {
                 **context.config,
                 "metadata": {
@@ -1013,6 +1104,7 @@ def build_supervisor_tools(state: SupervisorState) -> list[Tool]:
                     return ToolResult(output={
                         "task_id": task_id,
                         "research_topic": input.research_topic,
+                        "requirement_ids": requirement_ids,
                         "compressed_research": str(existing.get("compressed_research", "")),
                         "artifact_ref": existing_ref,
                         "metrics": dict(existing.get("metrics", {})),
@@ -1025,14 +1117,32 @@ def build_supervisor_tools(state: SupervisorState) -> list[Tool]:
                         HumanMessage(content=input.research_topic)
                     ],
                     "research_topic": input.research_topic,
+                    "requirement_ids": requirement_ids,
+                    "coverage_contract": (
+                        coverage_contract.model_dump(mode="json")
+                        if coverage_contract is not None
+                        else {}
+                    ),
+                    "research_risk_profile": risk_profile.model_dump(
+                        mode="json"
+                    ),
                     "memory_context": state.get("memory_context"),
                 },
                 researcher_config,
             )
             artifact = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "task_id": task_id,
                 "research_topic": input.research_topic,
+                "requirement_ids": requirement_ids,
+                "coverage_contract": (
+                    coverage_contract.model_dump(mode="json")
+                    if coverage_contract is not None
+                    else {}
+                ),
+                "research_risk_profile": risk_profile.model_dump(
+                    mode="json"
+                ),
                 "compressed_research": str(observation.get("compressed_research", "")),
                 "researcher_messages": [
                     message_to_dict(message)
@@ -1069,6 +1179,7 @@ def build_supervisor_tools(state: SupervisorState) -> list[Tool]:
             return ToolResult(output={
                 "task_id": task_id,
                 "research_topic": input.research_topic,
+                "requirement_ids": requirement_ids,
                 "compressed_research": artifact["compressed_research"],
                 "artifact_ref": {
                     "path": relative_path,
@@ -1168,6 +1279,27 @@ def build_supervisor_tools(state: SupervisorState) -> list[Tool]:
                     str(artifact.get("research_topic", "")),
                     quality_handoff,
                     context.config,
+                    **(
+                        {
+                            "coverage_contract": artifact[
+                                "coverage_contract"
+                            ],
+                            "requirement_ids": list(
+                                artifact.get("requirement_ids", [])
+                            ),
+                            "risk_profile": (
+                                ResearchRiskProfile.model_validate(
+                                    artifact.get(
+                                        "research_risk_profile",
+                                        {},
+                                    )
+                                    or {"level": "standard"}
+                                )
+                            ),
+                        }
+                        if artifact.get("coverage_contract")
+                        else {}
+                    ),
                 )
                 output.update({
                     "status": (
@@ -1176,7 +1308,11 @@ def build_supervisor_tools(state: SupervisorState) -> list[Tool]:
                         else "rejected_after_artifact_reassessment"
                     ),
                     "admission_status": (
-                        "accepted" if reassessment.accepted else "rejected"
+                        reassessment.admission_status.value
+                        if reassessment.admission_status is not None
+                        else "accepted"
+                        if reassessment.accepted
+                        else "rejected"
                     ),
                     "reassessment": reassessment.model_dump(),
                 })
@@ -1200,6 +1336,25 @@ def build_supervisor_tools(state: SupervisorState) -> list[Tool]:
     async def start_call(input, context, on_progress=None):
         del on_progress
         configurable = Configuration.from_runnable_config(context.config)
+        requirement_ids = list(
+            dict.fromkeys(str(item) for item in input.requirement_ids)
+        )
+        if coverage_contract is not None:
+            known_requirement_ids = set(
+                coverage_contract.requirement_ids()
+            )
+            if not requirement_ids:
+                raise ValueError("coverage_requirement_ids_required")
+            unknown_requirement_ids = [
+                item
+                for item in requirement_ids
+                if item not in known_requirement_ids
+            ]
+            if unknown_requirement_ids:
+                raise ValueError(
+                    "unknown_coverage_requirement_ids:"
+                    + ",".join(unknown_requirement_ids)
+                )
         registry = get_task_registry()
         run_id = context.config.get("metadata", {}).get("run_id", "default")
         writer = _event_writer(configurable, run_id)
@@ -1212,6 +1367,12 @@ def build_supervisor_tools(state: SupervisorState) -> list[Tool]:
                 launch_task=lambda record, _cfg: pool.submit(record),
                 event_writer=writer,
                 memory_context=state.get("memory_context"),
+                coverage_contract=(
+                    coverage_contract.model_dump()
+                    if coverage_contract is not None
+                    else None
+                ),
+                research_risk_profile=risk_profile.model_dump(),
             )
             return ToolResult(output=message.content)
         finally:
@@ -1393,8 +1554,11 @@ async def _finalize_async_research_outputs(
         state_store=state_store,
     )
     accepted_outputs: list[dict[str, Any]] = []
+    assessment_updates: list[dict[str, Any]] = []
+    coverage_ledger = dict(state.get("coverage_ledger", {}))
     for output in outputs:
         task_id = str(output["task_id"])
+        admission_status = AdmissionStatus.ACCEPTED.value
         snapshot = await state_store.get(task_id, run_id=run_id)
         if configurable.quality_evaluation_enabled:
             quality_handoff = _load_handoff_artifact_for_quality(
@@ -1403,14 +1567,45 @@ async def _finalize_async_research_outputs(
                 run_id=run_id,
                 configurable=configurable,
             )
-            assessment = await evaluate_subagent_handoff(
-                str(output.get("research_topic", "")),
-                quality_handoff,
-                config,
+            resolved_contract_payload = (
+                quality_handoff.get("coverage_contract")
+                or state.get("coverage_contract")
+            )
+            if resolved_contract_payload:
+                assessment = await evaluate_subagent_handoff(
+                    str(output.get("research_topic", "")),
+                    quality_handoff,
+                    config,
+                    coverage_contract=resolved_contract_payload,
+                    requirement_ids=list(
+                        quality_handoff.get("requirement_ids", [])
+                    ),
+                    risk_profile=ResearchRiskProfile.model_validate(
+                        quality_handoff.get("research_risk_profile")
+                        or state.get("research_risk_profile")
+                        or {"level": "standard"}
+                    ),
+                )
+            else:
+                assessment = await evaluate_subagent_handoff(
+                    str(output.get("research_topic", "")),
+                    quality_handoff,
+                    config,
+                )
+            admission_status = (
+                assessment.admission_status.value
+                if assessment.admission_status is not None
+                else "accepted"
+                if assessment.accepted
+                else "rejected"
             )
             if snapshot is not None:
-                snapshot.admission_status = "accepted" if assessment.accepted else "rejected"
+                snapshot.admission_status = admission_status
                 await state_store.upsert(snapshot)
+            assessment_updates.append({
+                "tool_call_id": task_id,
+                **assessment.model_dump(),
+            })
             if not assessment.accepted:
                 await publisher.publish(
                     "research.task.completed",
@@ -1428,6 +1623,11 @@ async def _finalize_async_research_outputs(
                     dedupe_key=f"task:{task_id}:admission:rejected",
                 )
                 continue
+            coverage_ledger = merge_coverage_ledger(
+                coverage_ledger,
+                task_id=task_id,
+                assessment=assessment,
+            )
             output["handoff_assessment"] = assessment.model_dump()
         elif snapshot is not None:
             snapshot.admission_status = "accepted"
@@ -1455,7 +1655,7 @@ async def _finalize_async_research_outputs(
                 "mode": "async",
                 "status": "completed",
                 "phase": "completed",
-                "admission_status": "accepted",
+                "admission_status": admission_status,
                 "source_count": len(sources),
                 "summary_status": "available" if summary else "unavailable",
                 "message": (
@@ -1464,7 +1664,7 @@ async def _finalize_async_research_outputs(
                     else None
                 ),
             },
-            dedupe_key=f"task:{task_id}:admission:accepted",
+            dedupe_key=f"task:{task_id}:admission:{admission_status}",
         )
         if summary:
             await publisher.publish(
@@ -1481,6 +1681,10 @@ async def _finalize_async_research_outputs(
             )
 
     update: dict[str, Any] = {"completed_task_outputs": accepted_outputs}
+    if assessment_updates:
+        update["handoff_assessments"] = assessment_updates
+    if coverage_ledger:
+        update["coverage_ledger"] = coverage_ledger
     for registry_key in (
         "candidate_registry",
         "document_registry",
@@ -1524,9 +1728,27 @@ async def _finalize_async_research_outputs(
 async def _execute_supervisor_tools(
     state: SupervisorState,
     config: RunnableConfig,
+    *,
+    committed_outcomes: Mapping[str, GovernedToolCallResult] | None = None,
+    on_committed: Callable[
+        [dict[str, Any], GovernedToolCallResult],
+        Awaitable[None],
+    ] | None = None,
 ) -> Command[Literal["supervisor", "__end__"]]:
     """Execute every supervisor request through the governed Tool.call pipeline."""
     configurable = Configuration.from_runnable_config(config)
+    coverage_payload = state.get("coverage_contract")
+    coverage_contract = (
+        ResearchCoverageContract.model_validate(coverage_payload)
+        if isinstance(coverage_payload, dict) and coverage_payload
+        else None
+    )
+    risk_payload = state.get("research_risk_profile")
+    risk_profile = (
+        ResearchRiskProfile.model_validate(risk_payload)
+        if isinstance(risk_payload, dict) and risk_payload
+        else ResearchRiskProfile(level="standard")
+    )
     publisher = event_publisher_from_config(config)
     supervisor_messages = state.get("supervisor_messages", [])
     most_recent_message = supervisor_messages[-1]
@@ -1729,32 +1951,82 @@ async def _execute_supervisor_tools(
                 )
         return outcome
 
+    outcomes_by_id = dict(committed_outcomes or {})
+
+    async def commit_outcome(
+        tool_call: dict[str, Any],
+        outcome: GovernedToolCallResult,
+    ) -> GovernedToolCallResult:
+        call_id = str(tool_call["id"])
+        if call_id not in outcomes_by_id and on_committed is not None:
+            await on_committed(tool_call, outcome)
+        outcomes_by_id[call_id] = outcome
+        return outcome
+
     if state.get("enable_async_research", False):
-        outcomes = []
         for tool_call in ordinary_calls:
-            outcomes.append(await execute_one(tool_call))
+            if str(tool_call["id"]) in outcomes_by_id:
+                continue
+            await commit_outcome(tool_call, await execute_one(tool_call))
     else:
         non_conduct = [
-            call for call in ordinary_calls if call["name"] != "ConductResearch"
+            call
+            for call in ordinary_calls
+            if call["name"] != "ConductResearch"
+            and str(call["id"]) not in outcomes_by_id
         ]
         conduct = [
-            call for call in ordinary_calls if call["name"] == "ConductResearch"
+            call
+            for call in ordinary_calls
+            if call["name"] == "ConductResearch"
+            and str(call["id"]) not in outcomes_by_id
         ]
-        outcomes = []
         for tool_call in non_conduct:
-            outcomes.append(await execute_one(tool_call))
+            await commit_outcome(tool_call, await execute_one(tool_call))
         semaphore = asyncio.Semaphore(configurable.max_concurrent_tool_calls)
 
         async def execute_bounded(call: dict[str, Any]):
             async with semaphore:
-                return await execute_one(call)
+                try:
+                    outcome = await asyncio.wait_for(
+                        execute_one(call),
+                        timeout=configurable.task_timeout_seconds,
+                    )
+                except TimeoutError:
+                    error = ToolError(
+                        error_type=ToolErrorType.timeout,
+                        tool_name=str(call.get("name", "ConductResearch")),
+                        message=(
+                            "The research task exceeded its execution timeout. "
+                            "Other completed research tasks in this batch remain usable."
+                        ),
+                        retryable=True,
+                        detail={
+                            "timeout_seconds": configurable.task_timeout_seconds,
+                            "partial_batch_preserved": True,
+                        },
+                    )
+                    await publisher.publish(
+                        "research.task.failed",
+                        stage="researching",
+                        payload={
+                            "task_id": call["id"],
+                            "wave_id": wave_id,
+                            "mode": "sync",
+                            "status": "failed",
+                            "phase": "researching",
+                            "error_code": "research_task_timed_out",
+                            "message": "The research task exceeded its execution timeout.",
+                        },
+                        dedupe_key=f"task:{call['id']}:failed",
+                    )
+                    outcome = GovernedToolCallResult(
+                        message=error.to_tool_message(str(call["id"])),
+                        error=error,
+                    )
+                return await commit_outcome(call, outcome)
 
-        outcomes.extend(await asyncio.gather(*(execute_bounded(call) for call in conduct)))
-
-    outcomes_by_id = {
-        outcome.message.tool_call_id: outcome
-        for outcome in outcomes
-    }
+        await asyncio.gather(*(execute_bounded(call) for call in conduct))
 
     # Supervisor handoff gate: assess each completed synchronous subagent before
     # its notes are admitted into the shared supervisor state. Rejected handoffs
@@ -1762,16 +2034,18 @@ async def _execute_supervisor_tools(
     # delegate a narrower replacement task.
     handoff_assessments: dict[str, Any] = {}
     if configurable.quality_evaluation_enabled:
-        assessable_calls = [
-            call
-            for call in conduct_calls
-            if call["id"] in outcomes_by_id
-            and outcomes_by_id[call["id"]].result is not None
-            and isinstance(outcomes_by_id[call["id"]].result.output, dict)
-        ]
+        assessable_calls: list[dict[str, Any]] = []
+        for call in conduct_calls:
+            outcome = outcomes_by_id.get(str(call["id"]))
+            result = outcome.result if outcome is not None else None
+            if result is not None and isinstance(result.output, dict):
+                assessable_calls.append(call)
 
         async def assess_handoff(call: dict[str, Any]):
-            observation = outcomes_by_id[call["id"]].result.output
+            result = outcomes_by_id[str(call["id"])].result
+            if result is None or not isinstance(result.output, dict):
+                raise RuntimeError("assessable_handoff_result_missing")
+            observation = result.output
             topic = str(call.get("args", {}).get("research_topic", ""))
             quality_handoff = _load_handoff_artifact_for_quality(
                 observation,
@@ -1779,10 +2053,28 @@ async def _execute_supervisor_tools(
                 run_id=run_id,
                 configurable=configurable,
             )
+            resolved_contract = (
+                coverage_contract
+                or quality_handoff.get("coverage_contract")
+            )
+            if resolved_contract is None:
+                return call["id"], await evaluate_subagent_handoff(
+                    topic,
+                    quality_handoff,
+                    config,
+                )
             return call["id"], await evaluate_subagent_handoff(
                 topic,
                 quality_handoff,
                 config,
+                coverage_contract=resolved_contract,
+                requirement_ids=list(
+                    call.get("args", {}).get(
+                        "requirement_ids",
+                        quality_handoff.get("requirement_ids", []),
+                    )
+                ),
+                risk_profile=risk_profile,
             )
 
         assessment_semaphore = asyncio.Semaphore(
@@ -1818,7 +2110,10 @@ async def _execute_supervisor_tools(
                 "trigger": "artifact_read_reassessment",
                 **reassessment,
             })
-        if output.get("admission_status") != "accepted" or not task_id:
+        if output.get("admission_status") not in {
+            AdmissionStatus.ACCEPTED.value,
+            AdmissionStatus.ACCEPTED_WITH_CAVEATS.value,
+        } or not task_id:
             continue
         artifact_ref = output.get("artifact_ref")
         if (
@@ -1853,7 +2148,14 @@ async def _execute_supervisor_tools(
         completed_sync += 1
         assessment = handoff_assessments.get(call["id"])
         accepted = assessment is None or assessment.accepted
-        admission_status = "accepted" if accepted else "rejected"
+        admission_status = (
+            assessment.admission_status.value
+            if assessment is not None
+            and assessment.admission_status is not None
+            else "accepted"
+            if accepted
+            else "rejected"
+        )
         if not accepted:
             rejected_sync += 1
         visible_result: dict[str, Any] = {}
@@ -2000,7 +2302,29 @@ async def _execute_supervisor_tools(
                 )
             )
         else:
-            tool_messages.append(outcome.message)
+            if (
+                assessment is not None
+                and assessment.admission_status
+                is AdmissionStatus.ACCEPTED_WITH_CAVEATS
+                and outcome.result is not None
+                and isinstance(outcome.result.output, dict)
+            ):
+                caveat_output = {
+                    **outcome.result.output,
+                    "admission_status": (
+                        AdmissionStatus.ACCEPTED_WITH_CAVEATS.value
+                    ),
+                    "caveats": list(assessment.caveats),
+                }
+                tool_messages.append(
+                    ToolMessage(
+                        content=serialize_tool_output(caveat_output),
+                        name="ConductResearch",
+                        tool_call_id=call["id"],
+                    )
+                )
+            else:
+                tool_messages.append(outcome.message)
     for overflow in overflow_conduct:
         tool_messages.append(
             ToolMessage(
@@ -2128,6 +2452,16 @@ async def _execute_supervisor_tools(
         "supervisor_messages": tool_messages,
         "research_artifact_refs": research_artifact_refs,
     }
+    coverage_ledger = dict(state.get("coverage_ledger", {}))
+    for call_id, assessment in handoff_assessments.items():
+        if assessment.accepted:
+            coverage_ledger = merge_coverage_ledger(
+                coverage_ledger,
+                task_id=str(call_id),
+                assessment=assessment,
+            )
+    if coverage_ledger:
+        update_payload["coverage_ledger"] = coverage_ledger
     if raw_notes:
         update_payload["raw_notes"] = ["\n".join(raw_notes)]
     if candidate_registry:
@@ -2581,6 +2915,8 @@ async def assess_research_results(
         evidence_pending,
         config,
         evidence_registry=list(state.get("evidence_registry", [])),
+        coverage_contract=state.get("coverage_contract"),
+        requirement_ids=list(state.get("requirement_ids", [])),
     )
     assessment_json = assessment.model_dump_json()
     update = {
@@ -2832,17 +3168,54 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
                 )),
             ]
             
-            # Execute compression
-            response = await asyncio.wait_for(
-                invoke_model_with_retry_observability(
-                    synthesizer_model,
-                    messages,
-                    config,
-                    span_name="researcher.compress",
-                    agent_role="researcher",
-                    model_name=configurable.compression_model,
+            async def call_compression_model(
+                request_messages: list[BaseMessage],
+                max_tokens_override: int | None,
+            ) -> BaseMessage:
+                model = (
+                    configurable_model.with_config(
+                        cast(
+                            RunnableConfig,
+                            {
+                                **compression_model_config,
+                                "max_tokens": max_tokens_override,
+                            },
+                        )
+                    )
+                    if max_tokens_override is not None
+                    else synthesizer_model
+                )
+                return await asyncio.wait_for(
+                    invoke_model_with_retry_observability(
+                        model,
+                        request_messages,
+                        config,
+                        span_name="researcher.compress",
+                        agent_role="researcher",
+                        model_name=configurable.compression_model,
+                    ),
+                    timeout=configurable.model_call_timeout_seconds,
+                )
+
+            response = await invoke_with_output_recovery(
+                call_compression_model,
+                messages,
+                requested_output_tokens=(
+                    configurable.compression_model_max_tokens
                 ),
-                timeout=configurable.model_call_timeout_seconds,
+                maximum_output_tokens=resolve_model_max_output_tokens(
+                    configurable.compression_model,
+                    requested=configurable.compression_model_max_tokens,
+                    overrides=(
+                        configurable.model_max_output_tokens_overrides
+                    ),
+                ),
+                escalation_enabled=(
+                    configurable.output_token_escalation_enabled
+                ),
+                continuation_max_attempts=(
+                    configurable.output_continuation_max_attempts
+                ),
             )
             if _compression_output_is_invalid(response):
                 raise ValueError(

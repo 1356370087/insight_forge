@@ -35,6 +35,40 @@ def completion_policy_context(
 ) -> CompletionPolicyContext:
     """Project runtime state into the deterministic completion-policy contract."""
     evidence = accepted_evidence(state)
+    coverage_payload = state.get("coverage_contract", {})
+    raw_requirements = (
+        coverage_payload.get("requirements", [])
+        if isinstance(coverage_payload, dict)
+        else []
+    )
+    owned_requirement_ids = [
+        str(item)
+        for item in state.get("requirement_ids", [])
+        if str(item)
+    ]
+    contract_requirement_ids = [
+        str(item.get("requirement_id"))
+        for item in raw_requirements
+        if isinstance(item, dict) and item.get("requirement_id")
+    ]
+    required_ids = (
+        owned_requirement_ids
+        if owned_requirement_ids
+        else contract_requirement_ids
+    )
+    coverage_ledger = state.get("coverage_ledger", {})
+    uncovered_from_contract = (
+        [
+            requirement_id
+            for requirement_id in required_ids
+            if not isinstance(coverage_ledger, dict)
+            or not isinstance(coverage_ledger.get(requirement_id), dict)
+            or coverage_ledger[requirement_id].get("status")
+            != "supported"
+        ]
+        if "coverage_ledger" in state
+        else []
+    )
     source_urls = {
         str(item.get("source_url", ""))
         for item in evidence
@@ -50,7 +84,15 @@ def completion_policy_context(
             state.get("result_assessment", {}).get("unresolved_conflicts", [])
         ),
         uncovered_requirements=tuple(
-            state.get("result_assessment", {}).get("uncovered_requirements", [])
+            dict.fromkeys(
+                [
+                    *uncovered_from_contract,
+                    *state.get("result_assessment", {}).get(
+                        "uncovered_requirements",
+                        [],
+                    ),
+                ]
+            )
         ),
         has_remaining_budget=has_remaining_budget,
         exhausted_reason=exhausted_reason,

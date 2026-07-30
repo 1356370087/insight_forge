@@ -324,6 +324,11 @@ async def run_task(
                 HumanMessage(content=task_record.research_topic)
             ],
             "research_topic": task_record.research_topic,
+            "requirement_ids": list(task_record.requirement_ids),
+            "coverage_contract": dict(task_record.coverage_contract),
+            "research_risk_profile": dict(
+                task_record.research_risk_profile
+            ),
         }
 
         if configurable.enable_docker_sandbox:
@@ -481,9 +486,24 @@ async def run_task_with_control(
         from langchain_core.messages import messages_from_dict
         researcher_state: dict[str, Any] = {
             "researcher_messages": messages_from_dict(existing_checkpoint.messages_snapshot),
-            "research_topic": task_record.research_topic,
+            "research_topic": (
+                existing_checkpoint.research_topic
+                or task_record.research_topic
+            ),
             "tool_call_iterations": existing_checkpoint.tool_call_iterations,
             "memory_context": existing_checkpoint.memory_context or task_record.memory_context,
+            "requirement_ids": list(
+                existing_checkpoint.requirement_ids
+                or task_record.requirement_ids
+            ),
+            "coverage_contract": dict(
+                existing_checkpoint.coverage_contract
+                or task_record.coverage_contract
+            ),
+            "research_risk_profile": dict(
+                existing_checkpoint.research_risk_profile
+                or task_record.research_risk_profile
+            ),
             "next_step": existing_checkpoint.next_step,
             "fence_token": existing_checkpoint.fence_token,
             "committed_tool_call_ids": list(
@@ -492,6 +512,38 @@ async def run_task_with_control(
             "artifact_refs": list(existing_checkpoint.artifact_refs),
             "completion_decision": dict(existing_checkpoint.completion_decision),
             "compressed_research": existing_checkpoint.compressed_research,
+            "raw_notes": list(existing_checkpoint.raw_notes),
+            "pending_tool_results": list(
+                existing_checkpoint.pending_tool_results
+            ),
+            "research_complete_requested": (
+                existing_checkpoint.research_complete_requested
+            ),
+            "research_complete_succeeded": (
+                existing_checkpoint.research_complete_succeeded
+            ),
+            "result_assessment": dict(
+                existing_checkpoint.result_assessment
+            ),
+            "permission_denials": list(
+                existing_checkpoint.permission_denials
+            ),
+            "candidate_registry": list(
+                existing_checkpoint.candidate_registry
+            ),
+            "document_registry": list(
+                existing_checkpoint.document_registry
+            ),
+            "evidence_registry": list(
+                existing_checkpoint.evidence_registry
+            ),
+            "web_research_iterations": list(
+                existing_checkpoint.web_research_iterations
+            ),
+            "applied_query_event_ids": list(
+                existing_checkpoint.applied_query_event_ids
+            ),
+            "query_state_snapshot": existing_checkpoint.query_state,
         }
         task_record.phase = (
             TaskPhase.COMPRESSING
@@ -505,6 +557,11 @@ async def run_task_with_control(
             ],
             "research_topic": task_record.research_topic,
             "memory_context": task_record.memory_context,
+            "requirement_ids": list(task_record.requirement_ids),
+            "coverage_contract": dict(task_record.coverage_contract),
+            "research_risk_profile": dict(
+                task_record.research_risk_profile
+            ),
         }
 
     # --- Helper: save checkpoint -------------------------------------------
@@ -534,6 +591,50 @@ async def run_task_with_control(
             run_id=task_record.run_id,
             user_id=task_record.user_id,
             memory_context=task_record.memory_context,
+            query_state=researcher_state.get("query_state_snapshot"),
+            requirement_ids=list(
+                researcher_state.get("requirement_ids", [])
+                or task_record.requirement_ids
+            ),
+            coverage_contract=dict(
+                researcher_state.get("coverage_contract", {})
+                or task_record.coverage_contract
+            ),
+            research_risk_profile=dict(
+                researcher_state.get("research_risk_profile", {})
+                or task_record.research_risk_profile
+            ),
+            raw_notes=list(researcher_state.get("raw_notes", [])),
+            pending_tool_results=list(
+                researcher_state.get("pending_tool_results", [])
+            ),
+            research_complete_requested=bool(
+                researcher_state.get("research_complete_requested", False)
+            ),
+            research_complete_succeeded=bool(
+                researcher_state.get("research_complete_succeeded", False)
+            ),
+            result_assessment=dict(
+                researcher_state.get("result_assessment", {})
+            ),
+            permission_denials=list(
+                researcher_state.get("permission_denials", [])
+            ),
+            candidate_registry=list(
+                researcher_state.get("candidate_registry", [])
+            ),
+            document_registry=list(
+                researcher_state.get("document_registry", [])
+            ),
+            evidence_registry=list(
+                researcher_state.get("evidence_registry", [])
+            ),
+            web_research_iterations=list(
+                researcher_state.get("web_research_iterations", [])
+            ),
+            applied_query_event_ids=list(
+                researcher_state.get("applied_query_event_ids", [])
+            ),
         )
         checkpoint_manager.save(cp)
         await _emit_state_change(
@@ -547,6 +648,23 @@ async def run_task_with_control(
             data={},
             notify=False,
         )
+
+    async def _save_query_state(query_state: Any) -> None:
+        """Bridge inner Query checkpoints into the task checkpoint file."""
+        researcher_state["query_state_snapshot"] = (
+            query_state.to_snapshot()
+        )
+        researcher_state["tool_call_iterations"] = query_state.turn
+        pending_batch = query_state.pending_tool_batch
+        researcher_state["committed_tool_call_ids"] = (
+            list(pending_batch.committed_tool_call_ids)
+            if pending_batch is not None
+            else []
+        )
+        researcher_state["next_step"] = query_state.phase.value
+        await _save_checkpoint()
+
+    researcher_state["_query_checkpoint_callback"] = _save_query_state
 
     try:
         max_iterations = 3  # safety valve for update loops
@@ -667,8 +785,14 @@ async def run_task_with_control(
 
             # --- Success ----------------------------------------------------
             durable_result = {
+                "schema_version": 2,
                 "task_id": task_record.task_id,
                 "research_topic": task_record.research_topic,
+                "requirement_ids": list(task_record.requirement_ids),
+                "coverage_contract": dict(task_record.coverage_contract),
+                "research_risk_profile": dict(
+                    task_record.research_risk_profile
+                ),
                 "compressed_research": result.get("compressed_research", ""),
                 "raw_notes": result.get("raw_notes", []),
                 "metrics": result.get("metrics", {}),

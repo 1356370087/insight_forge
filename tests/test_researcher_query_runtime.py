@@ -9,12 +9,20 @@ from langchain_core.tools import tool as lc_tool
 
 from open_deep_research.agents import deep_researcher
 from open_deep_research.agents.query_engine import ResearcherQueryEngine
+from open_deep_research.agents.query_state import (
+    PendingToolBatch,
+    QualityRecoveryState,
+    QueryLoopState,
+    QueryPhase,
+)
 from open_deep_research.completion import CompletionDecision
+from open_deep_research.runtime import RuntimeCommand
 from open_deep_research.tasks import registry as task_registry
 from open_deep_research.tools import utils
 from open_deep_research.tools.adapters import adapt_langchain_tool
 from open_deep_research.tools.base import ToolOrigin
 from open_deep_research.tools.governance import (
+    AgentRole,
     GovernedToolCallResult,
     ToolError,
     ToolErrorType,
@@ -125,6 +133,91 @@ async def test_researcher_engine_uses_unified_query_loop(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_researcher_resumes_inside_pending_tool_round(monkeypatch) -> None:
+    model = FakeResearchModel([
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "ResearchComplete",
+                    "args": {},
+                    "id": "done-1",
+                }
+            ],
+        ),
+    ])
+
+    async def fake_get_all_tools(_config):
+        return [
+            research_echo,
+            *deep_researcher.build_supervisor_tools({})[-2:-1],
+        ]
+
+    async def fake_compress(state, _config):
+        contents = [
+            str(message.content)
+            for message in state["researcher_messages"]
+        ]
+        return {
+            "compressed_research": "compressed",
+            "raw_notes": contents,
+        }
+
+    pending_ai = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "research_echo",
+                "args": {"text": "resumed"},
+                "id": "tool-resume-1",
+            }
+        ],
+    )
+    restored = QueryLoopState(
+        state_key="researcher:researcher-1",
+        role=AgentRole.RESEARCHER,
+        phase=QueryPhase.EXECUTING_TOOLS,
+        messages=(
+            HumanMessage(content="topic"),
+            pending_ai,
+        ),
+        turn=1,
+        revision=2,
+        transition_reason="next_turn",
+        pending_tool_batch=PendingToolBatch(
+            batch_id="researcher:researcher-1:1:2",
+            tool_calls=tuple(pending_ai.tool_calls),
+        ),
+    )
+
+    monkeypatch.setattr(deep_researcher, "configurable_model", model)
+    monkeypatch.setattr(
+        deep_researcher,
+        "get_all_tools",
+        fake_get_all_tools,
+    )
+    monkeypatch.setattr(
+        deep_researcher,
+        "compress_research",
+        fake_compress,
+    )
+
+    result = await ResearcherQueryEngine(_config()).ainvoke({
+        "researcher_messages": [HumanMessage(content="stale input")],
+        "research_topic": "topic",
+        "query_state_snapshot": restored.to_snapshot(),
+        "evidence_registry": [
+            {"id": "ev-1", "source_url": "https://example.com"}
+        ],
+    })
+
+    assert len(model.calls) == 1
+    assert any(
+        "evidence:resumed" in note for note in result["raw_notes"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_researcher_tools_use_dedicated_long_timeout(monkeypatch) -> None:
     model = FakeResearchModel([
         AIMessage(
@@ -165,6 +258,534 @@ async def test_researcher_tools_use_dedicated_long_timeout(monkeypatch) -> None:
     })
 
     assert any("slow-evidence:fact" in note for note in result["raw_notes"])
+
+
+@pytest.mark.asyncio
+async def test_quality_gap_recovery_adds_only_one_checkpointed_turn(
+    monkeypatch,
+) -> None:
+    model = FakeResearchModel([
+        AIMessage(
+            content="",
+            tool_calls=[{
+                "name": "research_echo",
+                "args": {"text": "initial"},
+                "id": "tool-1",
+            }],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[{
+                "name": "ResearchComplete",
+                "args": {},
+                "id": "done-1",
+            }],
+        ),
+    ])
+    assessment_calls = 0
+    checkpoints: list[dict[str, Any]] = []
+
+    async def fake_get_all_tools(_config):
+        return [
+            research_echo,
+            *deep_researcher.build_supervisor_tools({})[-2:-1],
+        ]
+
+    async def fake_assess(_state, _config):
+        nonlocal assessment_calls
+        assessment_calls += 1
+        if assessment_calls == 1:
+            return RuntimeCommand(
+                goto="compress_research",
+                update={
+                    "researcher_messages": [],
+                    "result_assessment": {
+                        "decision": "retry",
+                        "missing_information": ["Need an official recovery detail."],
+                        "suggested_queries": ["official checkpoint recovery"],
+                    },
+                    "pending_tool_results": [],
+                    "research_complete_requested": False,
+                },
+            )
+        return RuntimeCommand(
+            goto="compress_research",
+            update={
+                "researcher_messages": [],
+                "result_assessment": {
+                    "decision": "complete",
+                    "missing_information": [],
+                    "suggested_queries": [],
+                },
+                "pending_tool_results": [],
+                "research_complete_requested": False,
+            },
+        )
+
+    async def fake_compress(state, _config):
+        return {
+            **state,
+            "compressed_research": "compressed",
+            "raw_notes": [],
+        }
+
+    async def save_query_state(query_state):
+        checkpoints.append(query_state.to_snapshot())
+
+    monkeypatch.setattr(deep_researcher, "configurable_model", model)
+    monkeypatch.setattr(deep_researcher, "get_all_tools", fake_get_all_tools)
+    monkeypatch.setattr(
+        deep_researcher,
+        "assess_research_results",
+        fake_assess,
+    )
+    monkeypatch.setattr(deep_researcher, "compress_research", fake_compress)
+
+    result = await ResearcherQueryEngine(_config(
+        quality_evaluation_enabled=True,
+        max_react_tool_calls=1,
+        quality_gap_recovery_max_attempts=1,
+    )).ainvoke({
+        "researcher_messages": [HumanMessage(content="topic")],
+        "research_topic": "topic",
+        "requirement_ids": ["COV-01"],
+        "coverage_contract": {
+            "schema_version": 1,
+            "original_query_sha256": "a" * 64,
+            "requirements": [{
+                "requirement_id": "COV-01",
+                "text": "Explain recovery.",
+                "source_message_index": 0,
+                "source_start": 0,
+                "source_end": 17,
+            }],
+            "advisory_dimensions": [],
+        },
+        "_query_checkpoint_callback": save_query_state,
+        "evidence_registry": [{
+            "evidence_id": "EV-01",
+            "claim": "Initial fact.",
+            "source_url": "https://example.com",
+            "security_status": "accepted",
+        }],
+    })
+
+    assert len(model.calls) == 2
+    assert assessment_calls == 2
+    assert any(
+        "[Quality Gap Recovery]" in str(message.content)
+        for message in model.calls[1]
+    )
+    recovery_snapshots = [
+        snapshot
+        for snapshot in checkpoints
+        if snapshot.get("quality_recovery", {}).get("attempts") == 1
+    ]
+    assert recovery_snapshots
+    assert (
+        result["query_state_snapshot"]["quality_recovery"]["attempts"]
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_quality_gap_recovery_uses_previous_assessment_after_control_only_turn(
+    monkeypatch,
+) -> None:
+    model = FakeResearchModel([
+        AIMessage(
+            content="",
+            tool_calls=[{
+                "name": "research_echo",
+                "args": {"text": "initial"},
+                "id": "tool-evidence",
+            }],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[{
+                "name": "think_tool",
+                "args": {"reflection": "Review the remaining gap."},
+                "id": "tool-reflection",
+            }],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[{
+                "name": "ResearchComplete",
+                "args": {},
+                "id": "done-recovery",
+            }],
+        ),
+    ])
+    assessment_calls = 0
+    checkpoints: list[dict[str, Any]] = []
+
+    async def fake_get_all_tools(_config):
+        return [
+            research_echo,
+            deep_researcher.think_tool,
+            *deep_researcher.build_supervisor_tools({})[-2:-1],
+        ]
+
+    async def fake_assess(_state, _config):
+        nonlocal assessment_calls
+        assessment_calls += 1
+        if assessment_calls == 1:
+            return RuntimeCommand(
+                goto="researcher",
+                update={
+                    "researcher_messages": [],
+                    "result_assessment": {
+                        "decision": "retry",
+                        "missing_information": [
+                            "Need one more official recovery detail."
+                        ],
+                        "suggested_queries": [
+                            "official checkpoint recovery detail"
+                        ],
+                    },
+                    "pending_tool_results": [],
+                    "research_complete_requested": False,
+                },
+            )
+        if assessment_calls == 2:
+            # This matches the real control-only fast path: think_tool adds no
+            # evidence, so no new result_assessment is emitted.
+            return RuntimeCommand(
+                goto="researcher",
+                update={
+                    "pending_tool_results": [],
+                    "research_complete_requested": False,
+                },
+            )
+        return RuntimeCommand(
+            goto="compress_research",
+            update={
+                "researcher_messages": [],
+                "result_assessment": {
+                    "decision": "complete",
+                    "missing_information": [],
+                    "suggested_queries": [],
+                },
+                "pending_tool_results": [],
+                "research_complete_requested": False,
+            },
+        )
+
+    async def fake_compress(state, _config):
+        return {
+            **state,
+            "compressed_research": "compressed",
+            "raw_notes": [],
+        }
+
+    async def save_query_state(query_state):
+        checkpoints.append(query_state.to_snapshot())
+
+    monkeypatch.setattr(deep_researcher, "configurable_model", model)
+    monkeypatch.setattr(deep_researcher, "get_all_tools", fake_get_all_tools)
+    monkeypatch.setattr(
+        deep_researcher,
+        "assess_research_results",
+        fake_assess,
+    )
+    monkeypatch.setattr(deep_researcher, "compress_research", fake_compress)
+
+    result = await ResearcherQueryEngine(_config(
+        quality_evaluation_enabled=True,
+        max_react_tool_calls=2,
+        quality_gap_recovery_max_attempts=1,
+    )).ainvoke({
+        "researcher_messages": [HumanMessage(content="topic")],
+        "research_topic": "topic",
+        "requirement_ids": ["COV-01"],
+        "coverage_contract": {
+            "schema_version": 1,
+            "original_query_sha256": "a" * 64,
+            "requirements": [{
+                "requirement_id": "COV-01",
+                "text": "Explain recovery.",
+                "source_message_index": 0,
+                "source_start": 0,
+                "source_end": 17,
+            }],
+            "advisory_dimensions": [],
+        },
+        "_query_checkpoint_callback": save_query_state,
+        "evidence_registry": [{
+            "evidence_id": "EV-01",
+            "claim": "Initial fact.",
+            "source_url": "https://example.com",
+            "security_status": "accepted",
+        }],
+    })
+
+    assert len(model.calls) == 3
+    assert assessment_calls == 3
+    recovery_instructions = [
+        message
+        for call_messages in model.calls
+        for message in call_messages
+        if "[Quality Gap Recovery]" in str(message.content)
+    ]
+    assert len(recovery_instructions) == 1
+    recovery_snapshots = [
+        snapshot
+        for snapshot in checkpoints
+        if snapshot["quality_recovery"]["attempts"] == 1
+    ]
+    assert recovery_snapshots
+    assert any(
+        snapshot["quality_recovery"]["active"] is True
+        for snapshot in recovery_snapshots
+    )
+    assert all(
+        snapshot["quality_recovery"]["attempts"] <= 1
+        for snapshot in checkpoints
+    )
+    final_recovery = result["query_state_snapshot"]["quality_recovery"]
+    assert final_recovery["attempts"] == 1
+    assert final_recovery["active"] is False
+    assert final_recovery["target_requirement_ids"] == ["COV-01"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("decision", "missing_information", "suggested_queries", "evaluator_error"),
+    [
+        pytest.param(
+            "retry",
+            ["Need one more official detail."],
+            [],
+            None,
+            id="missing-without-query",
+        ),
+        pytest.param(
+            "retry",
+            [],
+            ["official checkpoint recovery"],
+            None,
+            id="query-without-missing",
+        ),
+        pytest.param(
+            "continue",
+            [],
+            [],
+            "403 insufficient_quota",
+            id="fail-open-evaluator-error-without-action",
+        ),
+    ],
+)
+async def test_quality_gap_recovery_requires_actionable_gap_and_query(
+    monkeypatch,
+    decision: str,
+    missing_information: list[str],
+    suggested_queries: list[str],
+    evaluator_error: str | None,
+) -> None:
+    model = FakeResearchModel([
+        AIMessage(
+            content="",
+            tool_calls=[{
+                "name": "research_echo",
+                "args": {"text": "initial"},
+                "id": "tool-no-recovery",
+            }],
+        ),
+    ])
+    checkpoints: list[dict[str, Any]] = []
+    assessment_calls = 0
+
+    async def fake_get_all_tools(_config):
+        return [
+            research_echo,
+            *deep_researcher.build_supervisor_tools({})[-2:-1],
+        ]
+
+    async def fake_assess(_state, _config):
+        nonlocal assessment_calls
+        assessment_calls += 1
+        return RuntimeCommand(
+            goto="compress_research",
+            update={
+                "researcher_messages": [],
+                "result_assessment": {
+                    "decision": decision,
+                    "missing_information": missing_information,
+                    "suggested_queries": suggested_queries,
+                    "evaluator_error": evaluator_error,
+                },
+                "pending_tool_results": [],
+                "research_complete_requested": False,
+            },
+        )
+
+    async def fake_compress(state, _config):
+        return {
+            **state,
+            "compressed_research": "compressed",
+            "raw_notes": [],
+        }
+
+    async def save_query_state(query_state):
+        checkpoints.append(query_state.to_snapshot())
+
+    monkeypatch.setattr(deep_researcher, "configurable_model", model)
+    monkeypatch.setattr(deep_researcher, "get_all_tools", fake_get_all_tools)
+    monkeypatch.setattr(
+        deep_researcher,
+        "assess_research_results",
+        fake_assess,
+    )
+    monkeypatch.setattr(deep_researcher, "compress_research", fake_compress)
+
+    result = await ResearcherQueryEngine(_config(
+        quality_evaluation_enabled=True,
+        max_react_tool_calls=1,
+        quality_gap_recovery_max_attempts=1,
+    )).ainvoke({
+        "researcher_messages": [HumanMessage(content="topic")],
+        "research_topic": "topic",
+        "requirement_ids": ["COV-01"],
+        "coverage_contract": {
+            "schema_version": 1,
+            "original_query_sha256": "a" * 64,
+            "requirements": [{
+                "requirement_id": "COV-01",
+                "text": "Explain recovery.",
+                "source_message_index": 0,
+                "source_start": 0,
+                "source_end": 17,
+            }],
+            "advisory_dimensions": [],
+        },
+        "_query_checkpoint_callback": save_query_state,
+        "evidence_registry": [{
+            "evidence_id": "EV-01",
+            "claim": "Initial fact.",
+            "source_url": "https://example.com",
+            "security_status": "accepted",
+        }],
+    })
+
+    assert len(model.calls) == 1
+    assert assessment_calls == 1
+    assert checkpoints
+    assert all(
+        snapshot["quality_recovery"]["attempts"] == 0
+        and snapshot["quality_recovery"]["active"] is False
+        for snapshot in checkpoints
+    )
+    assert all(
+        "[Quality Gap Recovery]" not in repr(snapshot)
+        for snapshot in checkpoints
+    )
+    assert result["query_state_snapshot"]["quality_recovery"] == {
+        "attempts": 0,
+        "active": False,
+        "target_requirement_ids": [],
+        "triggering_assessment_revision": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_quality_gap_recovery_resume_does_not_consume_second_attempt(
+    monkeypatch,
+) -> None:
+    model = FakeResearchModel([
+        AIMessage(
+            content="",
+            tool_calls=[{
+                "name": "ResearchComplete",
+                "args": {},
+                "id": "done-resumed",
+            }],
+        ),
+    ])
+
+    async def fake_get_all_tools(_config):
+        return [
+            research_echo,
+            *deep_researcher.build_supervisor_tools({})[-2:-1],
+        ]
+
+    async def fake_assess(_state, _config):
+        return RuntimeCommand(
+            goto="compress_research",
+            update={
+                "researcher_messages": [],
+                "result_assessment": {
+                    "decision": "complete",
+                    "missing_information": [],
+                    "suggested_queries": [],
+                },
+                "pending_tool_results": [],
+                "research_complete_requested": False,
+            },
+        )
+
+    async def fake_compress(state, _config):
+        return {
+            **state,
+            "compressed_research": "compressed",
+            "raw_notes": [],
+        }
+
+    restored = QueryLoopState(
+        state_key="researcher:researcher-1",
+        role=AgentRole.RESEARCHER,
+        phase=QueryPhase.PREPARING,
+        messages=(
+            HumanMessage(content="topic"),
+            HumanMessage(content="[Quality Gap Recovery] recover COV-01"),
+        ),
+        turn=1,
+        revision=6,
+        transition_reason="next_turn",
+        quality_recovery=QualityRecoveryState(
+            attempts=1,
+            active=True,
+            target_requirement_ids=("COV-01",),
+            triggering_assessment_revision=5,
+        ),
+    )
+
+    monkeypatch.setattr(deep_researcher, "configurable_model", model)
+    monkeypatch.setattr(deep_researcher, "get_all_tools", fake_get_all_tools)
+    monkeypatch.setattr(
+        deep_researcher,
+        "assess_research_results",
+        fake_assess,
+    )
+    monkeypatch.setattr(deep_researcher, "compress_research", fake_compress)
+
+    result = await ResearcherQueryEngine(_config(
+        quality_evaluation_enabled=True,
+        max_react_tool_calls=1,
+        quality_gap_recovery_max_attempts=1,
+    )).ainvoke({
+        "researcher_messages": [HumanMessage(content="stale input")],
+        "research_topic": "topic",
+        "requirement_ids": ["COV-01"],
+        "query_state_snapshot": restored.to_snapshot(),
+        "evidence_registry": [{
+            "evidence_id": "EV-01",
+            "claim": "Initial fact.",
+            "source_url": "https://example.com",
+            "security_status": "accepted",
+        }],
+    })
+
+    assert len(model.calls) == 1
+    assert (
+        result["query_state_snapshot"]["quality_recovery"]["attempts"]
+        == 1
+    )
+    assert (
+        result["query_state_snapshot"]["quality_recovery"]["active"]
+        is False
+    )
 
 
 @pytest.mark.asyncio

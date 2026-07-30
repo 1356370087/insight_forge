@@ -241,6 +241,11 @@ class TeammatePool:
                     user_id=snapshot.user_id,
                     status=TaskStatus.PENDING,
                     memory_context=snapshot.memory_context,
+                    requirement_ids=list(snapshot.requirement_ids),
+                    coverage_contract=dict(snapshot.coverage_contract),
+                    research_risk_profile=dict(
+                        snapshot.research_risk_profile
+                    ),
                     assignment_attempt=max(
                         snapshot.assignment_attempt,
                         1 if snapshot.assigned_teammate_id else 0,

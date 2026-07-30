@@ -954,12 +954,84 @@ class TestResearcherCheckpoint:
         assert restored.tool_call_iterations == cp.tool_call_iterations
         assert restored.completed_queries == cp.completed_queries
         assert restored.fetched_sources == cp.fetched_sources
-        assert restored.schema_version == 2
+        assert restored.schema_version == 4
         assert restored.next_step == "compress"
         assert restored.fence_token == 7
         assert restored.committed_tool_call_ids == ["call-1"]
         assert restored.artifact_refs == [{"path": "artifact.json", "sha256": "a" * 64}]
         assert restored.completion_decision == {"action": "complete_partial"}
+
+    def test_round_trip_preserves_coverage_and_domain_state(self):
+        from open_deep_research.tasks.recovery import ResearcherCheckpoint
+
+        cp = ResearcherCheckpoint(
+            task_id="task-domain-state",
+            phase="researching",
+            requirement_ids=["COV-01"],
+            coverage_contract={
+                "schema_version": 1,
+                "requirements": [{
+                    "requirement_id": "COV-01",
+                    "text": "Use official sources.",
+                }],
+            },
+            research_risk_profile={
+                "level": "standard",
+                "matched_rule_ids": ["quality-risk-v1"],
+            },
+            raw_notes=["verified note"],
+            pending_tool_results=[{"tool_call_id": "call-1", "content": "pending"}],
+            research_complete_requested=True,
+            research_complete_succeeded=False,
+            result_assessment={
+                "admission_status": "accepted_with_caveats",
+                "missing_information": ["minor display detail"],
+            },
+            permission_denials=[{"tool_call_id": "call-denied"}],
+            candidate_registry=[{"candidate_id": "candidate-1"}],
+            document_registry=[{"document_id": "document-1"}],
+            evidence_registry=[{"evidence_id": "evidence-1"}],
+            web_research_iterations=[{"iteration": 2}],
+            applied_query_event_ids=["researcher:task-domain-state:5"],
+        )
+
+        restored = ResearcherCheckpoint.from_dict(cp.to_dict())
+
+        assert restored.schema_version == 4
+        assert restored.requirement_ids == cp.requirement_ids
+        assert restored.coverage_contract == cp.coverage_contract
+        assert restored.research_risk_profile == cp.research_risk_profile
+        assert restored.raw_notes == cp.raw_notes
+        assert restored.pending_tool_results == cp.pending_tool_results
+        assert restored.research_complete_requested is True
+        assert restored.research_complete_succeeded is False
+        assert restored.result_assessment == cp.result_assessment
+        assert restored.permission_denials == cp.permission_denials
+        assert restored.candidate_registry == cp.candidate_registry
+        assert restored.document_registry == cp.document_registry
+        assert restored.evidence_registry == cp.evidence_registry
+        assert restored.web_research_iterations == cp.web_research_iterations
+        assert restored.applied_query_event_ids == cp.applied_query_event_ids
+
+    def test_v3_checkpoint_defaults_new_domain_state_fields(self):
+        from open_deep_research.tasks.recovery import ResearcherCheckpoint
+
+        restored = ResearcherCheckpoint.from_dict({
+            "schema_version": 3,
+            "task_id": "legacy-task",
+            "phase": "researching",
+        })
+
+        assert restored.schema_version == 3
+        assert restored.requirement_ids == []
+        assert restored.coverage_contract == {}
+        assert restored.research_risk_profile == {}
+        assert restored.raw_notes == []
+        assert restored.result_assessment == {}
+        assert restored.candidate_registry == []
+        assert restored.document_registry == []
+        assert restored.evidence_registry == []
+        assert restored.applied_query_event_ids == []
 
     def test_defaults_are_sensible(self):
         from open_deep_research.tasks.recovery import ResearcherCheckpoint
@@ -1043,6 +1115,129 @@ class TestCheckpointManager:
 
 class TestControlledExecutor:
     """Regression tests for live update/cancel handling."""
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_resume_restores_coverage_and_domain_state(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        from langchain_core.messages import HumanMessage, message_to_dict
+
+        from open_deep_research.tasks import executor
+        from open_deep_research.tasks.recovery import (
+            CheckpointManager,
+            ResearcherCheckpoint,
+        )
+
+        async def no_publish(*args, **kwargs):
+            del args, kwargs
+
+        class FakeContextStore:
+            def __init__(self, *args, **kwargs):
+                del args, kwargs
+
+            def persist_task_result(self, *args, **kwargs):
+                del args, kwargs
+                return "0" * 64
+
+        monkeypatch.setattr(executor, "publish_task_update", no_publish)
+        monkeypatch.setattr(executor, "RunContextStore", FakeContextStore)
+        run_id = "domain-restore-run"
+        task_id = "domain-restore-task"
+        checkpoint_manager = CheckpointManager(str(tmp_path), run_id)
+        checkpoint_manager.save(ResearcherCheckpoint(
+            task_id=task_id,
+            phase="researching",
+            messages_snapshot=[
+                message_to_dict(HumanMessage(content="restored research prompt"))
+            ],
+            tool_call_iterations=2,
+            requirement_ids=["COV-SAVED"],
+            coverage_contract={
+                "schema_version": 1,
+                "requirements": [{
+                    "requirement_id": "COV-SAVED",
+                    "text": "Saved requirement",
+                }],
+            },
+            research_risk_profile={"level": "standard", "rule_id": "risk-v1"},
+            raw_notes=["saved note"],
+            pending_tool_results=[{"tool_call_id": "call-pending"}],
+            research_complete_requested=True,
+            research_complete_succeeded=False,
+            result_assessment={"admission_status": "rejected"},
+            permission_denials=[{"tool_call_id": "call-denied"}],
+            candidate_registry=[{"candidate_id": "candidate-saved"}],
+            document_registry=[{"document_id": "document-saved"}],
+            evidence_registry=[{"evidence_id": "evidence-saved"}],
+            web_research_iterations=[{"iteration": 2}],
+            applied_query_event_ids=["researcher:domain-restore-task:7"],
+        ))
+        registry = TaskRegistry()
+        record = registry.restore(TaskRecord(
+            task_id=task_id,
+            run_id=run_id,
+            research_topic="topic",
+            requirement_ids=["COV-TASK-RECORD"],
+            coverage_contract={"requirements": []},
+            research_risk_profile={"level": "high"},
+        ))
+        captured: dict = {}
+
+        async def research(state, _config):
+            captured.update(state)
+            return {
+                **state,
+                "compressed_research": "done",
+                "raw_notes": state["raw_notes"],
+                "metrics": {},
+            }
+
+        await executor.run_task_with_control(
+            record,
+            {
+                "configurable": {
+                    "runs_dir": str(tmp_path),
+                    "task_state_backend": "memory",
+                    "task_checkpoint_enabled": True,
+                    "event_log_enabled": False,
+                    "task_timeout_seconds": 60,
+                },
+                "metadata": {"run_id": run_id},
+            },
+            registry,
+            research,
+            checkpoint_manager=checkpoint_manager,
+            runs_dir=str(tmp_path),
+            run_id=run_id,
+            event_log_enabled=False,
+        )
+
+        assert captured["requirement_ids"] == ["COV-SAVED"]
+        assert captured["coverage_contract"]["requirements"][0][
+            "requirement_id"
+        ] == "COV-SAVED"
+        assert captured["research_risk_profile"]["level"] == "standard"
+        assert captured["raw_notes"] == ["saved note"]
+        assert captured["pending_tool_results"] == [{"tool_call_id": "call-pending"}]
+        assert captured["research_complete_requested"] is True
+        assert captured["research_complete_succeeded"] is False
+        assert captured["result_assessment"] == {"admission_status": "rejected"}
+        assert captured["permission_denials"] == [{"tool_call_id": "call-denied"}]
+        assert captured["candidate_registry"] == [{
+            "candidate_id": "candidate-saved"
+        }]
+        assert captured["document_registry"] == [{
+            "document_id": "document-saved"
+        }]
+        assert captured["evidence_registry"] == [{
+            "evidence_id": "evidence-saved"
+        }]
+        assert captured["web_research_iterations"] == [{"iteration": 2}]
+        assert captured["applied_query_event_ids"] == [
+            "researcher:domain-restore-task:7"
+        ]
 
     @pytest.mark.asyncio
     async def test_controlled_executor_persists_current_fence_token(

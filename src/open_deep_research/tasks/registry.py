@@ -53,6 +53,9 @@ class TaskRecord:
     display_title: str = ""
     wave_id: str = ""
     plan_task_id: str = ""
+    requirement_ids: list[str] = field(default_factory=list)
+    coverage_contract: dict[str, Any] = field(default_factory=dict)
+    research_risk_profile: dict[str, Any] = field(default_factory=dict)
 
     # Isolation — prevents cross-run / cross-user contamination
     run_id: str = ""
@@ -144,6 +147,9 @@ class TaskRegistry:
         display_title: str = "",
         wave_id: str = "",
         plan_task_id: str = "",
+        requirement_ids: list[str] | None = None,
+        coverage_contract: dict[str, Any] | None = None,
+        research_risk_profile: dict[str, Any] | None = None,
     ) -> TaskRecord:
         """Create a new PENDING task record and return it."""
         record = TaskRecord(
@@ -153,6 +159,9 @@ class TaskRegistry:
             display_title=display_title,
             wave_id=wave_id,
             plan_task_id=plan_task_id,
+            requirement_ids=list(requirement_ids or []),
+            coverage_contract=dict(coverage_contract or {}),
+            research_risk_profile=dict(research_risk_profile or {}),
         )
         self._tasks[record.task_id] = record
         return record
@@ -172,12 +181,12 @@ class TaskRegistry:
         run_id: Optional[str] = None,
     ) -> list[TaskRecord]:
         """Return records, optionally filtered by status and/or run."""
-        records = self._tasks.values()
+        records = list(self._tasks.values())
         if run_id is not None:
             records = [t for t in records if t.run_id == run_id]
         if status_filter is not None:
             records = [t for t in records if t.status == status_filter]
-        return list(records)
+        return records
 
     def update_status(
         self, task_id: str, status: TaskStatus, **kwargs: Any
