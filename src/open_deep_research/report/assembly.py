@@ -10,18 +10,25 @@ strategy lands in a later phase; :func:`assemble` dispatches by the profile's
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Protocol
+from typing import Any, List, Optional, Protocol, cast
 
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import HumanMessage, get_buffer_string
+from langchain_core.messages import BaseMessage, HumanMessage, get_buffer_string
 from langchain_core.runnables import RunnableConfig
 
 from open_deep_research import prompts as _prompts
+from open_deep_research.agents.model_recovery import (
+    invoke_with_output_recovery,
+    resolve_model_max_output_tokens,
+)
 from open_deep_research.configuration import (
     Configuration,
     get_model_compatibility_kwargs,
 )
-from open_deep_research.evidence import eligible_evidence_records
+from open_deep_research.evidence import (
+    contract_requires_official_sources,
+    source_scoped_evidence_records,
+)
 from open_deep_research.observability import (
     apply_helicone_config,
     get_trace_recorder,
@@ -90,6 +97,35 @@ def _build_findings(state: dict) -> str:
     return "\n".join(notes)
 
 
+def _build_scoped_evidence_findings(
+    records: list[dict[str, Any]],
+) -> str:
+    """Project source-scoped evidence without admitting free-form handoff text."""
+    findings: list[str] = []
+    for index, record in enumerate(records, 1):
+        evidence_id = str(
+            record.get("evidence_id") or f"evidence-{index}"
+        )[:200]
+        claim = str(record.get("claim") or "").strip()[:2_000]
+        excerpt = str(
+            record.get("supporting_excerpt") or ""
+        ).strip()[:3_000]
+        title = str(record.get("source_title") or "Source").strip()[:300]
+        url = str(record.get("source_url") or "").strip()
+        locator = str(record.get("locator") or "").strip()[:500]
+        lines = [
+            f"## Evidence {evidence_id}",
+            f"Claim: {claim}",
+            f"Source: [{title}]({url})" if url else f"Source: {title}",
+        ]
+        if locator:
+            lines.append(f"Locator: {locator}")
+        if excerpt:
+            lines.append(f"Supporting excerpt: {excerpt}")
+        findings.append("\n".join(lines))
+    return "\n\n".join(findings)
+
+
 @dataclass
 class AssemblyResult:
     """The output of an assembly strategy, before output-format rendering."""
@@ -121,11 +157,20 @@ class ReportContext:
     ) -> ReportContext:
         """Build report context from graph state and runnable configuration."""
         configurable = Configuration.from_runnable_config(config)
+        coverage_contract = state.get("coverage_contract")
+        raw_evidence = state.get("evidence_registry", [])
+        if (
+            isinstance(raw_evidence, dict)
+            and raw_evidence.get("type") == "override"
+        ):
+            raw_evidence = raw_evidence.get("value", [])
+        scoped_evidence = source_scoped_evidence_records(
+            raw_evidence if isinstance(raw_evidence, list) else [],
+            coverage_contract,
+        )
         evidence_sources: list[SourceRef] = []
         seen_urls: set[str] = set()
-        for record in eligible_evidence_records(
-            state.get("evidence_registry", [])
-        ):
+        for record in scoped_evidence:
             url = str(record.get("source_url", ""))
             if not url or url in seen_urls:
                 continue
@@ -138,7 +183,11 @@ class ReportContext:
             config=config,
             profile=profile,
             configurable=configurable,
-            findings=_build_findings(state),
+            findings=(
+                _build_scoped_evidence_findings(scoped_evidence)
+                if contract_requires_official_sources(coverage_contract)
+                else _build_findings(state)
+            ),
             sources=list(sources or evidence_sources),
         )
 
@@ -147,11 +196,15 @@ class ReportContext:
         """Resolve the profile's prompt-constant name to the actual template."""
         return getattr(_prompts, self.profile.prompt_template)
 
-    def build_writer_model(self):
+    def build_writer_model(self, max_tokens: int | None = None):
         """Construct the writer model, configured for the lead.final_report span."""
         writer_model_config = {
             "model": self.configurable.final_report_model,
-            "max_tokens": self.configurable.final_report_model_max_tokens,
+            "max_tokens": (
+                max_tokens
+                if max_tokens is not None
+                else self.configurable.final_report_model_max_tokens
+            ),
             **get_model_connection_kwargs(
                 self.configurable.final_report_model,
                 self.config,
@@ -160,12 +213,12 @@ class ReportContext:
             **get_model_compatibility_kwargs(self.configurable.final_report_model),
         }
         return _writer_model_template.with_config(
-            apply_helicone_config(
+            cast(RunnableConfig, apply_helicone_config(
                 writer_model_config,
                 self.config,
                 span_name="lead.final_report",
                 agent_role="lead",
-            )
+            ))
         )
 
     def build_structured_model(self, schema):
@@ -185,6 +238,48 @@ class ReportContext:
             **get_model_compatibility_kwargs(self.configurable.final_report_model),
         )
         return model.with_structured_output(schema, method="function_calling")
+
+    async def invoke_writer_with_output_recovery(
+        self,
+        messages: list[BaseMessage],
+        *,
+        span_name: str,
+    ) -> BaseMessage:
+        """Invoke a report writer without accepting truncated output."""
+
+        async def call_model(
+            request_messages: list[BaseMessage],
+            max_tokens_override: int | None,
+        ) -> BaseMessage:
+            return await invoke_model_with_retry_observability(
+                self.build_writer_model(max_tokens_override),
+                request_messages,
+                self.config,
+                span_name=span_name,
+                agent_role="lead",
+                model_name=self.configurable.final_report_model,
+            )
+
+        return await invoke_with_output_recovery(
+            call_model,
+            messages,
+            requested_output_tokens=(
+                self.configurable.final_report_model_max_tokens
+            ),
+            maximum_output_tokens=resolve_model_max_output_tokens(
+                self.configurable.final_report_model,
+                requested=self.configurable.final_report_model_max_tokens,
+                overrides=(
+                    self.configurable.model_max_output_tokens_overrides
+                ),
+            ),
+            escalation_enabled=(
+                self.configurable.output_token_escalation_enabled
+            ),
+            continuation_max_attempts=(
+                self.configurable.output_continuation_max_attempts
+            ),
+        )
 
     def build_prompt(self, findings: str) -> str:
         """Format the profile's prompt template (one-shot genres).
@@ -240,18 +335,15 @@ class OneShotStrategy:
                 # Create comprehensive prompt with all research context
                 final_report_prompt = ctx.build_prompt(findings)
                 # Generate the final report
-                writer_model = ctx.build_writer_model()
-                final_report = await invoke_model_with_retry_observability(
-                    writer_model,
-                    [HumanMessage(content=final_report_prompt)],
-                    ctx.config,
-                    span_name="lead.final_report",
-                    agent_role="lead",
-                    model_name=configurable.final_report_model,
+                final_report = (
+                    await ctx.invoke_writer_with_output_recovery(
+                        [HumanMessage(content=final_report_prompt)],
+                        span_name="lead.final_report",
+                    )
                 )
                 # Return successful report generation
                 return AssemblyResult(
-                    body_markdown=final_report.content,
+                    body_markdown=str(final_report.content),
                     message=final_report,
                     sources=ctx.sources,
                 )
@@ -371,14 +463,9 @@ class SectionedStrategy:
                 date=get_today_str(),
             )
             prompt = ctx.with_skill_report_context(prompt)
-            model = ctx.build_writer_model()
-            resp = await invoke_model_with_retry_observability(
-                model,
+            resp = await ctx.invoke_writer_with_output_recovery(
                 [HumanMessage(content=prompt)],
-                ctx.config,
                 span_name=f"lead.section.{_sanitize_span(section.name)}",
-                agent_role="lead",
-                model_name=ctx.configurable.final_report_model,
             )
             written.append(WrittenSection(name=section.name, content=str(resp.content)))
         return written
@@ -392,14 +479,9 @@ class SectionedStrategy:
             date=get_today_str(),
         )
         prompt = ctx.with_skill_report_context(prompt)
-        model = ctx.build_writer_model()
-        resp = await invoke_model_with_retry_observability(
-            model,
+        resp = await ctx.invoke_writer_with_output_recovery(
             [HumanMessage(content=prompt)],
-            ctx.config,
             span_name=f"lead.{section_type.lower()}",
-            agent_role="lead",
-            model_name=ctx.configurable.final_report_model,
         )
         return str(resp.content)
 

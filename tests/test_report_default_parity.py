@@ -313,7 +313,7 @@ async def test_unknown_report_type_falls_back_to_default(monkeypatch):
 @pytest.mark.asyncio
 async def test_bibtex_reference_style_replaces_sources_section(monkeypatch):
     body = (
-        "# Report\n\nSome finding from a source.\n\n"
+        "# Report\n\nSome finding from a source [1].\n\n"
         "### Sources\n[1] Old Source: https://old.example.com\n"
     )
 
@@ -337,7 +337,7 @@ async def test_bibtex_reference_style_replaces_sources_section(monkeypatch):
     assert "howpublished = {https://old.example.com}" in update["final_report"]
     assert "[1] Old Source:" not in update["final_report"]
     # The report body outside Sources is preserved
-    assert "Some finding from a source." in update["final_report"]
+    assert "Some finding from a source [1]." in update["final_report"]
     # Structured sources are surfaced into state
     assert update["sources"]["type"] == "override"
     assert update["sources"]["value"][0]["url"] == "https://old.example.com"
@@ -345,7 +345,10 @@ async def test_bibtex_reference_style_replaces_sources_section(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_artifact_markdown_matches_reference_rewritten_final_report(monkeypatch):
-    body = "# Report\n\n### Sources\n[1] Source: https://example.com\n"
+    body = (
+        "# Report\n\nSupported finding [1].\n\n"
+        "### Sources\n[1] Source: https://example.com\n"
+    )
 
     async def fake_invoke(
         model, messages, config, *, span_name, agent_role=None, model_name=None, **_kw

@@ -19,15 +19,18 @@ Contract preserved for backward compatibility:
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
-from typing import Optional
+from collections.abc import Callable, Mapping
+from typing import Any, Optional
 
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 
-from open_deep_research.configuration import Configuration
+from open_deep_research.configuration import QUALITY_POLICY_VERSION, Configuration
 from open_deep_research.evaluation import build_evaluation_snapshot
-from open_deep_research.evidence import eligible_evidence_records
+from open_deep_research.evidence import (
+    contract_requires_official_sources,
+    source_scoped_evidence_records,
+)
 from open_deep_research.observability import get_trace_recorder
 from open_deep_research.run_context import RunContextStore
 from open_deep_research.security.content import sanitize_report_markdown
@@ -48,6 +51,28 @@ from .references import (
 )
 from .renderers import render_artifacts
 
+_FENCE_LINE_RE = re.compile(
+    r"^[ \t]{0,3}(?P<fence>`{3,}|~{3,})(?P<rest>[^\r\n]*)"
+)
+_URL_RE = re.compile(r"https?://[^\s)\]}>]+")
+_SOURCES_SECTION_RE = re.compile(
+    r"(?ims)^\s*#{1,6}\s*(?:sources|references|来源|参考资料)\s*$.*\Z"
+)
+_REPORT_MISSING_CITATIONS = "report_missing_verifiable_citations"
+_REPORT_DISALLOWED_CODE_URL = "report_disallowed_fenced_code_url"
+
+
+async def build_evidence_limited_report(
+    evidence_records: list[dict[str, Any]],
+    **kwargs: Any,
+) -> str:
+    """Load the restricted writer lazily to avoid quality/report import cycles."""
+    from .evidence_synthesis import (
+        build_evidence_limited_report as build_restricted_report,
+    )
+
+    return await build_restricted_report(evidence_records, **kwargs)
+
 
 def _cleared_state() -> dict:
     """Return the notes/task-outputs override used by the original node."""
@@ -55,6 +80,285 @@ def _cleared_state() -> dict:
         "notes": {"type": "override", "value": []},
         "completed_task_outputs": {"type": "override", "value": []},
     }
+
+
+def _markdown_regions(markdown: str) -> list[tuple[bool, str]]:
+    """Return ordered prose/code regions without parsing or rewriting content."""
+    regions: list[tuple[bool, str]] = []
+    buffer: list[str] = []
+    in_fence = False
+    fence_char = ""
+    fence_length = 0
+
+    def flush(is_code: bool) -> None:
+        if buffer:
+            regions.append((is_code, "".join(buffer)))
+            buffer.clear()
+
+    for line in markdown.splitlines(keepends=True):
+        match = _FENCE_LINE_RE.match(line)
+        if not in_fence:
+            if match is None:
+                buffer.append(line)
+                continue
+            flush(False)
+            in_fence = True
+            fence = match.group("fence")
+            fence_char = fence[0]
+            fence_length = len(fence)
+            buffer.append(line)
+            continue
+
+        buffer.append(line)
+        if match is None:
+            continue
+        fence = match.group("fence")
+        if (
+            fence[0] == fence_char
+            and len(fence) >= fence_length
+            and not match.group("rest").strip()
+        ):
+            flush(True)
+            in_fence = False
+            fence_char = ""
+            fence_length = 0
+
+    flush(in_fence)
+    return regions
+
+
+def _transform_markdown_prose(
+    markdown: str,
+    transform: Callable[[str], str],
+) -> str:
+    """Apply a text transform only outside fenced code blocks."""
+    return "".join(
+        region if is_code else transform(region)
+        for is_code, region in _markdown_regions(markdown)
+    )
+
+
+def _prose_without_sources(markdown: str) -> str:
+    """Return prose-only Markdown with the terminal references section removed."""
+    prose = "".join(
+        region
+        for is_code, region in _markdown_regions(markdown)
+        if not is_code
+    )
+    return _SOURCES_SECTION_RE.sub("", prose)
+
+
+def _normalized_urls(text: str) -> set[str]:
+    """Return normalized absolute URLs found in one Markdown fragment."""
+    return {
+        raw_url.rstrip(".,;:")
+        for raw_url in _URL_RE.findall(text)
+    }
+
+
+def _has_verifiable_body_citation(
+    markdown: str,
+    *,
+    allowed_urls: set[str],
+    source_count: int,
+) -> bool:
+    """Return whether report prose cites an allowlisted source before Sources."""
+    body = _prose_without_sources(markdown)
+    if _normalized_urls(body).intersection(allowed_urls):
+        return True
+    return any(
+        1 <= int(marker) <= source_count
+        for marker in re.findall(r"\[(\d+)\]", body)
+    )
+
+
+def _assert_fenced_urls_allowlisted(
+    markdown: str,
+    *,
+    allowed_urls: set[str],
+) -> None:
+    """Fail closed instead of mutating URL-shaped strings inside code."""
+    disallowed = {
+        url
+        for is_code, region in _markdown_regions(markdown)
+        if is_code
+        for url in _normalized_urls(region)
+        if url not in allowed_urls
+    }
+    if disallowed:
+        raise ValueError(_REPORT_DISALLOWED_CODE_URL)
+
+
+def _state_evidence_records(state: dict) -> list[dict]:
+    """Return JSON-native evidence records from reducer-wrapped state."""
+    records = state.get("evidence_registry", [])
+    if (
+        isinstance(records, dict)
+        and records.get("type") == "override"
+    ):
+        records = records.get("value", [])
+    return [
+        dict(record)
+        for record in records
+        if isinstance(record, Mapping)
+    ] if isinstance(records, list) else []
+
+
+def _artifact_references(state: dict) -> list[dict[str, str]]:
+    """Return bounded task artifact references for deterministic recovery."""
+    references = state.get("research_artifact_refs", {})
+    if (
+        isinstance(references, dict)
+        and references.get("type") == "override"
+    ):
+        references = references.get("value", {})
+    if not isinstance(references, Mapping):
+        return []
+    return [
+        {
+            "task_id": str(task_id),
+            "path": str(
+                reference.get("path")
+                or f"context/artifacts/research_tasks/{task_id}.json"
+            ),
+            "sha256": str(reference.get("sha256", "")),
+        }
+        for task_id, reference in list(references.items())[:50]
+        if isinstance(reference, Mapping) and reference.get("sha256")
+    ]
+
+
+def _uncovered_requirement_ids(state: dict) -> list[str]:
+    """Return contract requirement IDs not supported by the coverage ledger."""
+    contract = state.get("coverage_contract", {})
+    ledger = state.get("coverage_ledger", {})
+    if not isinstance(contract, Mapping) or not isinstance(ledger, Mapping):
+        return []
+    requirements = contract.get("requirements", [])
+    if not isinstance(requirements, list):
+        return []
+    return [
+        str(requirement.get("requirement_id"))
+        for requirement in requirements
+        if isinstance(requirement, Mapping)
+        and requirement.get("requirement_id")
+        and (
+            not isinstance(
+                ledger.get(str(requirement.get("requirement_id"))),
+                Mapping,
+            )
+            or ledger[str(requirement.get("requirement_id"))].get("status")
+            != "supported"
+        )
+    ]
+
+
+async def _evidence_limited_report_update(
+    state: dict,
+    config: RunnableConfig,
+    *,
+    evidence_records: list[dict],
+    caveats: list[str],
+    coverage_checklist: list[Any],
+    evaluation_snapshot: Any,
+    reason_code: str,
+) -> dict:
+    """Return a reducer-safe partial update sourced only from eligible evidence."""
+    eligible = source_scoped_evidence_records(
+        evidence_records,
+        state.get("coverage_contract"),
+    )
+    report = await build_evidence_limited_report(
+        eligible,
+        coverage_contract=state.get("coverage_contract"),
+        coverage_ledger=(
+            dict(state.get("coverage_ledger", {}))
+            if isinstance(state.get("coverage_ledger"), Mapping)
+            else {}
+        ),
+        caveats=caveats,
+        uncovered_requirement_ids=_uncovered_requirement_ids(state),
+        rejection_reasons=[reason_code],
+        artifact_refs=_artifact_references(state),
+        config=config,
+    )
+    prior_completion = state.get("completion_decision", {})
+    prior_gaps = (
+        list(prior_completion.get("gaps", []))
+        if isinstance(prior_completion, Mapping)
+        else []
+    )
+    completion = {
+        "action": "complete_partial",
+        "reason": "report_evidence_validation_failed",
+        "gaps": list(dict.fromkeys([*prior_gaps, reason_code])),
+    }
+    prior_gate = state.get("quality_gate", {})
+    quality_gate = (
+        dict(prior_gate)
+        if isinstance(prior_gate, Mapping)
+        else {}
+    )
+    quality_gate["status"] = "degraded"
+    quality_gate["reason_codes"] = list(dict.fromkeys([
+        *(
+            quality_gate.get("reason_codes", [])
+            if isinstance(quality_gate.get("reason_codes"), list)
+            else []
+        ),
+        reason_code,
+    ]))
+    configurable = Configuration.from_runnable_config(config)
+    metadata = config.get("metadata", {})
+    quality_gate.setdefault(
+        "evaluator_model",
+        configurable.quality_evaluation_model,
+    )
+    quality_gate.setdefault(
+        "policy_version",
+        metadata.get("quality_policy_version", QUALITY_POLICY_VERSION),
+    )
+    quality_gate.setdefault(
+        "evaluation_epoch",
+        metadata.get("quality_evaluation_epoch", "legacy-unpinned"),
+    )
+    quality_gate.setdefault("assessment_refs", [])
+    quality_gate.setdefault(
+        "quality_rigor",
+        metadata.get("quality_rigor_policy", {}).get(
+            "rigor",
+            configurable.quality_evaluation_rigor.value,
+        ),
+    )
+    quality_gate.setdefault(
+        "quality_thresholds",
+        dict(metadata.get("quality_rigor_policy", {})),
+    )
+    sources = parse_sources_from_text(report)
+    update: dict = {
+        "final_report": report,
+        "messages": [AIMessage(content=report)],
+        "evaluation_snapshot": evaluation_snapshot.model_dump(
+            mode="json",
+            exclude_none=True,
+        ),
+        "completion_decision": {
+            "type": "override",
+            "value": completion,
+        },
+        "quality_gate": quality_gate,
+        **_cleared_state(),
+        "coverage_checklist": {
+            "type": "override",
+            "value": coverage_checklist,
+        },
+    }
+    if sources:
+        update["sources"] = {
+            "type": "override",
+            "value": [source.model_dump() for source in sources],
+        }
+    return update
 
 
 def _resolve_output_format(cfg: Configuration, profile: ReportProfile) -> OutputFormat:
@@ -154,13 +458,21 @@ async def build_report(state: dict, config: RunnableConfig) -> dict:
         evidence_registry = evidence_registry.get("value", [])
     if isinstance(evidence_registry, list) and evidence_registry:
         has_accepted_evidence = bool(
-            eligible_evidence_records(evidence_registry)
+            source_scoped_evidence_records(
+                evidence_registry,
+                state.get("coverage_contract"),
+            )
         )
     else:
-        has_accepted_evidence = bool(
-            accepted_notes
-            or state.get("raw_notes")
-            or state.get("completed_task_outputs")
+        has_accepted_evidence = (
+            not contract_requires_official_sources(
+                state.get("coverage_contract")
+            )
+            and bool(
+                accepted_notes
+                or state.get("raw_notes")
+                or state.get("completed_task_outputs")
+            )
         )
     if (
         cfg.quality_evaluation_enabled
@@ -186,7 +498,13 @@ async def build_report(state: dict, config: RunnableConfig) -> dict:
         coverage_checklist=coverage_checklist,
         researcher_task_artifacts=researcher_task_artifacts,
     )
-    if cfg.quality_evaluation_enabled and not ctx.sources:
+    if (
+        cfg.quality_evaluation_enabled
+        and not ctx.sources
+        and not contract_requires_official_sources(
+            state.get("coverage_contract")
+        )
+    ):
         raw_evidence = "\n".join(
             str(note)
             for note in [
@@ -216,7 +534,28 @@ async def build_report(state: dict, config: RunnableConfig) -> dict:
     if needs_sources and not result.sources:
         result.sources = parse_sources_from_text(result.body_markdown + "\n" + ctx.findings)
 
-    markdown = sanitize_report_markdown(result.body_markdown)
+    markdown = _transform_markdown_prose(
+        result.body_markdown,
+        sanitize_report_markdown,
+    )
+    caveats = list(dict.fromkeys(
+        str(caveat).strip()[:500]
+        for assessment in state.get("handoff_assessments", [])
+        if isinstance(assessment, dict)
+        and assessment.get("admission_status")
+        == "accepted_with_caveats"
+        for caveat in assessment.get("caveats", [])
+        if str(caveat).strip()
+    ))[:20]
+    if caveats and not re.search(
+        r"(?im)^#{1,6}\s*(限制与不确定性|limitations?\s+and\s+uncertainties)\s*$",
+        markdown,
+    ):
+        markdown = (
+            markdown.rstrip()
+            + "\n\n## 限制与不确定性\n\n"
+            + "\n".join(f"- {caveat}" for caveat in caveats)
+        )
     if ctx.sources:
         allowed_urls = {source.url for source in ctx.sources}
 
@@ -224,7 +563,32 @@ async def build_report(state: dict, config: RunnableConfig) -> dict:
             label, url = match.group(1), match.group(2)
             return match.group(0) if url in allowed_urls else label
 
-        markdown = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", keep_fetched_link, markdown)
+        markdown = _transform_markdown_prose(
+            markdown,
+            lambda prose: re.sub(
+                r"\[([^\]]+)\]\((https?://[^)]+)\)",
+                keep_fetched_link,
+                prose,
+            ),
+        )
+    if (
+        evidence_allowlist_enabled
+        and result.sources
+        and not _has_verifiable_body_citation(
+            markdown,
+            allowed_urls={source.url for source in result.sources},
+            source_count=len(result.sources),
+        )
+    ):
+        return await _evidence_limited_report_update(
+            state,
+            config,
+            evidence_records=_state_evidence_records(state),
+            caveats=caveats,
+            coverage_checklist=coverage_checklist,
+            evaluation_snapshot=evaluation_snapshot,
+            reason_code=_REPORT_MISSING_CITATIONS,
+        )
     if result.sources and (
         is_sectioned
         or ref_style == ReferenceStyle.BIBTEX_LIKE
@@ -238,6 +602,23 @@ async def build_report(state: dict, config: RunnableConfig) -> dict:
         )
     if evidence_allowlist_enabled:
         allowed_urls = {source.url for source in result.sources}
+        try:
+            _assert_fenced_urls_allowlisted(
+                markdown,
+                allowed_urls=allowed_urls,
+            )
+        except ValueError as exc:
+            if str(exc) != _REPORT_DISALLOWED_CODE_URL:
+                raise
+            return await _evidence_limited_report_update(
+                state,
+                config,
+                evidence_records=_state_evidence_records(state),
+                caveats=caveats,
+                coverage_checklist=coverage_checklist,
+                evaluation_snapshot=evaluation_snapshot,
+                reason_code=_REPORT_DISALLOWED_CODE_URL,
+            )
 
         def keep_eligible_url(match: re.Match[str]) -> str:
             raw_url = match.group(0)
@@ -245,16 +626,25 @@ async def build_report(state: dict, config: RunnableConfig) -> dict:
             suffix = raw_url[len(url):]
             return raw_url if url in allowed_urls else suffix
 
-        markdown = re.sub(r"https?://[^\s)\]}>]+", keep_eligible_url, markdown)
-        source_count = len(result.sources)
-        markdown = re.sub(
-            r"\[(\d+)\]",
-            lambda match: match.group(0)
-            if 1 <= int(match.group(1)) <= source_count
-            else "",
+        markdown = _transform_markdown_prose(
             markdown,
+            lambda prose: _URL_RE.sub(keep_eligible_url, prose),
         )
-    markdown = sanitize_report_markdown(markdown)
+        source_count = len(result.sources)
+        markdown = _transform_markdown_prose(
+            markdown,
+            lambda prose: re.sub(
+                r"\[(\d+)\]",
+                lambda match: match.group(0)
+                if 1 <= int(match.group(1)) <= source_count
+                else "",
+                prose,
+            ),
+        )
+    markdown = _transform_markdown_prose(
+        markdown,
+        sanitize_report_markdown,
+    )
 
     # Render every artifact from the same canonical markdown exposed through
     # ``final_report`` so reference rewriting cannot create divergent payloads.

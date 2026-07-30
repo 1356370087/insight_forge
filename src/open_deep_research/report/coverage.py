@@ -8,9 +8,47 @@ _TAG_RE = re.compile(r"<[^>]+>")
 _SPACE_RE = re.compile(r"\s+")
 _CLAUSE_RE = re.compile(r"[。；;\n]+|(?<=\S)，(?=并|以及|同时|结合|区分|说明|提出|给出|评估|比较)")
 _LIST_RE = re.compile(r"[、,，]+")
+_NUMBERED_ITEM_RE = re.compile(r"(?<!\w)(\d{1,2})[.)]\s+")
+_GLOBAL_DIRECTIVE_RE = re.compile(
+    r"(?<=[.!?。！？])\s+(?=(?:for all\b|finally\b|additionally\b|also\b|最后|此外|并(?:最终|另外)))",
+    re.IGNORECASE,
+)
 _LEADING_RE = re.compile(
     r"^(?:截至\S+?[，,]\s*)?(?:请|需要|应当|应如何|报告应)?(?:重点)?(?:覆盖|比较|评估|分析|说明|区分|提出|给出)?\s*"
 )
+
+
+def _numbered_candidates(clean: str) -> list[str] | None:
+    """Keep numbered deliverables atomic, including their internal commas."""
+    markers = list(_NUMBERED_ITEM_RE.finditer(clean))
+    ordinals = [int(marker.group(1)) for marker in markers]
+    if (
+        len(markers) < 2
+        or ordinals[0] != 1
+        or any(
+            current != previous + 1
+            for previous, current in zip(ordinals, ordinals[1:])
+        )
+    ):
+        return None
+
+    candidates: list[str] = []
+    preamble = clean[: markers[0].start()].strip(" ：:。. ")
+    if preamble:
+        candidates.append(preamble)
+    for index, marker in enumerate(markers):
+        end = (
+            markers[index + 1].start()
+            if index + 1 < len(markers)
+            else len(clean)
+        )
+        item = clean[marker.end() : end].strip(" ：:。. ")
+        candidates.extend(
+            part.strip(" ：:。. ")
+            for part in _GLOBAL_DIRECTIVE_RE.split(item)
+            if part.strip(" ：:。. ")
+        )
+    return candidates
 
 
 def derive_coverage_checklist(text: str, *, max_items: int = 20) -> list[str]:
@@ -23,13 +61,15 @@ def derive_coverage_checklist(text: str, *, max_items: int = 20) -> list[str]:
     clean = re.sub(r"^截至[^，,。；;]+[，,]\s*", "", clean)
     if not clean:
         return []
-    candidates: list[str] = []
-    for clause in _CLAUSE_RE.split(clean):
-        clause = _LEADING_RE.sub("", clause).strip(" ：:。. ")
-        if not clause:
-            continue
-        parts = _LIST_RE.split(clause)
-        candidates.extend(part.strip(" ：:。. ") for part in parts)
+    candidates = _numbered_candidates(clean)
+    if candidates is None:
+        candidates = []
+        for clause in _CLAUSE_RE.split(clean):
+            clause = _LEADING_RE.sub("", clause).strip(" ：:。. ")
+            if not clause:
+                continue
+            parts = _LIST_RE.split(clause)
+            candidates.extend(part.strip(" ：:。. ") for part in parts)
 
     checklist: list[str] = []
     seen: set[str] = set()
@@ -42,10 +82,10 @@ def derive_coverage_checklist(text: str, *, max_items: int = 20) -> list[str]:
         if len(key) < 2 or key in seen:
             continue
         seen.add(key)
-        checklist.append(item[:240])
+        checklist.append(item[:500])
         if len(checklist) >= max_items:
             break
-    return checklist or [clean[:240]]
+    return checklist or [clean[:500]]
 
 
 def derive_state_coverage_checklist(
