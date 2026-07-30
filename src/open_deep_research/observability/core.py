@@ -1515,7 +1515,11 @@ async def invoke_model_with_retry_observability(
         attempt = 0  # attempts made so far (0 == first try in progress)
         while True:
             try:
-                response = await _ainvoke_model(model, messages, recorder, config)
+                invocation = _ainvoke_model(model, messages, recorder, config)
+                response = await asyncio.wait_for(
+                    invocation,
+                    timeout=configurable.model_call_timeout_seconds,
+                )
             except Exception as exc:  # noqa: BLE001 -- classify then decide
                 error_type, retryable = classify_llm_retryable_error(exc)
                 attempts_made = attempt + 1

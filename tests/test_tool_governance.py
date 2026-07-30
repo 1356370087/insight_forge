@@ -28,7 +28,7 @@ from open_deep_research.configuration import Configuration
 from open_deep_research.state import ConductResearch, ResearchComplete
 from open_deep_research.tasks.registry import TaskStatus
 from open_deep_research.tools.adapters import adapt_langchain_tool
-from open_deep_research.tools.base import Tool, ToolContext, ToolOrigin
+from open_deep_research.tools.base import Tool, ToolContext, ToolEffect, ToolOrigin
 from open_deep_research.tools.governance import (
     AgentRole,
     ToolErrorType,
@@ -210,6 +210,15 @@ class TestToolOriginFields:
 
     def test_retryable_defaults_are_conservative(self):
         assert get_tool_retryable(ok_tool) is False
+
+    def test_effectful_langchain_tool_is_serial_unless_explicitly_opted_in(self):
+        effectful_tool = adapt_langchain_tool(
+            lc_tool(_probe_search_fn),
+            origin=ToolOrigin.MCP,
+            effect=ToolEffect.EXTERNAL_WRITE,
+        )
+
+        assert effectful_tool.concurrency_safe is False
 
 
 # ---------------------------------------------------------------------------

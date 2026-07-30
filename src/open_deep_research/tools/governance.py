@@ -133,6 +133,16 @@ def get_tool_effect(tool: Tool) -> ToolEffect:
     return ToolEffect.READ_ONLY
 
 
+def get_tool_concurrency_safe(tool: Tool) -> bool:
+    """Return whether the tool explicitly permits concurrent execution."""
+    return getattr(tool, "concurrency_safe", False) is True
+
+
+def get_tool_supports_idempotency(tool: Tool) -> bool:
+    """Return whether the tool honors a stable operation id."""
+    return getattr(tool, "supports_idempotency", False) is True
+
+
 ##########################
 # Structured error
 ##########################
@@ -1023,6 +1033,8 @@ async def execute_governed_tool_call(
     base_delay: float = 1.0,
     max_delay: float = 30.0,
     sleeper: Optional[Callable[[float], Any]] = None,
+    operation_id: str = "",
+    operation_attempt: int = 1,
 ) -> GovernedToolCallResult:
     """Execute a single tool call under full governance.
 
@@ -1145,6 +1157,8 @@ async def execute_governed_tool_call(
         config=config,
         role=role.value,
         tool_call_id=tool_call_id,
+        operation_id=operation_id,
+        attempt=operation_attempt,
     )
 
     # Execution. Retry is applied only when the caller enables it (apply_retry)

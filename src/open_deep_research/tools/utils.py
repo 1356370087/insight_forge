@@ -1844,25 +1844,43 @@ tavily_search = adapt_langchain_tool(
     tavily_search,
     origin=ToolOrigin.SEARCH,
     retryable=True,
+    concurrency_safe=True,
 )
 openai_web_search = adapt_langchain_tool(
     openai_web_search,
     origin=ToolOrigin.SEARCH,
     retryable=True,
+    concurrency_safe=True,
 )
 anthropic_web_search = adapt_langchain_tool(
     anthropic_web_search,
     origin=ToolOrigin.SEARCH,
     retryable=True,
+    concurrency_safe=True,
 )
-web_research = adapt_langchain_tool(web_research, origin=ToolOrigin.SEARCH, retryable=True)
-fetch_url = adapt_langchain_tool(fetch_url, origin=ToolOrigin.SEARCH, retryable=True)
+web_research = adapt_langchain_tool(
+    web_research,
+    origin=ToolOrigin.SEARCH,
+    retryable=True,
+    concurrency_safe=True,
+)
+fetch_url = adapt_langchain_tool(
+    fetch_url,
+    origin=ToolOrigin.SEARCH,
+    retryable=True,
+    concurrency_safe=True,
+)
 fetch_webpage = adapt_langchain_tool(
     fetch_webpage,
     origin=ToolOrigin.SYSTEM,
     retryable=True,
+    concurrency_safe=True,
 )
-think_tool = adapt_langchain_tool(think_tool, origin=ToolOrigin.SYSTEM)
+think_tool = adapt_langchain_tool(
+    think_tool,
+    origin=ToolOrigin.SYSTEM,
+    concurrency_safe=True,
+)
 
 
 async def get_search_tool(search_api: SearchAPI):

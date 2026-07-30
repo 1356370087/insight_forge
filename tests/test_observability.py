@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any
 
@@ -57,6 +58,31 @@ class FakeModel:
     async def ainvoke(self, messages):
         self.calls.append(messages)
         return self.response
+
+
+@pytest.mark.asyncio
+async def test_llm_retry_loop_applies_configured_attempt_timeout(tmp_path):
+    class SlowModel(FakeModel):
+        async def ainvoke(self, messages):
+            self.calls.append(messages)
+            await asyncio.sleep(0.1)
+            return self.response
+
+    trace_path = tmp_path / "trace.sqlite3"
+    config = _config(trace_path, run_id="model-timeout-run")
+    config["configurable"]["model_call_timeout_seconds"] = 0.01
+    model = SlowModel(AIMessage(content="too late"))
+
+    with pytest.raises(TimeoutError):
+        await invoke_model_with_retry_observability(
+            model,
+            [HumanMessage(content="q")],
+            config,
+            span_name="test.timeout",
+            agent_role="lead",
+            model_name="openai:gpt-test",
+            max_attempts=1,
+        )
 
 
 def test_token_usage_extracts_usage_metadata_first():

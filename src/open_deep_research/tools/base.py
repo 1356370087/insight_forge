@@ -55,6 +55,8 @@ class ToolContext:
     config: RunnableConfig
     role: str
     tool_call_id: str
+    operation_id: str = ""
+    attempt: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +115,8 @@ class BuiltTool(Generic[InputT, OutputT, ProgressT]):
     origin: ToolOrigin
     effect: ToolEffect
     retryable: bool
+    concurrency_safe: bool
+    supports_idempotency: bool
     _description: Callable[[Optional[InputT]], Union[str, Awaitable[str]]]
     _call: Callable[
         [InputT, ToolContext, Optional[ProgressCallback[ProgressT]]],
@@ -156,6 +160,8 @@ def build_tool(
     origin: ToolOrigin,
     effect: ToolEffect = ToolEffect.READ_ONLY,
     retryable: bool = False,
+    concurrency_safe: bool = False,
+    supports_idempotency: bool = False,
 ) -> Tool[InputT, OutputT, ProgressT]:
     """Build a tool with conservative defaults and eager contract checks."""
     if not name or not name.strip():
@@ -181,6 +187,8 @@ def build_tool(
         origin=origin,
         effect=effect,
         retryable=bool(retryable),
+        concurrency_safe=bool(concurrency_safe),
+        supports_idempotency=bool(supports_idempotency),
         _description=description_fn,
         _call=call,
     )

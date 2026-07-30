@@ -25,6 +25,8 @@ class LangChainToolAdapter:
     origin: ToolOrigin
     effect: ToolEffect = ToolEffect.READ_ONLY
     retryable: bool = False
+    concurrency_safe: bool = False
+    supports_idempotency: bool = False
     auth_satisfied: bool = False
 
     @property
@@ -63,6 +65,8 @@ def adapt_langchain_tool(
     origin: ToolOrigin,
     effect: ToolEffect = ToolEffect.READ_ONLY,
     retryable: bool = False,
+    concurrency_safe: bool = False,
+    supports_idempotency: bool = False,
     auth_satisfied: bool = False,
 ) -> LangChainToolAdapter:
     """Create a LangChain Adapter with explicit governance metadata."""
@@ -71,5 +75,7 @@ def adapt_langchain_tool(
         origin=origin,
         effect=effect,
         retryable=retryable,
+        concurrency_safe=concurrency_safe,
+        supports_idempotency=supports_idempotency,
         auth_satisfied=auth_satisfied,
     )
