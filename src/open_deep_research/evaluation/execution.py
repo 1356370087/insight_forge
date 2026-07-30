@@ -20,7 +20,8 @@ _DOMAIN_RE = re.compile(
     re.IGNORECASE,
 )
 _NAMED_TOOL_RE = re.compile(
-    r"(?:使用|调用|use|call)\s*(?:the\s+)?`?([A-Za-z][A-Za-z0-9_.:-]*)`?",
+    r"(?:(?:使用|调用)\s*|(?:use|call)\b\s+(?:the\s+)?)"
+    r"`?([A-Za-z][A-Za-z0-9_.:-]*)`?",
     re.IGNORECASE,
 )
 _NEGATIVE_TOOL_PREFIX_RE = re.compile(

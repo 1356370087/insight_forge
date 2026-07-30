@@ -51,6 +51,23 @@ def _quality_env() -> dict[str, str]:
     }
 
 
+def _dashscope_test_env() -> dict[str, str]:
+    """Return deterministic unit-test settings independent of the developer .env."""
+    return {
+        "DASHSCOPE_API_KEY": "sk-dashscope-test",
+        "QUALITY_EVALUATION_ENABLED": "true",
+        "QUALITY_EVALUATION_MODEL": "openai:qwen3.7-flash",
+        "QUALITY_EVALUATION_BASE_URL": (
+            "https://workspace.cn-beijing.maas.aliyuncs.com/"
+            "compatible-mode/v1"
+        ),
+        "QUALITY_EVALUATION_FAIL_OPEN": "false",
+        "QUALITY_EVALUATION_RIGOR": "strict",
+        "QUALITY_EVALUATION_MIN_SCORE": "4",
+        "QUALITY_EVALUATION_MIN_SOURCES": "2",
+    }
+
+
 def _assert_dashscope_base_url(base_url: str) -> None:
     """Validate the deployable form of a DashScope OpenAI-compatible URL."""
     assert base_url, "QUALITY_EVALUATION_BASE_URL is required"
@@ -71,11 +88,11 @@ def _assert_dashscope_base_url(base_url: str) -> None:
 class TestDashScopeQualityEvaluationConfiguration:
     """Exercise the same configuration seam used by the runtime quality gate."""
 
-    def test_dotenv_contains_a_valid_openai_compatible_configuration(self) -> None:
-        values = _quality_env()
+    def test_dashscope_fixture_is_a_valid_openai_compatible_configuration(
+        self,
+    ) -> None:
+        values = _dashscope_test_env()
 
-        assert ENV_PATH.is_file(), "Project .env file is missing"
-        assert values["DASHSCOPE_API_KEY"], "DASHSCOPE_API_KEY is missing"
         assert values["DASHSCOPE_API_KEY"].startswith("sk-"), (
             "DASHSCOPE_API_KEY does not look like a DashScope API key"
         )
@@ -101,7 +118,7 @@ class TestDashScopeQualityEvaluationConfiguration:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        values = _quality_env()
+        values = _dashscope_test_env()
         captured: dict[str, object] = {}
 
         class FakeModel:
@@ -115,6 +132,7 @@ class TestDashScopeQualityEvaluationConfiguration:
 
         for key, value in values.items():
             monkeypatch.setenv(key, value)
+        monkeypatch.delenv("QUALITY_EVALUATION_API_KEY", raising=False)
         monkeypatch.setattr(
             "open_deep_research.quality.init_chat_model",
             fake_init_chat_model,

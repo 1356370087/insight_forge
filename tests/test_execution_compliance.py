@@ -179,3 +179,11 @@ def test_negative_fetch_url_constraint_is_not_required() -> None:
 
     assert "fetch_url" not in constraints.required_tools
     assert constraints.required_tools == ["web_search"]
+
+
+def test_plural_api_calls_is_not_parsed_as_tool_named_s() -> None:
+    constraints = extract_execution_constraints(
+        "Provide idempotency patterns for API calls, database writes, and file I/O."
+    )
+
+    assert constraints.required_tools == []

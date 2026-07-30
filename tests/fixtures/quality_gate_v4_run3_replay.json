@@ -1,0 +1,31 @@
+{
+  "fixture_schema_version": 1,
+  "source_run_id": "5e985ed4-f368-4c5c-b098-a50de200c894",
+  "source_artifact_schema_version": 1,
+  "original_query": "Based solely on the LangGraph official documentation, official API reference, and official GitHub repository (as of July 2026), provide a detailed technical explanation of:\n\n1. Checkpointer state at super-step boundaries: Exactly what state the checkpointer saves at super-step boundaries — distinguish between graph state, node results, pending tasks, configuration, and any internal metadata.\n\n2. Interrupt and Command(resume=...) mechanics: How interrupts are triggered, what happens to execution flow, how Command(resume=...) resumes execution, and what state is restored vs. recalculated upon resume.\n\n3. Re-execution of code upon node resume: When a node resumes after an interrupt, which parts of its code are guaranteed to re-execute, and which are skipped or cached.\n\n4. Idempotency design to avoid external side-effect duplication: What concrete patterns developers should use so that API calls, database writes, and file I/O are not duplicated on resume or replay.\n\nFor all four points, clearly label officially guaranteed behavior versus engineering inference. Finally provide a five-item Minimum Viable Reliability Checklist.",
+  "supervisor_research_topic": "Determine exactly what state the LangGraph checkpointer saves at super-step boundaries. Deliver a structured fact table containing every precise Checkpoint field, whether Managed Values are persisted, whether every behavior is guaranteed or inferred, and the specific latest LangGraph version as of July 2026. Use only langchain-ai.github.io/langgraph, the official API reference, and github.com/langchain-ai/langgraph.",
+  "v3_result_assessment": {
+    "decision": "continue",
+    "relevance": 4,
+    "source_quality": 5,
+    "evidence_coverage": 3,
+    "corroboration": 4,
+    "missing_information": [
+      "Explicit list of every field contained in the Checkpoint object.",
+      "Confirmation of whether Managed Values are included in checkpoint state.",
+      "Specific LangGraph version number for the documented structure.",
+      "Field-by-field guarantee versus implementation-detail labels."
+    ],
+    "suggested_queries": [
+      "LangGraph Checkpoint class fields channel_values versions pending_sends",
+      "LangGraph managed values persistence checkpoint super-step",
+      "LangGraph release notes checkpoint structure changes"
+    ],
+    "policy_version": "quality-gate-v3"
+  },
+  "expected_v4": {
+    "supervisor_exact_version_is_advisory": true,
+    "legacy_documentation_hostname_is_advisory": true,
+    "admission_when_owned_user_requirements_are_supported": "accepted_with_caveats"
+  }
+}

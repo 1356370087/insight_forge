@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
 from datetime import date
 from functools import lru_cache
-from typing import Any, Literal
+from typing import Any, Literal, get_args, get_origin
 
+from langchain_core.messages import AIMessage
 from pydantic import BaseModel, Field
 
+from open_deep_research import quality as quality_evaluation
 from open_deep_research.evaluation import (
     JUDGE_SECURITY_PROTOCOL,
     JudgeConfig,
@@ -34,6 +38,17 @@ from tests.prompts import (
     STRUCTURE_PROMPT,
     TOOL_EFFICIENCY_PROMPT,
 )
+
+logger = logging.getLogger(__name__)
+_SAFE_ERROR_TOKEN = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
+
+
+class JudgeOutputError(ValueError):
+    """Classified local Judge protocol failure safe for persisted metadata."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 @lru_cache(maxsize=1)
@@ -120,7 +135,96 @@ def _judge_input(content: str) -> str | list[dict[str, Any]]:
 
 def _structured_output(schema: type[BaseModel]):
     """Use tool calling because DeepSeek does not accept OpenAI json_schema output."""
-    return _get_eval_model().with_structured_output(schema, method="function_calling")
+    return _get_eval_model().with_structured_output(
+        schema,
+        method="function_calling",
+        include_raw=True,
+    )
+
+
+def _unwrap_single_key_schema_payload(
+    schema: type[BaseModel],
+    payload: Any,
+) -> Any:
+    """Repair only an unambiguous provider wrapper around a schema payload."""
+    if not isinstance(payload, dict) or len(payload) != 1:
+        return payload
+
+    nested = next(iter(payload.values()))
+    if isinstance(nested, str):
+        try:
+            nested = json.loads(nested)
+        except json.JSONDecodeError:
+            return payload
+    if not isinstance(nested, dict):
+        return payload
+
+    schema_fields = set(schema.model_fields)
+    if not schema_fields.issubset(nested):
+        return payload
+    return nested
+
+
+def _decode_json_list_schema_fields(
+    schema: type[BaseModel],
+    payload: Any,
+) -> Any:
+    """Decode only JSON strings whose declared schema field explicitly expects a list."""
+    if not isinstance(payload, dict):
+        return payload
+
+    decoded_payload: dict[str, Any] | None = None
+    for field_name, field in schema.model_fields.items():
+        value = payload.get(field_name)
+        if not isinstance(value, str) or get_origin(field.annotation) is not list:
+            continue
+        try:
+            decoded_value = json.loads(value)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(decoded_value, list):
+            continue
+        if decoded_payload is None:
+            decoded_payload = dict(payload)
+        decoded_payload[field_name] = decoded_value
+    return decoded_payload if decoded_payload is not None else payload
+
+
+def _payload_from_structured_result(result: Any) -> Any:
+    """Select parsed output or one normalized tool-call args payload."""
+    envelope_fields = {"raw", "parsed", "parsing_error"}
+    if not isinstance(result, dict) or not envelope_fields.issubset(result):
+        return result
+
+    parsed = result.get("parsed")
+    if parsed is not None:
+        return parsed
+
+    raw = result.get("raw")
+    if not isinstance(raw, AIMessage):
+        raise JudgeOutputError(
+            "invalid_raw_message",
+            "Judge raw response was not a normalized AIMessage",
+        )
+    tool_calls = raw.tool_calls
+    if not isinstance(tool_calls, list) or len(tool_calls) != 1:
+        raise JudgeOutputError(
+            "ambiguous_tool_calls",
+            "Judge raw response did not contain exactly one normalized tool call",
+        )
+    tool_call = tool_calls[0]
+    if not isinstance(tool_call, dict):
+        raise JudgeOutputError(
+            "invalid_tool_call",
+            "Judge normalized tool call was not a mapping",
+        )
+    arguments = tool_call.get("args")
+    if not isinstance(arguments, dict):
+        raise JudgeOutputError(
+            "invalid_tool_call_args",
+            "Judge normalized tool-call arguments were not a mapping",
+        )
+    return arguments
 
 
 def _invoke_structured_output(
@@ -132,21 +236,222 @@ def _invoke_structured_output(
     """Retry empty, invalid, and failed structured Judge responses uniformly."""
     runner = _structured_output(schema)
     last_error: Exception | None = None
-    for _attempt in range(max(1, attempts)):
+    last_failure_summary: str | None = None
+    attempt_count = max(1, attempts)
+    for attempt_index in range(attempt_count):
+        payload_shape: str | None = None
         try:
             result = runner.invoke(messages)
             if result is None:
-                raise ValueError(
-                    f"{schema.__name__} Judge returned no structured output"
+                raise JudgeOutputError(
+                    "no_structured_output",
+                    f"{schema.__name__} Judge returned no structured output",
                 )
             if isinstance(result, schema):
                 return result
-            return schema.model_validate(result)
+            payload = _payload_from_structured_result(result)
+            if isinstance(payload, schema):
+                return payload
+            payload_shape = _safe_payload_shape(payload, schema)
+            unwrapped_payload = _unwrap_single_key_schema_payload(schema, payload)
+            return schema.model_validate(
+                _decode_json_list_schema_fields(schema, unwrapped_payload)
+            )
         except Exception as exc:  # noqa: BLE001 - bounded Judge retry boundary
             last_error = exc
+            last_failure_summary = _judge_failure_summary(
+                exc,
+                payload_shape=payload_shape,
+            )
+            logger.warning(
+                "%s Judge attempt %d/%d failed (%s)",
+                schema.__name__,
+                attempt_index + 1,
+                attempt_count,
+                last_failure_summary,
+            )
+    assert last_error is not None
+    assert last_failure_summary is not None
     raise RuntimeError(
-        f"{schema.__name__} Judge failed after {max(1, attempts)} attempts"
+        f"{schema.__name__} Judge failed after {attempt_count} attempts; "
+        f"last error: {last_failure_summary}"
     ) from last_error
+
+
+def _judge_failure_summary(
+    exc: BaseException,
+    *,
+    payload_shape: str | None = None,
+) -> str:
+    """Return useful provider metadata without persisting exception text."""
+    parts = [type(exc).__name__]
+    status = next(
+        (
+            value
+            for value in (
+                getattr(exc, "status_code", None),
+                getattr(exc, "status", None),
+                getattr(getattr(exc, "response", None), "status_code", None),
+            )
+            if isinstance(value, int)
+        ),
+        None,
+    )
+    if status is not None:
+        parts.append(f"status={status}")
+    body = getattr(exc, "body", None)
+    code = getattr(exc, "code", None)
+    if code is None and isinstance(body, dict):
+        code = body.get("code")
+        if code is None and isinstance(body.get("error"), dict):
+            code = body["error"].get("code")
+    code_text = str(code or "")
+    if _SAFE_ERROR_TOKEN.fullmatch(code_text):
+        parts.append(f"code={code_text}")
+    validation_signatures = _validation_error_signatures(exc)
+    if validation_signatures:
+        parts.append(f"validation={';'.join(validation_signatures)}")
+        if payload_shape:
+            parts.append(f"payload_shape={payload_shape}")
+    return ", ".join(parts)
+
+
+def _validation_error_signatures(
+    exc: BaseException,
+    *,
+    max_items: int = 12,
+) -> list[str]:
+    """Extract bounded validation paths and types without input values or messages."""
+    errors_method = getattr(exc, "errors", None)
+    if not callable(errors_method):
+        return []
+    try:
+        errors = errors_method(
+            include_url=False,
+            include_context=False,
+            include_input=False,
+        )
+    except TypeError:
+        errors = errors_method()
+    except Exception:  # noqa: BLE001 - diagnostics must never replace root failure
+        return []
+    if not isinstance(errors, list):
+        return []
+
+    signatures: list[str] = []
+    for item in errors[:max_items]:
+        if not isinstance(item, dict):
+            continue
+        location = item.get("loc", ())
+        if not isinstance(location, (list, tuple)):
+            location = (location,)
+        safe_location = ".".join(
+            _safe_validation_token(part)
+            for part in location
+        ) or "<root>"
+        error_type = _safe_validation_token(item.get("type", "unknown"))
+        signatures.append(f"{safe_location}:{error_type}")
+    if len(errors) > max_items:
+        signatures.append(f"<truncated>:{len(errors) - max_items}")
+    return signatures
+
+
+def _safe_validation_token(value: Any) -> str:
+    if isinstance(value, int):
+        return str(value)
+    text = str(value)
+    if _SAFE_ERROR_TOKEN.fullmatch(text):
+        return text
+    return "<redacted>"
+
+
+def _safe_payload_shape(
+    payload: Any,
+    schema: type[BaseModel],
+    *,
+    max_depth: int = 2,
+    max_keys: int = 12,
+) -> str:
+    """Describe payload containers without serializing any scalar values."""
+    remaining_keys = [max(0, max_keys)]
+    allowed_fields = _schema_payload_field_names(schema)
+
+    def render(value: Any, depth: int) -> str:
+        if isinstance(value, dict):
+            if depth >= max_depth:
+                return "dict"
+            fields: list[str] = []
+            for key in sorted(value, key=lambda item: str(item)):
+                if remaining_keys[0] <= 0:
+                    fields.append("<truncated>")
+                    break
+                remaining_keys[0] -= 1
+                key_text = str(key)
+                safe_key = (
+                    _safe_validation_token(key_text)
+                    if key_text in allowed_fields
+                    else "<redacted>"
+                )
+                fields.append(
+                    f"{safe_key}:"
+                    f"{render(value[key], depth + 1)}"
+                )
+            return f"dict{{{','.join(fields)}}}"
+        if isinstance(value, list):
+            return f"list(len={len(value)})"
+        if isinstance(value, tuple):
+            return f"tuple(len={len(value)})"
+        if value is None:
+            return "none"
+        if isinstance(value, bool):
+            return "bool"
+        if isinstance(value, int):
+            return "int"
+        if isinstance(value, float):
+            return "float"
+        if isinstance(value, str):
+            return "str"
+        if isinstance(value, bytes):
+            return "bytes"
+        return _safe_validation_token(type(value).__name__)
+
+    shape = render(payload, 0)
+    if shape.startswith("dict{"):
+        return shape.removeprefix("dict")
+    return shape
+
+
+@lru_cache(maxsize=32)
+def _schema_payload_field_names(schema: type[BaseModel]) -> frozenset[str]:
+    """Return code-defined field names and aliases for a schema model graph."""
+    allowed: set[str] = set()
+    pending = [schema]
+    visited: set[type[BaseModel]] = set()
+    while pending:
+        model = pending.pop()
+        if model in visited:
+            continue
+        visited.add(model)
+        for field_name, field in model.model_fields.items():
+            allowed.add(field_name)
+            for alias in (
+                field.alias,
+                field.serialization_alias,
+                field.validation_alias,
+            ):
+                if isinstance(alias, str):
+                    allowed.add(alias)
+            pending.extend(_nested_schema_models(field.annotation))
+    return frozenset(allowed)
+
+
+def _nested_schema_models(annotation: Any) -> list[type[BaseModel]]:
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return [annotation]
+    nested: list[type[BaseModel]] = []
+    for argument in get_args(annotation):
+        nested.extend(_nested_schema_models(argument))
+    return nested
 
 
 def _judge_messages(
@@ -190,9 +495,12 @@ def _evidence_context(outputs: dict[str, Any]) -> str:
         registry = registry.get("value") or []
     if not isinstance(registry, list):
         registry = []
+    selected, _stats = quality_evaluation._bounded_evidence_records(
+        eligible_evidence_records(registry),
+        max_chars=max_chars,
+    )
     accepted: list[str] = []
-    used_chars = 0
-    for record in eligible_evidence_records(registry):
+    for record in selected:
         projected = {
             key: record.get(key)
             for key in (
@@ -209,13 +517,7 @@ def _evidence_context(outputs: dict[str, Any]) -> str:
             if record.get(key) is not None and record.get(key) != ""
         }
         line = json.dumps(projected, ensure_ascii=False, sort_keys=True)
-        separator_chars = 1 if accepted else 0
-        if used_chars + separator_chars + len(line) > max_chars:
-            if not accepted:
-                accepted.append(line[:max_chars])
-            break
         accepted.append(line)
-        used_chars += separator_chars + len(line)
     if snapshot is not None or registry:
         return "\n".join(accepted)[:max_chars]
 

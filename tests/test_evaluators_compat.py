@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
+import pytest
 from langchain_core.messages import AIMessage, ToolMessage
+from pydantic import create_model
 
 from open_deep_research.evaluation import build_evaluation_snapshot
 from tests import evaluators
@@ -192,6 +195,44 @@ def test_evidence_context_prefers_bounded_accepted_registry(monkeypatch) -> None
     assert "Quarantined claim" not in context
     assert "MALICIOUS LEGACY NOTE" not in context
     assert len(context) <= 600
+
+
+def test_evidence_context_preserves_late_source_host_under_budget(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("EVALUATION_EVIDENCE_MAX_CHARS", "1500")
+    records = [
+        {
+            "evidence_id": f"docs-{index}",
+            "claim": "Documentation claim " + ("d" * 400),
+            "supporting_excerpt": "Documentation excerpt " + ("e" * 400),
+            "source_url": f"https://docs.example.test/topic/{index}",
+            "source_authority": 0.95,
+            "confidence": 0.9,
+            "security_status": "accepted",
+        }
+        for index in range(8)
+    ]
+    records.append({
+        "evidence_id": "github-late",
+        "claim": "The official repository defines the checkpoint schema.",
+        "supporting_excerpt": "class Checkpoint(TypedDict): ...",
+        "source_url": "https://github.com/example/project/blob/main/schema.py",
+        "source_authority": 0.9,
+        "confidence": 0.9,
+        "security_status": "accepted",
+    })
+
+    context = evaluators._evidence_context({
+        "evaluation_snapshot": {
+            "schema_version": "1.0",
+            "evidence_registry": records,
+        }
+    })
+
+    assert "docs.example.test" in context
+    assert "github.com" in context
+    assert len(context) <= 1500
 
 
 def test_evaluation_snapshot_accepts_numeric_source_authority() -> None:
@@ -603,6 +644,645 @@ def test_empty_claim_and_citation_lists_do_not_divide_by_zero(monkeypatch) -> No
 
     assert evaluators.eval_groundedness(inputs, _outputs())[0]["score"] == 0
     assert evaluators.eval_citation_accuracy(inputs, _outputs())["score"] == 0
+
+
+def test_structured_judge_failure_exposes_safe_root_cause_metadata(
+    monkeypatch,
+) -> None:
+    class QuotaFailure(RuntimeError):
+        status_code = 429
+        code = "quota_exceeded"
+
+    class FailingRunner:
+        def invoke(self, _messages: list[dict[str, Any]]) -> Any:
+            raise QuotaFailure("api_key=sk-super-secret quota exhausted")
+
+    monkeypatch.setattr(
+        evaluators,
+        "_structured_output",
+        lambda _schema: FailingRunner(),
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        evaluators._invoke_structured_output(
+            evaluators.RelevanceScore,
+            [{"role": "user", "content": "payload"}],
+            attempts=2,
+        )
+
+    message = str(caught.value)
+    assert "QuotaFailure" in message
+    assert "status=429" in message
+    assert "code=quota_exceeded" in message
+    assert "sk-super-secret" not in message
+
+
+def test_structured_judge_validation_error_exposes_only_loc_and_type(
+    monkeypatch,
+) -> None:
+    class InvalidClaimRunner:
+        def invoke(self, _messages: list[dict[str, Any]]) -> dict[str, Any]:
+            return {
+                "claims": [{
+                    "claim": "sensitive claim text",
+                    "citation": "https://private.example/secret",
+                    "has_citation": True,
+                    "entailed_by_evidence": True,
+                    "cited_source_entails_claim": True,
+                    "source_authority": "PRIMARY_SOURCE",
+                }],
+                "reasoning": "sensitive reasoning",
+            }
+
+    monkeypatch.setattr(
+        evaluators,
+        "_structured_output",
+        lambda _schema: InvalidClaimRunner(),
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        evaluators._invoke_structured_output(
+            evaluators.EvidenceIntegrityScore,
+            [{"role": "user", "content": "payload"}],
+            attempts=1,
+        )
+
+    message = str(caught.value)
+    assert "claims.0.source_authority:literal_error" in message
+    assert "claims.0.reasoning:missing" in message
+    assert "sensitive claim text" not in message
+    assert "private.example" not in message
+    assert "sensitive reasoning" not in message
+
+
+def test_structured_judge_validation_error_exposes_safe_payload_shape(
+    monkeypatch,
+) -> None:
+    secret_key = "sk_abcd1234token"
+
+    class NestedInvalidRunner:
+        def invoke(self, _messages: list[dict[str, Any]]) -> dict[str, Any]:
+            return {
+                "claims": {
+                    "claims": [{
+                        "claim": "sensitive claim text",
+                        "citation": "https://private.example/secret",
+                    }],
+                    "reasoning": "sensitive nested reasoning",
+                },
+                "reasoning": "sensitive outer reasoning",
+                secret_key: "sensitive secret-key value",
+            }
+
+    monkeypatch.setattr(
+        evaluators,
+        "_structured_output",
+        lambda _schema: NestedInvalidRunner(),
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        evaluators._invoke_structured_output(
+            evaluators.EvidenceIntegrityScore,
+            [{"role": "user", "content": "payload"}],
+            attempts=1,
+        )
+
+    message = str(caught.value)
+    assert "validation=claims:list_type" in message
+    assert (
+        "payload_shape={claims:dict{claims:list(len=1),reasoning:str},"
+        "reasoning:str,<redacted>:str}"
+    ) in message
+    assert secret_key not in message
+    assert "sensitive claim text" not in message
+    assert "private.example" not in message
+    assert "sensitive nested reasoning" not in message
+    assert "sensitive outer reasoning" not in message
+
+
+def test_safe_payload_shape_is_bounded_by_depth_and_key_count() -> None:
+    wide_schema = create_model(
+        "WidePayloadSchema",
+        **{
+            f"field_{index:02d}": (str, ...)
+            for index in range(15)
+        },
+    )
+    wide_shape = evaluators._safe_payload_shape({
+        f"field_{index:02d}": f"sensitive value {index}"
+        for index in range(15)
+    }, wide_schema)
+    deep_shape = evaluators._safe_payload_shape({
+        "claims": {
+            "claims": {
+                "reasoning": "sensitive value",
+            }
+        }
+    }, evaluators.EvidenceIntegrityScore)
+
+    assert "field_11:str" in wide_shape
+    assert "field_12" not in wide_shape
+    assert "<truncated>" in wide_shape
+    assert deep_shape == "{claims:dict{claims:dict}}"
+    assert "reasoning" not in deep_shape
+    assert "sensitive value" not in deep_shape
+
+
+def test_empty_structured_judge_response_has_stable_error_code(
+    monkeypatch,
+) -> None:
+    class EmptyRunner:
+        def invoke(self, _messages: list[dict[str, Any]]) -> None:
+            return None
+
+    monkeypatch.setattr(
+        evaluators,
+        "_structured_output",
+        lambda _schema: EmptyRunner(),
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        evaluators._invoke_structured_output(
+            evaluators.RelevanceScore,
+            [{"role": "user", "content": "payload"}],
+            attempts=1,
+        )
+
+    assert "code=no_structured_output" in str(caught.value)
+
+
+def test_structured_judge_repairs_strict_single_key_schema_wrapper(
+    monkeypatch,
+) -> None:
+    class WrappedRunner:
+        def invoke(self, _messages: list[dict[str, Any]]) -> dict[str, Any]:
+            return {
+                "claims": {
+                    "claims": [{
+                        "claim": "Checkpoint state is persisted.",
+                        "citation": "https://docs.example/checkpoints",
+                        "has_citation": True,
+                        "entailed_by_evidence": True,
+                        "cited_source_entails_claim": True,
+                        "source_authority": "primary",
+                        "reasoning": "The cited documentation states this.",
+                    }],
+                    "reasoning": "The claim is supported.",
+                }
+            }
+
+    monkeypatch.setattr(
+        evaluators,
+        "_structured_output",
+        lambda _schema: WrappedRunner(),
+    )
+
+    result = evaluators._invoke_structured_output(
+        evaluators.EvidenceIntegrityScore,
+        [{"role": "user", "content": "payload"}],
+        attempts=1,
+    )
+
+    assert result.reasoning == "The claim is supported."
+    assert len(result.claims) == 1
+
+
+def test_structured_judge_repairs_wrapper_from_include_raw_envelope(
+    monkeypatch,
+) -> None:
+    claim = {
+        "claim": "Checkpoint state is persisted.",
+        "citation": "https://docs.example/checkpoints",
+        "has_citation": True,
+        "entailed_by_evidence": True,
+        "cited_source_entails_claim": True,
+        "source_authority": "primary",
+        "reasoning": "The cited documentation states this.",
+    }
+    raw = AIMessage(
+        content="",
+        tool_calls=[{
+            "name": "EvidenceIntegrityScore",
+            "args": {
+                "claims": {
+                    "claims": [claim],
+                    "reasoning": "The claim is supported.",
+                }
+            },
+            "id": "call-evidence",
+            "type": "tool_call",
+        }],
+    )
+
+    class IncludeRawRunner:
+        def invoke(self, _messages: list[dict[str, Any]]) -> dict[str, Any]:
+            return {
+                "raw": raw,
+                "parsed": None,
+                "parsing_error": ValueError("claims must be a list"),
+            }
+
+    monkeypatch.setattr(
+        evaluators,
+        "_structured_output",
+        lambda _schema: IncludeRawRunner(),
+    )
+
+    result = evaluators._invoke_structured_output(
+        evaluators.EvidenceIntegrityScore,
+        [{"role": "user", "content": "payload"}],
+        attempts=1,
+    )
+
+    assert result.reasoning == "The claim is supported."
+    assert len(result.claims) == 1
+
+
+def test_structured_judge_repairs_json_string_wrapper_from_include_raw_envelope(
+    monkeypatch,
+) -> None:
+    claim = {
+        "claim": "Checkpoint state is persisted.",
+        "citation": "https://docs.example/checkpoints",
+        "has_citation": True,
+        "entailed_by_evidence": True,
+        "cited_source_entails_claim": True,
+        "source_authority": "primary",
+        "reasoning": "The cited documentation states this.",
+    }
+    raw = AIMessage(
+        content="",
+        tool_calls=[{
+            "name": "EvidenceIntegrityScore",
+            "args": {
+                "claims": (
+                    '{"claims":['
+                    + json.dumps(claim)
+                    + '],"reasoning":"The claim is supported."}'
+                )
+            },
+            "id": "call-json-string-evidence",
+            "type": "tool_call",
+        }],
+    )
+
+    class IncludeRawRunner:
+        def invoke(self, _messages: list[dict[str, Any]]) -> dict[str, Any]:
+            return {
+                "raw": raw,
+                "parsed": None,
+                "parsing_error": ValueError("claims must be a list"),
+            }
+
+    monkeypatch.setattr(
+        evaluators,
+        "_structured_output",
+        lambda _schema: IncludeRawRunner(),
+    )
+
+    result = evaluators._invoke_structured_output(
+        evaluators.EvidenceIntegrityScore,
+        [{"role": "user", "content": "payload"}],
+        attempts=1,
+    )
+
+    assert result.reasoning == "The claim is supported."
+    assert len(result.claims) == 1
+
+
+def test_structured_judge_repairs_json_string_for_schema_list_field(
+    monkeypatch,
+) -> None:
+    claim = {
+        "claim": "Checkpoint state is persisted.",
+        "citation": "https://docs.example/checkpoints",
+        "has_citation": True,
+        "entailed_by_evidence": True,
+        "cited_source_entails_claim": True,
+        "source_authority": "primary",
+        "reasoning": "The cited documentation states this.",
+    }
+    raw = AIMessage(
+        content="",
+        tool_calls=[{
+            "name": "EvidenceIntegrityScore",
+            "args": {
+                "claims": json.dumps([claim]),
+                "reasoning": "The claim is supported.",
+            },
+            "id": "call-json-string-list",
+            "type": "tool_call",
+        }],
+    )
+
+    class IncludeRawRunner:
+        def invoke(self, _messages: list[dict[str, Any]]) -> dict[str, Any]:
+            return {
+                "raw": raw,
+                "parsed": None,
+                "parsing_error": ValueError("claims must be a list"),
+            }
+
+    monkeypatch.setattr(
+        evaluators,
+        "_structured_output",
+        lambda _schema: IncludeRawRunner(),
+    )
+
+    result = evaluators._invoke_structured_output(
+        evaluators.EvidenceIntegrityScore,
+        [{"role": "user", "content": "payload"}],
+        attempts=1,
+    )
+
+    assert result.reasoning == "The claim is supported."
+    assert len(result.claims) == 1
+
+
+@pytest.mark.parametrize(
+    "encoded_claims",
+    [
+        "malformed-json-sensitive-value",
+        '{"claim":"a dict is not a list"}',
+        '"a scalar is not a list"',
+        '[{"claim":"missing required element fields"}]',
+    ],
+    ids=["malformed-json", "json-dict", "json-scalar", "invalid-list-element"],
+)
+def test_structured_judge_rejects_invalid_json_for_schema_list_field(
+    monkeypatch,
+    caplog,
+    encoded_claims: str,
+) -> None:
+    raw = AIMessage(
+        content="",
+        tool_calls=[{
+            "name": "EvidenceIntegrityScore",
+            "args": {
+                "claims": encoded_claims,
+                "reasoning": "sensitive reasoning",
+            },
+            "id": "call-invalid-json-list",
+            "type": "tool_call",
+        }],
+    )
+
+    class IncludeRawRunner:
+        def invoke(self, _messages: list[dict[str, Any]]) -> dict[str, Any]:
+            return {
+                "raw": raw,
+                "parsed": None,
+                "parsing_error": ValueError("sensitive parser failure"),
+            }
+
+    monkeypatch.setattr(
+        evaluators,
+        "_structured_output",
+        lambda _schema: IncludeRawRunner(),
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        evaluators._invoke_structured_output(
+            evaluators.EvidenceIntegrityScore,
+            [{"role": "user", "content": "payload"}],
+            attempts=1,
+        )
+
+    assert type(caught.value.__cause__).__name__ == "ValidationError"
+    assert "sensitive" not in str(caught.value)
+    assert "sensitive" not in caplog.text
+
+
+def test_structured_judge_does_not_decode_json_string_for_scalar_schema_field(
+    monkeypatch,
+) -> None:
+    raw = AIMessage(
+        content="",
+        tool_calls=[{
+            "name": "EvidenceIntegrityScore",
+            "args": {
+                "claims": [],
+                "reasoning": '["this remains a string"]',
+            },
+            "id": "call-json-scalar-field",
+            "type": "tool_call",
+        }],
+    )
+
+    class IncludeRawRunner:
+        def invoke(self, _messages: list[dict[str, Any]]) -> dict[str, Any]:
+            return {
+                "raw": raw,
+                "parsed": None,
+                "parsing_error": None,
+            }
+
+    monkeypatch.setattr(
+        evaluators,
+        "_structured_output",
+        lambda _schema: IncludeRawRunner(),
+    )
+
+    result = evaluators._invoke_structured_output(
+        evaluators.EvidenceIntegrityScore,
+        [{"role": "user", "content": "payload"}],
+        attempts=1,
+    )
+
+    assert result.reasoning == '["this remains a string"]'
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"claims": "not-json-sensitive-value"},
+        {"claims": '["not", "an", "object"]'},
+        {"claims": '{"reasoning":"missing claims sensitive value"}'},
+        {
+            "claims": '{"claims":[],"reasoning":"complete nested sensitive value"}',
+            "reasoning": "unexpected second outer key",
+        },
+    ],
+    ids=["invalid-json", "json-array", "missing-field", "extra-outer-key"],
+)
+def test_structured_judge_rejects_ambiguous_json_string_wrappers(
+    monkeypatch,
+    caplog,
+    arguments: dict[str, Any],
+) -> None:
+    raw = AIMessage(
+        content="",
+        tool_calls=[{
+            "name": "EvidenceIntegrityScore",
+            "args": arguments,
+            "id": "call-ambiguous-json-string",
+            "type": "tool_call",
+        }],
+    )
+
+    class IncludeRawRunner:
+        def invoke(self, _messages: list[dict[str, Any]]) -> dict[str, Any]:
+            return {
+                "raw": raw,
+                "parsed": None,
+                "parsing_error": ValueError("sensitive parser failure"),
+            }
+
+    monkeypatch.setattr(
+        evaluators,
+        "_structured_output",
+        lambda _schema: IncludeRawRunner(),
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        evaluators._invoke_structured_output(
+            evaluators.EvidenceIntegrityScore,
+            [{"role": "user", "content": "payload"}],
+            attempts=1,
+        )
+
+    assert type(caught.value.__cause__).__name__ == "ValidationError"
+    assert "sensitive" not in str(caught.value)
+    assert "sensitive" not in caplog.text
+
+
+def test_structured_judge_prefers_parsed_include_raw_result(
+    monkeypatch,
+) -> None:
+    parsed = evaluators.EvidenceIntegrityScore(
+        claims=[],
+        reasoning="Already parsed.",
+    )
+    ambiguous_raw = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "EvidenceIntegrityScore",
+                "args": {"claims": [], "reasoning": "first"},
+                "id": "call-first",
+                "type": "tool_call",
+            },
+            {
+                "name": "EvidenceIntegrityScore",
+                "args": {"claims": [], "reasoning": "second"},
+                "id": "call-second",
+                "type": "tool_call",
+            },
+        ],
+    )
+
+    class ParsedRunner:
+        def invoke(self, _messages: list[dict[str, Any]]) -> dict[str, Any]:
+            return {
+                "raw": ambiguous_raw,
+                "parsed": parsed,
+                "parsing_error": None,
+            }
+
+    monkeypatch.setattr(
+        evaluators,
+        "_structured_output",
+        lambda _schema: ParsedRunner(),
+    )
+
+    result = evaluators._invoke_structured_output(
+        evaluators.EvidenceIntegrityScore,
+        [{"role": "user", "content": "payload"}],
+        attempts=1,
+    )
+
+    assert result is parsed
+
+
+@pytest.mark.parametrize("raw_shape", ["multiple_calls", "non_dict_args"])
+def test_structured_judge_rejects_ambiguous_include_raw_payload(
+    monkeypatch,
+    raw_shape: str,
+) -> None:
+    if raw_shape == "multiple_calls":
+        raw = AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "EvidenceIntegrityScore",
+                    "args": {"claims": [], "reasoning": "first"},
+                    "id": "call-first",
+                    "type": "tool_call",
+                },
+                {
+                    "name": "EvidenceIntegrityScore",
+                    "args": {"claims": [], "reasoning": "second"},
+                    "id": "call-second",
+                    "type": "tool_call",
+                },
+            ],
+        )
+    else:
+        raw = AIMessage(content="")
+        raw.tool_calls = [{
+            "name": "EvidenceIntegrityScore",
+            "args": "sensitive raw arguments",
+            "id": "call-invalid",
+            "type": "tool_call",
+        }]
+
+    class AmbiguousRawRunner:
+        def invoke(self, _messages: list[dict[str, Any]]) -> dict[str, Any]:
+            return {
+                "raw": raw,
+                "parsed": None,
+                "parsing_error": ValueError("sensitive parser failure"),
+            }
+
+    monkeypatch.setattr(
+        evaluators,
+        "_structured_output",
+        lambda _schema: AmbiguousRawRunner(),
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        evaluators._invoke_structured_output(
+            evaluators.EvidenceIntegrityScore,
+            [{"role": "user", "content": "payload"}],
+            attempts=1,
+        )
+
+    assert type(caught.value.__cause__).__name__ == "JudgeOutputError"
+    assert "sensitive" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"claims": {"reasoning": "missing the claims field"}},
+        {
+            "claims": {"claims": [], "reasoning": "complete nested shape"},
+            "unexpected": "a second outer key",
+        },
+    ],
+)
+def test_structured_judge_does_not_repair_ambiguous_wrappers(
+    monkeypatch,
+    payload: dict[str, Any],
+) -> None:
+    class AmbiguousRunner:
+        def invoke(self, _messages: list[dict[str, Any]]) -> dict[str, Any]:
+            return payload
+
+    monkeypatch.setattr(
+        evaluators,
+        "_structured_output",
+        lambda _schema: AmbiguousRunner(),
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        evaluators._invoke_structured_output(
+            evaluators.EvidenceIntegrityScore,
+            [{"role": "user", "content": "payload"}],
+            attempts=1,
+        )
+
+    assert type(caught.value.__cause__).__name__ == "ValidationError"
 
 
 def test_parallelism_evaluator_reads_current_top_level_state() -> None:

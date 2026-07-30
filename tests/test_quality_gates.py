@@ -11,8 +11,11 @@ from open_deep_research.configuration import Configuration
 from open_deep_research.quality import (
     TOOL_RESULT_EVALUATION_PROMPT,
     ToolResultAssessment,
+    _bounded_evidence_records,
     _build_quality_model,
+    _evaluate_json,
     _normalize_quality_payload,
+    _unwrap_single_key_schema_payload,
     deterministic_handoff_checks,
     deterministic_tool_checks,
     evaluate_subagent_handoff,
@@ -101,6 +104,128 @@ def test_deterministic_handoff_checks_reject_short_unsourced_output() -> None:
     assert checks["failures"] == ["handoff_too_short", "insufficient_traceable_sources"]
 
 
+def test_bounded_evidence_preserves_late_source_host_diversity() -> None:
+    records = [
+        {
+            "evidence_id": f"docs-{index:03d}",
+            "claim": f"Documentation claim {index}. " + ("d" * 420),
+            "supporting_excerpt": "Official documentation excerpt. " + ("x" * 420),
+            "source_url": f"https://docs.example.test/topic/{index}",
+            "source_authority": 0.95,
+            "confidence": 0.8,
+            "security_status": "accepted",
+        }
+        for index in range(40)
+    ]
+    records.extend(
+        {
+            "evidence_id": f"reference-{index:03d}",
+            "claim": f"API reference claim {index}. " + ("r" * 420),
+            "supporting_excerpt": "Official API reference excerpt. " + ("y" * 420),
+            "source_url": f"https://reference.example.test/api/{index}",
+            "source_authority": 0.95,
+            "confidence": 0.8,
+            "security_status": "accepted",
+        }
+        for index in range(40)
+    )
+    records.append({
+        "evidence_id": "github-late",
+        "claim": "The official repository defines the checkpoint schema.",
+        "supporting_excerpt": "class Checkpoint(TypedDict): ...",
+        "source_url": (
+            "https://github.com/example/project/blob/main/checkpoint.py"
+        ),
+        "source_authority": 0.9,
+        "confidence": 0.8,
+        "security_status": "accepted",
+    })
+
+    selected, stats = _bounded_evidence_records(
+        records,
+        max_chars=15_000,
+    )
+    selected_reversed, reversed_stats = _bounded_evidence_records(
+        list(reversed(records)),
+        max_chars=15_000,
+    )
+    selected_again, repeated_stats = _bounded_evidence_records(
+        records,
+        max_chars=15_000,
+    )
+
+    assert "github-late" in {
+        str(record.get("evidence_id")) for record in selected
+    }
+    assert {
+        record["source_url"].split("/", 3)[2] for record in selected
+    } >= {
+        "docs.example.test",
+        "reference.example.test",
+        "github.com",
+    }
+    assert selected_again == selected
+    assert repeated_stats == stats
+    assert "github-late" in {
+        str(record.get("evidence_id")) for record in selected_reversed
+    }
+    assert {
+        record["source_url"].split("/", 3)[2]
+        for record in selected_reversed
+    } >= {
+        "docs.example.test",
+        "reference.example.test",
+        "github.com",
+    }
+    assert reversed_stats == stats
+    assert len(json.dumps(selected, ensure_ascii=False, default=str)) <= 15_000
+    assert stats["accepted_count"] == 81
+    assert stats["unique_count"] == 81
+    assert stats["included_count"] == len(selected)
+    assert stats["truncated"] is True
+
+
+def test_bounded_evidence_prioritizes_strong_records_and_filters_unsafe() -> None:
+    records = [
+        {
+            "evidence_id": "weak-first",
+            "claim": "Weak evidence. " + ("w" * 1_000),
+            "supporting_excerpt": "Weak excerpt. " + ("w" * 1_000),
+            "source_url": "https://same.example.test/weak",
+            "source_authority": 0.2,
+            "confidence": 0.2,
+            "security_status": "accepted",
+        },
+        {
+            "evidence_id": "strong-late",
+            "claim": "Strong evidence. " + ("s" * 1_000),
+            "supporting_excerpt": "Strong excerpt. " + ("s" * 1_000),
+            "source_url": "https://same.example.test/strong",
+            "source_authority": 0.99,
+            "confidence": 0.99,
+            "security_status": "accepted",
+        },
+        {
+            "evidence_id": "unsafe",
+            "claim": "This must never reach the evaluator.",
+            "source_url": "https://unsafe.example.test/rejected",
+            "source_authority": 1.0,
+            "confidence": 1.0,
+            "security_status": "quarantined",
+        },
+    ]
+
+    selected, stats = _bounded_evidence_records(records, max_chars=2_500)
+
+    assert [record["evidence_id"] for record in selected] == ["strong-late"]
+    assert stats == {
+        "accepted_count": 2,
+        "unique_count": 2,
+        "included_count": 1,
+        "truncated": True,
+    }
+
+
 def test_compact_handoff_can_report_source_count_without_raw_notes() -> None:
     checks = deterministic_handoff_checks(
         {
@@ -137,6 +262,104 @@ def test_quality_payload_normalizes_cross_provider_score_variations() -> None:
     assert assessment.corroboration == 4
     assert assessment.unresolved_conflicts == []
     assert assessment.suggested_queries == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_judge_repairs_strict_single_key_schema_wrapper(
+    monkeypatch,
+) -> None:
+    wrapped = {
+        "assessment": {
+            "decision": "complete",
+            "relevance": 5,
+            "source_quality": 5,
+            "evidence_coverage": 5,
+            "corroboration": 5,
+            "unresolved_conflicts": [],
+            "missing_information": [],
+            "suggested_queries": [],
+            "reason": "The evidence is complete.",
+        }
+    }
+
+    async def fake_invoke(*_args, **_kwargs):
+        return SimpleNamespace(content=json.dumps(wrapped))
+
+    monkeypatch.setattr(
+        "open_deep_research.quality._build_quality_model",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "open_deep_research.quality.invoke_model_with_retry_observability",
+        fake_invoke,
+    )
+
+    result = await _evaluate_json(
+        ToolResultAssessment,
+        (
+            "Return decision, relevance, source_quality, evidence_coverage, "
+            "corroboration, unresolved_conflicts, missing_information, "
+            "suggested_queries, and reason as JSON."
+        ),
+        {"payload": "value"},
+        {"configurable": {}, "metadata": {"run_id": "wrapped-runtime"}},
+        span_name="quality.wrapper_test",
+    )
+
+    assert isinstance(result, ToolResultAssessment)
+    assert result.decision == "complete"
+    assert result.reason == "The evidence is complete."
+
+
+def test_runtime_judge_does_not_unwrap_incomplete_or_ambiguous_payload() -> None:
+    incomplete = {
+        "assessment": {
+            "decision": "complete",
+            "relevance": 5,
+            "source_quality": 5,
+            "evidence_coverage": 5,
+            "corroboration": 5,
+            "reason": "Complete.",
+        }
+    }
+    ambiguous = {
+        "assessment": {
+            "decision": "complete",
+            "relevance": 5,
+            "source_quality": 5,
+            "evidence_coverage": 5,
+            "corroboration": 5,
+            "reason": "Complete.",
+        },
+        "other": "value",
+    }
+
+    assert (
+        _unwrap_single_key_schema_payload(ToolResultAssessment, incomplete)
+        is incomplete
+    )
+    assert (
+        _unwrap_single_key_schema_payload(
+            ToolResultAssessment,
+            incomplete,
+            expected_fields={
+                "decision",
+                "relevance",
+                "source_quality",
+                "evidence_coverage",
+                "corroboration",
+                "unresolved_conflicts",
+                "missing_information",
+                "suggested_queries",
+                "reason",
+            },
+        )
+        is incomplete
+    )
+    assert (
+        _unwrap_single_key_schema_payload(ToolResultAssessment, ambiguous)
+        is ambiguous
+    )
 
 
 def test_final_notes_include_only_accepted_research_handoffs() -> None:
