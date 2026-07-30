@@ -16,12 +16,18 @@ from open_deep_research.quality_policy import (
     rigor_from_legacy_min_score,
 )
 
-RUN_CONFIG_SCHEMA_VERSION = 2
-QUALITY_POLICY_VERSION = "quality-gate-v3"
+RUN_CONFIG_SCHEMA_VERSION = 4
+QUALITY_POLICY_VERSION = "quality-gate-v4"
 RUN_CONFIG_FROZEN_FIELDS = (
     "max_structured_output_retries",
     "model_transport_max_attempts",
     "context_recovery_max_attempts",
+    "output_token_escalation_enabled",
+    "output_continuation_max_attempts",
+    "model_fallbacks",
+    "model_context_window_overrides",
+    "model_max_output_tokens_overrides",
+    "unknown_model_context_window_tokens",
     "run_deadline_seconds",
     "max_run_model_calls",
     "max_run_tool_calls",
@@ -59,15 +65,41 @@ RUN_CONFIG_FROZEN_FIELDS = (
     "quality_evaluation_rigor",
     "quality_evaluation_min_sources",
     "quality_evaluation_max_input_chars",
+    "quality_risk_mode",
+    "quality_caveat_admission_enabled",
+    "quality_gap_recovery_max_attempts",
     "sandbox_network_mode",
     "task_timeout_seconds",
     "sandbox_timeout_seconds",
+)
+_QUALITY_V4_FROZEN_FIELDS = {
+    "quality_risk_mode",
+    "quality_caveat_admission_enabled",
+    "quality_gap_recovery_max_attempts",
+}
+RUN_CONFIG_FROZEN_FIELDS_V3 = tuple(
+    field_name
+    for field_name in RUN_CONFIG_FROZEN_FIELDS
+    if field_name not in _QUALITY_V4_FROZEN_FIELDS
+)
+_MODEL_RECOVERY_FROZEN_FIELDS = {
+    "output_token_escalation_enabled",
+    "output_continuation_max_attempts",
+    "model_fallbacks",
+    "model_context_window_overrides",
+    "model_max_output_tokens_overrides",
+    "unknown_model_context_window_tokens",
+}
+RUN_CONFIG_FROZEN_FIELDS_V2 = tuple(
+    field_name
+    for field_name in RUN_CONFIG_FROZEN_FIELDS_V3
+    if field_name not in _MODEL_RECOVERY_FROZEN_FIELDS
 )
 RUN_CONFIG_FROZEN_FIELDS_V1 = tuple(
     "quality_evaluation_min_score"
     if field_name == "quality_evaluation_rigor"
     else field_name
-    for field_name in RUN_CONFIG_FROZEN_FIELDS
+    for field_name in RUN_CONFIG_FROZEN_FIELDS_V2
 )
 
 
@@ -236,6 +268,40 @@ class Configuration(BaseModel):
         ge=1,
         le=10,
         description="Maximum reactive context recovery attempts per model stage.",
+    )
+    output_token_escalation_enabled: bool = Field(
+        default=True,
+        description=(
+            "Allow one bounded max-output-token escalation before continuation."
+        ),
+    )
+    output_continuation_max_attempts: int = Field(
+        default=3,
+        ge=0,
+        le=10,
+        description="Maximum continuation requests after a truncated response.",
+    )
+    model_fallbacks: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description=(
+            "Optional frozen model fallback chains keyed by model role. "
+            "An empty object disables fallback."
+        ),
+    )
+    model_context_window_overrides: dict[str, int] = Field(
+        default_factory=dict,
+        description="Explicit context-window overrides keyed by model id.",
+    )
+    model_max_output_tokens_overrides: dict[str, int] = Field(
+        default_factory=dict,
+        description="Explicit maximum output-token overrides keyed by model id.",
+    )
+    unknown_model_context_window_tokens: int = Field(
+        default=32_768,
+        ge=4_096,
+        description=(
+            "Conservative context window used when a model has no known profile."
+        ),
     )
     run_deadline_seconds: Optional[int] = Field(
         default=None,
@@ -1134,6 +1200,29 @@ class Configuration(BaseModel):
     )
     quality_evaluation_min_sources: int = Field(default=2, ge=0, le=20)
     quality_evaluation_max_input_chars: int = Field(default=30000, ge=1000)
+    quality_risk_mode: Literal["auto", "high", "standard"] = Field(
+        default="auto",
+        description=(
+            "Classify caveat-admission risk automatically from versioned "
+            "medical/legal/finance rules, or force high/standard behavior."
+        ),
+    )
+    quality_caveat_admission_enabled: bool = Field(
+        default=True,
+        description=(
+            "Allow coverage-complete, non-high-risk handoffs with only soft "
+            "uncertainties to enter report synthesis."
+        ),
+    )
+    quality_gap_recovery_max_attempts: int = Field(
+        default=1,
+        ge=0,
+        le=3,
+        description=(
+            "Additional bounded Researcher turns reserved for explicit "
+            "quality-assessment gaps after the normal tool-call limit."
+        ),
+    )
     # File-backed Query session context
     query_session_persistence_enabled: bool = Field(
         default=True,
@@ -1483,6 +1572,74 @@ class Configuration(BaseModel):
             raise ValueError("memory half-lives must be at least one day")
         return parsed
 
+    @field_validator(
+        "model_fallbacks",
+        "model_context_window_overrides",
+        "model_max_output_tokens_overrides",
+        mode="before",
+    )
+    @classmethod
+    def parse_model_recovery_maps(cls, value: Any) -> dict[str, Any]:
+        """Accept JSON objects for model recovery configuration."""
+        if value is None or value == "":
+            return {}
+        if isinstance(value, str):
+            value = json.loads(value)
+        if not isinstance(value, dict):
+            raise ValueError("model recovery configuration must be an object")
+        return value
+
+    @field_validator("model_fallbacks")
+    @classmethod
+    def validate_model_fallbacks(
+        cls,
+        value: dict[str, list[str]],
+    ) -> dict[str, list[str]]:
+        """Reject unknown roles and empty model identifiers."""
+        allowed_roles = {
+            "supervisor",
+            "researcher",
+            "summarization",
+            "compression",
+            "final_report",
+            "message_summary",
+            "quality_evaluation",
+        }
+        unknown = set(value) - allowed_roles
+        if unknown:
+            raise ValueError(
+                "unknown model fallback roles: " + ",".join(sorted(unknown))
+            )
+        normalized: dict[str, list[str]] = {}
+        for role, candidates in value.items():
+            if not isinstance(candidates, list):
+                raise ValueError(
+                    f"model fallback chain for {role} must be an array"
+                )
+            normalized[role] = [
+                str(candidate).strip()
+                for candidate in candidates
+                if str(candidate).strip()
+            ]
+        return normalized
+
+    @field_validator(
+        "model_context_window_overrides",
+        "model_max_output_tokens_overrides",
+    )
+    @classmethod
+    def validate_model_token_overrides(
+        cls,
+        value: dict[str, int],
+    ) -> dict[str, int]:
+        """Require positive model capability overrides."""
+        normalized = {
+            str(model): int(tokens) for model, tokens in value.items()
+        }
+        if any(tokens < 1 for tokens in normalized.values()):
+            raise ValueError("model token overrides must be positive")
+        return normalized
+
     @field_validator("sandbox_allowed_domains", mode="before")
     @classmethod
     def parse_sandbox_allowed_domains(cls, value: Any) -> list[str]:
@@ -1622,6 +1779,10 @@ def frozen_run_config_values(config: RunnableConfig) -> dict[str, Any]:
     frozen_fields = (
         RUN_CONFIG_FROZEN_FIELDS_V1
         if schema_version == 1
+        else RUN_CONFIG_FROZEN_FIELDS_V2
+        if schema_version == 2
+        else RUN_CONFIG_FROZEN_FIELDS_V3
+        if schema_version == 3
         else RUN_CONFIG_FROZEN_FIELDS
     )
     return {
@@ -1675,6 +1836,10 @@ def freeze_run_config(
         frozen_fields = (
             RUN_CONFIG_FROZEN_FIELDS_V1
             if schema_version == 1
+            else RUN_CONFIG_FROZEN_FIELDS_V2
+            if schema_version == 2
+            else RUN_CONFIG_FROZEN_FIELDS_V3
+            if schema_version == 3
             else RUN_CONFIG_FROZEN_FIELDS
         )
         missing = [

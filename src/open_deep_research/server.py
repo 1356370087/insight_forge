@@ -463,7 +463,14 @@ async def resume_run(
         if engine.context_store is None:
             raise JournalCorruptedError("run_not_recoverable")
         replay = engine.context_store.replay()
-    except (ValueError, RunContextError, OSError):
+    except RunContextError as exc:
+        if str(exc) == "run_schema_not_resumable":
+            raise HTTPException(
+                status_code=409,
+                detail="run_schema_not_resumable",
+            ) from None
+        raise HTTPException(status_code=409, detail="run_not_recoverable") from None
+    except (ValueError, OSError):
         raise HTTPException(status_code=409, detail="run_not_recoverable") from None
     if replay.manifest.owner_id and replay.manifest.owner_id != user.get("identity"):
         raise HTTPException(status_code=404, detail="Run not found")

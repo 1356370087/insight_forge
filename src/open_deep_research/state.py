@@ -26,6 +26,13 @@ class ConductResearch(BaseModel):
         max_length=160,
         description="Short user-visible label for this delegated research task.",
     )
+    requirement_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Coverage requirement IDs owned by this task. Quality-gate v4 "
+            "requires at least one ID from the original user coverage contract."
+        ),
+    )
 
 
 class ReadResearchArtifact(BaseModel):
@@ -133,6 +140,9 @@ class AgentState(AgentInputState, total=False):
     sources: Annotated[list[dict], override_reducer]
     # Deterministically derived report requirements used by both writer and Judge.
     coverage_checklist: Annotated[list[str], override_reducer]
+    coverage_contract: dict
+    coverage_ledger: dict
+    research_risk_profile: dict
     # Versioned, data-minimized inputs retained for offline evaluation after
     # transient notes and full task outputs are cleared.
     evaluation_snapshot: dict
@@ -148,12 +158,16 @@ class AgentState(AgentInputState, total=False):
     research_artifact_refs: dict
     quality_gate: dict
     recoverable_artifacts: Annotated[list[dict], override_reducer]
+    applied_query_event_ids: Annotated[list[str], override_reducer]
 
 class SupervisorState(TypedDict, total=False):
     """State for the supervisor that manages research tasks."""
 
     supervisor_messages: Annotated[list[MessageLikeRepresentation], override_reducer]
     research_brief: str
+    coverage_contract: dict
+    coverage_ledger: dict
+    research_risk_profile: dict
     notes: Annotated[list[str], override_reducer]
     research_iterations: int
     raw_notes: Annotated[list[str], override_reducer]
@@ -171,6 +185,7 @@ class SupervisorState(TypedDict, total=False):
     web_research_iterations: Annotated[list[dict], override_reducer]
     completion_decision: dict
     permission_denials: Annotated[list[dict], override_reducer]
+    applied_query_event_ids: Annotated[list[str], override_reducer]
 
 class ResearcherState(TypedDict, total=False):
     """State for individual researchers conducting research."""
@@ -178,6 +193,9 @@ class ResearcherState(TypedDict, total=False):
     researcher_messages: Annotated[list[MessageLikeRepresentation], operator.add]
     tool_call_iterations: int
     research_topic: str
+    requirement_ids: list[str]
+    coverage_contract: dict
+    research_risk_profile: dict
     compressed_research: str
     raw_notes: Annotated[list[str], override_reducer]
     memory_context: Optional[str]
@@ -191,6 +209,7 @@ class ResearcherState(TypedDict, total=False):
     document_registry: Annotated[list[dict], override_reducer]
     evidence_registry: Annotated[list[dict], override_reducer]
     web_research_iterations: Annotated[list[dict], override_reducer]
+    applied_query_event_ids: Annotated[list[str], override_reducer]
 
 class ResearcherOutputState(BaseModel):
     """Output state from individual researchers."""

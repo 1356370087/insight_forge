@@ -78,4 +78,5 @@ uv.lock
 
 # Test scratch dirs and local evaluation output
 .codex-test-tmp/
+.pytest-public-events*/
 tests/local_eval_results/
