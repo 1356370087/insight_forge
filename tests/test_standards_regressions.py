@@ -347,6 +347,74 @@ async def test_parallel_sync_handoffs_do_not_merge_raw_context_into_supervisor(
 
 
 @pytest.mark.asyncio
+async def test_parallel_sync_handoff_timeout_preserves_completed_results(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    async def fake_ainvoke(state, _config):
+        topic = state["research_topic"]
+        if topic == "slow":
+            await asyncio.sleep(2)
+        return {
+            "research_topic": topic,
+            "researcher_messages": [],
+            "compressed_research": f"supported finding for {topic}",
+            "raw_notes": [f"raw note for {topic}"],
+            "evidence_registry": [
+                {
+                    "evidence_id": f"evidence-{topic}",
+                    "source_url": f"https://example.test/{topic}",
+                }
+            ],
+            "metrics": {"sources_read": 1},
+        }
+
+    monkeypatch.setattr(deep_researcher.researcher_runtime, "ainvoke", fake_ainvoke)
+    state = {
+        "enable_async_research": False,
+        "supervisor_messages": [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "ConductResearch",
+                        "args": {"research_topic": "fast"},
+                        "id": "conduct-fast",
+                    },
+                    {
+                        "name": "ConductResearch",
+                        "args": {"research_topic": "slow"},
+                        "id": "conduct-slow",
+                    },
+                ],
+            )
+        ],
+    }
+
+    command = await deep_researcher._execute_supervisor_tools(
+        state,
+        {
+            "configurable": {
+                "runs_dir": str(tmp_path),
+                "quality_evaluation_enabled": False,
+                "task_timeout_seconds": 1,
+            },
+            "metadata": {"run_id": "partial-timeout"},
+        },
+    )
+
+    assert [
+        item["evidence_id"] for item in command.update["evidence_registry"]
+    ] == ["evidence-fast"]
+    messages = {
+        message.tool_call_id: message
+        for message in command.update["supervisor_messages"]
+    }
+    assert "supported finding for fast" in str(messages["conduct-fast"].content)
+    assert '"error_type":"timeout"' in str(messages["conduct-slow"].content)
+
+
+@pytest.mark.asyncio
 async def test_rejected_sync_handoff_keeps_artifact_ref_without_admitting_evidence(
     monkeypatch,
     tmp_path,
