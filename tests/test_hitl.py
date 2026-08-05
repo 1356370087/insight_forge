@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from open_deep_research.agents.query_engine import QueryEngine
 from open_deep_research.configuration import Configuration
@@ -124,6 +124,45 @@ async def test_hitl_plan_approval_pauses_before_supervisor(monkeypatch):
     assert engine.final_state["approved_research_plan"] == engine.final_state["research_plan"]
     assert calls["supervisor"] == 1
     assert engine.final_state["final_report"] == "final report"
+
+
+@pytest.mark.asyncio
+async def test_clarification_pauses_and_continues_the_same_run(monkeypatch):
+    calls = await _install_basic_graph(monkeypatch)
+    from open_deep_research.agents import deep_researcher as graph
+
+    async def clarify_with_user(_state, _config):
+        return RuntimeCommand(
+            goto="__end__",
+            update={"messages": [AIMessage(content="需要覆盖哪个市场？")]},
+        )
+
+    monkeypatch.setattr(graph, "clarify_with_user", clarify_with_user)
+    engine = QueryEngine(_config(enable_human_in_loop=False))
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def run():
+        async for event in engine.stream_message([HumanMessage(content="研究云市场")]):
+            await queue.put(event)
+
+    task = asyncio.create_task(run())
+    pending = await asyncio.wait_for(
+        _collect_until([], "hitl.clarification_pending", queue), 2
+    )
+
+    assert engine.status == "awaiting_clarification"
+    action_id = pending["data"]["pending_human_action"]["action_id"]
+    with pytest.raises(ValueError, match="does not match"):
+        engine.handle_human_action(action_id, "approve")
+    engine.handle_human_action(action_id, "answer", "覆盖中国与东南亚")
+
+    await asyncio.wait_for(task, 2)
+    assert engine.run_id == "hitl-test"
+    assert calls["supervisor"] == 1
+    assert any(
+        isinstance(message, HumanMessage) and message.content == "覆盖中国与东南亚"
+        for message in engine.final_state["messages"]
+    )
 
 
 @pytest.mark.asyncio

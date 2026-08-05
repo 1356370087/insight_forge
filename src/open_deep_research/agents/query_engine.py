@@ -734,16 +734,31 @@ class QueryEngine:
             "Translate the evidence into the user's requested decision or deliverable.",
         ])
 
-    def _open_human_action(self, action_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _open_human_action(
+        self,
+        action_type: str,
+        payload: dict[str, Any],
+        *,
+        action_id: str | None = None,
+    ) -> dict[str, Any]:
         loop = asyncio.get_running_loop()
         self._pending_action_loop = loop
         self._pending_action_future = loop.create_future()
         self.pending_human_action = {
-            "action_id": str(uuid.uuid4()),
+            "action_id": action_id or str(uuid.uuid4()),
             "type": action_type,
             "payload": payload,
             "created_at": time.time(),
         }
+        if self.context_store is not None and self.context_store.manifest_path.exists():
+            try:
+                self.context_store._update_manifest(  # noqa: SLF001
+                    status=self.status,
+                    pending_human_action=self.pending_human_action,
+                )
+            except Exception as exc:  # noqa: BLE001 - in-memory HITL remains usable
+                self.persistence_degraded = True
+                self.context_store.mark_persistence_degraded(exc)
         return self.pending_human_action
 
     async def _wait_for_human_action(self) -> dict[str, Any]:
@@ -761,14 +776,29 @@ class QueryEngine:
             self.pending_human_action = None
             self._pending_action_future = None
             self._pending_action_loop = None
+            if self.context_store is not None and self.context_store.manifest_path.exists():
+                try:
+                    self.context_store._update_manifest(  # noqa: SLF001
+                        pending_human_action=None,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self.persistence_degraded = True
+                    self.context_store.mark_persistence_degraded(exc)
 
     def handle_human_action(self, action_id: str, action: str, message: str = "") -> dict[str, Any]:
-        """Resolve a pending plan or outline approval action."""
-        if action not in {"approve", "revise", "cancel"}:
-            raise ValueError("Unsupported human action")
+        """Resolve a pending approval or clarification action."""
         pending = self.pending_human_action
         if not pending or pending.get("action_id") != action_id:
             raise ValueError("No matching pending human action")
+        allowed = (
+            {"answer", "cancel"}
+            if pending.get("type") == "clarification"
+            else {"approve", "revise", "cancel"}
+        )
+        if action not in allowed:
+            raise ValueError("Human action does not match the pending action type")
+        if action in {"answer", "revise"} and not message.strip():
+            raise ValueError("A message is required for this human action")
         if self._pending_action_future is None or self._pending_action_future.done():
             raise ValueError("Pending human action is not awaiting input")
         decision = {"action": action, "message": message or "", "action_id": action_id}
@@ -782,6 +812,77 @@ class QueryEngine:
         else:
             set_result()
         return {"status": "accepted", "action": action}
+
+    async def _await_clarification(
+        self,
+        state: dict[str, Any],
+        *,
+        restored_action: dict[str, Any] | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Pause for one clarification answer and continue the same run."""
+        question = str(
+            (restored_action or {}).get("payload", {}).get("question")
+            or _message_text(state.get("messages", []))
+        ).strip()
+        self.status = "awaiting_clarification"
+        pending = self._open_human_action(
+            "clarification",
+            {"question": question},
+            action_id=(restored_action or {}).get("action_id"),
+        )
+        await self._persist_checkpoint(
+            "awaiting_clarification",
+            "clarification_wait",
+            status=self.status,
+            payload={"pending_human_action": pending},
+        )
+        await self._publish_public(
+            "clarification.required",
+            stage="preparing",
+            payload={
+                "action_id": pending["action_id"],
+                "question": question,
+                "status": "pending",
+                "allowed_actions": ["answer", "cancel"],
+            },
+            dedupe_key=f"clarification:{pending['action_id']}:required",
+        )
+        yield self._event(
+            "hitl.clarification_pending",
+            {
+                "run_id": self.run_id,
+                "status": self.status,
+                "question": question,
+                "pending_human_action": pending,
+            },
+        )
+        decision = await self._wait_for_human_action()
+        if decision["action"] == "cancel":
+            self.cancelled = True
+            self.status = "cancelled"
+        else:
+            answer = str(decision.get("message") or "").strip()
+            state["messages"] = [*state.get("messages", []), HumanMessage(content=answer)]
+            await self._persist_update(
+                channel="lead",
+                stage="clarification_resolved",
+                update={"messages": {"type": "override", "value": state["messages"]}},
+            )
+            self.status = "running"
+        await self._publish_public(
+            "clarification.resolved",
+            stage="preparing",
+            payload={
+                "action_id": decision["action_id"],
+                "action": decision["action"],
+                "status": "resolved",
+            },
+            dedupe_key=f"clarification:{decision['action_id']}:resolved",
+        )
+        yield self._event(
+            "hitl.clarification_resolved",
+            {"run_id": self.run_id, "status": self.status, "action": decision["action"]},
+        )
 
     async def submit_feedback(self, feedback: dict[str, Any]) -> dict[str, Any]:
         """Accept user direction or evidence questions while a run is active."""
@@ -879,6 +980,12 @@ class QueryEngine:
             state["human_feedback"] = list(self.human_feedback)
             self.status = "awaiting_plan_approval"
             pending = self._open_human_action("plan_approval", {"research_plan": plan})
+            await self._persist_checkpoint(
+                "awaiting_plan_approval",
+                "plan_approval",
+                status=self.status,
+                payload={"pending_human_action": pending},
+            )
             await self._publish_public(
                 "approval.required",
                 stage="planning",
@@ -888,6 +995,8 @@ class QueryEngine:
                     "status": "pending",
                     "plan_id": f"plan-{self.run_id}",
                     "revision": revisions + 1,
+                    "content_markdown": plan,
+                    "allowed_actions": ["approve", "revise", "cancel"],
                 },
                 dedupe_key=f"approval:plan:{pending['action_id']}:required",
             )
@@ -956,6 +1065,12 @@ class QueryEngine:
         while True:
             self.status = "awaiting_outline_approval"
             pending = self._open_human_action("outline_approval", {"report_outline": outline})
+            await self._persist_checkpoint(
+                "awaiting_outline_approval",
+                "outline_approval",
+                status=self.status,
+                payload={"pending_human_action": pending},
+            )
             await self._publish_public(
                 "approval.required",
                 stage="synthesizing",
@@ -963,6 +1078,8 @@ class QueryEngine:
                     "action_id": pending["action_id"],
                     "approval_type": "outline",
                     "status": "pending",
+                    "content_markdown": outline,
+                    "allowed_actions": ["approve", "revise", "cancel"],
                 },
                 dedupe_key=f"approval:outline:{pending['action_id']}:required",
             )
@@ -1287,10 +1404,33 @@ class QueryEngine:
                     clarify = await self._run_node("clarify_with_user", graph.clarify_with_user, state)
                     yield self._event("lead.message", {"stage": "clarify_with_user", "goto": clarify.goto})
                     if clarify.goto == END:
-                        await self._persist_checkpoint("clarified", "completed", status="completed")
-                        result_text = _message_text(state.get("messages", []))
-                        async for event in self._finish_success(state, recorder, result_text):
-                            yield event
+                        async for hitl_event in self._await_clarification(state):
+                            yield hitl_event
+                        if self.cancelled:
+                            await self._persist_checkpoint("cancelled", "cancelled", status="cancelled")
+                            self.total_usage = recorder.finish_run(self.run_id, "cancelled")
+                            self._cancelled_state(state)
+                            await self._publish_public_cancelled()
+                            yield self._event("run.cancelled", {"run_id": self.run_id, "status": "cancelled"})
+                            return
+                    await self._persist_checkpoint("clarified", "write_research_brief")
+                    stage = "write_research_brief"
+
+                if stage == "clarification_wait":
+                    restored_action = None
+                    if self.context_store is not None:
+                        restored_action = self.context_store.load_manifest().pending_human_action
+                    async for hitl_event in self._await_clarification(
+                        state,
+                        restored_action=restored_action,
+                    ):
+                        yield hitl_event
+                    if self.cancelled:
+                        await self._persist_checkpoint("cancelled", "cancelled", status="cancelled")
+                        self.total_usage = recorder.finish_run(self.run_id, "cancelled")
+                        self._cancelled_state(state)
+                        await self._publish_public_cancelled()
+                        yield self._event("run.cancelled", {"run_id": self.run_id, "status": "cancelled"})
                         return
                     await self._persist_checkpoint("clarified", "write_research_brief")
                     stage = "write_research_brief"
