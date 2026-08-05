@@ -80,3 +80,11 @@ uv.lock
 .codex-test-tmp/
 .pytest-public-events*/
 tests/local_eval_results/
+
+research_runs/
+
+# 文档相关目录
+docs/
+!docs/
+docs/*
+!docs/前端展示模块-SPEC.md
