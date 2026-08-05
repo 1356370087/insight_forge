@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 
 from open_deep_research.configuration import Configuration
 
-PUBLIC_EVENT_SCHEMA_VERSION = 1
+PUBLIC_EVENT_SCHEMA_VERSION = 2
 PUBLIC_STAGES = (
     "preparing",
     "planning",
@@ -107,8 +107,15 @@ _PAYLOAD_KEYS: dict[str, set[str]] = {
     "findings.updated": {"task_id", "wave_id", "summary", "sources", "source_count"},
     "report.started": {"status"},
     "report.completed": {"status", "result_ref", "sha256", "length"},
-    "approval.required": {"action_id", "approval_type", "status", "plan_id", "revision"},
+    "approval.required": {
+        "action_id", "approval_type", "status", "plan_id", "revision",
+        "content_markdown", "allowed_actions",
+    },
     "approval.resolved": {"action_id", "approval_type", "action", "status"},
+    "clarification.required": {
+        "action_id", "question", "status", "allowed_actions",
+    },
+    "clarification.resolved": {"action_id", "action", "status"},
     "feedback.received": {"feedback_id", "feedback_type", "task_id", "status"},
     "system.warning": {"warning_code", "message"},
 }
@@ -145,6 +152,7 @@ class PublicEvent(BaseModel):
 class PublicRunProjection(BaseModel):
     """Replay-derived current state for a public research run."""
 
+    status: str = "pending"
     current_stage: Optional[str] = None
     stage_index: int = 0
     stage_count: int = len(PUBLIC_STAGES)
@@ -160,6 +168,9 @@ class PublicRunProjection(BaseModel):
     })
     waves: dict[str, int] = Field(default_factory=lambda: {"total": 0, "completed": 0})
     latest_findings: list[dict[str, Any]] = Field(default_factory=list)
+    task_items: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    sources: list[dict[str, Any]] = Field(default_factory=list)
+    pending_human_action: Optional[dict[str, Any]] = None
     last_event_id: int = 0
 
 
@@ -627,9 +638,14 @@ def project_public_events(events: list[PublicEvent]) -> PublicRunProjection:
     waves: set[str] = set()
     completed_waves: set[str] = set()
     findings: dict[str, dict[str, Any]] = {}
+    sources: dict[str, dict[str, Any]] = {}
     for event in events:
         projection.last_event_id = event.sequence
         payload = event.payload
+        if event.type.startswith("run.") and payload.get("status"):
+            projection.status = str(payload["status"])
+            if event.type in TERMINAL_EVENT_TYPES:
+                projection.pending_human_action = None
         if event.type.startswith("stage.") and payload.get("stage_id"):
             projection.current_stage = str(payload["stage_id"])
             projection.stage_index = int(payload.get("stage_index", 0))
@@ -643,12 +659,21 @@ def project_public_events(events: list[PublicEvent]) -> PublicRunProjection:
             if not any(item.get("task_id") == payload.get("task_id") for item in tasks):
                 tasks.append(dict(payload))
             task_statuses[str(payload.get("task_id"))] = str(payload.get("status", "pending"))
+            projection.task_items[str(payload.get("task_id"))] = dict(payload)
         elif event.type.startswith("research.task."):
             task_id = str(payload.get("task_id", ""))
             if task_id:
                 status = payload.get("status")
                 if status:
                     task_statuses[task_id] = str(status)
+                projection.task_items[task_id] = {
+                    **projection.task_items.get(task_id, {}),
+                    **dict(payload),
+                }
+        elif event.type == "research.source.discovered":
+            source_key = str(payload.get("source_id") or payload.get("url") or "")
+            if source_key:
+                sources[source_key] = dict(payload)
         elif event.type == "research.wave.started":
             waves.add(str(payload.get("wave_id")))
         elif event.type == "research.wave.completed":
@@ -657,6 +682,30 @@ def project_public_events(events: list[PublicEvent]) -> PublicRunProjection:
             completed_waves.add(wave_id)
         elif event.type == "findings.updated":
             findings[str(payload.get("task_id"))] = dict(payload)
+        elif event.type == "approval.required":
+            approval_type = str(payload.get("approval_type") or "plan")
+            projection.status = f"awaiting_{approval_type}_approval"
+            projection.pending_human_action = {
+                "action_id": payload.get("action_id"),
+                "type": f"{approval_type}_approval",
+                "payload": {
+                    "content_markdown": payload.get("content_markdown", ""),
+                },
+                "allowed_actions": payload.get("allowed_actions", ["approve", "revise", "cancel"]),
+            }
+        elif event.type == "clarification.required":
+            projection.status = "awaiting_clarification"
+            projection.pending_human_action = {
+                "action_id": payload.get("action_id"),
+                "type": "clarification",
+                "payload": {"question": payload.get("question", "")},
+                "allowed_actions": payload.get("allowed_actions", ["answer", "cancel"]),
+            }
+        elif event.type in {"approval.resolved", "clarification.resolved"}:
+            pending = projection.pending_human_action or {}
+            if pending.get("action_id") == payload.get("action_id"):
+                projection.pending_human_action = None
+            projection.status = "running"
 
     counts = {key: 0 for key in ("pending", "running", "completed", "failed", "cancelled", "timed_out")}
     for status in task_statuses.values():
@@ -666,6 +715,7 @@ def project_public_events(events: list[PublicEvent]) -> PublicRunProjection:
     projection.tasks = {"total": len(task_statuses), **counts}
     projection.waves = {"total": len(waves), "completed": len(completed_waves)}
     projection.latest_findings = list(findings.values())
+    projection.sources = list(sources.values())
     return projection
 
 

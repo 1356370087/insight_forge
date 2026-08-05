@@ -86,6 +86,9 @@ class RunManifest(BaseModel):
     schema_version: int = SCHEMA_VERSION
     run_id: str
     owner_id: Optional[str] = None
+    title: Optional[str] = None
+    query_preview: Optional[str] = None
+    idempotency_key: Optional[str] = None
     created_at: float = Field(default_factory=time.time)
     updated_at: float = Field(default_factory=time.time)
     status: str = "pending"
@@ -107,6 +110,7 @@ class RunManifest(BaseModel):
         default_factory=list
     )
     result: Optional[dict[str, Any]] = None
+    pending_human_action: Optional[dict[str, Any]] = None
     final_artifacts: dict[str, Any] = Field(default_factory=dict)
     coordination_schema_version: int = 0
     coordination_backend: str = "legacy"

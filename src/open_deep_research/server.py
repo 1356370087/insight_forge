@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import html
 import json
 import logging
+import os
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
@@ -19,6 +24,7 @@ from open_deep_research.agents.query_engine import QueryEngine
 from open_deep_research.configuration import Configuration
 from open_deep_research.observability import SQLiteTraceStore
 from open_deep_research.public_events import (
+    PUBLIC_EVENT_SCHEMA_VERSION,
     PublicEvent,
     RunEventStore,
     event_publisher_from_config,
@@ -45,6 +51,7 @@ class RunRequest(BaseModel):
     messages: list[dict[str, Any]]
     configurable: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    title: str | None = Field(default=None, max_length=160)
 
 
 class ResumeRunRequest(BaseModel):
@@ -57,7 +64,7 @@ class ResumeRunRequest(BaseModel):
 class HumanActionRequest(BaseModel):
     """Approval/revision/cancellation response for a pending HITL action."""
 
-    action: Literal["approve", "revise", "cancel"]
+    action: Literal["approve", "revise", "answer", "cancel"]
     message: str | None = None
 
 
@@ -85,9 +92,51 @@ class RunRecord:
 
 
 app = FastAPI(title="Open Deep Research", version="0.1.0")
+_allowed_origins = [
+    item.strip()
+    for item in os.environ.get(
+        "FRONTEND_ALLOWED_ORIGINS",
+        "http://localhost:3000,http://127.0.0.1:3000",
+    ).split(",")
+    if item.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "Last-Event-ID"],
+)
 logger = logging.getLogger(__name__)
 _runs: dict[str, RunRecord] = {}
 _metrics_path = Configuration.from_runnable_config(None).prometheus_metrics_path
+
+FRONTEND_EDITABLE_CONFIG_KEYS = (
+    "allow_clarification", "enable_async_research", "enable_human_in_loop",
+    "summarization_model", "summarization_model_max_tokens",
+    "research_model", "research_model_max_tokens",
+    "compression_model", "compression_model_max_tokens",
+    "final_report_model", "final_report_model_max_tokens",
+    "search_api", "web_pipeline_mode", "web_pipeline_shadow_sample_rate",
+    "web_min_source_authority", "search_candidate_limit",
+    "max_fetches_per_researcher", "max_concurrent_research_units",
+    "max_researcher_iterations", "max_react_tool_calls",
+    "hitl_require_plan_approval", "hitl_require_outline_approval",
+    "hitl_max_plan_revisions", "hitl_feedback_mode", "report_type", "output_format",
+    "quality_evaluation_enabled", "quality_evaluation_model",
+    "quality_evaluation_model_max_tokens", "quality_evaluation_rigor",
+    "quality_evaluation_min_sources", "quality_evaluation_max_input_chars",
+    "quality_risk_mode", "quality_evaluation_fail_open",
+    "quality_caveat_admission_enabled", "quality_gap_recovery_max_attempts",
+    "enable_memory", "memory_top_k", "memory_min_confidence", "memory_auto_write",
+    "memory_write_after_report", "memory_fail_open", "memory_advanced_enabled",
+    "memory_decay_enabled", "memory_reflection_enabled", "memory_profile_enabled",
+    "memory_soft_forgetting_enabled", "memory_verified_insights_enabled",
+    "memory_search_threshold", "memory_search_rerank", "memory_importance_weight",
+    "memory_relevance_weight", "memory_recency_weight",
+    "memory_reflection_observation_threshold", "memory_reflection_importance_threshold",
+    "memory_reflection_max_age_hours", "memory_profile_max_chars", "memory_half_life_days",
+)
 
 
 @app.get(_metrics_path, include_in_schema=False)
@@ -165,6 +214,89 @@ def _user_identity(user: dict[str, Any]) -> str | None:
     return str(value) if value else None
 
 
+def _request_query_preview(request: RunRequest) -> str:
+    for message in request.messages:
+        if str(message.get("role", "")).lower() in {"user", "human"}:
+            content = message.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    str(item.get("text", "")) if isinstance(item, dict) else str(item)
+                    for item in content
+                )
+            return " ".join(str(content).split())[:280]
+    return ""
+
+
+def _run_title(request: RunRequest, run_id: str) -> str:
+    explicit = " ".join((request.title or "").split())
+    preview = _request_query_preview(request)
+    return (explicit or preview[:80] or run_id)[:160]
+
+
+def _runs_root(config: dict[str, Any] | None = None) -> Path:
+    return Path(Configuration.from_runnable_config(config).runs_dir).resolve()
+
+
+def _load_manifests(config: dict[str, Any] | None = None) -> list[Any]:
+    root = _runs_root(config)
+    if not root.exists():
+        return []
+    manifests = []
+    for path in root.glob("*/context/manifest.json"):
+        try:
+            manifests.append(
+                RunContextStore(path.parent.parent.name, runs_dir=str(root)).load_manifest()
+            )
+        except (ValueError, JournalCorruptedError, OSError):
+            continue
+    return manifests
+
+
+def _find_idempotent_run(
+    config: dict[str, Any],
+    owner_id: str | None,
+    idempotency_key: str,
+) -> Any | None:
+    return next(
+        (
+            manifest
+            for manifest in _load_manifests(config)
+            if manifest.owner_id == owner_id and manifest.idempotency_key == idempotency_key
+        ),
+        None,
+    )
+
+
+def _encode_cursor(created_at: float, run_id: str) -> str:
+    raw = json.dumps([created_at, run_id], separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _decode_cursor(cursor: str) -> tuple[float, str]:
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        value = json.loads(base64.urlsafe_b64decode(padded).decode())
+        return float(value[0]), str(value[1])
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid_cursor") from exc
+
+
+def _stable_output(result: dict[str, Any] | None, report: str = "") -> dict[str, Any]:
+    state = result or {}
+    outcome = state.get("result") if isinstance(state.get("result"), dict) else state
+    outcome = outcome if isinstance(outcome, dict) else {}
+    markdown = report or str(state.get("final_report") or outcome.get("result") or "")
+    return {
+        "markdown": markdown,
+        "artifacts": state.get("artifacts") or outcome.get("artifacts") or [],
+        "quality_gate": state.get("quality_gate") or outcome.get("quality_gate"),
+        "termination_reason": outcome.get("termination_reason"),
+        "status": outcome.get("status"),
+        "usage": outcome.get("usage") or {},
+        "metrics": outcome.get("metrics") or {},
+    }
+
+
 def _require_record_owner(record: RunRecord, user: dict[str, Any]) -> None:
     """Hide in-memory runs from users other than their owner."""
     metadata = getattr(record.engine, "config", {}).get("metadata", {})
@@ -233,6 +365,7 @@ async def _run_background(record: RunRecord, request: RunRequest, config: dict[s
             status = event.get("data", {}).get("status")
             if status in {
                 "running",
+                "awaiting_clarification",
                 "awaiting_plan_approval",
                 "awaiting_outline_approval",
                 "completed",
@@ -322,6 +455,92 @@ async def _run_control_listener(record: RunRecord, config: dict[str, Any]) -> No
         await asyncio.sleep(poll_seconds)
 
 
+@app.get("/capabilities")
+async def get_capabilities(
+    _user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Return the safe, explicit browser-editable runtime contract."""
+    schema = Configuration.model_json_schema()
+    properties = schema.get("properties", {})
+    selected = {
+        key: properties[key]
+        for key in FRONTEND_EDITABLE_CONFIG_KEYS
+        if key in properties
+    }
+    defaults = Configuration().model_dump(mode="json")
+    return {
+        "public_event_schema_version": PUBLIC_EVENT_SCHEMA_VERSION,
+        "accepted_event_schema_versions": [1, PUBLIC_EVENT_SCHEMA_VERSION],
+        "features": {
+            "clarification": True,
+            "human_in_loop": True,
+            "feedback": True,
+            "artifacts": True,
+            "memory": True,
+            "local_dev_auth_bypass": os.environ.get("LOCAL_DEV_AUTH_BYPASS", "").lower()
+            in {"1", "true", "yes"},
+        },
+        "editable_config_keys": list(selected),
+        "config_schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": selected,
+            "$defs": schema.get("$defs", {}),
+        },
+        "defaults": {key: defaults[key] for key in selected if key in defaults},
+        "ui": {
+            key: (Configuration.model_fields[key].json_schema_extra or {})
+            for key in selected
+        },
+    }
+
+
+@app.get("/runs")
+async def list_runs(
+    limit: int = 30,
+    cursor: str | None = None,
+    status: str | None = None,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    """List the authenticated user's persisted run manifests newest first."""
+    if limit < 1 or limit > 100:
+        raise HTTPException(status_code=422, detail="limit_must_be_between_1_and_100")
+    owner = _user_identity(user)
+    manifests = [
+        item
+        for item in _load_manifests()
+        if item.owner_id == owner
+        and (status is None or item.status == status)
+    ]
+    manifests.sort(key=lambda item: (item.created_at, item.run_id), reverse=True)
+    if cursor:
+        cursor_key = _decode_cursor(cursor)
+        manifests = [
+            item for item in manifests if (item.created_at, item.run_id) < cursor_key
+        ]
+    page = manifests[: limit + 1]
+    has_more = len(page) > limit
+    page = page[:limit]
+    items = [
+        {
+            "run_id": item.run_id,
+            "title": item.title or item.run_id,
+            "query_preview": item.query_preview or item.run_id,
+            "status": item.status,
+            "created_at": item.created_at,
+            "updated_at": item.updated_at,
+            "last_event_id": item.last_public_event_seq,
+        }
+        for item in page
+    ]
+    next_cursor = (
+        _encode_cursor(page[-1].created_at, page[-1].run_id)
+        if has_more and page
+        else None
+    )
+    return {"items": items, "next_cursor": next_cursor}
+
+
 @app.post("/runs/stream")
 async def stream_run(
     request: RunRequest,
@@ -331,6 +550,12 @@ async def stream_run(
     config = _config_from_request(request, user)
     engine = QueryEngine(config)
     record = RunRecord(run_id=engine.run_id, engine=engine, status="running")
+    if engine.context_store is not None:
+        engine.context_store.initialize(_user_identity(user), config)
+        engine.context_store._update_manifest(  # noqa: SLF001
+            title=_run_title(request, engine.run_id),
+            query_preview=_request_query_preview(request),
+        )
     await event_publisher_from_config(config).publish(
         "run.created",
         payload={"status": "pending"},
@@ -352,12 +577,30 @@ async def stream_run(
 @app.post("/runs")
 async def create_run(
     request: RunRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Create a background research run."""
     config = _config_from_request(request, user)
+    if idempotency_key:
+        existing = _find_idempotent_run(config, _user_identity(user), idempotency_key)
+        if existing is not None:
+            return {
+                "run_id": existing.run_id,
+                "status": existing.status,
+                "events_url": f"/runs/{existing.run_id}/events",
+                "last_event_id": existing.last_public_event_seq,
+                "idempotent_replay": True,
+            }
     engine = QueryEngine(config)
     record = RunRecord(run_id=engine.run_id, engine=engine, status="running")
+    if engine.context_store is not None:
+        engine.context_store.initialize(_user_identity(user), config)
+        engine.context_store._update_manifest(  # noqa: SLF001
+            title=_run_title(request, engine.run_id),
+            query_preview=_request_query_preview(request),
+            idempotency_key=idempotency_key,
+        )
     created = await event_publisher_from_config(config).publish(
         "run.created",
         payload={"status": "pending"},
@@ -370,6 +613,7 @@ async def create_run(
         "status": record.status,
         "events_url": f"/runs/{record.run_id}/events",
         "last_event_id": created.sequence,
+        "idempotent_replay": False,
     }
 
 
@@ -390,17 +634,24 @@ async def get_run(
         if manifest.owner_id and manifest.owner_id != user.get("identity"):
             raise HTTPException(status_code=404, detail="Run not found")
         result = manifest.result
+        report_text = ""
         if manifest.status == "completed":
             report_path = store.context_dir / "final_report.md"
             if report_path.exists():
-                result = {"status": "success", "result": report_path.read_text(encoding="utf-8")}
+                report_text = report_path.read_text(encoding="utf-8")
+                result = {"status": "success", "result": report_text}
         event_store = RunEventStore(run_id, runs_dir=configurable.runs_dir)
         projection = event_store.project() if event_store.exists else None
         return {
             "run_id": run_id,
+            "title": manifest.title or run_id,
             "status": manifest.status,
-            "pending_human_action": None,
+            "created_at": manifest.created_at,
+            "updated_at": manifest.updated_at,
+            "runtime_seconds": max(0.0, manifest.updated_at - manifest.created_at),
+            "pending_human_action": manifest.pending_human_action,
             "result": result,
+            "output": _stable_output(manifest.result, report_text),
             "event_count": manifest.last_journal_seq,
             "persistence_degraded": manifest.persistence_degraded,
             "progress": projection.model_dump() if projection else None,
@@ -411,11 +662,27 @@ async def get_run(
     configurable = Configuration.from_runnable_config(record.engine.config)
     event_store = RunEventStore(run_id, runs_dir=configurable.runs_dir)
     projection = event_store.project()
+    manifest = (
+        record.engine.context_store.load_manifest()
+        if getattr(record.engine, "context_store", None)
+        and record.engine.context_store.manifest_path.exists()
+        else None
+    )
+    now = time.time()
     return {
         "run_id": run_id,
+        "title": (manifest.title if manifest else None) or run_id,
         "status": record.status,
-        "pending_human_action": getattr(record.engine, "pending_human_action", None),
+        "created_at": manifest.created_at if manifest else record.engine.started_at,
+        "updated_at": manifest.updated_at if manifest else now,
+        "runtime_seconds": max(0.0, now - record.engine.started_at),
+        "pending_human_action": (
+            getattr(record.engine, "pending_human_action", None)
+            or (manifest.pending_human_action if manifest else None)
+            or projection.pending_human_action
+        ),
         "result": record.result,
+        "output": _stable_output(record.result),
         "event_count": projection.last_event_id,
         "progress": projection.model_dump(),
         "events_url": f"/runs/{run_id}/events",
@@ -510,6 +777,22 @@ async def submit_human_action(
         if request.action == "cancel":
             record.status = "cancelled"
         return result
+    manifest = RunContextStore(run_id, runs_dir=configurable.runs_dir).load_manifest()
+    pending = manifest.pending_human_action or {}
+    if pending.get("action_id") != action_id:
+        raise HTTPException(status_code=400, detail="No matching pending human action")
+    allowed = (
+        {"answer", "cancel"}
+        if pending.get("type") == "clarification"
+        else {"approve", "revise", "cancel"}
+    )
+    if request.action not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail="Human action does not match the pending action type",
+        )
+    if request.action in {"answer", "revise"} and not (request.message or "").strip():
+        raise HTTPException(status_code=400, detail="A message is required for this human action")
     command = await RunControlStore(run_id, runs_dir=configurable.runs_dir).enqueue(
         "human_action",
         {"action_id": action_id, "action": request.action, "message": request.message or ""},
