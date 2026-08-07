@@ -24,7 +24,7 @@ Researcher 需要处理不可信网页、调用外部工具并持续运行，如
 
 异步任务经 Teammate Pool 进入执行器；当 `enable_docker_sandbox` 开启时，执行器将该任务交给 `DockerSandboxManager`。Manager 按 `run_id/task_id` 创建独立工作区，并检查解析后的路径不能逃逸配置根目录。
 
-输入目录只读，其他目录按用途可写；只读 RootFS 用于限制容器可写层，只允许任务写入明确挂载的目录。容器使用非 Root UID/GID，并组合 `cap_drop=ALL` 与 `no-new-privileges` 降低提权风险。
+输入目录只读，其他目录按用途可写；只读 RootFS 用于限制容器可写层，**只允许任务写入明确挂载的目录**。容器使用非 Root UID/GID，并组合 `cap_drop=ALL` 与 `no-new-privileges` 降低提权风险。
 
 容器创建时设置 CPU、内存和 PID 配额，任务系统同时限制并发量和运行时间。任务主动取消时会根据容器 ID 执行停止和强制删除；正常结束后归档输出与日志，并按清理策略回收临时目录和容器。宿主侧另行记录沙箱生命周期事件，避免只依赖容器内可写日志进行排查。
 
@@ -41,7 +41,7 @@ Researcher 需要处理不可信网页、调用外部工具并持续运行，如
 
 其中两个中间模式侧重点不同：`allow-search-only` 偏向限制可使用的研究链路，`allowlist-domain` 偏向限制访问目标，不能把它们理解为严格的线性强弱关系。
 
-静态允许域名来自人工配置，也会根据研究模型、摘要模型、搜索提供商和 MCP 地址自动推导必要主机，减少安全策略开启后的配置成本。
+**静态允许域名来自人工配置，也会根据研究模型、摘要模型、搜索提供商和 MCP 地址自动推导必要主机，减少安全策略开启后的配置成本**。
 
 
 
@@ -57,15 +57,15 @@ Docker Worker 无法共享宿主进程中的 `Future`，因此返回结构化的
 
 
 
-### 4. SSRF 与目标校验
+### 4. SSRF 与目标校验⭐
 
 域名获批只代表"业务上允许访问"，并不代表"最终连接目标一定安全"。受控抓取链路还会：
 
-- 只允许 `http/https`，禁止 URL 中携带用户凭据；
-- 拒绝本机、云元数据域名，以及私网、回环、链路本地、组播、保留和未指定地址；
-- 检查域名解析得到的全部 IP；
-- 关闭自动重定向，对每一跳重新校验，跨域跳转还需重新满足域名策略；
-- 在 Transport 能提供 `peername` 时检查实际连接对端，并限制超时、响应类型、响应大小和重定向次数。
+1. 只允许 `http/https`，禁止 URL 中携带用户凭据；
+2. 拒绝本机、云元数据域名，以及私网、回环、链路本地、组播、保留和未指定地址；
+3. 检查域名解析得到的全部 IP；
+4. 关闭自动重定向，对每一跳重新校验，跨域跳转还需重新满足域名策略；
+5. 在 Transport 能提供 `peername` 时检查实际连接对端，并限制超时、响应类型、响应大小和重定向次数。
 
 真实对端检查是连接后的一致性补充，能够发现部分 DNS 变化，但不能单独消除检查与使用之间的竞态。若要约束任意容器网络流量或进一步防御 DNS Rebinding，生产环境还需要不可绕过的 Egress Proxy、网络策略或防火墙，并由代理端执行目标解析和私网阻断。
 
@@ -91,13 +91,13 @@ Docker Worker 无法共享宿主进程中的 `Future`，因此返回结构化的
 
 
 
-### 2. 为什么选择 Docker，而不是只启动 Python 子进程？
+### 2. 为什么选择 Docker，而不是只启动 Python 子进程？⭐
 
-Python 子进程默认仍共享宿主文件、用户权限和网络边界，也缺少统一的 CPU、内存、PID 与 RootFS 约束。Docker 能将这些限制组合成标准运行规格。它仍共享宿主内核，所以这里强调的是降低风险和故障半径，而不是把 Docker 描述成绝对安全边界。
+子进程默认仍共享宿主文件、用户权限与网络边界，也缺少统一的 CPU、内存、PID 与 RootFS 约束。Docker 能将这些限制组合成标准运行规格。它仍共享宿主内核，所以这里强调的是降低风险和故障半径，而不是把 Docker 描述成绝对安全边界。
 
 
 
-### 3. 文件隔离和最小权限如何实现？
+### 3. 文件隔离和最小权限如何实现？⭐
 
 每个任务拥有独立的工作区，输入只读挂载，输出、临时文件、日志和制品目录按需写入，同时校验工作区真实路径不能越过配置根目录。容器再叠加只读 RootFS、非 Root 身份、删除全部 Capabilities 和 `no-new-privileges`。
 
@@ -109,37 +109,36 @@ Python 子进程默认仍共享宿主文件、用户权限和网络边界，也�
 
 
 
-### 5. 四种网络模式有什么区别？
+### 5. 四种网络模式有什么区别？⭐
 
 `no-network` 是 Docker 网络层硬隔离；`allow-search-only` 允许标准研究链路；`allowlist-domain` 对受治理工具的目标域名做静态或动态授权；`open-network` 跳过应用层域名白名单。即使是 `open-network`，框架内置 HTTP 抓取仍会执行 SSRF 校验。
+
+
 
 ### 6. 未知域名的审批流程是怎样的？
 
 系统先检查静态域名，再查询本次 `run_id` 的动态决定。进程内任务可等待 Supervisor 决策；容器任务返回待审批结果，并把后续重试交给上层调度策略。授权作用域是一次研究运行，因此可被同一 `run_id` 下的多个 Researcher 共享，但不会自动扩散到其他 `run_id`。面试中应将其描述为审批与可重试协议，不要声称已经实现容器内透明续跑。
 
-### 7. Supervisor 审批是否等同于人工安全审批？
+
+
+### 7. Supervisor 审批是否等同于人工安全审批？⭐
 
 不等同。当前它是主 Agent 编排层的一项治理工具，独立性弱于人工或确定性策略。生产环境应根据风险等级设置自动白名单、规则审批和人工确认，并记录批准者、原因和有效期；不确定或超时场景应默认拒绝。
+
+
 
 ### 8. 已有域名白名单，为什么还需要 SSRF 防护？
 
 白名单回答"允许访问谁"，SSRF 校验回答"这个 URL 最终连到哪里"。合法域名仍可能解析到私网 IP，或通过重定向转向内部服务，因此需要同时检查协议、DNS 结果、重定向目标，并在客户端可获得时复核真实连接对端。
 
+
+
 ### 9. 这套方案最大的边界和后续改进是什么？
 
 只有 `no-network` 是明确的 Docker 网络层硬隔离；其余模式主要治理已经接入框架的工具和 Web 抓取链路，不能阻止容器内任意程序绕过框架直接创建 Socket。生产环境应强制出口代理或防火墙、禁止直连，并进一步补充 seccomp、AppArmor/SELinux、用户命名空间、磁盘配额、短期任务凭据和孤儿容器回收。
 
+
+
 ### 10. 如何证明这些能力不是只停留在设计上？
 
 源码中有针对工作区挂载、只读 RootFS、Capabilities、资源参数和网络模式的沙箱测试；有域名允许、拒绝、按运行隔离、等待与恢复的治理测试；也有私网、云元数据地址和真实连接对端的 SSRF 回归测试。生命周期事件、任务状态、输出归档和容器日志用于运行时排查，但更完整的生产验证还应增加真实 Docker、代理绕过和攻击用例集成测试。
-
-## 五、主要源码依据
-
-| 能力 | 主要源码 |
-|---|---|
-| 异步任务调度与沙箱接入 | `src/open_deep_research/tasks/async_tools.py`、`src/open_deep_research/tasks/teammate_pool.py`、`src/open_deep_research/tasks/executor.py` |
-| 工作区、权限、配额、超时和清理 | `src/open_deep_research/sandbox/manager.py`、`src/open_deep_research/sandbox/worker.py` |
-| 四种网络模式与静态允许域名 | `src/open_deep_research/configuration.py`、`src/open_deep_research/sandbox/policy.py` |
-| 动态域名审批 | `src/open_deep_research/tools/governance.py`、`src/open_deep_research/tasks/domain_approvals.py` |
-| SSRF 和 HTTP 抓取防护 | `src/open_deep_research/security/network.py`、`src/open_deep_research/tools/utils.py`、`src/open_deep_research/web/pipeline.py` |
-| 回归测试 | `tests/test_sandbox.py`、`tests/test_domain_allowlist.py`、`tests/test_tool_governance.py`、`tests/test_prompt_injection_security.py`、`tests/test_web_pipeline.py` |
