@@ -3,6 +3,15 @@ import type { PublicEvent, ResearchRunState, ResearchSource, ResearchTask, RunSn
 export const STAGES: StageId[] = ["preparing", "planning", "researching", "synthesizing", "writing", "finalizing"];
 const TERMINAL = new Set(["run.completed", "run.failed", "run.cancelled"]);
 
+export function deriveWaveStatus(tasks: ResearchTask[], explicitStatus?: string): string {
+  if (explicitStatus) return explicitStatus;
+  const statuses = tasks.map((task) => String(task.status ?? task.phase ?? "pending").toLowerCase());
+  if (statuses.some((status) => status === "failed")) return "failed";
+  if (statuses.length > 0 && statuses.every((status) => status === "completed")) return "completed";
+  if (statuses.some((status) => ["running", "researching", "compressing"].includes(status))) return "running";
+  return "queued";
+}
+
 export function emptyRunState(runId = ""): ResearchRunState {
   return {
     runId, title: runId, status: "pending", connectionState: "idle", stageProgress: {},
@@ -23,6 +32,12 @@ function sourceKey(source: Partial<ResearchSource>): string {
 
 export function hydrateSnapshot(state: ResearchRunState, snapshot: RunSnapshot): ResearchRunState {
   const progress = snapshot.progress ?? {};
+  const terminal = ["completed", "failed", "cancelled"].includes(snapshot.status);
+  const stageProgress = snapshot.status === "completed"
+    ? Object.fromEntries(STAGES.map((stage) => [stage, "completed" as const]))
+    : progress.current_stage && snapshot.status === "failed"
+      ? { ...state.stageProgress, [progress.current_stage]: "failed" as const }
+      : state.stageProgress;
   const findings = Object.fromEntries((progress.latest_findings ?? []).map((item) => [
     String(item.task_id ?? "unknown"),
     { ...item, task_id: String(item.task_id ?? "unknown"), updatedAt: new Date().toISOString() },
@@ -33,7 +48,9 @@ export function hydrateSnapshot(state: ResearchRunState, snapshot: RunSnapshot):
     runId: snapshot.run_id,
     title: snapshot.title ?? snapshot.run_id,
     status: snapshot.status,
+    connectionState: terminal ? "closed" : state.connectionState,
     currentStage: progress.current_stage,
+    stageProgress,
     plan: progress.plan ?? {},
     tasksById: progress.task_items ?? {},
     sourcesById: sources,
@@ -44,7 +61,7 @@ export function hydrateSnapshot(state: ResearchRunState, snapshot: RunSnapshot):
     qualityGate: snapshot.output?.quality_gate,
     lastEventId: snapshot.last_event_id ?? progress.last_event_id ?? 0,
     isHydrated: true,
-    terminal: ["completed", "failed", "cancelled"].includes(snapshot.status),
+    terminal,
   };
 }
 
@@ -62,7 +79,13 @@ export function reducePublicEvent(state: ResearchRunState, event: PublicEvent): 
     next.plan = { ...state.plan, ...payload };
   } else if (event.type === "plan.task.added" || event.type.startsWith("research.task.")) {
     const id = String(payload.task_id ?? "");
-    if (id) next.tasksById = { ...state.tasksById, [id]: { ...state.tasksById[id], ...payload, task_id: id } as ResearchTask };
+    if (id) {
+      const previous = state.tasksById[id];
+      const task = { ...previous, ...payload, task_id: id } as ResearchTask;
+      if (typeof previous?.iteration === "number" && typeof task.iteration === "number") task.iteration = Math.max(previous.iteration, task.iteration);
+      if (typeof previous?.source_count === "number" && typeof task.source_count === "number") task.source_count = Math.max(previous.source_count, task.source_count);
+      next.tasksById = { ...state.tasksById, [id]: task };
+    }
   } else if (event.type.startsWith("research.wave.")) {
     const id = String(payload.wave_id ?? "");
     if (id) next.wavesById = { ...state.wavesById, [id]: { ...state.wavesById[id], ...payload, wave_id: id, status: event.type.endsWith("completed") ? "completed" : "running", task_ids: (payload.task_ids as string[]) ?? state.wavesById[id]?.task_ids ?? [] } };

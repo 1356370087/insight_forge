@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { emptyRunState, reducePublicEvent } from "./run-reducer";
+import { deriveWaveStatus, emptyRunState, hydrateSnapshot, reducePublicEvent } from "./run-reducer";
 import type { PublicEvent } from "./types";
 
 const event = (sequence: number, type: string, payload: Record<string, unknown>): PublicEvent => ({
@@ -13,6 +13,22 @@ const event = (sequence: number, type: string, payload: Record<string, unknown>)
 });
 
 describe("reducePublicEvent", () => {
+  it("hydrates a completed snapshot with a closed connection and completed stages", () => {
+    const state = hydrateSnapshot(emptyRunState("run-1"), {
+      run_id: "run-1", status: "completed", last_event_id: 9,
+      progress: { current_stage: "finalizing" }, output: { markdown: "# Report" },
+    });
+    expect(state.connectionState).toBe("closed");
+    expect(state.terminal).toBe(true);
+    expect(state.stageProgress).toEqual(Object.fromEntries(["preparing", "planning", "researching", "synthesizing", "writing", "finalizing"].map((stage) => [stage, "completed"])));
+  });
+
+  it("derives a wave status when the snapshot only contains task projections", () => {
+    expect(deriveWaveStatus([{ task_id: "t1", status: "running" }])).toBe("running");
+    expect(deriveWaveStatus([{ task_id: "t1", status: "completed" }, { task_id: "t2", status: "completed" }])).toBe("completed");
+    expect(deriveWaveStatus([{ task_id: "t1", status: "failed" }])).toBe("failed");
+  });
+
   it("ignores repeated or older sequences", () => {
     const state = reducePublicEvent(emptyRunState("run-1"), event(2, "run.started", { status: "running" }));
     expect(reducePublicEvent(state, event(2, "run.failed", { status: "failed" }))).toBe(state);
@@ -20,11 +36,13 @@ describe("reducePublicEvent", () => {
 
   it("upserts tasks and sources by stable identity", () => {
     let state = reducePublicEvent(emptyRunState("run-1"), event(1, "research.task.started", { task_id: "t1", status: "running" }));
-    state = reducePublicEvent(state, event(2, "research.task.progress", { task_id: "t1", iteration: 2 }));
+    state = reducePublicEvent(state, event(2, "research.task.progress", { task_id: "t1", iteration: 2, source_count: 10 }));
     state = reducePublicEvent(state, event(3, "research.source.discovered", { task_id: "t1", source_id: "s1", url: "https://example.com/a?x=1" }));
     state = reducePublicEvent(state, event(4, "research.source.discovered", { task_id: "t1", source_id: "s2", url: "https://example.com/a?x=2" }));
+    state = reducePublicEvent(state, event(5, "research.task.completed", { task_id: "t1", status: "completed", source_count: 0 }));
     expect(Object.keys(state.tasksById)).toEqual(["t1"]);
     expect(state.tasksById.t1.iteration).toBe(2);
+    expect(state.tasksById.t1.source_count).toBe(10);
     expect(Object.keys(state.sourcesById)).toHaveLength(1);
   });
 

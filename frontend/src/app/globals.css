@@ -82,6 +82,7 @@ button { color: inherit; }
 
 .run-topbar { padding: 22px 30px 17px; border-bottom: 1px solid var(--line); background: rgba(8,12,15,.72); position: sticky; top: 0; z-index: 10; backdrop-filter: blur(14px); }
 .run-topbar-row { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
+.run-controls { display: flex; gap: 8px; align-items: center; }
 .run-topbar h1 { margin: 4px 0 0; font-size: 20px; font-weight: 500; }
 .connection { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font: 10px var(--mono); text-transform: uppercase; }
 .connection i { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
@@ -171,7 +172,7 @@ button { color: inherit; }
   .mobile-bar { display: flex; position: sticky; top: 0; z-index: 15; height: 46px; align-items: center; justify-content: space-between; padding: 0 14px; border-bottom: 1px solid var(--line); background: rgba(8,12,15,.92); font: 10px var(--mono); }
   .mobile-bar button { display: grid; place-items: center; border: 0; background: transparent; cursor: pointer; }
   .mobile-bar button:first-child { visibility: hidden; }
-  .drawer-close { display: grid; position: absolute; top: 10px; right: 10px; background: var(--surface-3); border: 1px solid var(--line); place-items: center; width: 34px; height: 34px; }
+  .right-rail .drawer-close { display: grid; position: absolute; top: 10px; right: 10px; background: var(--surface-3); border: 1px solid var(--line); place-items: center; width: 34px; height: 34px; }
   .drawer-scrim { display: block; position: fixed; inset: 0; z-index: 16; background: rgba(0,0,0,.62); border: 0; }
   .left-rail, .right-rail { z-index: 20; }
 }
@@ -179,12 +180,17 @@ button { color: inherit; }
   .command-shell { display: block; }
   .left-rail { position: fixed; left: 0; width: min(300px, 92vw); transform: translateX(-105%); transition: transform .22s; }
   .left-rail.drawer-open { transform: translateX(0); }
+  .left-rail .drawer-close { display: grid; position: absolute; top: 10px; right: 10px; background: var(--surface-3); border: 1px solid var(--line); place-items: center; width: 34px; height: 34px; }
   .mobile-bar button:first-child { visibility: visible; }
   .page { padding: 22px 16px 90px; }
   .hero-console { min-height: calc(100vh - 90px); align-content: start; padding-top: 9vh; }
   .hero-title { font-size: 45px; }
   .research-composer { margin-top: 28px; }
   .run-topbar { padding: 16px; top: 46px; }
+  .run-topbar-row { align-items: stretch; flex-direction: column; }
+  .run-topbar .eyebrow { display: block; max-width: 100%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .run-topbar h1 { font-size: 18px; line-height: 1.35; }
+  .run-controls { flex-wrap: wrap; justify-content: flex-start; }
   .run-content { padding: 18px 14px 110px; }
   .stage-node span { display: none; }
   .settings-fields { grid-template-columns: 1fr; }
