@@ -21,6 +21,7 @@ from langchain_core.messages import (
 )
 from langchain_core.messages.utils import count_tokens_approximately
 from langchain_core.runnables import RunnableConfig
+from pydantic import BaseModel, Field, create_model
 
 from open_deep_research.agents.model_recovery import (
     invoke_with_output_recovery,
@@ -713,6 +714,40 @@ def _render_supervisor_coverage_contract(
     )
 
 
+def _coverage_bound_input_schema(
+    base_schema: type[BaseModel],
+    contract: ResearchCoverageContract | None,
+) -> type[BaseModel]:
+    """Expose the contract IDs as an enum while retaining server validation.
+
+    The enum guides tool-calling models to copy one complete, legal identifier
+    instead of combining the ordinal from one requirement with another one's
+    hash. The field remains ``list[str]`` so the authoritative call-level
+    validation below still rejects unknown IDs even if a provider ignores the
+    JSON schema constraint.
+    """
+    if contract is None or not contract.requirements:
+        return base_schema
+    requirement_field = base_schema.model_fields["requirement_ids"]
+    return create_model(
+        base_schema.__name__,
+        __base__=base_schema,
+        requirement_ids=(
+            list[str],
+            Field(
+                default_factory=list,
+                description=requirement_field.description,
+                json_schema_extra={
+                    "items": {
+                        "type": "string",
+                        "enum": list(contract.requirement_ids()),
+                    }
+                },
+            ),
+        ),
+    )
+
+
 async def write_research_brief(state: AgentState, config: RunnableConfig) -> Command[Literal["research_supervisor"]]:
     """Transform user messages into a structured research brief and initialize supervisor.
     
@@ -1193,7 +1228,10 @@ def build_supervisor_tools(state: SupervisorState) -> list[Tool]:
         conduct_tool = build_tool(
             name="ConductResearch",
             description=ConductResearch.__doc__ or "Delegate a research topic.",
-            input_schema=ConductResearch,
+            input_schema=_coverage_bound_input_schema(
+                ConductResearch,
+                coverage_contract,
+            ),
             call=conduct_call,
             origin=ToolOrigin.SYSTEM,
         )
@@ -1490,7 +1528,7 @@ def build_supervisor_tools(state: SupervisorState) -> list[Tool]:
         return ToolResult(output="No new research updates before the timeout.")
 
     definitions = [
-        (StartResearchTask, start_call),
+        (_coverage_bound_input_schema(StartResearchTask, coverage_contract), start_call),
         (CheckResearchTask, check_call),
         (ListResearchTasks, list_call),
         (UpdateResearchTask, update_call),

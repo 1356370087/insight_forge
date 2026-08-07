@@ -816,3 +816,34 @@ async def test_conduct_research_rejects_unknown_requirement_id() -> None:
                 tool_call_id="task-1",
             ),
         )
+
+
+def test_research_tool_schemas_enumerate_contract_requirement_ids() -> None:
+    contract = build_research_coverage_contract(
+        [HumanMessage(content="说明检查点恢复机制，并比较失败恢复策略。")]
+    )
+    expected_ids = list(contract.requirement_ids())
+
+    sync_tool = next(
+        tool
+        for tool in deep_researcher.build_supervisor_tools({
+            "coverage_contract": contract.model_dump(mode="json"),
+            "research_risk_profile": {"level": "standard"},
+        })
+        if tool.name == "ConductResearch"
+    )
+    async_tool = next(
+        tool
+        for tool in deep_researcher.build_supervisor_tools({
+            "coverage_contract": contract.model_dump(mode="json"),
+            "research_risk_profile": {"level": "standard"},
+            "enable_async_research": True,
+        })
+        if tool.name == "StartResearchTask"
+    )
+
+    for tool in (sync_tool, async_tool):
+        requirement_schema = tool.input_schema.model_json_schema()["properties"][
+            "requirement_ids"
+        ]
+        assert requirement_schema["items"]["enum"] == expected_ids
