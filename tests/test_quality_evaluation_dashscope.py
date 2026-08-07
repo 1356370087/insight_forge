@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from open_deep_research.configuration import Configuration
 from open_deep_research.evaluation import JudgeConfig, build_judge_model
+from open_deep_research.model_capabilities import dashscope_qwen_enable_thinking
 from open_deep_research.quality import (
     _build_quality_model,
     _content_text,
@@ -154,7 +155,9 @@ class TestDashScopeQualityEvaluationConfiguration:
             "base_url": values["QUALITY_EVALUATION_BASE_URL"],
         }
         if model_spec.split(":", 1)[1].lower().startswith("qwen"):
-            expected_init["extra_body"] = {"enable_thinking": False}
+            expected_init["extra_body"] = {
+                "enable_thinking": dashscope_qwen_enable_thinking(model_spec)
+            }
         assert captured["init"] == expected_init
         assert captured["bind"] == {"response_format": {"type": "json_object"}}
 
@@ -179,9 +182,10 @@ class TestDashScopeQualityEvaluationConfiguration:
                 "role": "user",
                 "content": 'Return exactly this JSON object: {"ok": true}',
             }],
-            max_completion_tokens=64,
             response_format={"type": "json_object"},
-            extra_body={"enable_thinking": False},
+            extra_body={
+                "enable_thinking": dashscope_qwen_enable_thinking(model)
+            },
         )
 
         content = response.choices[0].message.content
@@ -203,12 +207,13 @@ class TestDashScopeQualityEvaluationConfiguration:
             monkeypatch.setenv(key, value)
 
         result = await evaluate_tool_results(
-            "Assess whether two official sources support a test claim.",
+            "Assess whether three official sources support a test claim.",
             [{
                 "name": "tavily_search",
                 "content": (
                     "Source A: https://example.com/official-a supports the claim. "
-                    "Source B: https://example.org/official-b independently supports it."
+                    "Source B: https://example.org/official-b independently supports it. "
+                    "Source C: https://example.net/official-c confirms it."
                 ),
                 "error": False,
             }],
@@ -220,7 +225,7 @@ class TestDashScopeQualityEvaluationConfiguration:
 
         assert result.evaluator_error is None
         assert result.deterministic_checks["passed"] is True
-        assert result.deterministic_checks["source_count"] == 2
+        assert result.deterministic_checks["source_count"] == 3
         assert 1 <= result.relevance <= 5
         assert 1 <= result.source_quality <= 5
         assert 1 <= result.evidence_coverage <= 5

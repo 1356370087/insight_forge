@@ -54,6 +54,31 @@ def test_qwen_judge_disables_thinking_without_deepseek_options(monkeypatch) -> N
     assert captured["extra_body"] == {"enable_thinking": False}
 
 
+def test_qwen_max_judge_enables_required_thinking(monkeypatch) -> None:
+    captured: dict = {}
+    monkeypatch.setattr(
+        judge,
+        "ChatOpenAI",
+        lambda **kwargs: captured.update(kwargs) or object(),
+    )
+    config = judge.JudgeConfig(
+        provider="openai",
+        model="qwen3.7-max-2026-05-17",
+        api_key="dashscope-key",
+        base_url=(
+            "https://workspace.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+        ),
+    )
+
+    judge.build_judge_model(config)
+
+    assert captured["extra_body"] == {
+        "enable_thinking": True,
+        "thinking_budget": config.max_tokens,
+    }
+    assert "max_tokens" not in captured
+
+
 def test_deepseek_judge_uses_only_deepseek_compatible_configuration(
     monkeypatch,
 ) -> None:

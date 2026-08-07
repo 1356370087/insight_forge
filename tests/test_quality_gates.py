@@ -49,6 +49,36 @@ def test_quality_model_uses_json_mode_and_disables_thinking(monkeypatch) -> None
     assert "JSON" in TOOL_RESULT_EVALUATION_PROMPT
 
 
+def test_quality_model_enables_thinking_for_qwen_max_series(monkeypatch) -> None:
+    captured: dict = {}
+
+    class FakeModel:
+        def bind(self, **kwargs):
+            captured["bind"] = kwargs
+            return self
+
+    def fake_init_chat_model(**kwargs):
+        captured["init"] = kwargs
+        return FakeModel()
+
+    monkeypatch.setattr("open_deep_research.quality.init_chat_model", fake_init_chat_model)
+    configurable = Configuration(
+        quality_evaluation_model="openai:qwen3.7-max-2026-05-17",
+        quality_evaluation_base_url=(
+            "https://workspace.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+        ),
+    )
+
+    _build_quality_model(configurable, {"configurable": {}})
+
+    assert captured["init"]["extra_body"] == {
+        "enable_thinking": True,
+        "thinking_budget": configurable.quality_evaluation_model_max_tokens,
+    }
+    assert "max_tokens" not in captured["init"]
+    assert captured["bind"]["response_format"] == {"type": "json_object"}
+
+
 def test_deterministic_tool_checks_require_traceable_search_sources() -> None:
     passed = deterministic_tool_checks(
         [{

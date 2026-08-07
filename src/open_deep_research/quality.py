@@ -23,6 +23,7 @@ from open_deep_research.evidence import (
     is_evidence_eligible,
     source_scoped_evidence_records,
 )
+from open_deep_research.model_capabilities import dashscope_qwen_enable_thinking
 from open_deep_research.observability import (
     get_trace_recorder,
     invoke_model_with_retry_observability,
@@ -330,14 +331,18 @@ def _quality_api_key(
 def _build_quality_model(configurable: Configuration, config: RunnableConfig):
     """Create a provider-isolated evaluator model.
 
-    DashScope Qwen receives its documented non-thinking and JSON-mode options.
+    DashScope Qwen receives its documented thinking and JSON-mode options.
+    Thinking-only Qwen Max models omit ``max_tokens`` because DashScope warns
+    that an explicit cap can truncate structured JSON before the answer begins.
     Other providers rely on the strict JSON system prompt so OpenAI-only request
     fields are not leaked into native Anthropic, Google, or other clients.
     """
-    kwargs: dict[str, Any] = {
-        "model": configurable.quality_evaluation_model,
-        "max_tokens": configurable.quality_evaluation_model_max_tokens,
-    }
+    qwen_thinking = _is_dashscope_qwen(
+        configurable
+    ) and dashscope_qwen_enable_thinking(configurable.quality_evaluation_model)
+    kwargs: dict[str, Any] = {"model": configurable.quality_evaluation_model}
+    if not qwen_thinking:
+        kwargs["max_tokens"] = configurable.quality_evaluation_model_max_tokens
     api_key = _quality_api_key(configurable, config)
     if api_key:
         kwargs["api_key"] = api_key
@@ -350,7 +355,11 @@ def _build_quality_model(configurable: Configuration, config: RunnableConfig):
     if base_url:
         kwargs["base_url"] = base_url
     if _is_dashscope_qwen(configurable):
-        kwargs["extra_body"] = {"enable_thinking": False}
+        kwargs["extra_body"] = {"enable_thinking": qwen_thinking}
+        if qwen_thinking:
+            kwargs["extra_body"]["thinking_budget"] = (
+                configurable.quality_evaluation_model_max_tokens
+            )
     model = init_chat_model(**kwargs)
     if _is_dashscope_qwen(configurable):
         return model.bind(response_format={"type": "json_object"})

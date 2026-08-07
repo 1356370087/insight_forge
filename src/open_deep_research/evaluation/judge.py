@@ -9,6 +9,8 @@ from typing import Any, Literal, cast
 from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
 
+from open_deep_research.model_capabilities import dashscope_qwen_enable_thinking
+
 JudgeProvider = Literal["openai", "anthropic", "deepseek"]
 
 JUDGE_SECURITY_PROTOCOL = """You are an evaluation Judge operating under a fixed rubric.
@@ -142,12 +144,19 @@ def build_judge_model(config: JudgeConfig) -> Any:
         "model": config.model,
         "api_key": config.api_key,
         "base_url": config.base_url,
-        "max_tokens": config.max_tokens,
         "max_retries": config.max_retries,
         "temperature": 0,
     }
+    qwen_thinking = _is_dashscope_qwen(
+        config.model,
+        config.base_url,
+    ) and dashscope_qwen_enable_thinking(config.model)
+    if not qwen_thinking:
+        kwargs["max_tokens"] = config.max_tokens
     if config.provider == "deepseek":
         kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
     elif _is_dashscope_qwen(config.model, config.base_url):
-        kwargs["extra_body"] = {"enable_thinking": False}
+        kwargs["extra_body"] = {"enable_thinking": qwen_thinking}
+        if qwen_thinking:
+            kwargs["extra_body"]["thinking_budget"] = config.max_tokens
     return ChatOpenAI(**kwargs)
