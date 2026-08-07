@@ -227,9 +227,15 @@ async def test_projection_reduces_plan_tasks_waves_and_findings(tmp_path):
         dedupe_key="wave:1:started",
     )
     await store.append(
+        "research.task.progress",
+        stage="researching",
+        payload={"task_id": "task-1", "status": "running", "phase": "researching", "iteration": 8, "source_count": 10},
+        dedupe_key="task:1:progress",
+    )
+    await store.append(
         "research.task.completed",
         stage="researching",
-        payload={"task_id": "task-1", "status": "completed", "phase": "completed", "mode": "sync"},
+        payload={"task_id": "task-1", "status": "completed", "phase": "completed", "mode": "sync", "source_count": 0},
         dedupe_key="task:1:completed",
     )
     await store.append(
@@ -257,6 +263,8 @@ async def test_projection_reduces_plan_tasks_waves_and_findings(tmp_path):
         "timed_out": 0,
     }
     assert projection.waves == {"total": 1, "completed": 1}
+    assert projection.task_items["task-1"]["iteration"] == 8
+    assert projection.task_items["task-1"]["source_count"] == 10
     assert projection.latest_findings[0]["summary"] == "Finding"
 
 

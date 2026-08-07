@@ -666,10 +666,14 @@ def project_public_events(events: list[PublicEvent]) -> PublicRunProjection:
                 status = payload.get("status")
                 if status:
                     task_statuses[task_id] = str(status)
-                projection.task_items[task_id] = {
-                    **projection.task_items.get(task_id, {}),
-                    **dict(payload),
-                }
+                previous = projection.task_items.get(task_id, {})
+                merged = {**previous, **dict(payload)}
+                for monotonic_key in ("iteration", "source_count"):
+                    prior_value = previous.get(monotonic_key)
+                    next_value = payload.get(monotonic_key)
+                    if isinstance(prior_value, int) and isinstance(next_value, int):
+                        merged[monotonic_key] = max(prior_value, next_value)
+                projection.task_items[task_id] = merged
         elif event.type == "research.source.discovered":
             source_key = str(payload.get("source_id") or payload.get("url") or "")
             if source_key:
