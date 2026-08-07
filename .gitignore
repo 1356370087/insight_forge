@@ -88,3 +88,7 @@ docs/
 !docs/
 docs/*
 !docs/前端展示模块-SPEC.md
+
+# 临时工具缓存与运行输出
+.playwright-cli/
+output/
