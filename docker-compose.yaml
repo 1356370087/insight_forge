@@ -16,8 +16,6 @@ services:
       args:
         NEXT_PUBLIC_RESEARCH_API_BASE: /api/research
         NEXT_PUBLIC_LOCAL_DEV_AUTH_BYPASS: ${LOCAL_DEV_AUTH_BYPASS:-false}
-        NEXT_PUBLIC_SUPABASE_URL: ${SUPABASE_URL:-}
-        NEXT_PUBLIC_SUPABASE_ANON_KEY: ${SUPABASE_KEY:-}
     depends_on: [api]
 
   proxy:

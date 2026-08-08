@@ -170,7 +170,7 @@ curl -N "http://127.0.0.1:2024/runs/<run_id>/events" \
 生产环境请求需要增加认证头：
 
 ```bash
--H "Authorization: Bearer <supabase-jwt>"
+-H "Authorization: Bearer <odr-access-token>"
 ```
 
 ### Python 调用
