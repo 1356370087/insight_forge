@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import html
 import json
 import logging
@@ -48,7 +49,29 @@ from open_deep_research.security.inputs import (
     validate_http_configurable,
     validate_http_metadata,
 )
-from security.auth import apply_user_to_config, get_current_user
+from security.rbac import (
+    Principal,
+    apply_principal_to_config,
+    mount_rbac,
+    register_ownership_checker,
+    require_active_user,
+    require_permissions,
+    shutdown_rbac,
+    startup_checks,
+)
+from security.rbac.app_extension import assert_schema_current
+from security.rbac.database import session_scope
+from security.rbac.dependencies import reauthorize_session
+from security.rbac.permissions import (
+    RESEARCH_DIAGNOSTICS_PREVIEW,
+    RESEARCH_OBSERVABILITY_READ_OWN,
+    RESEARCH_RUN_CONTROL_OWN,
+    RESEARCH_RUN_CREATE,
+    RESEARCH_RUN_INTERACT_OWN,
+    RESEARCH_RUN_READ_OWN,
+    RESEARCH_TASK_ACTIVITY_READ_OWN,
+)
+from security.rbac.settings import get_settings as get_iam_settings
 
 load_dotenv()
 
@@ -99,7 +122,18 @@ class RunRecord:
     task: asyncio.Task | None = None
 
 
-app = FastAPI(title="Open Deep Research", version="0.1.0")
+@contextlib.asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Validate IAM before serving and release its pool on shutdown."""
+    await startup_checks()
+    await assert_schema_current()
+    try:
+        yield
+    finally:
+        await shutdown_rbac()
+
+
+app = FastAPI(title="Open Deep Research", version="0.1.0", lifespan=_lifespan)
 _allowed_origins = [
     item.strip()
     for item in os.environ.get(
@@ -115,6 +149,39 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "Last-Event-ID"],
 )
+
+# Self-hosted identity & RBAC subsystem. Supabase is intentionally not mounted.
+mount_rbac(app)
+
+
+async def _rbac_run_owner_checker(_db, principal, run_id: str) -> bool:
+    """Ownership bridge used by ``require_run_owner`` (prepared for cutover)."""
+    record = _runs.get(run_id)
+    if record is not None:
+        metadata = getattr(record.engine, "config", {}).get("metadata", {})
+        owner = metadata.get("owner") or metadata.get("user_id")
+        return bool(owner) and str(owner) == principal.user_id
+    configurable = Configuration.from_runnable_config(None)
+    try:
+        manifest = RunContextStore(run_id, runs_dir=configurable.runs_dir).load_manifest()
+    except (ValueError, JournalCorruptedError, OSError):
+        return False
+    return bool(manifest.owner_id) and manifest.owner_id == principal.user_id
+
+
+async def _rbac_task_owner_checker(_db, principal, key: tuple[str, str]) -> bool:
+    """Ownership bridge used by ``require_task_owner`` (prepared for cutover)."""
+    run_id, task_id = key
+    if not await _rbac_run_owner_checker(_db, principal, run_id):
+        return False
+    configurable = Configuration.from_runnable_config(None)
+    projection = RunEventStore(run_id, runs_dir=configurable.runs_dir).project()
+    return task_id in projection.task_items
+
+
+register_ownership_checker("run", _rbac_run_owner_checker)
+register_ownership_checker("task", _rbac_task_owner_checker)
+
 logger = logging.getLogger(__name__)
 _runs: dict[str, RunRecord] = {}
 _metrics_path = Configuration.from_runnable_config(None).prometheus_metrics_path
@@ -178,14 +245,27 @@ def _sse_headers() -> dict[str, str]:
     }
 
 
-async def _public_event_iterator(store: RunEventStore, *, after: int = 0):
+async def _public_event_iterator(
+    store: RunEventStore, *, after: int = 0, principal: Principal | None = None
+):
     """Replay then tail a durable public stream, including cross-worker writes."""
     configurable = Configuration.from_runnable_config(None)
     poll_seconds = configurable.sse_poll_interval_ms / 1000
     heartbeat_seconds = configurable.sse_heartbeat_seconds
     cursor = after
     last_output_at = asyncio.get_running_loop().time()
+    last_auth_at = last_output_at
     while True:
+        now = asyncio.get_running_loop().time()
+        if (
+            principal is not None
+            and principal.session_id is not None
+            and now - last_auth_at >= get_iam_settings().sse_reauth_interval
+        ):
+            async with session_scope() as db:
+                if await reauthorize_session(db, principal) is None:
+                    return
+            last_auth_at = now
         events = await asyncio.to_thread(store.read, cursor)
         for event in events:
             yield _sse(event)
@@ -206,14 +286,27 @@ async def _public_event_iterator(store: RunEventStore, *, after: int = 0):
         await asyncio.sleep(poll_seconds)
 
 
-async def _task_activity_iterator(store: TaskActivityStore, *, after: int = 0):
+async def _task_activity_iterator(
+    store: TaskActivityStore, *, after: int = 0, principal: Principal | None = None
+):
     """Replay then tail one task-local durable activity stream."""
     configurable = Configuration.from_runnable_config(None)
     poll_seconds = configurable.sse_poll_interval_ms / 1000
     heartbeat_seconds = configurable.sse_heartbeat_seconds
     cursor = after
     last_output_at = asyncio.get_running_loop().time()
+    last_auth_at = last_output_at
     while True:
+        now = asyncio.get_running_loop().time()
+        if (
+            principal is not None
+            and principal.session_id is not None
+            and now - last_auth_at >= get_iam_settings().sse_reauth_interval
+        ):
+            async with session_scope() as db:
+                if await reauthorize_session(db, principal) is None:
+                    return
+            last_auth_at = now
         events = await asyncio.to_thread(store.read, cursor)
         terminal_seen = False
         for event in events:
@@ -237,7 +330,7 @@ async def _task_activity_iterator(store: TaskActivityStore, *, after: int = 0):
         await asyncio.sleep(poll_seconds)
 
 
-def _config_from_request(request: RunRequest, user: dict[str, Any]) -> dict[str, Any]:
+def _config_from_request(request: RunRequest, principal: Principal) -> dict[str, Any]:
     try:
         validate_http_configurable(request.configurable)
         validate_http_metadata(request.metadata)
@@ -248,7 +341,7 @@ def _config_from_request(request: RunRequest, user: dict[str, Any]) -> dict[str,
         "configurable": dict(request.configurable),
         "metadata": {**request.metadata, "deployment_surface": "http"},
     }
-    return apply_user_to_config(config, user)
+    return apply_principal_to_config(config, principal)
 
 
 def _observability_store() -> SQLiteTraceStore:
@@ -256,10 +349,9 @@ def _observability_store() -> SQLiteTraceStore:
     return SQLiteTraceStore(configurable.trace_store_path)
 
 
-def _user_identity(user: dict[str, Any]) -> str | None:
+def _user_identity(user: Principal) -> str:
     """Return the normalized authenticated identity used by run ownership checks."""
-    value = user.get("identity") or user.get("id")
-    return str(value) if value else None
+    return user.user_id
 
 
 def _request_query_preview(request: RunRequest) -> str:
@@ -345,15 +437,15 @@ def _stable_output(result: dict[str, Any] | None, report: str = "") -> dict[str,
     }
 
 
-def _require_record_owner(record: RunRecord, user: dict[str, Any]) -> None:
+def _require_record_owner(record: RunRecord, user: Principal) -> None:
     """Hide in-memory runs from users other than their owner."""
     metadata = getattr(record.engine, "config", {}).get("metadata", {})
     owner = metadata.get("owner") or metadata.get("user_id")
-    if owner and str(owner) != _user_identity(user):
+    if not owner or str(owner) != _user_identity(user):
         raise HTTPException(status_code=404, detail="Run not found")
 
 
-def _require_run_owner(run_id: str, user: dict[str, Any]) -> tuple[RunRecord | None, Configuration]:
+def _require_run_owner(run_id: str, user: Principal) -> tuple[RunRecord | None, Configuration]:
     """Authorize an active or persisted run and return its effective config."""
     record = _runs.get(run_id)
     if record is not None:
@@ -364,12 +456,12 @@ def _require_run_owner(run_id: str, user: dict[str, Any]) -> tuple[RunRecord | N
         manifest = RunContextStore(run_id, runs_dir=configurable.runs_dir).load_manifest()
     except (ValueError, JournalCorruptedError, OSError):
         raise HTTPException(status_code=404, detail="Run not found") from None
-    if manifest.owner_id and manifest.owner_id != _user_identity(user):
+    if not manifest.owner_id or manifest.owner_id != _user_identity(user):
         raise HTTPException(status_code=404, detail="Run not found")
     return None, configurable
 
 
-def _task_activity_preview_allowed(user: dict[str, Any]) -> bool:
+def _task_activity_preview_allowed(user: Principal) -> bool:
     """Authorize bounded diagnostic previews without trusting the browser."""
     local_bypass = os.environ.get("LOCAL_DEV_AUTH_BYPASS", "false").lower() in {
         "1", "true", "yes", "on",
@@ -379,8 +471,7 @@ def _task_activity_preview_allowed(user: dict[str, Any]) -> bool:
     enabled = os.environ.get("TASK_ACTIVITY_PREVIEW_ENABLED", "false").lower() in {
         "1", "true", "yes", "on",
     }
-    permissions = {str(item) for item in user.get("permissions", [])}
-    return enabled and bool(permissions & {"admin", "developer"})
+    return enabled and user.has(RESEARCH_DIAGNOSTICS_PREVIEW.code)
 
 
 def _augment_run_projection(
@@ -550,7 +641,7 @@ async def _run_control_listener(record: RunRecord, config: dict[str, Any]) -> No
 
 @app.get("/capabilities")
 async def get_capabilities(
-    user: dict[str, Any] = Depends(get_current_user),
+    user: Principal = Depends(require_active_user),
 ) -> dict[str, Any]:
     """Return the safe, explicit browser-editable runtime contract."""
     schema = Configuration.model_json_schema()
@@ -596,7 +687,7 @@ async def list_runs(
     limit: int = 30,
     cursor: str | None = None,
     status: str | None = None,
-    user: dict[str, Any] = Depends(get_current_user),
+    user: Principal = Depends(require_permissions(RESEARCH_RUN_READ_OWN.code)),
 ) -> dict[str, Any]:
     """List the authenticated user's persisted run manifests newest first."""
     if limit < 1 or limit > 100:
@@ -640,7 +731,7 @@ async def list_runs(
 @app.post("/runs/stream")
 async def stream_run(
     request: RunRequest,
-    user: dict[str, Any] = Depends(get_current_user),
+    user: Principal = Depends(require_permissions(RESEARCH_RUN_CREATE.code)),
 ) -> StreamingResponse:
     """Run a research request and stream events with SSE."""
     config = _config_from_request(request, user)
@@ -664,7 +755,7 @@ async def stream_run(
         runs_dir=Configuration.from_runnable_config(config).runs_dir,
     )
     return StreamingResponse(
-        _public_event_iterator(store),
+        _public_event_iterator(store, principal=user),
         media_type="text/event-stream",
         headers=_sse_headers(),
     )
@@ -674,7 +765,7 @@ async def stream_run(
 async def create_run(
     request: RunRequest,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
-    user: dict[str, Any] = Depends(get_current_user),
+    user: Principal = Depends(require_permissions(RESEARCH_RUN_CREATE.code)),
 ) -> dict[str, Any]:
     """Create a background research run."""
     config = _config_from_request(request, user)
@@ -716,7 +807,7 @@ async def create_run(
 @app.get("/runs/{run_id}")
 async def get_run(
     run_id: str,
-    user: dict[str, Any] = Depends(get_current_user),
+    user: Principal = Depends(require_permissions(RESEARCH_RUN_READ_OWN.code)),
 ) -> dict[str, Any]:
     """Return the latest status/result for a run."""
     record = _runs.get(run_id)
@@ -727,7 +818,7 @@ async def get_run(
             manifest = store.load_manifest()
         except (ValueError, JournalCorruptedError, OSError):
             raise HTTPException(status_code=404, detail="Run not found") from None
-        if manifest.owner_id and manifest.owner_id != user.get("identity"):
+        if not manifest.owner_id or manifest.owner_id != user.user_id:
             raise HTTPException(status_code=404, detail="Run not found")
         result = manifest.result
         report_text = ""
@@ -792,7 +883,7 @@ async def get_run(
 async def resume_run(
     run_id: str,
     request: ResumeRunRequest,
-    user: dict[str, Any] = Depends(get_current_user),
+    user: Principal = Depends(require_permissions(RESEARCH_RUN_CONTROL_OWN.code)),
 ) -> dict[str, str]:
     """Explicitly resume an interrupted file-backed Query run."""
     active = _runs.get(run_id)
@@ -811,7 +902,7 @@ async def resume_run(
     except ValueError as exc:
         logger.warning("security.unsafe_config_rejected: %s", exc)
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    config = apply_user_to_config(
+    config = apply_principal_to_config(
         {
             "configurable": dict(request.configurable),
             "metadata": {
@@ -837,7 +928,7 @@ async def resume_run(
         raise HTTPException(status_code=409, detail="run_not_recoverable") from None
     except (ValueError, OSError):
         raise HTTPException(status_code=409, detail="run_not_recoverable") from None
-    if replay.manifest.owner_id and replay.manifest.owner_id != user.get("identity"):
+    if not replay.manifest.owner_id or replay.manifest.owner_id != user.user_id:
         raise HTTPException(status_code=404, detail="Run not found")
     if replay.manifest.status == "completed":
         raise HTTPException(status_code=409, detail="run_already_completed")
@@ -863,7 +954,7 @@ async def submit_human_action(
     run_id: str,
     action_id: str,
     request: HumanActionRequest,
-    user: dict[str, Any] = Depends(get_current_user),
+    user: Principal = Depends(require_permissions(RESEARCH_RUN_INTERACT_OWN.code)),
 ) -> dict[str, Any]:
     """Resolve a pending human approval, revision, or cancellation action."""
     record, configurable = _require_run_owner(run_id, user)
@@ -903,7 +994,7 @@ async def submit_human_action(
 async def submit_feedback(
     run_id: str,
     request: HumanFeedbackRequest,
-    user: dict[str, Any] = Depends(get_current_user),
+    user: Principal = Depends(require_permissions(RESEARCH_RUN_INTERACT_OWN.code)),
 ) -> dict[str, Any]:
     """Accept mid-run human direction or evidence questions."""
     record, configurable = _require_run_owner(run_id, user)
@@ -928,7 +1019,7 @@ async def get_task_activity(
     before: int | None = None,
     limit: int = 100,
     kind: str | None = None,
-    user: dict[str, Any] = Depends(get_current_user),
+    user: Principal = Depends(require_permissions(RESEARCH_TASK_ACTIVITY_READ_OWN.code)),
 ) -> dict[str, Any]:
     """Return one reverse-page of safe task activity in chronological order."""
     _record, configurable = _require_run_owner(run_id, user)
@@ -989,7 +1080,7 @@ async def stream_task_activity(
     task_id: str,
     after: int = 0,
     last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
-    user: dict[str, Any] = Depends(get_current_user),
+    user: Principal = Depends(require_permissions(RESEARCH_TASK_ACTIVITY_READ_OWN.code)),
 ) -> StreamingResponse:
     """Replay and tail a task-local activity stream while the drawer is open."""
     record, configurable = _require_run_owner(run_id, user)
@@ -1011,7 +1102,7 @@ async def stream_task_activity(
     ):
         raise HTTPException(status_code=409, detail="activity_stream_unavailable_legacy_run")
     return StreamingResponse(
-        _task_activity_iterator(store, after=cursor),
+        _task_activity_iterator(store, after=cursor, principal=user),
         media_type="text/event-stream",
         headers=_sse_headers(),
     )
@@ -1022,7 +1113,7 @@ async def stream_run_events(
     run_id: str,
     after: int = 0,
     last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
-    user: dict[str, Any] = Depends(get_current_user),
+    user: Principal = Depends(require_permissions(RESEARCH_RUN_READ_OWN.code)),
 ) -> StreamingResponse:
     """Replay and tail the durable public event stream for a run."""
     record = _runs.get(run_id)
@@ -1035,7 +1126,7 @@ async def stream_run_events(
             manifest = RunContextStore(run_id, runs_dir=configurable.runs_dir).load_manifest()
         except (ValueError, JournalCorruptedError, OSError):
             raise HTTPException(status_code=404, detail="Run not found") from None
-        if manifest.owner_id and manifest.owner_id != _user_identity(user):
+        if not manifest.owner_id or manifest.owner_id != _user_identity(user):
             raise HTTPException(status_code=404, detail="Run not found")
 
     store = RunEventStore(run_id, runs_dir=configurable.runs_dir)
@@ -1053,7 +1144,7 @@ async def stream_run_events(
     if cursor > current:
         raise HTTPException(status_code=409, detail="event_cursor_ahead")
     return StreamingResponse(
-        _public_event_iterator(store, after=cursor),
+        _public_event_iterator(store, after=cursor, principal=user),
         media_type="text/event-stream",
         headers=_sse_headers(),
     )
@@ -1062,7 +1153,7 @@ async def stream_run_events(
 @app.get("/observability/runs")
 async def list_observed_runs(
     limit: int = 100,
-    user: dict[str, Any] = Depends(get_current_user),
+    user: Principal = Depends(require_permissions(RESEARCH_OBSERVABILITY_READ_OWN.code)),
 ) -> dict[str, Any]:
     """Return persisted observed run summaries."""
     store = _observability_store()
@@ -1072,7 +1163,7 @@ async def list_observed_runs(
 @app.get("/observability/runs/{run_id}")
 async def get_observed_run(
     run_id: str,
-    user: dict[str, Any] = Depends(get_current_user),
+    user: Principal = Depends(require_permissions(RESEARCH_OBSERVABILITY_READ_OWN.code)),
 ) -> dict[str, Any]:
     """Return one persisted observed run summary."""
     store = _observability_store()
@@ -1085,7 +1176,7 @@ async def get_observed_run(
 @app.get("/observability/runs/{run_id}/spans")
 async def get_observed_run_spans(
     run_id: str,
-    user: dict[str, Any] = Depends(get_current_user),
+    user: Principal = Depends(require_permissions(RESEARCH_OBSERVABILITY_READ_OWN.code)),
 ) -> dict[str, Any]:
     """Return ordered spans for a persisted observed run."""
     store = _observability_store()
@@ -1097,7 +1188,7 @@ async def get_observed_run_spans(
 @app.get("/observability/runs/{run_id}/usage")
 async def get_observed_run_usage(
     run_id: str,
-    user: dict[str, Any] = Depends(get_current_user),
+    user: Principal = Depends(require_permissions(RESEARCH_OBSERVABILITY_READ_OWN.code)),
 ) -> dict[str, Any]:
     """Return token usage aggregate for a persisted observed run."""
     store = _observability_store()
@@ -1109,7 +1200,7 @@ async def get_observed_run_usage(
 @app.get("/observability/runs/{run_id}/metrics")
 async def get_observed_run_metrics(
     run_id: str,
-    user: dict[str, Any] = Depends(get_current_user),
+    user: Principal = Depends(require_permissions(RESEARCH_OBSERVABILITY_READ_OWN.code)),
 ) -> dict[str, Any]:
     """Return token usage, retry counts, and 429 rate for a persisted observed run."""
     store = _observability_store()
@@ -1121,7 +1212,7 @@ async def get_observed_run_metrics(
 @app.get("/observability/ui", response_class=HTMLResponse)
 async def observability_ui(
     run_id: str | None = None,
-    user: dict[str, Any] = Depends(get_current_user),
+    user: Principal = Depends(require_permissions(RESEARCH_OBSERVABILITY_READ_OWN.code)),
 ) -> HTMLResponse:
     """Render a small server-side observability page."""
     store = _observability_store()
@@ -1220,7 +1311,7 @@ async def observability_ui(
 @app.post("/runs/{run_id}/cancel")
 async def cancel_run(
     run_id: str,
-    user: dict[str, Any] = Depends(get_current_user),
+    user: Principal = Depends(require_permissions(RESEARCH_RUN_CONTROL_OWN.code)),
 ) -> dict[str, str]:
     """Cancel a background run."""
     record, configurable = _require_run_owner(run_id, user)

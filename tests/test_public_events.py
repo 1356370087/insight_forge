@@ -279,7 +279,9 @@ def test_sse_replays_after_last_event_id(monkeypatch, tmp_path):
     store = RunEventStore(run_id, runs_dir=str(tmp_path))
     asyncio.run(store.append("run.created", payload={"status": "pending"}, dedupe_key="run:created"))
     asyncio.run(store.append("run.completed", payload={"status": "completed", "result_ref": f"/runs/{run_id}"}, dedupe_key="run:completed"))
-    server.app.dependency_overrides[get_current_user] = lambda: {"identity": "user-1"}
+    from tests.auth_helpers import research_principal
+
+    server.app.dependency_overrides[get_current_user] = lambda: research_principal("user-1")
     try:
         client = TestClient(server.app)
         response = client.get(

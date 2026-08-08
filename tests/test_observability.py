@@ -32,6 +32,7 @@ from open_deep_research.tools.governance import (
     invoke_tool_with_retry,
 )
 from security.auth import get_current_user
+from tests.auth_helpers import research_principal
 
 
 def _config(trace_path, run_id: str = "obs-run") -> dict[str, Any]:
@@ -344,7 +345,7 @@ def test_observability_endpoints_return_persisted_trace(tmp_path, monkeypatch):
     store.finish_span(span_id="span-1", status="success")
     store.finish_run("api-run", "success")
 
-    app.dependency_overrides[get_current_user] = lambda: {"id": "user-1"}
+    app.dependency_overrides[get_current_user] = lambda: research_principal("user-1")
     try:
         client = TestClient(app)
         spans_resp = client.get("/observability/runs/api-run/spans")
@@ -366,7 +367,7 @@ def test_observability_endpoints_are_scoped_to_authenticated_owner(tmp_path, mon
         store.start_run(run_id, owner, {})
         store.finish_run(run_id, "success")
 
-    app.dependency_overrides[get_current_user] = lambda: {"identity": "user-1"}
+    app.dependency_overrides[get_current_user] = lambda: research_principal("user-1")
     try:
         client = TestClient(app)
         listed = client.get("/observability/runs")
@@ -409,7 +410,7 @@ def test_metrics_endpoint_returns_aggregated_metrics(tmp_path, monkeypatch):
     store.finish_span(span_id="span-m", status="success", retry_count=1)
     store.finish_run("metrics-run", "success")
 
-    app.dependency_overrides[get_current_user] = lambda: {"id": "user-1"}
+    app.dependency_overrides[get_current_user] = lambda: research_principal("user-1")
     try:
         client = TestClient(app)
         resp = client.get("/observability/runs/metrics-run/metrics")

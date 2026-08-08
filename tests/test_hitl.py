@@ -12,6 +12,7 @@ from open_deep_research.agents.query_engine import QueryEngine
 from open_deep_research.configuration import Configuration
 from open_deep_research.observability import SQLiteTraceStore
 from open_deep_research.runtime import RuntimeCommand
+from tests.auth_helpers import research_principal
 
 
 def _config(**configurable: Any) -> dict[str, Any]:
@@ -23,7 +24,7 @@ def _config(**configurable: Any) -> dict[str, Any]:
             "runs_dir": tempfile.mkdtemp(prefix="open-deep-research-hitl-"),
             **configurable,
         },
-        "metadata": {"run_id": "hitl-test"},
+        "metadata": {"run_id": "hitl-test", "owner": "u1"},
     }
 
 
@@ -358,6 +359,7 @@ def test_hitl_api_accepts_human_action():
 
     class FakeEngine:
         pending_human_action = {"action_id": "act-1", "type": "plan_approval"}
+        config = {"metadata": {"owner": "u1"}}
 
         def handle_human_action(self, action_id: str, action: str, message: str = ""):
             assert action_id == "act-1"
@@ -368,7 +370,7 @@ def test_hitl_api_accepts_human_action():
 
     server._runs.clear()
     server._runs["run-1"] = server.RunRecord(run_id="run-1", engine=FakeEngine(), status="awaiting_plan_approval")
-    server.app.dependency_overrides[get_current_user] = lambda: {"identity": "u1", "permissions": []}
+    server.app.dependency_overrides[get_current_user] = lambda: research_principal("u1")
     client = TestClient(server.app)
     try:
         response = client.post("/runs/run-1/human-actions/act-1", json={"action": "approve"})
@@ -402,10 +404,7 @@ def test_cancel_api_requests_cancellation_without_terminal_event(monkeypatch):
         engine=fake_engine,
         status="running",
     )
-    server.app.dependency_overrides[get_current_user] = lambda: {
-        "identity": "u1",
-        "permissions": [],
-    }
+    server.app.dependency_overrides[get_current_user] = lambda: research_principal("u1")
     monkeypatch.setattr(
         server,
         "event_publisher_from_config",
@@ -452,6 +451,7 @@ def test_hitl_api_records_feedback():
 
     class FakeEngine:
         pending_human_action = None
+        config = {"metadata": {"owner": "u1"}}
 
         async def submit_feedback(self, feedback):
             assert feedback["type"] == "evidence_question"
@@ -460,7 +460,7 @@ def test_hitl_api_records_feedback():
 
     server._runs.clear()
     server._runs["run-1"] = server.RunRecord(run_id="run-1", engine=FakeEngine(), status="running")
-    server.app.dependency_overrides[get_current_user] = lambda: {"identity": "u1", "permissions": []}
+    server.app.dependency_overrides[get_current_user] = lambda: research_principal("u1")
     client = TestClient(server.app)
     try:
         response = client.post(

@@ -682,7 +682,7 @@ def _peek_mcp_tokens(config: RunnableConfig) -> Optional[Any]:
 
 
 def get_user_permissions(config: RunnableConfig) -> list[str]:
-    """Read the authenticated user's roles/permissions from the run config.
+    """Read the authenticated user's role codes from the run config.
 
     The LangGraph server injects the authenticated user (as returned by
     ``auth.authenticate``) into ``config["configurable"]["langgraph_auth_user"]``,
@@ -696,15 +696,38 @@ def get_user_permissions(config: RunnableConfig) -> list[str]:
     auth_user = configurable.get("langgraph_auth_user")
     if auth_user is not None:
         # BaseUser instance (server path) or a plain dict (tests).
-        perms = getattr(auth_user, "permissions", None)
+        perms = getattr(auth_user, "roles", None)
         if perms is None and isinstance(auth_user, dict):
-            perms = auth_user.get("permissions")
+            perms = auth_user.get("roles") or auth_user.get("permissions")
         if isinstance(perms, list | tuple):
             return [str(p) for p in perms]
     fallback = configurable.get("user_permissions")
     if isinstance(fallback, list | tuple):
         return [str(p) for p in fallback]
     return []
+
+
+def get_effective_permissions(config: RunnableConfig) -> tuple[bool, set[str]]:
+    """Return ``(authenticated, effective_permissions)`` from runtime config."""
+    configurable = config.get("configurable", {}) or {} if isinstance(config, dict) else {}
+    auth_user = configurable.get("langgraph_auth_user")
+    if auth_user is None:
+        return False, set()
+    values = getattr(auth_user, "effective_permissions", None)
+    if values is None and isinstance(auth_user, dict):
+        values = auth_user.get("effective_permissions") or auth_user.get("permissions")
+    if isinstance(values, list | tuple | set | frozenset):
+        return True, {str(item) for item in values}
+    return True, set()
+
+
+_ORIGIN_PERMISSION = {
+    ToolOrigin.SEARCH: "research.tool.search",
+    ToolOrigin.PROVIDER_NATIVE: "research.tool.provider_native",
+    ToolOrigin.MCP: "research.tool.mcp",
+    ToolOrigin.BROWSER: "research.tool.browser",
+    ToolOrigin.SKILL: "research.tool.skill",
+}
 
 
 def check_permission(
@@ -729,6 +752,15 @@ def check_permission(
 
     # 2. Origin policy.
     origin = get_tool_origin(tool)
+    authenticated, effective_permissions = get_effective_permissions(config)
+    origin_permission = _ORIGIN_PERMISSION.get(origin)
+    if authenticated and origin_permission and origin_permission not in effective_permissions:
+        return ToolError(
+            error_type=ToolErrorType.permission_denied,
+            tool_name=tool_name,
+            message=f"Tool '{tool_name}' is not permitted for this user.",
+            detail={"origin": origin.value, "required_permission": origin_permission},
+        )
     blocked = _origin_blocklist(role, config)
     if origin in blocked:
         return ToolError(
@@ -806,7 +838,13 @@ def filter_tools_by_permission(
     names = {t.name for t in tools}
     allowed = resolve_allowed_tools(role, config, names)
     # Fast path: nothing to enforce -> return input as-is.
-    if allowed is None and not _origin_blocklist(role, config) and not _user_role_blocklists_active(config):
+    authenticated, _ = get_effective_permissions(config)
+    if (
+        allowed is None
+        and not _origin_blocklist(role, config)
+        and not _user_role_blocklists_active(config)
+        and not authenticated
+    ):
         return tools
 
     filtered: list[Tool] = []

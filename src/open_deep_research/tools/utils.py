@@ -441,14 +441,14 @@ def think_tool(reflection: str) -> str:
 # MCP Utils
 ##########################
 
-async def get_mcp_access_token(
-    supabase_token: str,
+async def exchange_mcp_subject_token(
+    subject_token: str,
     base_mcp_url: str,
 ) -> Optional[Dict[str, Any]]:
-    """Exchange Supabase token for MCP access token using OAuth token exchange.
+    """Exchange a server-supplied subject token for an MCP access token.
     
     Args:
-        supabase_token: Valid Supabase authentication token
+        subject_token: Server-managed OAuth subject token
         base_mcp_url: Base URL of the MCP server
         
     Returns:
@@ -458,7 +458,7 @@ async def get_mcp_access_token(
         # Prepare OAuth token exchange request data
         form_data = {
             "client_id": "mcp_default",
-            "subject_token": supabase_token,
+            "subject_token": subject_token,
             "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
             "resource": base_mcp_url.rstrip("/") + "/mcp",
             "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
@@ -536,9 +536,11 @@ async def fetch_tokens(config: RunnableConfig) -> dict[str, Any]:
     if current_tokens:
         return current_tokens
     
-    # Extract Supabase token for new token exchange
-    supabase_token = config.get("configurable", {}).get("x-supabase-access-token")
-    if not supabase_token:
+    # Browser access tokens are deliberately never copied into runtime config.
+    # Optional subject tokens may only be injected by a trusted server-side
+    # deployment integration.
+    subject_token = config.get("configurable", {}).get("mcp_subject_token")
+    if not subject_token:
         return None
     
     # Extract MCP configuration
@@ -546,8 +548,7 @@ async def fetch_tokens(config: RunnableConfig) -> dict[str, Any]:
     if not mcp_config or not mcp_config.get("url"):
         return None
     
-    # Exchange Supabase token for MCP tokens
-    mcp_tokens = await get_mcp_access_token(supabase_token, mcp_config.get("url"))
+    mcp_tokens = await exchange_mcp_subject_token(subject_token, mcp_config.get("url"))
     if not mcp_tokens:
         return None
 

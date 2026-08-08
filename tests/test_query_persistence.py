@@ -24,6 +24,7 @@ from open_deep_research.run_context import (
     RunContextStore,
 )
 from open_deep_research.runtime import RuntimeCommand
+from tests.auth_helpers import research_principal
 
 
 def _config(tmp_path, run_id: str, **overrides: Any) -> dict[str, Any]:
@@ -400,10 +401,7 @@ def test_resume_api_launches_explicit_recovery(monkeypatch) -> None:
 
     monkeypatch.setattr(server.QueryEngine, "load", lambda *_args, **_kwargs: FakeEngine())
     server._runs.clear()
-    server.app.dependency_overrides[get_current_user] = lambda: {
-        "identity": "user-1",
-        "permissions": [],
-    }
+    server.app.dependency_overrides[get_current_user] = lambda: research_principal("user-1")
     client = TestClient(server.app)
     try:
         response = client.post("/runs/resume-api/resume", json={})
@@ -424,10 +422,7 @@ def test_resume_api_maps_frozen_config_conflict_to_409(monkeypatch) -> None:
 
     monkeypatch.setattr(server.QueryEngine, "load", reject_conflict)
     server._runs.clear()
-    server.app.dependency_overrides[get_current_user] = lambda: {
-        "identity": "user-1",
-        "permissions": [],
-    }
+    server.app.dependency_overrides[get_current_user] = lambda: research_principal("user-1")
     client = TestClient(server.app, raise_server_exceptions=False)
     try:
         response = client.post("/runs/config-conflict/resume", json={})
@@ -448,10 +443,7 @@ def test_resume_api_maps_legacy_schema_to_specific_409(monkeypatch) -> None:
 
     monkeypatch.setattr(server.QueryEngine, "load", reject_legacy_schema)
     server._runs.clear()
-    server.app.dependency_overrides[get_current_user] = lambda: {
-        "identity": "user-1",
-        "permissions": [],
-    }
+    server.app.dependency_overrides[get_current_user] = lambda: research_principal("user-1")
     client = TestClient(server.app, raise_server_exceptions=False)
     try:
         response = client.post("/runs/legacy-schema/resume", json={})
@@ -557,7 +549,7 @@ def test_resume_api_rejects_completed_run(monkeypatch) -> None:
     from security.auth import get_current_user
 
     class CompletedEngine:
-        pass
+        config = {"metadata": {"owner": "user-1"}}
 
     server._runs.clear()
     server._runs["done"] = server.RunRecord(
@@ -565,10 +557,7 @@ def test_resume_api_rejects_completed_run(monkeypatch) -> None:
         engine=CompletedEngine(),
         status="completed",
     )
-    server.app.dependency_overrides[get_current_user] = lambda: {
-        "identity": "user-1",
-        "permissions": [],
-    }
+    server.app.dependency_overrides[get_current_user] = lambda: research_principal("user-1")
     client = TestClient(server.app)
     try:
         response = client.post("/runs/done/resume", json={})

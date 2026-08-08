@@ -9,13 +9,11 @@ from open_deep_research.public_events import RunEventStore
 from open_deep_research.public_task_activity import TaskActivityStore
 from open_deep_research.run_context import RunContextStore
 from security.auth import get_current_user
+from tests.auth_helpers import research_principal
 
 
 def _client(identity: str) -> TestClient:
-    server.app.dependency_overrides[get_current_user] = lambda: {
-        "identity": identity,
-        "permissions": [],
-    }
+    server.app.dependency_overrides[get_current_user] = lambda: research_principal(identity)
     return TestClient(server.app)
 
 
