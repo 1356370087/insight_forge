@@ -26,6 +26,47 @@ export interface ResearchTask {
   source_count?: number;
   elapsed_ms?: number;
   mode?: string;
+  activity_phase?: TaskActivityPhase;
+  activity_label?: string;
+  last_activity_at?: string;
+  activity_event_count?: number;
+  model_call_count?: number;
+  tool_call_count?: number;
+  retry_count?: number;
+  warning_count?: number;
+  activity_available?: boolean;
+}
+
+export type TaskActivityKind = "lifecycle" | "model" | "tool" | "source" | "quality" | "checkpoint" | "control" | "security" | "error";
+export type TaskActivityPhase = "queued" | "initializing" | "reasoning" | "tool_execution" | "evidence_review" | "quality_check" | "gap_recovery" | "compressing" | "handoff" | "terminal";
+export type TaskActivityStatus = "pending" | "running" | "success" | "warning" | "error" | "cancelled";
+
+export interface TaskActivityEvent {
+  schema_version: number;
+  event_id: string;
+  sequence: number;
+  run_id: string;
+  task_id: string;
+  timestamp: string;
+  type: string;
+  kind: TaskActivityKind;
+  phase: TaskActivityPhase;
+  status: TaskActivityStatus;
+  title: string;
+  summary: string;
+  iteration?: number;
+  duration_ms?: number;
+  payload: Record<string, unknown>;
+}
+
+export interface TaskActivityPage {
+  items: TaskActivityEvent[];
+  oldest_sequence: number;
+  last_event_id: number;
+  has_more: boolean;
+  detail_level: "summary" | "preview";
+  source: "native" | "derived_trace" | "summary_only";
+  stream_url: string;
 }
 
 export interface ResearchSource {

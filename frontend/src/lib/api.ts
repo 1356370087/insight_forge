@@ -1,6 +1,6 @@
 import { fetchEventSource } from "@microsoft/fetch-event-source";
 import { getAccessToken } from "./auth";
-import type { PublicEvent, RunSnapshot } from "./types";
+import type { PublicEvent, RunSnapshot, TaskActivityEvent, TaskActivityKind, TaskActivityPage } from "./types";
 
 const API_BASE = process.env.NEXT_PUBLIC_RESEARCH_API_BASE ?? "/api/research";
 
@@ -30,6 +30,12 @@ export const researchApi = {
   feedback: (runId: string, payload: Record<string, unknown>) => apiFetch(`/runs/${runId}/feedback`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }),
   cancel: (runId: string) => apiFetch(`/runs/${runId}/cancel`, { method: "POST" }),
   resume: (runId: string) => apiFetch(`/runs/${runId}/resume`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }),
+  taskActivity: (runId: string, taskId: string, options: { before?: number; limit?: number; kind?: TaskActivityKind } = {}) => {
+    const query = new URLSearchParams({ limit: String(options.limit ?? 100) });
+    if (options.before !== undefined) query.set("before", String(options.before));
+    if (options.kind) query.set("kind", options.kind);
+    return apiFetch<TaskActivityPage>(`/runs/${encodeURIComponent(runId)}/tasks/${encodeURIComponent(taskId)}/activity?${query}`);
+  },
 };
 
 export async function subscribeToRun(options: {
@@ -52,6 +58,35 @@ export async function subscribeToRun(options: {
     onerror(error) {
       const message = error instanceof Error ? error.message : String(error);
       if (message.includes("cursor-ahead") || message.includes("sse-auth") || message.includes("sse-401")) throw error;
+      options.onReconnect();
+      const delay = Math.min(30_000, 1_000 * 2 ** retryAttempt);
+      retryAttempt += 1;
+      return delay;
+    },
+  });
+}
+
+export async function subscribeToTaskActivity(options: {
+  runId: string; taskId: string; after: number; signal: AbortSignal;
+  onOpen: () => void; onEvent: (event: TaskActivityEvent) => void;
+  onReconnect: () => void; onCursorAhead: () => Promise<void>;
+}): Promise<void> {
+  let authRetried = false;
+  let retryAttempt = 0;
+  const path = `/runs/${encodeURIComponent(options.runId)}/tasks/${encodeURIComponent(options.taskId)}/activity/stream?after=${options.after}`;
+  await fetchEventSource(`${API_BASE}${path}`, {
+    method: "GET", signal: options.signal, openWhenHidden: true,
+    headers: Object.fromEntries((await headers({ Accept: "text/event-stream", "Last-Event-ID": String(options.after) })).entries()),
+    async onopen(response) {
+      if (response.ok) { retryAttempt = 0; options.onOpen(); return; }
+      if (response.status === 401 && !authRetried) { authRetried = true; await getAccessToken(true); throw new Error("task-sse-auth-refreshed"); }
+      if (response.status === 409) { await options.onCursorAhead(); throw new Error("task-cursor-ahead"); }
+      throw new Error(`task-sse-${response.status}`);
+    },
+    onmessage(message) { if (message.data) options.onEvent(JSON.parse(message.data) as TaskActivityEvent); },
+    onerror(error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes("cursor-ahead") || message.includes("sse-auth")) throw error;
       options.onReconnect();
       const delay = Math.min(30_000, 1_000 * 2 ** retryAttempt);
       retryAttempt += 1;
