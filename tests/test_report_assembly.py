@@ -440,6 +440,13 @@ async def test_quality_report_without_body_citations_uses_evidence_limited_fallb
         fake_evidence_limited,
         raising=False,
     )
+    async def leave_uncited(markdown, _ctx):
+        return markdown
+
+    monkeypatch.setattr(
+        "open_deep_research.report.orchestrator._repair_missing_report_citations",
+        leave_uncited,
+    )
     state = {
         "messages": [],
         "research_brief": "research A",
@@ -497,6 +504,79 @@ async def test_quality_report_without_body_citations_uses_evidence_limited_fallb
     assert "report_missing_verifiable_citations" in (
         update["quality_gate"]["reason_codes"]
     )
+
+
+@pytest.mark.asyncio
+async def test_quality_report_repairs_missing_body_citations(monkeypatch):
+    async def fake_assemble(_ctx):
+        return AssemblyResult(
+            body_markdown="# Draft\n\nA supported claim without a citation."
+        )
+
+    async def fake_repair(_markdown, _ctx):
+        return "# Draft\n\nA supported claim [Official](https://allowed.example/paper)."
+
+    monkeypatch.setattr(
+        "open_deep_research.report.orchestrator.assemble",
+        fake_assemble,
+    )
+    monkeypatch.setattr(
+        "open_deep_research.report.orchestrator._repair_missing_report_citations",
+        fake_repair,
+    )
+    state = {
+        "messages": [],
+        "research_brief": "research A",
+        "notes": [],
+        "evidence_registry": [{
+            "evidence_id": "EV-01",
+            "claim": "A supported claim.",
+            "supporting_excerpt": "A supported claim.",
+            "source_title": "Official",
+            "source_url": "https://allowed.example/paper",
+            "security_status": "accepted",
+        }],
+    }
+
+    update = await build_report(
+        state,
+        _config(quality_evaluation_enabled=True),
+    )
+
+    assert "A supported claim [Official]" in update["final_report"]
+    assert "quality_gate" not in update
+
+
+@pytest.mark.asyncio
+async def test_quality_report_accepts_allowlisted_trailing_slash_variant(monkeypatch):
+    async def fake_assemble(_ctx):
+        return AssemblyResult(
+            body_markdown=(
+                "Supported claim [Official](https://allowed.example/paper/)."
+            )
+        )
+
+    monkeypatch.setattr(
+        "open_deep_research.report.orchestrator.assemble",
+        fake_assemble,
+    )
+    state = {
+        "messages": [],
+        "research_brief": "research A",
+        "notes": [],
+        "evidence_registry": [{
+            "source_title": "Official",
+            "source_url": "https://allowed.example/paper",
+            "security_status": "accepted",
+        }],
+    }
+
+    update = await build_report(
+        state,
+        _config(quality_evaluation_enabled=True),
+    )
+
+    assert "https://allowed.example/paper" in update["final_report"]
 
 
 @pytest.mark.asyncio
