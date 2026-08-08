@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import uuid
 from collections.abc import Callable, Mapping
 from datetime import date
 from typing import Any, Literal
@@ -28,6 +29,7 @@ from open_deep_research.observability import (
     get_trace_recorder,
     invoke_model_with_retry_observability,
 )
+from open_deep_research.public_task_activity import publish_task_activity
 from open_deep_research.quality_contract import (
     AdmissionStatus,
     HandoffPolicyInput,
@@ -1163,6 +1165,46 @@ async def evaluate_tool_results(
             result.decision = "retry"
     _attach_quality_provenance(result, configurable, config)
     _record_quality_scores("tool_result", result, config)
+    await publish_task_activity(
+        config,
+        "quality.completed" if result.evaluator_error is None else "quality.failed",
+        kind="quality" if result.evaluator_error is None else "error",
+        phase="quality_check",
+        status=(
+            "success" if result.decision == "complete" and result.evaluator_error is None
+            else "warning" if result.evaluator_error is None
+            else "error"
+        ),
+        title=(
+            "证据质量通过"
+            if result.decision == "complete" and result.evaluator_error is None
+            else "需要继续补证"
+            if result.evaluator_error is None
+            else "质量评估不可用"
+        ),
+        summary=(
+            "当前证据达到完成条件。"
+            if result.decision == "complete" and result.evaluator_error is None
+            else "质量门禁发现缺口，Subagent 将继续研究。"
+            if result.evaluator_error is None
+            else "质量评估请求失败，已按运行策略处理。"
+        ),
+        iteration=None,
+        duration_ms=None,
+        payload={
+            "evaluation_type": "tool_result",
+            "decision": result.decision,
+            "scores": {
+                "relevance": result.relevance,
+                "source_quality": result.source_quality,
+                "evidence_coverage": result.evidence_coverage,
+                "corroboration": result.corroboration,
+            },
+            "gap_count": len(result.missing_information),
+        },
+        dedupe_key=f"activity:quality:tool-result:{uuid.uuid4().hex}",
+        update_run_summary=True,
+    )
     return result
 
 

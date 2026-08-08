@@ -64,6 +64,7 @@ from open_deep_research.public_events import (
     event_publisher_from_config,
     extract_public_sources,
 )
+from open_deep_research.public_task_activity import publish_task_activity
 from open_deep_research.quality import (
     HandoffAssessment,
     evaluate_subagent_handoff,
@@ -3710,7 +3711,7 @@ class ResearcherQueryEngine:
                         payload={
                             "task_id": task_id,
                             "wave_id": task_record.wave_id if task_record else "",
-                            "mode": "async",
+                            "mode": str(cfg.get("metadata", {}).get("research_mode") or "async"),
                             "status": "running",
                             "phase": "researching",
                             "iteration": turn,
@@ -3720,6 +3721,19 @@ class ResearcherQueryEngine:
                         dedupe_key=f"task:{task_id}:progress:{turn}",
                     )
                     for source in sources:
+                        await publish_task_activity(
+                            cfg,
+                            "source.discovered",
+                            kind="source",
+                            phase="evidence_review",
+                            status="success",
+                            title="发现可追溯来源",
+                            summary=str(source.get("title") or source.get("domain") or "新来源"),
+                            iteration=turn,
+                            duration_ms=None,
+                            payload=source,
+                            dedupe_key=f"activity:source:{source['source_id']}",
+                        )
                         await publisher.publish(
                             "research.source.discovered",
                             stage="researching",
@@ -3883,6 +3897,23 @@ class ResearcherQueryEngine:
                             ),
                             triggering_assessment_revision=None,
                         )
+                        await publish_task_activity(
+                            cfg,
+                            "recovery.started",
+                            kind="quality",
+                            phase="gap_recovery",
+                            status="warning",
+                            title="进入定向补证",
+                            summary="质量门禁发现用户需求覆盖缺口，正在执行一次受限补证。",
+                            iteration=turn,
+                            duration_ms=None,
+                            payload={
+                                "attempt": quality_recovery_state.attempts,
+                                "requirement_count": len(owned_requirement_ids),
+                            },
+                            dedupe_key=f"activity:recovery:{quality_recovery_state.attempts}:started",
+                            update_run_summary=True,
+                        )
                         evidence_summary = [
                             {
                                 "evidence_id": str(
@@ -3913,6 +3944,7 @@ class ResearcherQueryEngine:
                         ))]
                         should_continue = True
                     elif quality_recovery_state.active:
+                        completed_recovery_attempt = quality_recovery_state.attempts
                         quality_recovery_state = QualityRecoveryState(
                             attempts=quality_recovery_state.attempts,
                             active=False,
@@ -3924,6 +3956,23 @@ class ResearcherQueryEngine:
                                 quality_recovery_state
                                 .triggering_assessment_revision
                             ),
+                        )
+                        await publish_task_activity(
+                            cfg,
+                            "recovery.completed",
+                            kind="quality",
+                            phase="evidence_review",
+                            status="success",
+                            title="定向补证结束",
+                            summary="受限补证轮已完成，正在重新判断证据覆盖。",
+                            iteration=turn,
+                            duration_ms=None,
+                            payload={
+                                "attempt": completed_recovery_attempt,
+                                "decision": assessment_payload.get("decision"),
+                            },
+                            dedupe_key=f"activity:recovery:{completed_recovery_attempt}:completed",
+                            update_run_summary=True,
                         )
 
                 return ToolResultsHookResult(
@@ -4188,7 +4237,7 @@ class ResearcherQueryEngine:
                     payload={
                         "task_id": task_id,
                         "wave_id": task_record.wave_id if task_record else "",
-                        "mode": "async",
+                        "mode": str(cfg.get("metadata", {}).get("research_mode") or "async"),
                         "status": "running",
                         "phase": "compressing",
                         "iteration": completed_turn,
@@ -4197,6 +4246,20 @@ class ResearcherQueryEngine:
                     },
                     dedupe_key=f"task:{task_id}:compressing",
                 )
+            await publish_task_activity(
+                cfg,
+                "task.phase.changed",
+                kind="lifecycle",
+                phase="compressing",
+                status="running",
+                title="压缩研究发现",
+                summary="正在把已验证证据整理为可交接的结构化研究发现。",
+                iteration=completed_turn,
+                duration_ms=None,
+                payload={"activity_label": "压缩研究发现"},
+                dedupe_key=f"activity:phase:compressing:{completed_turn}",
+                update_run_summary=True,
+            )
             update = await graph.compress_research(researcher_state, cfg)
             apply_update_to_state(researcher_state, update)
             return researcher_state

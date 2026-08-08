@@ -30,6 +30,7 @@ from open_deep_research.observability.telemetry import (
     get_prometheus_metrics,
     monotonic_time,
 )
+from open_deep_research.public_task_activity import publish_task_activity
 
 logger = logging.getLogger(__name__)
 
@@ -1503,6 +1504,34 @@ async def invoke_model_with_retry_observability(
     span_attributes = dict(attributes or {})
     if recorder.langfuse is not None and recorder.configuration.langfuse_langchain_callback_enabled:
         span_attributes["langfuse_callback_managed"] = True
+    task_id = str((config or {}).get("metadata", {}).get("task_id") or "")
+    activity_call_id = uuid.uuid4().hex
+    activity_started = monotonic_time()
+    activity_is_quality = agent_role == "quality_evaluator"
+    if task_id:
+        await publish_task_activity(
+            config or {},
+            "quality.started" if activity_is_quality else "model.started",
+            kind="quality" if activity_is_quality else "model",
+            phase="quality_check" if activity_is_quality else "reasoning",
+            status="running",
+            title="质量复核" if activity_is_quality else "模型规划",
+            summary=(
+                "正在依据质量合同复核当前证据。"
+                if activity_is_quality
+                else "Subagent 正在分析证据并规划下一步动作。"
+            ),
+            iteration=None,
+            duration_ms=None,
+            payload={
+                "evaluation_type": span_name,
+                "provider": provider,
+                "model": model_id or model_name,
+                "attempt": 1,
+            },
+            dedupe_key=f"activity:model:{activity_call_id}:started",
+            update_run_summary=True,
+        )
     with recorder.start_span(
         name=span_name,
         kind="llm",
@@ -1528,6 +1557,27 @@ async def invoke_model_with_retry_observability(
                         error_type=error_type.value,
                         http_status=_safe_http_status(exc),
                     )
+                    if task_id:
+                        await publish_task_activity(
+                            config or {},
+                            "quality.failed" if activity_is_quality else "model.failed",
+                            kind="quality" if activity_is_quality else "error",
+                            phase="quality_check" if activity_is_quality else "reasoning",
+                            status="error",
+                            title="质量复核失败" if activity_is_quality else "模型调用失败",
+                            summary="调用未能在重试预算内完成。",
+                            iteration=None,
+                            duration_ms=int((monotonic_time() - activity_started) * 1000),
+                            payload={
+                                "evaluation_type": span_name,
+                                "provider": provider,
+                                "model": model_id or model_name,
+                                "error_code": error_type.value,
+                                "retry_count": attempt,
+                            },
+                            dedupe_key=f"activity:model:{activity_call_id}:failed",
+                            update_run_summary=True,
+                        )
                     raise
                 delay = min(max_delay, base_delay * (2 ** attempt)) + random.uniform(0, base_delay)
                 span.record_retry(
@@ -1538,6 +1588,27 @@ async def invoke_model_with_retry_observability(
                     delay_s=delay,
                     message=_exc_message(exc),
                 )
+                if task_id:
+                    await publish_task_activity(
+                        config or {},
+                        "model.retrying",
+                        kind="quality" if activity_is_quality else "model",
+                        phase="quality_check" if activity_is_quality else "reasoning",
+                        status="warning",
+                        title="质量复核重试" if activity_is_quality else "模型调用重试",
+                        summary="遇到可恢复错误，正在按退避策略重试。",
+                        iteration=None,
+                        duration_ms=None,
+                        payload={
+                            "provider": provider,
+                            "model": model_id or model_name,
+                            "attempt": attempts_made,
+                            "error_code": error_type.value,
+                            "delay_ms": int(delay * 1000),
+                        },
+                        dedupe_key=f"activity:model:{activity_call_id}:retry:{attempts_made}",
+                        update_run_summary=True,
+                    )
                 await sleeper(delay)
                 attempt += 1
                 continue
@@ -1549,6 +1620,33 @@ async def invoke_model_with_retry_observability(
                     response,
                     None if recorder.configuration.trace_payload_mode == "full" else recorder.configuration.trace_preview_chars,
                     redact=recorder.configuration.trace_redaction_enabled,
+                )
+            if task_id:
+                await publish_task_activity(
+                    config or {},
+                    "quality.completed" if activity_is_quality else "model.completed",
+                    kind="quality" if activity_is_quality else "model",
+                    phase="quality_check" if activity_is_quality else "reasoning",
+                    status="success",
+                    title="质量复核响应完成" if activity_is_quality else "模型规划完成",
+                    summary=(
+                        "质量评估模型已返回结构化结果。"
+                        if activity_is_quality
+                        else "模型已完成本轮分析。"
+                    ),
+                    iteration=None,
+                    duration_ms=int((monotonic_time() - activity_started) * 1000),
+                    payload={
+                        "evaluation_type": span_name,
+                        "provider": provider,
+                        "model": model_id or model_name,
+                        "input_tokens": usage.input_tokens,
+                        "output_tokens": usage.output_tokens,
+                        "reasoning_tokens": usage.reasoning_tokens,
+                        "retry_count": attempt,
+                    },
+                    dedupe_key=f"activity:model:{activity_call_id}:completed",
+                    update_run_summary=True,
                 )
             return response
 
@@ -1562,6 +1660,44 @@ async def observe_tool_call(
     """Run a tool call inside a tool span."""
     recorder = get_trace_recorder(config)
     name = tool_call.get("name", "unknown_tool")
+    task_id = str(config.get("metadata", {}).get("task_id") or "")
+    activity_call_id = str(tool_call.get("id") or uuid.uuid4().hex)
+    activity_started = monotonic_time()
+    category = (
+        "search" if "search" in str(name).lower() else
+        "fetch" if any(token in str(name).lower() for token in ("fetch", "browser")) else
+        "completion" if str(name) == "ResearchComplete" else
+        "reasoning" if str(name) == "think_tool" else
+        "tool"
+    )
+    if task_id:
+        args = tool_call.get("args") or {}
+        args_summary = ""
+        for key in ("query", "search_query", "url"):
+            value = args.get(key) if isinstance(args, dict) else None
+            if isinstance(value, str) and value.strip():
+                args_summary = " ".join(value.split())[:240]
+                break
+        await publish_task_activity(
+            config,
+            "tool.started",
+            kind="tool",
+            phase="tool_execution",
+            status="running",
+            title=f"执行工具 · {name}",
+            summary=(args_summary or f"正在调用 {name}。"),
+            iteration=None,
+            duration_ms=None,
+            payload={
+                "tool_call_id": activity_call_id,
+                "tool_name": name,
+                "tool_category": category,
+                "args_summary": args_summary,
+                "args_keys": sorted(args.keys()) if isinstance(args, dict) else [],
+            },
+            dedupe_key=f"activity:tool:{activity_call_id}:started",
+            update_run_summary=True,
+        )
     with recorder.start_span(
         name=f"tool.{name}",
         kind="tool",
@@ -1573,7 +1709,31 @@ async def observe_tool_call(
         },
         input_payload=tool_call,
     ) as span:
-        result = await invoke()
+        try:
+            result = await invoke()
+        except Exception as exc:
+            if task_id:
+                await publish_task_activity(
+                    config,
+                    "tool.failed",
+                    kind="error",
+                    phase="tool_execution",
+                    status="error",
+                    title=f"工具失败 · {name}",
+                    summary="工具调用未能完成。",
+                    iteration=None,
+                    duration_ms=int((monotonic_time() - activity_started) * 1000),
+                    payload={
+                        "tool_call_id": activity_call_id,
+                        "tool_name": name,
+                        "tool_category": category,
+                        "error_code": type(exc).__name__,
+                        "retry_count": getattr(span, "retry_count", 0),
+                    },
+                    dedupe_key=f"activity:tool:{activity_call_id}:failed",
+                    update_run_summary=True,
+                )
+            raise
         result_content = getattr(getattr(result, "message", result), "content", result)
         result_text = str(result_content)
         result_urls = set(re.findall(r"https?://[^\s\]\)>'\"}]+", result_text))
@@ -1622,6 +1782,39 @@ async def observe_tool_call(
                     else recorder.configuration.trace_preview_chars,
                     redact=recorder.configuration.trace_redaction_enabled,
                 )
+        if task_id:
+            governed_error = getattr(result, "error", None)
+            await publish_task_activity(
+                config,
+                "tool.failed" if governed_error is not None else "tool.completed",
+                kind="error" if governed_error is not None else "tool",
+                phase="tool_execution",
+                status="error" if governed_error is not None else "success",
+                title=(f"工具失败 · {name}" if governed_error is not None else f"工具完成 · {name}"),
+                summary=(
+                    "工具返回了受治理的错误结果。"
+                    if governed_error is not None
+                    else f"工具已完成，识别到 {len(result_urls)} 个来源链接。"
+                ),
+                iteration=None,
+                duration_ms=int((monotonic_time() - activity_started) * 1000),
+                payload={
+                    "tool_call_id": activity_call_id,
+                    "tool_name": name,
+                    "tool_category": category,
+                    "source_count": len(result_urls),
+                    "result_chars": len(result_text),
+                    "retry_count": getattr(span, "retry_count", 0),
+                    "error_code": getattr(getattr(governed_error, "error_type", None), "value", None),
+                    "urls": sorted(result_urls),
+                },
+                dedupe_key=(
+                    f"activity:tool:{activity_call_id}:failed"
+                    if governed_error is not None
+                    else f"activity:tool:{activity_call_id}:completed"
+                ),
+                update_run_summary=True,
+            )
         return result
 
 

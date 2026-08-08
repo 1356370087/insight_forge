@@ -20,6 +20,7 @@ from open_deep_research.public_events import (
     extract_public_sources,
     summarize_public_findings,
 )
+from open_deep_research.public_task_activity import publish_task_activity
 from open_deep_research.run_context import RunContextStore
 from open_deep_research.sandbox.manager import DockerSandboxManager
 from open_deep_research.tasks.coordination import publish_task_update
@@ -103,6 +104,139 @@ async def _emit_state_change(
         task_record,
         fence_token=_run_fence_token(config),
     )
+    activity_type, activity_kind, activity_phase, activity_status, activity_title = {
+        EventType.TASK_STARTED: (
+            "task.started",
+            "lifecycle",
+            "initializing",
+            "running",
+            "Subagent 已启动",
+        ),
+        EventType.TASK_COMPLETED: (
+            "task.completed",
+            "lifecycle",
+            "terminal",
+            "success",
+            "Subagent 已完成",
+        ),
+        EventType.TASK_FAILED: (
+            "task.failed",
+            "error",
+            "terminal",
+            "error",
+            "Subagent 执行失败",
+        ),
+        EventType.TASK_TIMED_OUT: (
+            "task.timed_out",
+            "error",
+            "terminal",
+            "error",
+            "Subagent 执行超时",
+        ),
+        EventType.TASK_CANCELLED: (
+            "task.cancelled",
+            "lifecycle",
+            "terminal",
+            "cancelled",
+            "Subagent 已取消",
+        ),
+        EventType.CHECKPOINT_LOADED: (
+            "checkpoint.loaded",
+            "checkpoint",
+            "initializing",
+            "success",
+            "已恢复研究检查点",
+        ),
+        EventType.CHECKPOINT_SAVED: (
+            "checkpoint.saved",
+            "checkpoint",
+            "evidence_review",
+            "success",
+            "已保存研究检查点",
+        ),
+        EventType.TASK_DOMAIN_CONFIRMATION_REQUESTED: (
+            "security.blocked",
+            "security",
+            "tool_execution",
+            "warning",
+            "等待域名访问确认",
+        ),
+        EventType.TASK_DOMAIN_DECISION: (
+            "control.received",
+            "control",
+            "tool_execution",
+            "success",
+            "已应用域名访问决定",
+        ),
+        EventType.TASK_UPDATED: (
+            "control.received",
+            "control",
+            "reasoning",
+            "success",
+            "已接收任务控制更新",
+        ),
+        EventType.TASK_PHASE_CHANGE: (
+            "task.phase.changed",
+            "lifecycle",
+            "reasoning",
+            "running",
+            "研究阶段已更新",
+        ),
+    }.get(event_type, (None, None, None, None, None))
+    if event_type == EventType.TASK_COMPLETED and configurable.quality_evaluation_enabled:
+        activity_type = "task.phase.changed"
+        activity_kind = "lifecycle"
+        activity_phase = "handoff"
+        activity_status = "running"
+        activity_title = "等待交接质量复核"
+    if activity_type is not None:
+        safe_payload: dict[str, Any] = {
+            "mode": "async",
+            "wave_id": task_record.wave_id,
+            "source_count": task_record.source_count,
+        }
+        event_data = data or {}
+        if event_type == EventType.TASK_COMPLETED and configurable.quality_evaluation_enabled:
+            safe_payload["activity_label"] = "质量交接"
+        if event_type in {EventType.CHECKPOINT_LOADED, EventType.CHECKPOINT_SAVED}:
+            safe_payload["completed_queries"] = int(
+                event_data.get("completed_queries", 0) or 0
+            )
+        if event_type in {
+            EventType.TASK_UPDATED,
+            EventType.TASK_DOMAIN_DECISION,
+        }:
+            instruction = str(
+                event_data.get("instruction")
+                or event_data.get("decision")
+                or "Task control update received."
+            )
+            safe_payload["instruction_summary"] = instruction[:240]
+        if event_type == EventType.TASK_DOMAIN_CONFIRMATION_REQUESTED:
+            safe_payload["domain"] = str(
+                event_data.get("domain")
+                or task_record.pending_domain
+                or "unknown"
+            )[:253]
+        await publish_task_activity(
+            config,
+            task_id=task_record.task_id,
+            event_type=activity_type,
+            kind=activity_kind,
+            phase=activity_phase,
+            status=activity_status,
+            title=activity_title,
+            summary=(
+                "该事件来自异步 Researcher 的持久化执行状态。"
+                if activity_status != "error"
+                else "任务已进入异常终态，请查看安全错误码和运行警告。"
+            ),
+            iteration=None,
+            duration_ms=int(task_record.elapsed_seconds * 1000),
+            payload=safe_payload,
+            dedupe_key=f"async:{task_record.task_id}:{event.event_id}",
+            update_run_summary=True,
+        )
     public_type = {
         EventType.TASK_STARTED: "research.task.started",
         EventType.TASK_COMPLETED: "research.task.completed",
@@ -114,8 +248,12 @@ async def _emit_state_change(
         EventType.TASK_DOMAIN_CONFIRMATION_REQUESTED: "research.task.progress",
         EventType.TASK_DOMAIN_DECISION: "research.task.progress",
     }.get(event_type)
+    if event_type == EventType.TASK_COMPLETED and configurable.quality_evaluation_enabled:
+        public_type = "research.task.progress"
     if public_type is not None:
         status = task_record.status.value
+        if event_type == EventType.TASK_COMPLETED and configurable.quality_evaluation_enabled:
+            status = "running"
         public_payload: dict[str, Any] = {
             "task_id": task_record.task_id,
             "wave_id": task_record.wave_id,
@@ -123,7 +261,12 @@ async def _emit_state_change(
             "title": task_record.display_title,
             "mode": "async",
             "status": status,
-            "phase": phase or task_record.phase.value,
+            "phase": (
+                "handoff"
+                if event_type == EventType.TASK_COMPLETED
+                and configurable.quality_evaluation_enabled
+                else phase or task_record.phase.value
+            ),
             "elapsed_ms": int(task_record.elapsed_seconds * 1000),
             "source_count": task_record.source_count,
         }
@@ -253,7 +396,11 @@ def _config_with_task_id(config: RunnableConfig, task_id: str) -> RunnableConfig
     pause for a domain decision, without mutating the caller's config.
     """
     new_config: RunnableConfig = dict(config)  # type: ignore[assignment]
-    new_config["metadata"] = {**(config.get("metadata") or {}), "task_id": task_id}
+    new_config["metadata"] = {
+        **(config.get("metadata") or {}),
+        "task_id": task_id,
+        "research_mode": "async",
+    }
     return new_config
 
 

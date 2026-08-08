@@ -30,6 +30,14 @@ from open_deep_research.public_events import (
     event_publisher_from_config,
     is_terminal_event,
 )
+from open_deep_research.public_task_activity import (
+    PUBLIC_TASK_ACTIVITY_SCHEMA_VERSION,
+    TASK_TERMINAL_TYPES,
+    PublicTaskActivityEvent,
+    TaskActivityStore,
+    activity_summary,
+    derive_trace_activity,
+)
 from open_deep_research.run_context import (
     JournalCorruptedError,
     RunContextError,
@@ -153,6 +161,15 @@ def _sse(event: PublicEvent) -> str:
     )
 
 
+def _task_activity_sse(event: PublicTaskActivityEvent) -> str:
+    """Serialize one browser-safe task activity as SSE."""
+    return (
+        f"id: {event.sequence}\n"
+        f"event: {event.type}\n"
+        f"data: {json.dumps(event.public_dict(), ensure_ascii=False, default=str)}\n\n"
+    )
+
+
 def _sse_headers() -> dict[str, str]:
     return {
         "Cache-Control": "no-cache",
@@ -181,6 +198,37 @@ async def _public_event_iterator(store: RunEventStore, *, after: int = 0):
             if last_sequence and cursor >= last_sequence:
                 latest = await asyncio.to_thread(store.read, last_sequence - 1)
                 if latest and is_terminal_event(latest[-1]):
+                    return
+            now = asyncio.get_running_loop().time()
+            if now - last_output_at >= heartbeat_seconds:
+                yield ": keep-alive\n\n"
+                last_output_at = now
+        await asyncio.sleep(poll_seconds)
+
+
+async def _task_activity_iterator(store: TaskActivityStore, *, after: int = 0):
+    """Replay then tail one task-local durable activity stream."""
+    configurable = Configuration.from_runnable_config(None)
+    poll_seconds = configurable.sse_poll_interval_ms / 1000
+    heartbeat_seconds = configurable.sse_heartbeat_seconds
+    cursor = after
+    last_output_at = asyncio.get_running_loop().time()
+    while True:
+        events = await asyncio.to_thread(store.read, cursor)
+        terminal_seen = False
+        for event in events:
+            yield _task_activity_sse(event)
+            cursor = event.sequence
+            last_output_at = asyncio.get_running_loop().time()
+            if event.type in TASK_TERMINAL_TYPES:
+                terminal_seen = True
+        if terminal_seen:
+            return
+        if not events:
+            last_sequence = await asyncio.to_thread(store.last_sequence)
+            if last_sequence and cursor >= last_sequence:
+                history = await asyncio.to_thread(store.read)
+                if any(event.type in TASK_TERMINAL_TYPES for event in history):
                     return
             now = asyncio.get_running_loop().time()
             if now - last_output_at >= heartbeat_seconds:
@@ -321,6 +369,51 @@ def _require_run_owner(run_id: str, user: dict[str, Any]) -> tuple[RunRecord | N
     return None, configurable
 
 
+def _task_activity_preview_allowed(user: dict[str, Any]) -> bool:
+    """Authorize bounded diagnostic previews without trusting the browser."""
+    local_bypass = os.environ.get("LOCAL_DEV_AUTH_BYPASS", "false").lower() in {
+        "1", "true", "yes", "on",
+    }
+    if local_bypass:
+        return True
+    enabled = os.environ.get("TASK_ACTIVITY_PREVIEW_ENABLED", "false").lower() in {
+        "1", "true", "yes", "on",
+    }
+    permissions = {str(item) for item in user.get("permissions", [])}
+    return enabled and bool(permissions & {"admin", "developer"})
+
+
+def _augment_run_projection(
+    run_id: str,
+    projection: Any,
+    configurable: Configuration,
+) -> Any:
+    """Attach task activity summaries without changing the public event reducer."""
+    if projection is None:
+        return None
+    for task_id, task in projection.task_items.items():
+        try:
+            store = TaskActivityStore(run_id, task_id, runs_dir=configurable.runs_dir)
+            if store.exists:
+                task.update(activity_summary(store.read()))
+        except (OSError, RuntimeError, ValueError):
+            task.setdefault("activity_available", False)
+    return projection
+
+
+def _require_task_in_run(
+    run_id: str,
+    task_id: str,
+    configurable: Configuration,
+) -> Any:
+    """Return the public task projection or hide unknown/cross-run task IDs."""
+    projection = RunEventStore(run_id, runs_dir=configurable.runs_dir).project()
+    task = projection.task_items.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task
+
+
 def _span_tree_rows(spans: list[dict[str, Any]]) -> str:
     children: dict[str | None, list[dict[str, Any]]] = {}
     for span in spans:
@@ -457,7 +550,7 @@ async def _run_control_listener(record: RunRecord, config: dict[str, Any]) -> No
 
 @app.get("/capabilities")
 async def get_capabilities(
-    _user: dict[str, Any] = Depends(get_current_user),
+    user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Return the safe, explicit browser-editable runtime contract."""
     schema = Configuration.model_json_schema()
@@ -470,6 +563,7 @@ async def get_capabilities(
     defaults = Configuration().model_dump(mode="json")
     return {
         "public_event_schema_version": PUBLIC_EVENT_SCHEMA_VERSION,
+        "public_task_activity_schema_version": PUBLIC_TASK_ACTIVITY_SCHEMA_VERSION,
         "accepted_event_schema_versions": [1, PUBLIC_EVENT_SCHEMA_VERSION],
         "features": {
             "clarification": True,
@@ -477,6 +571,8 @@ async def get_capabilities(
             "feedback": True,
             "artifacts": True,
             "memory": True,
+            "subagent_activity": True,
+            "subagent_activity_preview": _task_activity_preview_allowed(user),
             "local_dev_auth_bypass": os.environ.get("LOCAL_DEV_AUTH_BYPASS", "").lower()
             in {"1", "true", "yes"},
         },
@@ -642,6 +738,7 @@ async def get_run(
                 result = {"status": "success", "result": report_text}
         event_store = RunEventStore(run_id, runs_dir=configurable.runs_dir)
         projection = event_store.project() if event_store.exists else None
+        projection = _augment_run_projection(run_id, projection, configurable)
         return {
             "run_id": run_id,
             "title": manifest.title or run_id,
@@ -662,6 +759,7 @@ async def get_run(
     configurable = Configuration.from_runnable_config(record.engine.config)
     event_store = RunEventStore(run_id, runs_dir=configurable.runs_dir)
     projection = event_store.project()
+    projection = _augment_run_projection(run_id, projection, configurable)
     manifest = (
         record.engine.context_store.load_manifest()
         if getattr(record.engine, "context_store", None)
@@ -821,6 +919,102 @@ async def submit_feedback(
         command_id=request.command_id,
     )
     return {"status": "accepted", "command_id": command.command_id}
+
+
+@app.get("/runs/{run_id}/tasks/{task_id}/activity")
+async def get_task_activity(
+    run_id: str,
+    task_id: str,
+    before: int | None = None,
+    limit: int = 100,
+    kind: str | None = None,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Return one reverse-page of safe task activity in chronological order."""
+    _record, configurable = _require_run_owner(run_id, user)
+    _require_task_in_run(run_id, task_id, configurable)
+    if before is not None and before < 1:
+        raise HTTPException(status_code=400, detail="invalid_activity_cursor")
+    if not 1 <= limit <= 200:
+        raise HTTPException(status_code=422, detail="activity_limit_out_of_range")
+    valid_kinds = {
+        "lifecycle", "model", "tool", "source", "quality", "checkpoint",
+        "control", "security", "error",
+    }
+    if kind is not None and kind not in valid_kinds:
+        raise HTTPException(status_code=400, detail="invalid_activity_kind")
+
+    store = TaskActivityStore(run_id, task_id, runs_dir=configurable.runs_dir)
+    source = "native"
+    if store.exists:
+        items, has_more, last_event_id = await asyncio.to_thread(
+            store.page,
+            before=before,
+            limit=limit,
+            kind=kind,
+        )
+    else:
+        observed = _observability_store()
+        run = observed.get_run(run_id, user_id=_user_identity(user))
+        all_derived = derive_trace_activity(
+            run_id,
+            task_id,
+            observed.list_spans(run_id) if run is not None else [],
+        )
+        last_event_id = all_derived[-1].sequence if all_derived else 0
+        source = "derived_trace" if all_derived else "summary_only"
+        derived = all_derived
+        if kind is not None:
+            derived = [event for event in derived if event.kind == kind]
+        if before is not None:
+            derived = [event for event in derived if event.sequence < before]
+        has_more = len(derived) > limit
+        items = derived[-limit:]
+    return {
+        "run_id": run_id,
+        "task_id": task_id,
+        "items": [event.public_dict() for event in items],
+        "oldest_sequence": items[0].sequence if items else 0,
+        "last_event_id": last_event_id,
+        "has_more": has_more,
+        "detail_level": "preview" if _task_activity_preview_allowed(user) else "summary",
+        "source": source,
+        "stream_url": f"/runs/{run_id}/tasks/{task_id}/activity/stream",
+    }
+
+
+@app.get("/runs/{run_id}/tasks/{task_id}/activity/stream")
+async def stream_task_activity(
+    run_id: str,
+    task_id: str,
+    after: int = 0,
+    last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+    user: dict[str, Any] = Depends(get_current_user),
+) -> StreamingResponse:
+    """Replay and tail a task-local activity stream while the drawer is open."""
+    record, configurable = _require_run_owner(run_id, user)
+    _require_task_in_run(run_id, task_id, configurable)
+    store = TaskActivityStore(run_id, task_id, runs_dir=configurable.runs_dir)
+    cursor = after
+    if last_event_id is not None:
+        try:
+            cursor = int(last_event_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid_activity_cursor") from None
+    if cursor < 0:
+        raise HTTPException(status_code=400, detail="invalid_activity_cursor")
+    current = await asyncio.to_thread(store.last_sequence)
+    if cursor > current:
+        raise HTTPException(status_code=409, detail="activity_cursor_ahead")
+    if not store.exists and (
+        record is None or record.status in {"completed", "failed", "cancelled"}
+    ):
+        raise HTTPException(status_code=409, detail="activity_stream_unavailable_legacy_run")
+    return StreamingResponse(
+        _task_activity_iterator(store, after=cursor),
+        media_type="text/event-stream",
+        headers=_sse_headers(),
+    )
 
 
 @app.get("/runs/{run_id}/events")

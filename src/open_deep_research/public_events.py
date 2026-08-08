@@ -90,7 +90,10 @@ _PAYLOAD_KEYS: dict[str, set[str]] = {
         "task_id", "wave_id", "plan_task_id", "title", "mode", "status", "phase"
     },
     "research.task.progress": {
-        "task_id", "wave_id", "mode", "status", "phase", "iteration", "source_count", "tool_categories"
+        "task_id", "wave_id", "mode", "status", "phase", "iteration", "source_count",
+        "tool_categories", "activity_phase", "activity_label", "last_activity_at",
+        "activity_event_count", "model_call_count", "tool_call_count", "retry_count",
+        "warning_count", "activity_available",
     },
     "research.source.discovered": {"task_id", "source_id", "title", "domain", "url"},
     "research.task.completed": {

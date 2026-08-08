@@ -74,6 +74,7 @@ from open_deep_research.public_events import (
     public_display_title,
     summarize_public_findings,
 )
+from open_deep_research.public_task_activity import publish_task_activity
 from open_deep_research.quality import (
     evaluate_subagent_handoff,
     evaluate_tool_results,
@@ -1598,6 +1599,13 @@ async def _finalize_async_research_outputs(
         task_id = str(output["task_id"])
         admission_status = AdmissionStatus.ACCEPTED.value
         snapshot = await state_store.get(task_id, run_id=run_id)
+        task_config: RunnableConfig = dict(config)  # type: ignore[assignment]
+        task_config["metadata"] = {
+            **(config.get("metadata") or {}),
+            "task_id": task_id,
+            "research_mode": "async",
+            "research_wave_id": snapshot.wave_id if snapshot else "",
+        }
         if configurable.quality_evaluation_enabled:
             quality_handoff = _load_handoff_artifact_for_quality(
                 output,
@@ -1613,7 +1621,7 @@ async def _finalize_async_research_outputs(
                 assessment = await evaluate_subagent_handoff(
                     str(output.get("research_topic", "")),
                     quality_handoff,
-                    config,
+                    task_config,
                     coverage_contract=resolved_contract_payload,
                     requirement_ids=list(
                         quality_handoff.get("requirement_ids", [])
@@ -1628,7 +1636,7 @@ async def _finalize_async_research_outputs(
                 assessment = await evaluate_subagent_handoff(
                     str(output.get("research_topic", "")),
                     quality_handoff,
-                    config,
+                    task_config,
                 )
             admission_status = (
                 assessment.admission_status.value
@@ -1644,7 +1652,57 @@ async def _finalize_async_research_outputs(
                 "tool_call_id": task_id,
                 **assessment.model_dump(),
             })
+            await publish_task_activity(
+                task_config,
+                task_id=task_id,
+                event_type="quality.completed",
+                kind="quality",
+                phase="handoff",
+                status="success" if assessment.accepted else "warning",
+                title=(
+                    "研究交接已接纳"
+                    if assessment.accepted
+                    else "研究交接需补证"
+                ),
+                summary=(
+                    "结构化研究证据已通过 Supervisor 交接质量门禁。"
+                    if assessment.accepted
+                    else "当前交接未被完整接纳，Supervisor 将依据稳定缺口继续补证。"
+                ),
+                iteration=None,
+                duration_ms=None,
+                payload={
+                    "evaluation_type": "subagent_handoff",
+                    "decision": "accepted" if assessment.accepted else "rejected",
+                    "admission_status": admission_status,
+                    "gap_count": len(assessment.missing_information)
+                    + len(assessment.unsupported_claims)
+                    + len(assessment.follow_up_tasks),
+                },
+                dedupe_key=f"handoff:{task_id}:{admission_status}",
+                update_run_summary=True,
+            )
             if not assessment.accepted:
+                await publish_task_activity(
+                    task_config,
+                    task_id=task_id,
+                    event_type="task.completed",
+                    kind="lifecycle",
+                    phase="terminal",
+                    status="warning",
+                    title="Subagent 已完成，交接需补证",
+                    summary="研究执行已经结束，但当前交接未通过 Supervisor 质量门禁。",
+                    iteration=None,
+                    duration_ms=None,
+                    payload={
+                        "mode": "async",
+                        "wave_id": snapshot.wave_id if snapshot else "",
+                        "source_count": snapshot.source_count if snapshot else 0,
+                        "admission_status": admission_status,
+                    },
+                    dedupe_key=f"task:{task_id}:activity:completed:{admission_status}",
+                    update_run_summary=True,
+                )
                 await publisher.publish(
                     "research.task.completed",
                     stage="researching",
@@ -1684,6 +1742,26 @@ async def _finalize_async_research_outputs(
                 payload={"task_id": task_id, **source},
                 dedupe_key=f"source:{source['source_id']}",
             )
+        await publish_task_activity(
+            task_config,
+            task_id=task_id,
+            event_type="task.completed",
+            kind="lifecycle",
+            phase="terminal",
+            status="success",
+            title="Subagent 已完成",
+            summary=f"研究交接已接纳，共确认 {len(sources)} 个公开来源。",
+            iteration=None,
+            duration_ms=None,
+            payload={
+                "mode": "async",
+                "wave_id": snapshot.wave_id if snapshot else "",
+                "source_count": len(sources),
+                "admission_status": admission_status,
+            },
+            dedupe_key=f"task:{task_id}:activity:completed:{admission_status}",
+            update_run_summary=True,
+        )
         await publisher.publish(
             "research.task.completed",
             stage="researching",
@@ -1908,9 +1986,25 @@ async def _execute_supervisor_tools(
             **(config.get("metadata") or {}),
             "research_wave_id": wave_id,
             "supervisor_turn": int(state.get("research_iterations", 0) or 0),
+            "task_id": tool_call["id"] if tool_call["name"] == "ConductResearch" else None,
+            "research_mode": "sync" if tool_call["name"] == "ConductResearch" else "supervisor",
         }
         is_sync_research = tool_call["name"] == "ConductResearch"
         if is_sync_research:
+            await publish_task_activity(
+                call_config,
+                "task.started",
+                kind="lifecycle",
+                phase="initializing",
+                status="running",
+                title="Subagent 已启动",
+                summary="正在初始化独立研究上下文。",
+                iteration=0,
+                duration_ms=None,
+                payload={"mode": "sync", "wave_id": wave_id},
+                dedupe_key=f"task:{tool_call['id']}:activity:started",
+                update_run_summary=True,
+            )
             await publisher.publish(
                 "research.task.started",
                 stage="researching",
@@ -1946,6 +2040,24 @@ async def _execute_supervisor_tools(
         )
         if is_sync_research:
             if outcome.error is not None or outcome.result is None:
+                await publish_task_activity(
+                    call_config,
+                    "task.failed",
+                    kind="error",
+                    phase="terminal",
+                    status="error",
+                    title="Subagent 执行失败",
+                    summary="研究任务未能完成，请查看错误事件。",
+                    iteration=None,
+                    duration_ms=None,
+                    payload={
+                        "error_code": "research_task_failed",
+                        "mode": "sync",
+                        "wave_id": wave_id,
+                    },
+                    dedupe_key=f"task:{tool_call['id']}:activity:failed",
+                    update_run_summary=True,
+                )
                 await publisher.publish(
                     "research.task.failed",
                     stage="researching",
@@ -1967,26 +2079,25 @@ async def _execute_supervisor_tools(
                     limit=configurable.public_event_source_limit,
                 )
                 for source in sources:
+                    await publish_task_activity(
+                        call_config,
+                        "source.discovered",
+                        kind="source",
+                        phase="evidence_review",
+                        status="success",
+                        title="发现可追溯来源",
+                        summary=str(source.get("title") or source.get("domain") or "新来源"),
+                        iteration=None,
+                        duration_ms=None,
+                        payload=source,
+                        dedupe_key=f"task:{tool_call['id']}:activity:source:{source['source_id']}",
+                    )
                     await publisher.publish(
                         "research.source.discovered",
                         stage="researching",
                         payload={"task_id": tool_call["id"], **source},
                         dedupe_key=f"source:{source['source_id']}",
                     )
-                await publisher.publish(
-                    "research.task.completed",
-                    stage="researching",
-                    payload={
-                        "task_id": tool_call["id"],
-                        "wave_id": wave_id,
-                        "mode": "sync",
-                        "status": "completed",
-                        "phase": "completed",
-                        "source_count": len(sources),
-                        "admission_status": "pending",
-                    },
-                    dedupe_key=f"task:{tool_call['id']}:completed",
-                )
         return outcome
 
     outcomes_by_id = dict(committed_outcomes or {})
@@ -2095,25 +2206,80 @@ async def _execute_supervisor_tools(
                 coverage_contract
                 or quality_handoff.get("coverage_contract")
             )
+            task_config: RunnableConfig = dict(config)  # type: ignore[assignment]
+            task_config["metadata"] = {
+                **(config.get("metadata") or {}),
+                "task_id": str(call["id"]),
+                "research_mode": "sync",
+                "research_wave_id": wave_id,
+            }
+            await publish_task_activity(
+                task_config,
+                task_id=str(call["id"]),
+                event_type="task.phase.changed",
+                kind="lifecycle",
+                phase="handoff",
+                status="running",
+                title="评估研究交接",
+                summary="Supervisor 正在判断该 Subagent 的证据是否可以进入最终报告。",
+                iteration=None,
+                duration_ms=None,
+                payload={"activity_label": "质量交接"},
+                dedupe_key=f"handoff:{call['id']}:started",
+                update_run_summary=True,
+            )
             if resolved_contract is None:
-                return call["id"], await evaluate_subagent_handoff(
+                assessment = await evaluate_subagent_handoff(
                     topic,
                     quality_handoff,
-                    config,
+                    task_config,
                 )
-            return call["id"], await evaluate_subagent_handoff(
-                topic,
-                quality_handoff,
-                config,
-                coverage_contract=resolved_contract,
-                requirement_ids=list(
-                    call.get("args", {}).get(
-                        "requirement_ids",
-                        quality_handoff.get("requirement_ids", []),
-                    )
-                ),
-                risk_profile=risk_profile,
+            else:
+                assessment = await evaluate_subagent_handoff(
+                    topic,
+                    quality_handoff,
+                    task_config,
+                    coverage_contract=resolved_contract,
+                    requirement_ids=list(
+                        call.get("args", {}).get(
+                            "requirement_ids",
+                            quality_handoff.get("requirement_ids", []),
+                        )
+                    ),
+                    risk_profile=risk_profile,
+                )
+            admission_status = (
+                assessment.admission_status.value
+                if assessment.admission_status is not None
+                else "accepted" if assessment.accepted else "rejected"
             )
+            await publish_task_activity(
+                task_config,
+                task_id=str(call["id"]),
+                event_type="quality.completed",
+                kind="quality",
+                phase="handoff",
+                status="success" if assessment.accepted else "warning",
+                title="研究交接已接纳" if assessment.accepted else "研究交接需补证",
+                summary=(
+                    "结构化研究证据已通过 Supervisor 交接质量门禁。"
+                    if assessment.accepted
+                    else "当前交接未被完整接纳，Supervisor 将依据稳定缺口继续补证。"
+                ),
+                iteration=None,
+                duration_ms=None,
+                payload={
+                    "evaluation_type": "subagent_handoff",
+                    "decision": "accepted" if assessment.accepted else "rejected",
+                    "admission_status": admission_status,
+                    "gap_count": len(assessment.missing_information)
+                    + len(assessment.unsupported_claims)
+                    + len(assessment.follow_up_tasks),
+                },
+                dedupe_key=f"handoff:{call['id']}:{admission_status}",
+                update_run_summary=True,
+            )
+            return call["id"], assessment
 
         assessment_semaphore = asyncio.Semaphore(
             configurable.max_concurrent_tool_calls
@@ -2218,6 +2384,37 @@ async def _execute_supervisor_tools(
                 visible_result,
                 limit=configurable.public_event_source_limit,
             )
+        task_config: RunnableConfig = dict(config)  # type: ignore[assignment]
+        task_config["metadata"] = {
+            **(config.get("metadata") or {}),
+            "task_id": str(call["id"]),
+            "research_mode": "sync",
+            "research_wave_id": wave_id,
+        }
+        await publish_task_activity(
+            task_config,
+            task_id=str(call["id"]),
+            event_type="task.completed",
+            kind="lifecycle",
+            phase="terminal",
+            status="success" if accepted else "warning",
+            title="Subagent 已完成" if accepted else "Subagent 已完成，交接需补证",
+            summary=(
+                f"研究交接已接纳，共确认 {len(sources)} 个公开来源。"
+                if accepted
+                else "研究执行已经结束，但当前交接未通过 Supervisor 质量门禁。"
+            ),
+            iteration=None,
+            duration_ms=None,
+            payload={
+                "mode": "sync",
+                "wave_id": wave_id,
+                "source_count": len(sources),
+                "admission_status": admission_status,
+            },
+            dedupe_key=f"task:{call['id']}:activity:completed:{admission_status}",
+            update_run_summary=True,
+        )
         await publisher.publish(
             "research.task.completed",
             stage="researching",
