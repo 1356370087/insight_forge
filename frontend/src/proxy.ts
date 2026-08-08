@@ -1,27 +1,17 @@
-import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
 
-export async function proxy(request: NextRequest) {
+const publicPages = ["/login", "/register", "/verify-email", "/forgot-password", "/reset-password"];
+
+export function proxy(request: NextRequest) {
   if (process.env.NEXT_PUBLIC_LOCAL_DEV_AUTH_BYPASS === "true") return NextResponse.next();
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-  if (!url || !key) return NextResponse.next();
-  let response = NextResponse.next({ request });
-  const supabase = createServerClient(url, key, {
-    cookies: {
-      getAll: () => request.cookies.getAll(),
-      setAll: (items) => {
-        items.forEach(({ name, value }) => request.cookies.set(name, value));
-        response = NextResponse.next({ request });
-        items.forEach(({ name, value, options }) => response.cookies.set(name, value, options));
-      },
-    },
-  });
-  const { data } = await supabase.auth.getUser();
-  const isLogin = request.nextUrl.pathname === "/login";
-  if (!data.user && !isLogin) return NextResponse.redirect(new URL("/login", request.url));
-  if (data.user && isLogin) return NextResponse.redirect(new URL("/research/new", request.url));
-  return response;
+  const path = request.nextUrl.pathname;
+  const isPublic = publicPages.some((item) => path === item || path.startsWith(`${item}/`));
+  const hasSession = Boolean(request.cookies.get("odr.access") || request.cookies.get("odr.refresh"));
+  if (!hasSession && !isPublic) return NextResponse.redirect(new URL("/login", request.url));
+  if (hasSession && ["/login", "/register"].includes(path)) return NextResponse.redirect(new URL("/research/new", request.url));
+  return NextResponse.next();
 }
 
-export const config = { matcher: ["/((?!_next/static|_next/image|favicon.ico|api/research).*)"] };
+export const config = {
+  matcher: ["/((?!_next/static|_next/image|favicon.ico|api/).*)"],
+};

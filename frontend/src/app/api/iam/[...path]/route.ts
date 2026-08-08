@@ -2,7 +2,7 @@ import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
 import { authenticatedProxy } from "@/lib/server-auth";
 
-const allowed = /^(capabilities|runs(?:\/.*)?|observability(?:\/.*)?)$/;
+const allowed = /^(auth\/(me|sessions(?:\/[^/]+)?|logout-all|password\/change)|admin\/(users(?:\/.*)?|roles(?:\/.*)?|permissions|audit-events))$/;
 
 async function proxy(request: NextRequest, context: { params: Promise<{ path: string[] }> }) {
   const { path } = await context.params;
@@ -17,4 +17,3 @@ export const POST = proxy;
 export const PUT = proxy;
 export const PATCH = proxy;
 export const DELETE = proxy;
-export const OPTIONS = proxy;

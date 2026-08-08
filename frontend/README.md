@@ -17,7 +17,9 @@ pnpm install
 pnpm dev
 ```
 
-浏览器访问 `http://localhost:3000`。本地旁路需要前端 `NEXT_PUBLIC_LOCAL_DEV_AUTH_BYPASS=true`，同时后端环境设置 `LOCAL_DEV_AUTH_BYPASS=true`。
+浏览器访问 `http://localhost:3000`。常规开发应先配置 PostgreSQL、执行 `alembic upgrade head`，再用 `python -m security.cli bootstrap-admin` 创建首位管理员。只有明确的无认证本地演示才同时设置前端 `NEXT_PUBLIC_LOCAL_DEV_AUTH_BYPASS=true` 和后端 `LOCAL_DEV_AUTH_BYPASS=true`。
+
+浏览器只连接 Next.js BFF。Access Token 与 Refresh Token 使用 HttpOnly Cookie 保存，研究请求由 `/api/research` 代理注入身份；不要在 `NEXT_PUBLIC_*` 变量或 localStorage 中存放任何 JWT。
 
 ## 验证
 

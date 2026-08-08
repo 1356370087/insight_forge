@@ -1,19 +1,23 @@
 import { fetchEventSource } from "@microsoft/fetch-event-source";
-import { getAccessToken } from "./auth";
+import { csrfHeaders, refreshBrowserSession } from "./auth";
 import type { PublicEvent, RunSnapshot, TaskActivityEvent, TaskActivityKind, TaskActivityPage } from "./types";
 
 const API_BASE = process.env.NEXT_PUBLIC_RESEARCH_API_BASE ?? "/api/research";
 
-async function headers(extra?: HeadersInit, refresh = false): Promise<Headers> {
-  const value = new Headers(extra);
-  const token = await getAccessToken(refresh);
-  if (token) value.set("Authorization", `Bearer ${token}`);
-  return value;
+async function headers(extra?: HeadersInit): Promise<Headers> {
+  return csrfHeaders(extra);
 }
 
 export async function apiFetch<T>(path: string, init: RequestInit = {}, refresh = false): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, { ...init, headers: await headers(init.headers, refresh) });
-  if (response.status === 401 && !refresh) return apiFetch<T>(path, init, true);
+  const response = await fetch(`${API_BASE}${path}`, {
+    ...init,
+    credentials: "same-origin",
+    headers: await headers(init.headers),
+  });
+  if (response.status === 401 && !refresh && await refreshBrowserSession()) return apiFetch<T>(path, init, true);
+  if (response.status === 401 && typeof window !== "undefined") {
+    window.location.replace("/login");
+  }
   if (!response.ok) throw new Error(`${response.status}:${await response.text()}`);
   return response.json() as Promise<T>;
 }
@@ -50,7 +54,7 @@ export async function subscribeToRun(options: {
     headers: Object.fromEntries((await headers({ Accept: "text/event-stream", "Last-Event-ID": String(options.after) })).entries()),
     async onopen(response) {
       if (response.ok) { retryAttempt = 0; options.onOpen(); return; }
-      if (response.status === 401 && !authRetried) { authRetried = true; await getAccessToken(true); throw new Error("sse-auth-refreshed"); }
+      if (response.status === 401 && !authRetried) { authRetried = true; await refreshBrowserSession(); throw new Error("sse-auth-refreshed"); }
       if (response.status === 409) { await options.onCursorAhead(); throw new Error("cursor-ahead"); }
       throw new Error(`sse-${response.status}`);
     },
@@ -79,7 +83,7 @@ export async function subscribeToTaskActivity(options: {
     headers: Object.fromEntries((await headers({ Accept: "text/event-stream", "Last-Event-ID": String(options.after) })).entries()),
     async onopen(response) {
       if (response.ok) { retryAttempt = 0; options.onOpen(); return; }
-      if (response.status === 401 && !authRetried) { authRetried = true; await getAccessToken(true); throw new Error("task-sse-auth-refreshed"); }
+      if (response.status === 401 && !authRetried) { authRetried = true; await refreshBrowserSession(); throw new Error("task-sse-auth-refreshed"); }
       if (response.status === 409) { await options.onCursorAhead(); throw new Error("task-cursor-ahead"); }
       throw new Error(`task-sse-${response.status}`);
     },
