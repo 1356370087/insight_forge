@@ -516,6 +516,17 @@ def _unwrap_single_key_schema_payload(
 def _normalize_quality_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """Normalize harmless cross-provider JSON variations before validation."""
     normalized = dict(payload)
+    nested_score_keys = {
+        "score",
+        "value",
+        "overall",
+        "rating",
+        "rigor",
+        "independence",
+        "traceability",
+        "source_diversity",
+        "cross_validation",
+    }
     for key in (
         "relevance",
         "source_quality",
@@ -526,6 +537,22 @@ def _normalize_quality_payload(payload: dict[str, Any]) -> dict[str, Any]:
         value = normalized.get(key)
         if value is None or isinstance(value, bool):
             continue
+        if isinstance(value, Mapping):
+            # Some structured-output providers expand a scalar score into
+            # named sub-dimensions. Collapse only recognized numeric score
+            # fields, and use the minimum so compatibility cannot inflate a
+            # quality decision. Unknown objects still fail schema validation.
+            candidates: list[float] = []
+            for nested_key, nested_value in value.items():
+                if nested_key not in nested_score_keys or isinstance(nested_value, bool):
+                    continue
+                try:
+                    candidates.append(float(nested_value))
+                except (TypeError, ValueError):
+                    continue
+            if not candidates:
+                continue
+            value = min(candidates)
         try:
             numeric_value = float(value)
         except (TypeError, ValueError):

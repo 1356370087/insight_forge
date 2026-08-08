@@ -294,6 +294,29 @@ def test_quality_payload_normalizes_cross_provider_score_variations() -> None:
     assert assessment.suggested_queries == []
 
 
+def test_quality_payload_conservatively_collapses_nested_corroboration() -> None:
+    """Qwen-style score dimensions become one non-inflated scalar score."""
+    normalized = _normalize_quality_payload({
+        "decision": "continue",
+        "relevance": 4,
+        "source_quality": 4,
+        "evidence_coverage": 3,
+        "corroboration": {
+            "rigor": 4,
+            "independence": 3,
+            "traceability": 4,
+        },
+        "unresolved_conflicts": [],
+        "missing_information": ["One official source is still missing."],
+        "suggested_queries": [],
+        "reason": "Useful but incomplete.",
+    })
+
+    assessment = ToolResultAssessment.model_validate(normalized)
+
+    assert assessment.corroboration == 3
+
+
 @pytest.mark.asyncio
 async def test_runtime_judge_repairs_strict_single_key_schema_wrapper(
     monkeypatch,
