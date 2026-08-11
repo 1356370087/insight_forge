@@ -22,6 +22,11 @@ const hopByHopHeaders = new Set([
   "trailer", "transfer-encoding", "upgrade", "host", "content-length", "cookie", "authorization",
 ]);
 
+function localDevAuthBypassEnabled(): boolean {
+  return process.env.NODE_ENV !== "production"
+    && process.env.NEXT_PUBLIC_LOCAL_DEV_AUTH_BYPASS === "true";
+}
+
 export function csrfValid(request: NextRequest): boolean {
   const cookie = request.cookies.get(CSRF_COOKIE)?.value;
   const header = request.headers.get("x-csrf-token");
@@ -87,12 +92,25 @@ async function callUpstream(request: NextRequest, target: URL, accessToken: stri
 }
 
 export async function authenticatedProxy(request: NextRequest, upstreamPath: string): Promise<NextResponse> {
-  if (!["GET", "HEAD", "OPTIONS"].includes(request.method) && !csrfValid(request)) {
+  const localDevBypass = localDevAuthBypassEnabled();
+  if (!localDevBypass && !["GET", "HEAD", "OPTIONS"].includes(request.method) && !csrfValid(request)) {
     return NextResponse.json({ detail: "csrf_validation_failed" }, { status: 403 });
   }
   const target = new URL(upstreamPath, backendOrigin);
   target.search = request.nextUrl.search;
   const body = ["GET", "HEAD"].includes(request.method) ? undefined : await request.arrayBuffer();
+  if (localDevBypass) {
+    const upstream = await callUpstream(request, target, "local-dev-bypass", body);
+    const headers = new Headers(upstream.headers);
+    for (const name of hopByHopHeaders) headers.delete(name);
+    headers.set("Cache-Control", upstream.headers.get("content-type")?.includes("text/event-stream") ? "no-cache, no-transform" : "no-store");
+    headers.set("X-Accel-Buffering", "no");
+    return new NextResponse(upstream.body, {
+      status: upstream.status,
+      statusText: upstream.statusText,
+      headers,
+    });
+  }
   let access = request.cookies.get(ACCESS_COOKIE)?.value;
   let pair: TokenPair | null = null;
   if (!access) {
