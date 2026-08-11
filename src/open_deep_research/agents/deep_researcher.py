@@ -4,7 +4,7 @@ import asyncio
 import json
 import re
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from typing import Any, Literal, cast
 
 from langchain.chat_models import init_chat_model
@@ -32,6 +32,12 @@ from open_deep_research.agents.research_context import offload_tool_message
 from open_deep_research.configuration import (
     Configuration,
     get_model_compatibility_kwargs,
+)
+from open_deep_research.evidence import (
+    SourceScopeStatus,
+    classify_evidence_source,
+    contract_has_source_constraints,
+    source_scoped_evidence_records,
 )
 from open_deep_research.memory.lifecycle import (
     configure_advanced_store,
@@ -76,6 +82,7 @@ from open_deep_research.public_events import (
 )
 from open_deep_research.public_task_activity import publish_task_activity
 from open_deep_research.quality import (
+    _bounded_evidence_records,
     evaluate_subagent_handoff,
     evaluate_tool_results,
 )
@@ -709,7 +716,15 @@ def _render_supervisor_coverage_contract(
         "Every ConductResearch or StartResearchTask call must select one or "
         "more requirement_ids exactly from this list. The research brief and "
         "task descriptions are advisory: they may refine how to investigate "
-        "these requirements, but they must not create new hard requirements.\n"
+        "these requirements, but they must not create new hard requirements. "
+        "Give each topical requirement exactly one primary owner in a wave; "
+        "share an ID only when its text explicitly applies to every item. "
+        "Aggregate final-output requirements, such as a minimum total source "
+        "or link count, must not be assigned to every parallel task. Assign "
+        "such a requirement to exactly one coverage owner and make that "
+        "task's deliverable and stopping rule sufficient to satisfy the total. "
+        "Never assign a requirement whose subject is explicitly excluded by "
+        "that task's scope.\n"
         f"{requirements}\n"
         "</User Coverage Contract>"
     )
@@ -747,6 +762,64 @@ def _coverage_bound_input_schema(
             ),
         ),
     )
+
+
+def _canonicalize_coverage_requirement_ids(
+    requirement_ids: Iterable[object],
+    contract: ResearchCoverageContract,
+) -> list[str]:
+    """Repair a copied hash suffix only when the COV ordinal is unambiguous."""
+    allowed = tuple(contract.requirement_ids())
+    allowed_set = set(allowed)
+    by_ordinal: dict[str, list[str]] = {}
+    for requirement_id in allowed:
+        ordinal, separator, _suffix = requirement_id.rpartition("-")
+        if separator and re.fullmatch(r"COV-\d+", ordinal):
+            by_ordinal.setdefault(ordinal, []).append(requirement_id)
+
+    normalized: list[str] = []
+    for raw_id in requirement_ids:
+        requirement_id = str(raw_id)
+        if requirement_id in allowed_set:
+            resolved = requirement_id
+        else:
+            ordinal, separator, _suffix = requirement_id.rpartition("-")
+            candidates = by_ordinal.get(ordinal, []) if separator else []
+            resolved = candidates[0] if len(candidates) == 1 else requirement_id
+        if resolved not in normalized:
+            normalized.append(resolved)
+    return normalized
+
+
+def _canonicalize_supervisor_tool_call_requirements(
+    tool_calls: list[dict[str, Any]],
+    contract: ResearchCoverageContract | None,
+) -> list[dict[str, Any]]:
+    """Normalize safe requirement-ID near misses before governance validation."""
+    if contract is None:
+        return tool_calls
+    normalized_calls: list[dict[str, Any]] = []
+    for tool_call in tool_calls:
+        args = tool_call.get("args")
+        requirement_ids = (
+            args.get("requirement_ids")
+            if isinstance(args, dict)
+            else None
+        )
+        if not isinstance(requirement_ids, list):
+            normalized_calls.append(tool_call)
+            continue
+        normalized_calls.append({
+            **tool_call,
+            "args": {
+                **args,
+                "requirement_ids": _canonicalize_coverage_requirement_ids(
+                    requirement_ids,
+                    contract,
+                ),
+            },
+        })
+    return normalized_calls
 
 
 async def write_research_brief(state: AgentState, config: RunnableConfig) -> Command[Literal["research_supervisor"]]:
@@ -1841,6 +1914,41 @@ async def _finalize_async_research_outputs(
     return update
 
 
+def _effective_sync_research_task_timeout_seconds(
+    configurable: Configuration,
+) -> float:
+    """Return a bounded deadline that accounts for runtime quality judging.
+
+    ``task_timeout_seconds`` predates the per-tool-batch quality gate.  Applying
+    it unchanged makes every evaluator request consume the Researcher's
+    evidence-gathering budget, so a healthy task can be cancelled while it is
+    still evaluating its final batch.  Reserve at most one additional base
+    timeout for the bounded quality/recovery turns, while retaining the public
+    3600-second ceiling.
+    """
+    base_timeout = max(1.0, float(configurable.task_timeout_seconds))
+    if not configurable.quality_evaluation_enabled:
+        return base_timeout
+
+    evaluation_turns = max(
+        1,
+        min(
+            32,
+            int(configurable.max_react_tool_calls)
+            + int(configurable.quality_gap_recovery_max_attempts),
+        ),
+    )
+    per_evaluation_budget = min(
+        60.0,
+        max(1.0, float(configurable.model_call_timeout_seconds)),
+    )
+    quality_grace = min(
+        base_timeout,
+        evaluation_turns * per_evaluation_budget,
+    )
+    return min(3600.0, base_timeout + quality_grace)
+
+
 async def _execute_supervisor_tools(
     state: SupervisorState,
     config: RunnableConfig,
@@ -1868,7 +1976,10 @@ async def _execute_supervisor_tools(
     publisher = event_publisher_from_config(config)
     supervisor_messages = state.get("supervisor_messages", [])
     most_recent_message = supervisor_messages[-1]
-    tool_calls = most_recent_message.tool_calls
+    tool_calls = _canonicalize_supervisor_tool_call_requirements(
+        most_recent_message.tool_calls,
+        coverage_contract,
+    )
 
     if (
         state.get("research_iterations", 0)
@@ -2133,13 +2244,16 @@ async def _execute_supervisor_tools(
         for tool_call in non_conduct:
             await commit_outcome(tool_call, await execute_one(tool_call))
         semaphore = asyncio.Semaphore(configurable.max_concurrent_tool_calls)
+        research_task_timeout = _effective_sync_research_task_timeout_seconds(
+            configurable
+        )
 
         async def execute_bounded(call: dict[str, Any]):
             async with semaphore:
                 try:
                     outcome = await asyncio.wait_for(
                         execute_one(call),
-                        timeout=configurable.task_timeout_seconds,
+                        timeout=research_task_timeout,
                     )
                 except TimeoutError:
                     error = ToolError(
@@ -2151,7 +2265,14 @@ async def _execute_supervisor_tools(
                         ),
                         retryable=True,
                         detail={
-                            "timeout_seconds": configurable.task_timeout_seconds,
+                            "timeout_seconds": research_task_timeout,
+                            "configured_task_timeout_seconds": (
+                                configurable.task_timeout_seconds
+                            ),
+                            "quality_grace_applied": (
+                                research_task_timeout
+                                > configurable.task_timeout_seconds
+                            ),
                             "partial_batch_preserved": True,
                         },
                     )
@@ -3216,6 +3337,79 @@ def _accepted_evidence_records(state: ResearcherState) -> list[dict[str, Any]]:
     ]
 
 
+def _owned_compression_requirements(
+    state: ResearcherState,
+) -> list[dict[str, str]]:
+    """Return the exact owned coverage checklist for compression."""
+    payload = state.get("coverage_contract")
+    if not isinstance(payload, dict) or not payload:
+        return []
+    try:
+        contract = ResearchCoverageContract.model_validate(payload)
+    except ValueError:
+        return []
+    owned_ids = {
+        str(requirement_id)
+        for requirement_id in state.get("requirement_ids", [])
+    }
+    if not owned_ids:
+        owned_ids = set(contract.requirement_ids())
+    return [
+        {
+            "requirement_id": requirement.requirement_id,
+            "text": requirement.text,
+        }
+        for requirement in contract.requirements
+        if requirement.requirement_id in owned_ids
+    ]
+
+
+def _compression_missing_requirement_ids(
+    text: str,
+    state: ResearcherState,
+) -> tuple[str, ...]:
+    """Return owned requirements omitted by a candidate compression."""
+    return tuple(
+        requirement["requirement_id"]
+        for requirement in _owned_compression_requirements(state)
+        if requirement["requirement_id"] not in text
+    )
+
+
+def _compression_out_of_scope_urls(
+    text: str,
+    state: ResearcherState,
+) -> tuple[str, ...]:
+    """Return URLs a compression model added outside the source contract."""
+    coverage_payload = state.get("coverage_contract")
+    if (
+        not isinstance(coverage_payload, dict)
+        or not coverage_payload
+        or not contract_has_source_constraints(coverage_payload)
+    ):
+        return ()
+    urls = {
+        match.rstrip(".,;:")
+        for match in re.findall(
+            r"https?://[^\s\]\[()<>\"']+",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if match.rstrip(".,;:")
+    }
+    return tuple(
+        sorted(
+            url
+            for url in urls
+            if classify_evidence_source(
+                {"source_url": url},
+                coverage_payload,
+            ).source_scope_status
+            is not SourceScopeStatus.IN_SCOPE
+        )
+    )
+
+
 def _compression_evidence_text(state: ResearcherState, max_chars: int) -> str:
     """Build an evidence-only compression input, excluding agent plans/actions."""
     tool_messages = [
@@ -3246,18 +3440,78 @@ def _compression_evidence_text(state: ResearcherState, max_chars: int) -> str:
         }
         for message in tool_messages
     ]
-    sections = [
-        "Research topic:\n" + str(state.get("research_topic", "")),
-        "Structured evidence registry:\n"
+    topic = str(state.get("research_topic", ""))
+    owned_requirements = _owned_compression_requirements(state)
+    coverage_payload = state.get("coverage_contract")
+    evidence = _accepted_evidence_records(state)
+    source_scope_enforced = False
+    if isinstance(coverage_payload, dict) and coverage_payload:
+        source_scope_enforced = contract_has_source_constraints(
+            coverage_payload
+        )
+        evidence = source_scoped_evidence_records(
+            evidence,
+            coverage_payload,
+        )
+        if source_scope_enforced:
+            documents = [
+                document
+                for document in documents
+                if classify_evidence_source(
+                    {
+                        "source_url": (
+                            document.get("canonical_url")
+                            or document.get("final_url")
+                            or ""
+                        )
+                    },
+                    coverage_payload,
+                ).source_scope_status is SourceScopeStatus.IN_SCOPE
+            ]
+            # Raw tool payloads can contain candidates outside the user's
+            # source contract. The scoped evidence registry is the only safe
+            # compression input under an active source constraint.
+            tool_results = []
+    prefix_sections = [
+        "Research topic:\n" + topic,
+        "Owned coverage contract:\n"
         + json.dumps(
-            _accepted_evidence_records(state),
+            owned_requirements,
             ensure_ascii=False,
             default=str,
         ),
+    ]
+    suffix_sections = [
         "Document registry:\n"
         + json.dumps(documents, ensure_ascii=False, default=str),
         "Protected tool evidence:\n"
         + json.dumps(tool_results, ensure_ascii=False, default=str),
+    ]
+    fixed_chars = len("\n\n".join([*prefix_sections, *suffix_sections]))
+    bounded_evidence, evidence_stats = _bounded_evidence_records(
+        evidence,
+        max_chars=max(1_000, max_chars - fixed_chars - 500),
+        priority_text=(
+            topic
+            + "\n"
+            + json.dumps(
+                owned_requirements,
+                ensure_ascii=False,
+                default=str,
+            )
+        ),
+    )
+    sections = [
+        *prefix_sections,
+        "Structured evidence registry:\n"
+        + json.dumps(
+            bounded_evidence,
+            ensure_ascii=False,
+            default=str,
+        ),
+        "Structured evidence stats:\n"
+        + json.dumps(evidence_stats, ensure_ascii=False, default=str),
+        *suffix_sections,
     ]
     return "\n\n".join(sections)[:max_chars]
 
@@ -3265,17 +3519,39 @@ def _compression_evidence_text(state: ResearcherState, max_chars: int) -> str:
 def _deterministic_compression_fallback(state: ResearcherState) -> str:
     """Produce a traceable handoff when the compression model stays in tool mode."""
     evidence = _accepted_evidence_records(state)
+    coverage_payload = state.get("coverage_contract")
+    if isinstance(coverage_payload, dict) and coverage_payload:
+        evidence = source_scoped_evidence_records(evidence, coverage_payload)
+    evidence, _evidence_stats = _bounded_evidence_records(
+        evidence,
+        max_chars=12_000,
+        priority_text=(
+            str(state.get("research_topic", ""))
+            + "\n"
+            + json.dumps(
+                _owned_compression_requirements(state),
+                ensure_ascii=False,
+                default=str,
+            )
+        ),
+    )
     if not evidence:
         return ""
 
+    source_scope_enforced = bool(
+        isinstance(coverage_payload, dict)
+        and coverage_payload
+        and contract_has_source_constraints(coverage_payload)
+    )
     source_numbers: dict[str, int] = {}
     source_titles: dict[str, str] = {}
     findings: list[str] = []
     for record in evidence:
         claim = str(record.get("claim") or "").strip()
         source_url = str(record.get("source_url") or "").strip()
-        if not claim:
+        if not claim or _compression_out_of_scope_urls(claim, state):
             continue
+        evidence_id = str(record.get("evidence_id") or "").strip()
         citation = ""
         if source_url:
             if source_url not in source_numbers:
@@ -3283,8 +3559,15 @@ def _deterministic_compression_fallback(state: ResearcherState) -> str:
                 source_titles[source_url] = str(record.get("source_title") or source_url)
             citation = f" [{source_numbers[source_url]}]"
         excerpt = str(record.get("supporting_excerpt") or "").strip()
-        excerpt_suffix = f" Supporting excerpt: {excerpt[:500]}" if excerpt else ""
-        findings.append(f"- {claim[:1500]}{citation}.{excerpt_suffix}")
+        excerpt_suffix = (
+            f" Supporting excerpt: {excerpt[:500]}"
+            if excerpt and not source_scope_enforced
+            else ""
+        )
+        evidence_citation = f" [{evidence_id}]" if evidence_id else ""
+        findings.append(
+            f"- {claim[:1500]}{evidence_citation}{citation}.{excerpt_suffix}"
+        )
 
     if not findings:
         return ""
@@ -3292,14 +3575,24 @@ def _deterministic_compression_fallback(state: ResearcherState) -> str:
         f"[{number}] {source_titles[url]}: {url}"
         for url, number in source_numbers.items()
     ]
+    coverage_checklist = [
+        (
+            f"- {requirement['requirement_id']}: evidence-backed fallback "
+            "assembled; final support status requires Handoff admission."
+        )
+        for requirement in _owned_compression_requirements(state)
+    ]
     return "\n".join([
-        "**List of Queries and Tool Calls Made**",
-        "Compression-model fallback assembled from the accepted structured evidence registry.",
+        "**Research Queries and Tool Calls / 研究查询与工具调用**",
+        "压缩模型安全回退：以下内容仅由已接纳的结构化证据确定性组装。",
         "",
-        "**Fully Comprehensive Findings**",
+        "**Traceable Findings / 可追溯发现**",
         *findings,
         "",
-        "### Sources",
+        "### Coverage Checklist / Coverage 检查清单",
+        *coverage_checklist,
+        "",
+        "### Sources / 来源",
         *sources,
     ])
 
@@ -3456,8 +3749,27 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
                 raise ValueError(
                     "compression_model_returned_tool_call_instead_of_summary"
                 )
+            compressed_research = _message_content_text(response.content)
+            missing_requirement_ids = _compression_missing_requirement_ids(
+                compressed_research,
+                state,
+            )
+            if missing_requirement_ids:
+                raise ValueError(
+                    "compression_output_missing_requirements:"
+                    + ",".join(missing_requirement_ids)
+                )
+            out_of_scope_urls = _compression_out_of_scope_urls(
+                compressed_research,
+                state,
+            )
+            if out_of_scope_urls:
+                raise ValueError(
+                    "compression_output_out_of_scope_urls:"
+                    + ",".join(out_of_scope_urls)
+                )
             return {
-                "compressed_research": _message_content_text(response.content),
+                "compressed_research": compressed_research,
                 "raw_notes": [raw_notes_content],
                 "metrics": metrics,
             }
@@ -3486,11 +3798,34 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
                 reduced_length = max(1000, int(len(compression_evidence) * 0.8))
                 compression_evidence = compression_evidence[:reduced_length]
                 continue
-            retry_instruction = (
-                "\n\nA previous compression attempt returned an action, tool call, "
-                "or invalid output. Do not continue research. Return the finished "
-                "evidence synthesis now."
-            )
+            if str(e).startswith(
+                "compression_output_missing_requirements:"
+            ):
+                missing_ids = str(e).partition(":")[2]
+                retry_instruction = (
+                    "\n\nThe previous synthesis was incomplete and omitted owned "
+                    "coverage requirements. Regenerate the entire report, not a "
+                    "continuation. Include findings plus the final Coverage "
+                    "checklist for every exact requirement_id. Missing IDs: "
+                    + missing_ids
+                )
+            elif str(e).startswith(
+                "compression_output_out_of_scope_urls:"
+            ):
+                invalid_urls = str(e).partition(":")[2]
+                retry_instruction = (
+                    "\n\nThe previous synthesis included URLs outside the "
+                    "source contract. Regenerate the entire report using only "
+                    "the structured evidence and allowed source URLs. Do not "
+                    "repeat or mention these invalid URLs: "
+                    + invalid_urls
+                )
+            else:
+                retry_instruction = (
+                    "\n\nA previous compression attempt returned an action, tool call, "
+                    "or invalid output. Do not continue research. Return the finished "
+                    "evidence synthesis now."
+                )
             continue
 
     fallback = _deterministic_compression_fallback(state)

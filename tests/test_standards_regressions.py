@@ -69,6 +69,157 @@ def test_structured_web_output_remains_json_after_injection_filtering() -> None:
     assert payload["_trust_notice"]
 
 
+def test_compression_input_excludes_out_of_scope_documents_and_tool_text() -> None:
+    allowed_url = "https://allowed.example/research"
+    blocked_url = "https://blocked.example/private"
+    contract = {
+        "schema_version": 1,
+        "original_query_sha256": "a" * 64,
+        "requirements": [{
+            "requirement_id": "COV-01",
+            "text": f"只允许使用以下 URL 作为证据：{allowed_url}",
+            "source_message_index": 0,
+            "source_start": 0,
+            "source_end": 80,
+        }],
+        "advisory_dimensions": [],
+    }
+    state = {
+        "research_topic": "Constrained source research",
+        "requirement_ids": ["COV-01"],
+        "coverage_contract": contract,
+        "researcher_messages": [
+            ToolMessage(
+                content=f"Allowed {allowed_url}; leaked {blocked_url}",
+                tool_call_id="web-1",
+                name="web_research",
+            )
+        ],
+        "document_registry": [
+            {"document_id": "doc-allowed", "canonical_url": allowed_url},
+            {"document_id": "doc-blocked", "canonical_url": blocked_url},
+        ],
+        "evidence_registry": [
+            {
+                "evidence_id": "ev-allowed",
+                "claim": "Allowed claim",
+                "source_url": allowed_url,
+                "security_status": "accepted",
+            },
+            {
+                "evidence_id": "ev-blocked",
+                "claim": "Blocked claim",
+                "source_url": blocked_url,
+                "security_status": "accepted",
+            },
+        ],
+    }
+
+    compression_input = deep_researcher._compression_evidence_text(
+        state,
+        max_chars=30_000,
+    )
+
+    assert allowed_url in compression_input
+    assert "Allowed claim" in compression_input
+    assert blocked_url not in compression_input
+    assert "Blocked claim" not in compression_input
+
+
+def test_deterministic_compression_fallback_keeps_owned_requirement_ids() -> None:
+    state = {
+        "requirement_ids": ["COV-01"],
+        "coverage_contract": {
+            "schema_version": 1,
+            "original_query_sha256": "a" * 64,
+            "requirements": [{
+                "requirement_id": "COV-01",
+                "text": "Explain checkpoint recovery.",
+                "source_message_index": 0,
+                "source_start": 0,
+                "source_end": 30,
+            }],
+            "advisory_dimensions": [],
+        },
+        "evidence_registry": [{
+            "evidence_id": "ev-1",
+            "claim": "Checkpoint state can be restored.",
+            "source_url": "https://example.test/checkpoint",
+            "security_status": "accepted",
+        }],
+    }
+
+    fallback = deep_researcher._deterministic_compression_fallback(state)
+
+    assert "COV-01" in fallback
+    assert deep_researcher._compression_missing_requirement_ids(
+        fallback,
+        state,
+    ) == ()
+
+
+def test_compression_output_rejects_urls_outside_explicit_scope() -> None:
+    state = {
+        "coverage_contract": {
+            "requirements": [
+                {
+                    "requirement_id": "COV-01",
+                    "text": (
+                        "只允许以下 URL 作为证据："
+                        "https://allowed.example/research"
+                    ),
+                }
+            ]
+        }
+    }
+
+    assert deep_researcher._compression_out_of_scope_urls(
+        (
+            "Allowed https://allowed.example/research and blocked "
+            "https://blocked.example/context."
+        ),
+        state,
+    ) == ("https://blocked.example/context",)
+
+
+def test_deterministic_fallback_skips_claim_urls_outside_scope_and_cites_ids(
+) -> None:
+    allowed_url = "https://allowed.example/research"
+    blocked_url = "https://blocked.example/context"
+    state = {
+        "requirement_ids": ["COV-01"],
+        "coverage_contract": {
+            "requirements": [
+                {
+                    "requirement_id": "COV-01",
+                    "text": f"只允许以下 URL 作为证据：{allowed_url}",
+                }
+            ]
+        },
+        "evidence_registry": [
+            {
+                "evidence_id": "ev_allowed",
+                "claim": "Allowed traceable claim.",
+                "source_url": allowed_url,
+                "security_status": "accepted",
+            },
+            {
+                "evidence_id": "ev_embedded_blocked",
+                "claim": f"Unsafe claim points to {blocked_url}",
+                "source_url": allowed_url,
+                "security_status": "accepted",
+            },
+        ],
+    }
+
+    fallback = deep_researcher._deterministic_compression_fallback(state)
+
+    assert "Allowed traceable claim" in fallback
+    assert "ev_allowed" in fallback
+    assert blocked_url not in fallback
+    assert "ev_embedded_blocked" not in fallback
+
+
 @pytest.mark.asyncio
 async def test_researcher_registry_survives_structured_web_injection_filter(
     monkeypatch,
@@ -703,6 +854,90 @@ async def test_compression_retries_tool_mode_and_excludes_agent_plans(
     assert "TOOL_EVIDENCE_SENTINEL" in captured_messages[0][-1].content
     assert "primary paper defines" in update["compressed_research"]
     assert "AGENT_PLAN_SENTINEL" not in update["raw_notes"][0]
+
+
+@pytest.mark.asyncio
+async def test_compression_retries_when_owned_requirements_are_omitted(
+    monkeypatch,
+) -> None:
+    captured_messages: list[list] = []
+    responses = iter([
+        AIMessage(content=(
+            "Finding one is supported [ev-one].\n\n"
+            "Coverage checklist\nCOV-01-alpha: supported"
+        )),
+        AIMessage(content=(
+            "Finding one is supported [ev-one]. Finding two is supported "
+            "[ev-two].\n\nCoverage checklist\n"
+            "COV-01-alpha: supported [ev-one]\n"
+            "COV-02-beta: supported [ev-two]"
+        )),
+    ])
+
+    async def fake_invoke(_model, messages, *_args, **_kwargs):
+        captured_messages.append(messages)
+        return next(responses)
+
+    monkeypatch.setattr(
+        deep_researcher,
+        "invoke_model_with_retry_observability",
+        fake_invoke,
+    )
+    coverage_contract = {
+        "schema_version": 1,
+        "original_query_sha256": "a" * 64,
+        "requirements": [
+            {
+                "requirement_id": "COV-01-alpha",
+                "text": "Report finding one.",
+                "source_message_index": 0,
+                "source_start": 0,
+                "source_end": 19,
+            },
+            {
+                "requirement_id": "COV-02-beta",
+                "text": "Report finding two.",
+                "source_message_index": 0,
+                "source_start": 20,
+                "source_end": 39,
+            },
+        ],
+    }
+    update = await deep_researcher.compress_research(
+        {
+            "research_topic": "Report both findings.",
+            "requirement_ids": ["COV-01-alpha", "COV-02-beta"],
+            "coverage_contract": coverage_contract,
+            "researcher_messages": [],
+            "evidence_registry": [
+                {
+                    "evidence_id": "ev-one",
+                    "claim": "Finding one is supported.",
+                    "source_url": "https://example.com/one",
+                    "supporting_excerpt": "Finding one is supported.",
+                    "security_status": "accepted",
+                },
+                {
+                    "evidence_id": "ev-two",
+                    "claim": "Finding two is supported.",
+                    "source_url": "https://example.com/two",
+                    "supporting_excerpt": "Finding two is supported.",
+                    "security_status": "accepted",
+                },
+            ],
+        },
+        {
+            "configurable": {
+                "compression_model": "openai:deepseek-v4-flash"
+            },
+            "metadata": {"run_id": "compression-coverage-retry"},
+        },
+    )
+
+    assert len(captured_messages) == 2
+    assert "Owned coverage contract" in captured_messages[0][-1].content
+    assert "Missing IDs: COV-02-beta" in captured_messages[1][-1].content
+    assert "COV-02-beta: supported" in update["compressed_research"]
 
 
 @pytest.mark.asyncio

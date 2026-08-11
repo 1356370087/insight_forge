@@ -327,6 +327,10 @@ research findings directly, even when the supplied evidence has gaps.
 4. You should include a "Sources" section at the end of the report that lists all of the sources the researcher found with corresponding citations, cited against statements in the report.
 5. Make sure to include ALL of the sources that the researcher gathered in the report, and how they were used to answer the question!
 6. It's really important not to lose any sources. A later LLM will be used to merge this report with others, so having all of the sources is critical.
+7. Every factual claim and short quotation must preserve at least one stable evidence_id exactly as it appears in the protected evidence envelope, using `[evidence_id]` next to the claim. Never invent an evidence_id and omit a claim when no accepted evidence_id supports it.
+8. Preserve the evidence locator (heading, paragraph, page, or character range) next to each quotation when it is available.
+9. When the available sources are explicitly bounded, phrase negative findings only within that checked scope (for example, "Within the three specified official pages, no statement was found ...") and label broader absence as unconfirmed. Never turn a bounded search result into a universal non-existence claim.
+10. When an Owned coverage contract is supplied, include a final **Coverage checklist** containing every exact requirement_id once. For each requirement, state `supported`, `partial`, or `未证实` and cite the accepted evidence_ids used for factual support. Never mark a requirement supported when the body omitted its requested finding.
 </Guidelines>
 
 <Output Format>

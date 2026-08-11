@@ -9,6 +9,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from open_deep_research.agents import deep_researcher
 from open_deep_research.agents.query_engine import QueryEngine
 from open_deep_research.completion import accepted_evidence
+from open_deep_research.configuration import Configuration
 from open_deep_research.quality import HandoffAssessment
 from open_deep_research.run_context import RunContextStore
 from open_deep_research.runtime import apply_update_to_state
@@ -60,6 +61,54 @@ def _main_state(*, with_evidence: bool = False) -> dict[str, Any]:
             else []
         ),
     }
+
+
+def test_sync_research_timeout_is_unchanged_without_quality_gate() -> None:
+    configurable = Configuration(
+        task_timeout_seconds=600,
+        quality_evaluation_enabled=False,
+    )
+
+    assert (
+        deep_researcher._effective_sync_research_task_timeout_seconds(
+            configurable
+        )
+        == 600
+    )
+
+
+def test_sync_research_timeout_reserves_bounded_quality_grace() -> None:
+    configurable = Configuration(
+        task_timeout_seconds=600,
+        quality_evaluation_enabled=True,
+        max_react_tool_calls=10,
+        quality_gap_recovery_max_attempts=1,
+        model_call_timeout_seconds=180,
+    )
+
+    assert (
+        deep_researcher._effective_sync_research_task_timeout_seconds(
+            configurable
+        )
+        == 1200
+    )
+
+
+def test_sync_research_timeout_keeps_public_ceiling() -> None:
+    configurable = Configuration(
+        task_timeout_seconds=3600,
+        quality_evaluation_enabled=True,
+        max_react_tool_calls=30,
+        quality_gap_recovery_max_attempts=3,
+        model_call_timeout_seconds=180,
+    )
+
+    assert (
+        deep_researcher._effective_sync_research_task_timeout_seconds(
+            configurable
+        )
+        == 3600
+    )
 
 
 @pytest.mark.asyncio
