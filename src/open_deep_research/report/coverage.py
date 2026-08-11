@@ -8,6 +8,7 @@ _TAG_RE = re.compile(r"<[^>]+>")
 _SPACE_RE = re.compile(r"\s+")
 _CLAUSE_RE = re.compile(r"[。；;\n]+|(?<=\S)，(?=并|以及|同时|结合|区分|说明|提出|给出|评估|比较)")
 _LIST_RE = re.compile(r"[、,，]+")
+_FINAL_LIST_CONJUNCTION_RE = re.compile(r"\s*(?:以及|和|与)\s*(?=\S)")
 _NUMBERED_ITEM_RE = re.compile(r"(?<!\w)(\d{1,2})[.)]\s+")
 _GLOBAL_DIRECTIVE_RE = re.compile(
     r"(?<=[.!?。！？])\s+(?=(?:for all\b|finally\b|additionally\b|also\b|最后|此外|并(?:最终|另外)))",
@@ -69,7 +70,22 @@ def derive_coverage_checklist(text: str, *, max_items: int = 20) -> list[str]:
             if not clause:
                 continue
             parts = _LIST_RE.split(clause)
-            candidates.extend(part.strip(" ：:。. ") for part in parts)
+            # Chinese enumerations commonly use a delimiter for the first
+            # items and a conjunction for the final pair (``A、B 和 C``).
+            # Once an explicit list delimiter is present, keep the final item
+            # atomic as well instead of merging two independently delegable
+            # coverage requirements into one impossible Subagent contract.
+            if len(parts) > 1:
+                expanded_parts = [
+                    nested
+                    for part in parts
+                    for nested in _FINAL_LIST_CONJUNCTION_RE.split(part)
+                ]
+            else:
+                expanded_parts = parts
+            candidates.extend(
+                part.strip(" ：:。. ") for part in expanded_parts
+            )
 
     checklist: list[str] = []
     seen: set[str] = set()

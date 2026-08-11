@@ -26,7 +26,7 @@ from open_deep_research.configuration import (
     get_model_compatibility_kwargs,
 )
 from open_deep_research.evidence import (
-    contract_requires_official_sources,
+    contract_has_source_constraints,
     source_scoped_evidence_records,
 )
 from open_deep_research.observability import (
@@ -185,7 +185,7 @@ class ReportContext:
             configurable=configurable,
             findings=(
                 _build_scoped_evidence_findings(scoped_evidence)
-                if contract_requires_official_sources(coverage_contract)
+                if contract_has_source_constraints(coverage_contract)
                 else _build_findings(state)
             ),
             sources=list(sources or evidence_sources),

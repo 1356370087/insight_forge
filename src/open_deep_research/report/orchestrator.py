@@ -29,7 +29,7 @@ from langchain_core.runnables import RunnableConfig
 from open_deep_research.configuration import QUALITY_POLICY_VERSION, Configuration
 from open_deep_research.evaluation import build_evaluation_snapshot
 from open_deep_research.evidence import (
-    contract_requires_official_sources,
+    contract_has_source_constraints,
     source_scoped_evidence_records,
 )
 from open_deep_research.observability import get_trace_recorder
@@ -539,7 +539,7 @@ async def build_report(state: dict, config: RunnableConfig) -> dict:
         )
     else:
         has_accepted_evidence = (
-            not contract_requires_official_sources(
+            not contract_has_source_constraints(
                 state.get("coverage_contract")
             )
             and bool(
@@ -575,7 +575,7 @@ async def build_report(state: dict, config: RunnableConfig) -> dict:
     if (
         cfg.quality_evaluation_enabled
         and not ctx.sources
-        and not contract_requires_official_sources(
+        and not contract_has_source_constraints(
             state.get("coverage_contract")
         )
     ):
