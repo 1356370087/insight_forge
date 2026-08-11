@@ -1,10 +1,13 @@
 "use client";
 
 import { useEffect } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { researchApi, subscribeToRun } from "@/lib/api";
 import { useResearchRunStore } from "@/stores/research-run-store";
 
 export function useRunStream(runId: string) {
+  const queryClient = useQueryClient();
+
   useEffect(() => {
     const controller = new AbortController();
     let stopped = false;
@@ -26,6 +29,7 @@ export function useRunStream(runId: string) {
             if (["run.completed", "run.failed", "run.cancelled"].includes(event.type)) {
               const finalSnapshot = await researchApi.getRun(runId);
               useResearchRunStore.getState().hydrate(finalSnapshot);
+              await queryClient.invalidateQueries({ queryKey: ["runs"] });
               controller.abort();
             }
           },
@@ -47,5 +51,5 @@ export function useRunStream(runId: string) {
     }
     void connect();
     return () => { stopped = true; controller.abort(); };
-  }, [runId]);
+  }, [queryClient, runId]);
 }
