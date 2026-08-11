@@ -14,6 +14,7 @@ from open_deep_research.quality import (
     _bounded_evidence_records,
     _build_quality_model,
     _evaluate_json,
+    _evidence_optional_requirement_ids,
     _normalize_quality_payload,
     _unwrap_single_key_schema_payload,
     deterministic_handoff_checks,
@@ -21,6 +22,7 @@ from open_deep_research.quality import (
     evaluate_subagent_handoff,
     evaluate_tool_results,
 )
+from open_deep_research.quality_contract import ResearchCoverageContract
 from open_deep_research.tools.utils import get_notes_from_tool_calls
 
 
@@ -256,6 +258,176 @@ def test_bounded_evidence_prioritizes_strong_records_and_filters_unsafe() -> Non
     }
 
 
+def test_bounded_evidence_prioritizes_handoff_citations() -> None:
+    cited_quote = (
+        "Skip scan works by generating a dynamic equality constraint "
+        "internally for a leading index column."
+    )
+    records = [
+        {
+            "evidence_id": f"irrelevant-{index}",
+            "claim": f"Unrelated high-authority claim {index}. " + ("x" * 300),
+            "supporting_excerpt": "Unrelated excerpt. " + ("y" * 300),
+            "source_url": "https://www.postgresql.org/docs/18/other.html",
+            "source_authority": 1.0,
+            "confidence": 1.0,
+            "security_status": "accepted",
+        }
+        for index in range(20)
+    ]
+    records.append({
+        "evidence_id": "cited-late",
+        "claim": "The planner can generate an equality constraint.",
+        "supporting_excerpt": cited_quote,
+        "source_url": (
+            "https://www.postgresql.org/docs/18/indexes-multicolumn.html"
+        ),
+        "source_authority": 0.5,
+        "confidence": 0.7,
+        "security_status": "accepted",
+    })
+
+    selected, stats = _bounded_evidence_records(
+        records,
+        max_chars=1_100,
+        priority_text=f"The report quotes: {cited_quote}",
+    )
+
+    assert selected[0]["evidence_id"] == "cited-late"
+    assert stats["priority_matched_count"] == 1
+    assert stats["priority_included_count"] == 1
+
+
+def test_bounded_evidence_prioritizes_explicit_ids_over_fuzzy_matches() -> None:
+    cited = {
+        "evidence_id": "ev_explicit_citation",
+        "claim": "A short cited claim.",
+        "supporting_excerpt": "A short cited excerpt.",
+        "source_url": "https://example.com/cited",
+        "source_authority": 0.5,
+        "confidence": 0.7,
+        "security_status": "accepted",
+    }
+    fuzzy = {
+        "evidence_id": "ev_fuzzy_match",
+        "claim": "Skip scan dynamic equality constraint planner conditions.",
+        "supporting_excerpt": "Skip scan dynamic equality constraint.",
+        "source_url": "https://example.com/fuzzy",
+        "source_authority": 1.0,
+        "confidence": 1.0,
+        "security_status": "accepted",
+    }
+    cited_size = len(json.dumps(cited, ensure_ascii=False)) + 2
+
+    selected, stats = _bounded_evidence_records(
+        [fuzzy, cited],
+        max_chars=cited_size,
+        priority_text=(
+            "Skip scan dynamic equality constraint "
+            "[ev_explicit_citation]."
+        ),
+    )
+
+    assert [record["evidence_id"] for record in selected] == [
+        "ev_explicit_citation"
+    ]
+    assert stats["explicit_citation_count"] == 1
+    assert stats["explicit_citation_included_count"] == 1
+
+
+def test_bounded_evidence_fits_every_explicit_citation_in_tight_budget() -> None:
+    records = [
+        {
+            "evidence_id": f"ev_cited_{index:02d}",
+            "claim": f"Cited claim {index}. " + ("c" * 1_000),
+            "supporting_excerpt": f"Quoted evidence {index}. " + ("e" * 2_000),
+            "source_url": f"https://example.com/source-{index}",
+            "source_title": "Official source " + ("t" * 400),
+            "source_authority": 1.0,
+            "confidence": 0.9,
+            "security_status": "accepted",
+        }
+        for index in range(12)
+    ]
+    priority_text = " ".join(record["evidence_id"] for record in records)
+
+    selected, stats = _bounded_evidence_records(
+        records,
+        max_chars=12_000,
+        priority_text=priority_text,
+    )
+
+    assert {record["evidence_id"] for record in selected} == {
+        record["evidence_id"] for record in records
+    }
+    assert stats["explicit_citation_count"] == 12
+    assert stats["explicit_citation_included_count"] == 12
+    assert len(json.dumps(selected, ensure_ascii=False)) <= 12_000
+
+
+def test_parallel_and_source_contract_requirements_are_evidence_optional() -> None:
+    contract = ResearchCoverageContract.model_validate({
+        "schema_version": 1,
+        "original_query_sha256": "a" * 64,
+        "requirements": [
+            {
+                "requirement_id": "COV-01",
+                "text": (
+                    "严格仅使用以下 URL 作为证据：https://example.com/a；"
+                    "至少拆分为两个并行 Subagent"
+                ),
+                "source_message_index": 0,
+                "source_start": 0,
+                "source_end": 80,
+            },
+            {
+                "requirement_id": "COV-02",
+                "text": "每个 Subagent 都必须交叉读取并引用全部 3 个 URL",
+                "source_message_index": 0,
+                "source_start": 81,
+                "source_end": 130,
+            },
+            {
+                "requirement_id": "COV-03",
+                "text": "研究迁移风险",
+                "source_message_index": 0,
+                "source_start": 131,
+                "source_end": 140,
+            },
+        ],
+        "advisory_dimensions": [],
+    })
+
+    assert _evidence_optional_requirement_ids(contract) == (
+        "COV-01",
+        "COV-02",
+    )
+
+
+def test_bounded_evidence_omits_claim_duplicated_by_excerpt() -> None:
+    selected, _stats = _bounded_evidence_records(
+        [
+            {
+                "evidence_id": "ev_duplicate",
+                "claim": "Skip scan uses a dynamic equality constraint.",
+                "supporting_excerpt": (
+                    "Skip scan uses a dynamic equality constraint. "
+                    "The planner repeats the index search."
+                ),
+                "source_url": "https://example.com/source",
+                "security_status": "accepted",
+            }
+        ],
+        max_chars=2_000,
+    )
+
+    assert selected[0]["evidence_id"] == "ev_duplicate"
+    assert "claim" not in selected[0]
+    assert "dynamic equality constraint" in selected[0][
+        "supporting_excerpt"
+    ]
+
+
 def test_compact_handoff_can_report_source_count_without_raw_notes() -> None:
     checks = deterministic_handoff_checks(
         {
@@ -315,6 +487,110 @@ def test_quality_payload_conservatively_collapses_nested_corroboration() -> None
     assessment = ToolResultAssessment.model_validate(normalized)
 
     assert assessment.corroboration == 3
+
+
+def test_quality_payload_collapses_provider_named_score_dimensions() -> None:
+    """Captured DeepSeek/Qwen-compatible dimensions remain a scalar score."""
+    normalized = _normalize_quality_payload({
+        "decision": "complete",
+        "relevance": 5,
+        "source_quality": 5,
+        "evidence_coverage": 4,
+        "corroboration": {
+            "core_claims": 5,
+            "syntax_details": 4,
+            "limitations": 4,
+            "comparison": 5,
+        },
+        "unresolved_conflicts": 0,
+        "missing_information": [],
+        "suggested_queries": [],
+        "reason": "The evidence is complete.",
+    })
+
+    assessment = ToolResultAssessment.model_validate(normalized)
+
+    assert assessment.corroboration == 4
+    assert assessment.unresolved_conflicts == []
+
+
+def test_quality_payload_preserves_provider_reported_gap_counts() -> None:
+    """Captured DeepSeek count-only gaps remain conservative quality signals."""
+    normalized = _normalize_quality_payload({
+        "decision": "continue",
+        "relevance": 4,
+        "source_quality": 2,
+        "evidence_coverage": 2,
+        "corroboration": 3,
+        "unresolved_conflicts": 3,
+        "missing_information": 2,
+        "suggested_queries": ["PostgreSQL 18 official asynchronous I/O docs"],
+        "reason": "More official evidence is required.",
+    })
+
+    assessment = ToolResultAssessment.model_validate(normalized)
+
+    assert assessment.unresolved_conflicts == [
+        "Provider reported 3 unresolved conflicts without itemized details."
+    ]
+    assert assessment.missing_information == [
+        "Provider reported 2 missing information items without itemized details."
+    ]
+
+
+def test_quality_payload_preserves_numeric_gaps_despite_no_gap_reason() -> None:
+    """Contradictory provider fields must retain the conservative gap signal."""
+    normalized = _normalize_quality_payload({
+        "decision": "complete",
+        "relevance": 5,
+        "source_quality": 5,
+        "evidence_coverage": 5,
+        "corroboration": 4,
+        "unresolved_conflicts": 5,
+        "missing_information": 5,
+        "suggested_queries": [],
+        "reason": (
+            "All owned requirements are fully satisfied, with no unresolved "
+            "gaps or conflicts."
+        ),
+    })
+
+    assessment = ToolResultAssessment.model_validate(normalized)
+
+    assert assessment.decision == "complete"
+    assert assessment.unresolved_conflicts == [
+        "Provider reported 5 unresolved conflicts without itemized details."
+    ]
+    assert assessment.missing_information == [
+        "Provider reported 5 missing information items without itemized details."
+    ]
+
+
+def test_quality_payload_wraps_provider_single_gap_strings() -> None:
+    """Captured DeepSeek singleton gap strings satisfy the requested list shape."""
+    normalized = _normalize_quality_payload({
+        "decision": "continue",
+        "relevance": 4,
+        "source_quality": 3,
+        "evidence_coverage": 2,
+        "corroboration": 4,
+        "unresolved_conflicts": "Official-source admissibility remains unresolved.",
+        "missing_information": "A PostgreSQL 17 baseline is still missing.",
+        "suggested_queries": "site:postgresql.org/docs/17 generated columns",
+        "reason": "More official evidence is required.",
+    })
+
+    assessment = ToolResultAssessment.model_validate(normalized)
+
+    assert assessment.unresolved_conflicts == [
+        "Official-source admissibility remains unresolved."
+    ]
+    assert assessment.missing_information == [
+        "A PostgreSQL 17 baseline is still missing."
+    ]
+    assert assessment.suggested_queries == [
+        "site:postgresql.org/docs/17 generated columns"
+    ]
 
 
 @pytest.mark.asyncio

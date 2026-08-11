@@ -20,7 +20,8 @@ from open_deep_research.configuration import QUALITY_POLICY_VERSION, Configurati
 from open_deep_research.evidence import (
     SourceScopeStatus,
     classify_evidence_source,
-    contract_requires_official_sources,
+    compile_source_scope,
+    contract_has_source_constraints,
     is_evidence_eligible,
     source_scoped_evidence_records,
 )
@@ -59,6 +60,23 @@ _QUALITY_EVIDENCE_FIELD_LIMITS = {
     "conflict_group": 160,
     "security_status": 40,
 }
+_EVIDENCE_OPTIONAL_REQUIREMENT_RE = re.compile(
+    r"(?:不可拆分|单一研究任务)|"
+    r"(?:至少.{0,48}(?:并行.{0,16})?(?:Subagent|子智能体|研究员))|"
+    r"(?:并行.{0,24}(?:委派|开展|执行|运行)?.{0,16}(?:两个|多个|多名|两名)?.{0,16}(?:Subagent|子智能体|研究员))|"
+    r"(?:最终.{0,32}(?:中文.{0,16})?(?:对照表|比较表|表格|报告|输出|呈现))|"
+    r"(?:(?:用|使用|以).{0,12}(?:中文|英文).{0,24}(?:输出|撰写|呈现|回答|报告))|"
+    r"(?:每个.{0,24}(?:Subagent|子智能体|研究员).{0,80}(?:读取|引用|来源))|"
+    r"(?:(?:只|仅|严格).{0,480}(?:URL|网址|链接).{0,80}(?:证据|来源))|"
+    r"(?:不得.{0,32}(?:引用|使用).{0,32}(?:其他|额外|未指定).{0,16}(?:URL|网址|链接|来源))|"
+    r"(?:每项.{0,48}(?:引用|来源))|"
+    r"(?:(?:必须|需要).{0,48}标(?:为|注为).{0,24}未证实)|"
+    r"(?:不得.{0,80}(?:引用第三方|搜索候选摘要|当作证据))|"
+    r"(?:single\s+(?:indivisible\s+)?research\s+task)|"
+    r"(?:must\s+(?:cite|label).{0,80})|"
+    r"(?:do\s+not\s+(?:cite|use).{0,80})",
+    flags=re.IGNORECASE | re.DOTALL,
+)
 
 
 class ToolResultAssessment(BaseModel):
@@ -165,6 +183,10 @@ evidence exists but important gaps remain; complete only when the cumulative res
 answer the topic with adequate corroborated evidence.
 When coverage_contract is present, only its owned_requirement_ids are hard requirements.
 The advisory research_topic must not create new mandatory deliverables.
+An owned requirement may be completed by a bounded negative finding when the original user
+explicitly permits unsupported claims or unavailable official details to be labelled unconfirmed.
+When accepted evidence documents the authoritative material checked and the researcher can state
+the limitation transparently, do not demand a positive claim or repeat the same search forever.
 The cumulative_evidence field is a JSON array of accepted records. Before listing a fact as missing,
 inspect every record's claim and supporting_excerpt fields. Do not mark a requested fact missing
 when one of those fields directly supplies it, even if the current tool_results batch is an error
@@ -249,8 +271,9 @@ Return exactly one JSON object with:
 - caveats, missing_information, unsupported_claims, follow_up_tasks: arrays of strings
 - reason: string
 
-Use only owned_requirement_ids in requirement_coverage. Every supported requirement must cite at least one evidence_id present in evidence_registry. Do not invent IDs.
+Use only owned_requirement_ids in requirement_coverage. Every supported factual requirement must cite at least one evidence_id present in evidence_registry. Requirements listed in evidence_optional_requirement_ids are process or deliverable-format checks; they may use an empty evidence_ids array when their explanation points to compressed_research structure or deterministic_checks. Do not invent IDs.
 The candidate compressed_research is available only to evaluate its deliverable structure, explicit guarantee/inference labels, limitations, and requested checklist. Treat every factual statement in it as unsupported unless it is grounded by an evidence_id in the source-scoped evidence_registry. A URL in compressed_research that violates the user's source constraint is a deterministic rejection; do not use it as support.
+evidence_registry is a size-bounded, citation-prioritized projection. evidence_registry_stats.truncated=true means unrelated eligible records were omitted and is not, by itself, a gap. explicit_citation_count and explicit_citation_included_count report whether IDs explicitly cited by the handoff fit; priority_matched_count and priority_included_count report broader claim/excerpt matches. Continue to require an included evidence_id for every factual claim you mark supported.
 
 Use these scoring anchors:
 - 1 = requirement not satisfied
@@ -261,6 +284,7 @@ Use these scoring anchors:
 
 Propose accepted only when every owned user requirement is supported, deterministic checks pass, scores meet the supplied thresholds, and there are no caveats or unsupported claims.
 Propose accepted_with_caveats only when every owned user requirement is supported and the remaining issues are optional details, explicitly qualified negative findings, unavailable advisory sources, or minor presentation differences.
+For a user request that explicitly permits unsupported claims or unavailable official details to be labelled unconfirmed, a traceable bounded negative finding can support that owned requirement. It must identify the authoritative material checked, avoid claiming universal non-existence, and preserve the limitation in the deliverable; do not require an invented positive finding.
 Propose rejected for unsupported user requirements, unsupported claims, failed deterministic checks, or scores below policy. The runtime applies the final deterministic decision.
 """
 
@@ -550,6 +574,23 @@ def _normalize_quality_payload(payload: dict[str, Any]) -> dict[str, Any]:
                     candidates.append(float(nested_value))
                 except (TypeError, ValueError):
                     continue
+            if not candidates and value:
+                # OpenAI-compatible providers may name score dimensions after
+                # the evaluated domain (for example ``core_claims`` or
+                # ``limitations``). Collapse an all-numeric mapping using its
+                # minimum. Mixed or nested objects remain invalid so this
+                # compatibility path cannot silently reinterpret prose.
+                provider_candidates: list[float] = []
+                for nested_value in value.values():
+                    if isinstance(nested_value, bool | Mapping | list | tuple):
+                        provider_candidates = []
+                        break
+                    try:
+                        provider_candidates.append(float(nested_value))
+                    except (TypeError, ValueError):
+                        provider_candidates = []
+                        break
+                candidates = provider_candidates
             if not candidates:
                 continue
             value = min(candidates)
@@ -572,7 +613,7 @@ def _normalize_quality_payload(payload: dict[str, Any]) -> dict[str, Any]:
         normalized["accepted"] = (
             normalized["admission_status"] != AdmissionStatus.REJECTED.value
         )
-    for key in (
+    list_keys = (
         "unresolved_conflicts",
         "missing_information",
         "suggested_queries",
@@ -581,18 +622,135 @@ def _normalize_quality_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "requirement_coverage",
         "caveats",
         "hard_rejection_reasons",
-    ):
-        if normalized.get(key) is None:
+    )
+    count_only_gap_labels = {
+        "unresolved_conflicts": "unresolved conflicts",
+        "missing_information": "missing information items",
+        "unsupported_claims": "unsupported claims",
+        "caveats": "caveats",
+        "hard_rejection_reasons": "hard rejection reasons",
+    }
+    single_string_list_keys = set(list_keys) - {"requirement_coverage"}
+    for key in list_keys:
+        value = normalized.get(key)
+        if key in single_string_list_keys and isinstance(value, str):
+            stripped = value.strip()
+            normalized[key] = [stripped] if stripped else []
+        elif value is None or (
+            isinstance(value, int | float)
+            and not isinstance(value, bool)
+            and value == 0
+        ):
             normalized[key] = []
+        elif (
+            key in count_only_gap_labels
+            and isinstance(value, int | float)
+            and not isinstance(value, bool)
+            and value > 0
+        ):
+            # Some OpenAI-compatible structured-output providers return only
+            # the number of gaps even though the schema requests an itemized
+            # string list. Preserve that conservative quality signal instead
+            # of discarding it or failing the whole evaluation. We do not
+            # synthesize executable follow-up queries or requirement objects.
+            normalized[key] = [
+                "Provider reported "
+                f"{value:g} {count_only_gap_labels[key]} without itemized details."
+            ]
     return normalized
+
+
+def _trusted_inner_assessment_scores(
+    handoff: Mapping[str, Any],
+    policy: QualityRigorPolicy,
+) -> tuple[int, int, int, int] | None:
+    """Return validated inner-gate scores suitable for fail-open admission."""
+    assessment = handoff.get("result_assessment")
+    if not isinstance(assessment, Mapping):
+        return None
+    if assessment.get("decision") != "complete" or assessment.get("evaluator_error"):
+        return None
+    deterministic = assessment.get("deterministic_checks")
+    if not isinstance(deterministic, Mapping) or deterministic.get("passed") is not True:
+        return None
+    score_keys = (
+        "relevance",
+        "source_quality",
+        "evidence_coverage",
+        "corroboration",
+    )
+    values: list[int] = []
+    for key in score_keys:
+        value = assessment.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 5:
+            return None
+        values.append(value)
+    scores = (values[0], values[1], values[2], values[3])
+    return scores if scores_meet_runtime_policy(scores, policy) else None
+
+
+def _fit_projected_evidence_record(
+    record: Mapping[str, Any],
+    *,
+    max_chars: int,
+) -> dict[str, Any] | None:
+    """Shrink one cited record while retaining its auditable identity."""
+    candidate = dict(record)
+    encoded = json.dumps(candidate, ensure_ascii=False, default=str)
+    if len(encoded) <= max_chars:
+        return candidate
+
+    shrinkable = (
+        "supporting_excerpt",
+        "claim",
+        "source_title",
+        "locator",
+        "conflict_group",
+    )
+    while len(encoded) > max_chars:
+        available = [
+            field_name
+            for field_name in shrinkable
+            if field_name in candidate
+            and len(str(candidate[field_name])) > 32
+        ]
+        if not available:
+            break
+        field_name = max(
+            available,
+            key=lambda name: len(str(candidate[name])),
+        )
+        value = str(candidate[field_name])
+        candidate[field_name] = value[: max(32, len(value) // 2)]
+        encoded = json.dumps(candidate, ensure_ascii=False, default=str)
+
+    for field_name in (
+        "conflict_group",
+        "source_title",
+        "locator",
+        "source_authority",
+        "confidence",
+    ):
+        if len(encoded) <= max_chars:
+            break
+        candidate.pop(field_name, None)
+        encoded = json.dumps(candidate, ensure_ascii=False, default=str)
+    return candidate if len(encoded) <= max_chars else None
 
 
 def _bounded_evidence_records(
     records: Any,
     *,
     max_chars: int,
+    priority_text: str = "",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Return strong, source-diverse evidence as a bounded JSON-native array."""
+    """Return strong, source-diverse evidence as a bounded JSON-native array.
+
+    When a handoff is available, records whose claims or excerpts are actually
+    cited by that handoff are placed first. This keeps the outer Judge from
+    rejecting a grounded report merely because unrelated registry entries
+    consumed the bounded projection.
+    """
     if not isinstance(records, list):
         return [], {
             "accepted_count": 0,
@@ -618,6 +776,21 @@ def _bounded_evidence_records(
                 projected[field_name] = value
             else:
                 projected[field_name] = str(value)[:field_limit]
+        normalized_claim = _normalize_evidence_match_text(
+            projected.get("claim", "")
+        )
+        normalized_excerpt = _normalize_evidence_match_text(
+            projected.get("supporting_excerpt", "")
+        )
+        if (
+            normalized_claim
+            and normalized_excerpt
+            and normalized_claim in normalized_excerpt
+        ):
+            # The excerpt is the stronger audit field and already contains the
+            # claim verbatim after normalization.  Keeping both wastes the
+            # bounded Judge payload and can evict an explicitly cited record.
+            projected.pop("claim", None)
         if not projected:
             continue
         evidence_id = projected.get("evidence_id")
@@ -637,14 +810,41 @@ def _bounded_evidence_records(
         ) < _evidence_quality_sort_key(existing):
             projected_by_identity[identity] = projected
 
-    grouped_by_host: dict[str, list[dict[str, Any]]] = {}
+    grouped_by_host_page: dict[
+        str,
+        dict[str, list[dict[str, Any]]],
+    ] = {}
     for projected in projected_by_identity.values():
-        grouped_by_host.setdefault(
+        grouped_by_host_page.setdefault(
             _evidence_source_host(projected),
+            {},
+        ).setdefault(
+            _evidence_source_page(projected),
             [],
         ).append(projected)
-    for host_records in grouped_by_host.values():
-        host_records.sort(key=_evidence_quality_sort_key)
+
+    grouped_by_host: dict[str, list[dict[str, Any]]] = {}
+    for host, page_groups in grouped_by_host_page.items():
+        for page_records in page_groups.values():
+            page_records.sort(key=_evidence_quality_sort_key)
+        page_order = sorted(
+            page_groups,
+            key=lambda page: (
+                _evidence_quality_sort_key(page_groups[page][0]),
+                page,
+            ),
+        )
+        host_records: list[dict[str, Any]] = []
+        max_page_records = max(
+            (len(page_records) for page_records in page_groups.values()),
+            default=0,
+        )
+        for record_index in range(max_page_records):
+            for page in page_order:
+                page_records = page_groups[page]
+                if record_index < len(page_records):
+                    host_records.append(page_records[record_index])
+        grouped_by_host[host] = host_records
     host_order = sorted(
         grouped_by_host,
         key=lambda host: (
@@ -667,9 +867,80 @@ def _bounded_evidence_records(
             if record_index < len(host_records):
                 candidate_order.append(host_records[record_index])
 
+    normalized_priority_text = _normalize_evidence_match_text(priority_text)
+    # Exact evidence IDs written into the compressed handoff are a stronger
+    # signal than fuzzy claim/excerpt overlap.  Select them first and preserve
+    # their first-citation order.  Otherwise a semantically similar, uncited
+    # record can consume the bounded payload and make a valid citation look
+    # absent to the outer Judge.
+    explicit_citation_records = sorted(
+        (
+            record
+            for record in projected_by_identity.values()
+            if str(record.get("evidence_id", "")).strip()
+            and str(record["evidence_id"]) in priority_text
+        ),
+        key=lambda record: (
+            priority_text.find(str(record["evidence_id"])),
+            *_evidence_quality_sort_key(record),
+            str(record["evidence_id"]),
+        ),
+    )
+    explicit_record_budget = (
+        max(
+            1,
+            (max_chars - 2 - 2 * (len(explicit_citation_records) - 1))
+            // len(explicit_citation_records),
+        )
+        if explicit_citation_records
+        else 0
+    )
+    fitted_explicit_citation_records = [
+        fitted
+        for record in explicit_citation_records
+        if (
+            fitted := _fit_projected_evidence_record(
+                record,
+                max_chars=explicit_record_budget,
+            )
+        )
+        is not None
+    ]
+    priority_records: list[dict[str, Any]] = []
+    if normalized_priority_text:
+        priority_records = sorted(
+            (
+                record
+                for record in projected_by_identity.values()
+                if _evidence_text_match_score(
+                    record,
+                    normalized_priority_text,
+                )
+                > 0
+            ),
+            key=lambda record: (
+                -_evidence_text_match_score(
+                    record,
+                    normalized_priority_text,
+                ),
+                *_evidence_quality_sort_key(record),
+                str(record.get("evidence_id", "")),
+                str(record.get("source_url", "")),
+            ),
+        )
+
     projected_records: list[dict[str, Any]] = []
+    selected_identities: set[tuple[str, ...]] = set()
     used_chars = 2
-    for projected in candidate_order:
+    for projected in [
+        *fitted_explicit_citation_records,
+        *priority_records,
+        *candidate_order,
+    ]:
+        identity = _projected_evidence_identity(projected)
+        if identity in selected_identities:
+            continue
+        selected_identities.add(identity)
         encoded = json.dumps(projected, ensure_ascii=False, default=str)
         # json.dumps(list) separates records with ", ".
         separator_chars = 2 if projected_records else 0
@@ -679,25 +950,136 @@ def _bounded_evidence_records(
         used_chars += separator_chars + len(encoded)
 
     unique_count = len(projected_by_identity)
-    return projected_records, {
+    stats = {
         "accepted_count": accepted_count,
         "unique_count": unique_count,
         "included_count": len(projected_records),
         "truncated": len(projected_records) < unique_count,
     }
+    if normalized_priority_text:
+        priority_identities = {
+            _projected_evidence_identity(record)
+            for record in priority_records
+        }
+        included_identities = {
+            _projected_evidence_identity(record)
+            for record in projected_records
+        }
+        stats.update({
+            "priority_matched_count": len(priority_identities),
+            "priority_included_count": len(
+                priority_identities & included_identities
+            ),
+        })
+    if priority_text:
+        explicit_citation_identities = {
+            _projected_evidence_identity(record)
+            for record in explicit_citation_records
+        }
+        included_identities = {
+            _projected_evidence_identity(record)
+            for record in projected_records
+        }
+        stats.update({
+            "explicit_citation_count": len(
+                explicit_citation_identities
+            ),
+            "explicit_citation_included_count": len(
+                explicit_citation_identities & included_identities
+            ),
+        })
+    return projected_records, stats
+
+
+def _projected_evidence_identity(
+    record: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Return the stable identity used by the bounded evidence projection."""
+    evidence_id = str(record.get("evidence_id", "")).strip()
+    if evidence_id:
+        return ("evidence_id", evidence_id)
+    return (
+        "content",
+        str(record.get("claim", "")),
+        str(record.get("supporting_excerpt", "")),
+        str(record.get("source_url", "")),
+    )
+
+
+def _normalize_evidence_match_text(value: Any) -> str:
+    """Normalize prose for deterministic quote/claim overlap matching."""
+    return " ".join(
+        token
+        for token in re.findall(r"\w+", str(value).casefold())
+        if len(token) > 1
+    )
+
+
+def _evidence_text_match_score(
+    record: Mapping[str, Any],
+    normalized_priority_text: str,
+) -> int:
+    """Score whether a projected claim or excerpt is cited in a handoff."""
+    best = 0
+    for field_name in ("supporting_excerpt", "claim"):
+        normalized = _normalize_evidence_match_text(record.get(field_name, ""))
+        if not normalized:
+            continue
+        if len(normalized) >= 40 and normalized in normalized_priority_text:
+            best = max(best, 10_000 + min(len(normalized), 2_000))
+            continue
+        tokens = normalized.split()
+        for width in (12, 8, 5):
+            if len(tokens) < width:
+                continue
+            matches = sum(
+                1
+                for index in range(len(tokens) - width + 1)
+                if " ".join(tokens[index : index + width])
+                in normalized_priority_text
+            )
+            if matches:
+                best = max(best, width * 100 + min(matches, 99))
+                break
+    return best
+
+
+def _evidence_optional_requirement_ids(
+    coverage_contract: ResearchCoverageContract,
+) -> tuple[str, ...]:
+    """Return process/output requirements that do not need external proof."""
+    return tuple(
+        requirement.requirement_id
+        for requirement in coverage_contract.requirements
+        if _EVIDENCE_OPTIONAL_REQUIREMENT_RE.search(requirement.text)
+    )
 
 
 def _evidence_source_host(record: Mapping[str, Any]) -> str:
-    """Return a stable source bucket for evaluator diversity."""
+    """Return a stable host bucket for evaluator evidence diversity."""
     source_url = str(record.get("source_url", "")).strip()
     if source_url:
         try:
-            hostname = urlsplit(source_url).hostname
+            parsed = urlsplit(source_url)
+            hostname = parsed.hostname
         except ValueError:
             hostname = None
         if hostname:
             return hostname.lower().rstrip(".")
     return "<unknown-source>"
+
+
+def _evidence_source_page(record: Mapping[str, Any]) -> str:
+    """Return a query-free page bucket within one evidence source host."""
+    source_url = str(record.get("source_url", "")).strip()
+    if source_url:
+        try:
+            parsed = urlsplit(source_url)
+        except ValueError:
+            return "<unknown-page>"
+        if parsed.hostname:
+            return parsed.path.rstrip("/") or "/"
+    return "<unknown-page>"
 
 
 def _evidence_quality_sort_key(
@@ -752,6 +1134,30 @@ def _bounded_tool_results(
         bounded.append(projected)
         used_chars += separator_chars + len(encoded)
     return bounded
+
+
+def _source_scoped_tool_result_summaries(
+    tool_results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Hide raw candidates when an exclusive source contract is active.
+
+    Every admitted record from the current batch is already present in the
+    source-scoped cumulative evidence registry.  Passing the raw web-pipeline
+    JSON as well would reintroduce out-of-scope search candidates and make the
+    evaluator treat their mere discovery as a contract violation.
+    """
+    return [
+        {
+            "name": str(result.get("name", ""))[:160],
+            "content": (
+                "Current-batch source content is projected in the "
+                "source-scoped cumulative_evidence field; raw candidates "
+                "were omitted by policy."
+            ),
+            "error": bool(result.get("error", False)),
+        }
+        for result in tool_results
+    ]
 
 
 def deterministic_tool_checks(
@@ -846,8 +1252,20 @@ def deterministic_handoff_checks(
     """Reject empty handoffs and handoffs without enough traceable sources."""
     compressed = str(handoff.get("compressed_research", "")).strip()
     raw_notes = "\n".join(str(note) for note in handoff.get("raw_notes", []))
-    source_scope_enforced = contract_requires_official_sources(
+    source_scope_enforced = contract_has_source_constraints(
         coverage_contract
+    )
+    source_scope = compile_source_scope(coverage_contract)
+    # A leaf task that is explicitly restricted to named URLs may legitimately
+    # own just one of the Run-level allowlisted sources. Requiring the global
+    # diversity floor at this boundary creates an impossible contract and
+    # pressures the task to violate the user's source whitelist. Diversity is
+    # still evaluated on the merged Run output; non-explicit/official scopes
+    # retain the configured minimum here.
+    effective_min_sources = (
+        1
+        if source_scope.explicit_url_only and source_scope.allowed_urls
+        else max(1, int(min_sources))
     )
     if source_scope_enforced:
         accepted_evidence: list[Mapping[str, Any]] = [
@@ -910,12 +1328,13 @@ def deterministic_handoff_checks(
             failures.append("handoff_contains_out_of_scope_source_url")
     if len(compressed) < 200 and len(structured_text) < 200:
         failures.append("handoff_too_short")
-    if source_count < min_sources:
+    if source_count < effective_min_sources:
         failures.append("insufficient_traceable_sources")
     return {
         "passed": not failures,
         "failures": failures,
         "source_count": source_count,
+        "required_source_count": effective_min_sources,
         "source_scope_enforced": source_scope_enforced,
         "out_of_scope_source_count": out_of_scope_source_count,
     }
@@ -1069,19 +1488,54 @@ async def evaluate_tool_results(
     """Evaluate one tool batch and apply deterministic overrides."""
     configurable = Configuration.from_runnable_config(config)
     policy = _quality_policy(configurable, config)
-    checks = deterministic_tool_checks(
-        tool_results,
-        min_sources=configurable.quality_evaluation_min_sources,
-        evidence_registry=evidence_registry,
+    resolved_contract = (
+        coverage_contract
+        if isinstance(coverage_contract, ResearchCoverageContract)
+        else ResearchCoverageContract.model_validate(coverage_contract)
+        if isinstance(coverage_contract, dict) and coverage_contract
+        else None
     )
+    use_v4_contract = (
+        resolved_contract is not None
+        and str(
+            config.get("metadata", {}).get(
+                "quality_policy_version",
+                QUALITY_POLICY_VERSION,
+            )
+        )
+        == "quality-gate-v4"
+    )
+    source_scope_enforced = (
+        use_v4_contract
+        and contract_has_source_constraints(resolved_contract)
+    )
+    scoped_evidence_registry = (
+        source_scoped_evidence_records(
+            evidence_registry or [],
+            resolved_contract,
+        )
+        if source_scope_enforced
+        else list(evidence_registry or [])
+    )
+    evaluator_tool_results = (
+        _source_scoped_tool_result_summaries(tool_results)
+        if source_scope_enforced
+        else tool_results
+    )
+    checks = deterministic_tool_checks(
+        evaluator_tool_results,
+        min_sources=configurable.quality_evaluation_min_sources,
+        evidence_registry=scoped_evidence_registry,
+    )
+    checks["source_scope_enforced"] = source_scope_enforced
     input_limit = configurable.quality_evaluation_max_input_chars
     evidence_budget = max(500, input_limit // 2)
     cumulative_evidence, evidence_stats = _bounded_evidence_records(
-        evidence_registry or [],
+        scoped_evidence_registry,
         max_chars=evidence_budget,
     )
     bounded_tool_results = _bounded_tool_results(
-        tool_results,
+        evaluator_tool_results,
         max_chars=max(500, input_limit - len(
             json.dumps(cumulative_evidence, ensure_ascii=False, default=str)
         )),
@@ -1095,24 +1549,9 @@ async def evaluate_tool_results(
         "research_topic": research_topic,
         "tool_results": bounded_tool_results,
         "deterministic_checks": checks,
+        "source_scope_enforced": source_scope_enforced,
     }
-    resolved_contract = (
-        coverage_contract
-        if isinstance(coverage_contract, ResearchCoverageContract)
-        else ResearchCoverageContract.model_validate(coverage_contract)
-        if isinstance(coverage_contract, dict) and coverage_contract
-        else None
-    )
-    if (
-        resolved_contract is not None
-        and str(
-            config.get("metadata", {}).get(
-                "quality_policy_version",
-                QUALITY_POLICY_VERSION,
-            )
-        )
-        == "quality-gate-v4"
-    ):
+    if use_v4_contract:
         payload.update(
             {
                 "coverage_contract": resolved_contract.model_dump(
@@ -1247,6 +1686,7 @@ async def evaluate_subagent_handoff(
     """Run the Supervisor handoff gate over one completed subagent result."""
     configurable = Configuration.from_runnable_config(config)
     policy = _quality_policy(configurable, config)
+    resolved_risk = risk_profile or ResearchRiskProfile(level="standard")
     resolved_contract = (
         coverage_contract
         if isinstance(coverage_contract, ResearchCoverageContract)
@@ -1267,9 +1707,23 @@ async def evaluate_subagent_handoff(
         )
         == "quality-gate-v4"
     )
+    evidence_optional_requirement_ids = (
+        _evidence_optional_requirement_ids(resolved_contract)
+        if use_v4_contract and resolved_contract is not None
+        else ()
+    )
+    # Orchestration and source-process requirements are verified at the Run /
+    # Supervisor layer. A single Subagent handoff cannot prove that its sibling
+    # tasks ran in parallel, so binding those IDs here creates an impossible
+    # per-task contract and rejects otherwise grounded evidence.
+    owned_requirement_ids = tuple(
+        requirement_id
+        for requirement_id in owned_requirement_ids
+        if requirement_id not in evidence_optional_requirement_ids
+    )
     source_scope_enforced = (
         use_v4_contract
-        and contract_requires_official_sources(resolved_contract)
+        and contract_has_source_constraints(resolved_contract)
     )
     scoped_handoff = handoff
     if source_scope_enforced:
@@ -1291,25 +1745,42 @@ async def evaluate_subagent_handoff(
             resolved_contract if source_scope_enforced else None
         ),
     )
+    trusted_inner_scores = _trusted_inner_assessment_scores(handoff, policy)
+    fail_open_inner_admission = (
+        configurable.quality_evaluation_fail_open
+        and configurable.quality_caveat_admission_enabled
+        and not resolved_risk.high_risk
+        and checks["passed"]
+        and trusted_inner_scores is not None
+    )
     limit = configurable.quality_evaluation_max_input_chars
+    full_compressed_research = str(
+        scoped_handoff.get("compressed_research", "")
+    )
+    raw_notes_text = "\n".join(
+        str(note) for note in scoped_handoff.get("raw_notes", [])
+    )
+    raw_notes_reserve = min(len(raw_notes_text), max(0, limit // 10))
+    compressed_reserve = min(
+        len(full_compressed_research),
+        max(500, int(limit * 0.4)),
+    )
     evidence_registry, evidence_stats = _bounded_evidence_records(
         scoped_handoff.get("evidence_registry", []),
-        max_chars=max(500, limit // 2),
+        max_chars=max(
+            500,
+            limit - compressed_reserve - raw_notes_reserve,
+        ),
+        priority_text=full_compressed_research,
     )
     evidence_chars = len(
         json.dumps(evidence_registry, ensure_ascii=False, default=str)
     )
     remaining = max(0, limit - evidence_chars)
-    compressed_budget = max(0, int(remaining * 0.8))
-    compressed_research = str(scoped_handoff.get("compressed_research", ""))[
-        :compressed_budget
-    ]
+    compressed_budget = max(0, remaining - raw_notes_reserve)
+    compressed_research = full_compressed_research[:compressed_budget]
     remaining = max(0, remaining - len(compressed_research))
-    raw_notes = "\n".join(
-        str(note) for note in scoped_handoff.get("raw_notes", [])
-    )[
-        :remaining
-    ]
+    raw_notes = raw_notes_text[:remaining]
     payload: dict[str, Any] = {
         "runtime_current_date": date.today().isoformat(),
         "quality_rigor": policy.rigor.value,
@@ -1328,6 +1799,9 @@ async def evaluate_subagent_handoff(
                     mode="json"
                 ),
                 "owned_requirement_ids": list(owned_requirement_ids),
+                "evidence_optional_requirement_ids": list(
+                    evidence_optional_requirement_ids
+                ),
                 "advisory_task_description": research_topic,
                 "research_topic": (
                     "Advisory task description only; hard requirements come "
@@ -1358,7 +1832,25 @@ async def evaluate_subagent_handoff(
         evaluator_failed = True
         protocol_errors = _protocol_errors_from_exception(exc)
         if configurable.quality_evaluation_fail_open:
-            if use_v4_contract:
+            if use_v4_contract and fail_open_inner_admission:
+                assert trusted_inner_scores is not None
+                result = HandoffAssessment(
+                    accepted=True,
+                    admission_status=AdmissionStatus.ACCEPTED_WITH_CAVEATS,
+                    relevance=trusted_inner_scores[0],
+                    source_quality=trusted_inner_scores[1],
+                    evidence_coverage=trusted_inner_scores[2],
+                    groundedness=trusted_inner_scores[3],
+                    caveats=["quality_evaluator_unavailable"],
+                    reason=(
+                        "Supervisor quality evaluator unavailable; admitting "
+                        "with caveats because the task's inner quality gate and "
+                        "deterministic evidence checks both passed."
+                    ),
+                    evaluator_error=str(exc),
+                    protocol_errors=protocol_errors,
+                )
+            elif use_v4_contract:
                 result = HandoffAssessment(
                     accepted=False,
                     admission_status=AdmissionStatus.REJECTED,
@@ -1433,12 +1925,19 @@ async def evaluate_subagent_handoff(
         if (
             evaluator_failed
             and configurable.quality_evaluation_fail_open
+            and not fail_open_inner_admission
         ):
             v4_protocol_failures.append(
                 "quality_evaluator_unavailable"
             )
         normalized_coverage: list[RequirementCoverage] = []
         for coverage in result.requirement_coverage:
+            if (
+                coverage.requirement_id
+                in evidence_optional_requirement_ids
+                and coverage.requirement_id not in owned_requirement_ids
+            ):
+                continue
             if (
                 coverage.requirement_id not in valid_requirement_ids
                 or coverage.requirement_id not in owned_requirement_ids
@@ -1448,22 +1947,31 @@ async def evaluate_subagent_handoff(
                     f"{coverage.requirement_id}"
                 )
                 continue
-            if coverage.status.value == "supported" and (
-                not coverage.evidence_ids
-                or any(
-                    evidence_id not in valid_evidence_ids
-                    for evidence_id in coverage.evidence_ids
-                )
-            ):
-                v4_protocol_failures.append(
-                    "supported_requirement_has_invalid_evidence:"
-                    f"{coverage.requirement_id}"
-                )
+            if coverage.status.value == "supported":
+                if (
+                    coverage.requirement_id
+                    in evidence_optional_requirement_ids
+                ):
+                    coverage = coverage.model_copy(update={
+                        "evidence_ids": tuple(
+                            evidence_id
+                            for evidence_id in coverage.evidence_ids
+                            if evidence_id in valid_evidence_ids
+                        )
+                    })
+                elif (
+                    not coverage.evidence_ids
+                    or any(
+                        evidence_id not in valid_evidence_ids
+                        for evidence_id in coverage.evidence_ids
+                    )
+                ):
+                    v4_protocol_failures.append(
+                        "supported_requirement_has_invalid_evidence:"
+                        f"{coverage.requirement_id}"
+                    )
             normalized_coverage.append(coverage)
         result.requirement_coverage = normalized_coverage
-        resolved_risk = risk_profile or ResearchRiskProfile(
-            level="standard"
-        )
         policy_result = resolve_handoff_admission(
             HandoffPolicyInput(
                 requested_status=(

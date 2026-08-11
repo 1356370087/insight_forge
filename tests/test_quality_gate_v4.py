@@ -11,7 +11,10 @@ from langchain_core.messages import HumanMessage
 from open_deep_research.agents import deep_researcher
 from open_deep_research.quality import (
     HandoffAssessment,
+    ToolResultAssessment,
+    deterministic_handoff_checks,
     evaluate_subagent_handoff,
+    evaluate_tool_results,
 )
 from open_deep_research.quality_contract import (
     AdmissionStatus,
@@ -24,6 +27,145 @@ from open_deep_research.quality_contract import (
 )
 from open_deep_research.state import ResearchQuestion
 from open_deep_research.tools.base import ToolContext
+
+
+def test_contract_splits_final_chinese_conjunction_in_explicit_list() -> None:
+    contract = build_research_coverage_contract([
+        HumanMessage(content=(
+            "验证并比较三项能力：异步 I/O、"
+            "B-tree skip scan（跳跃扫描）和虚拟生成列。"
+        ))
+    ])
+    texts = [requirement.text for requirement in contract.requirements]
+
+    assert any("B-tree skip scan" in text for text in texts)
+    assert "虚拟生成列" in texts
+    assert not any(
+        "B-tree skip scan" in text and "虚拟生成列" in text
+        for text in texts
+    )
+
+
+def test_supervisor_contract_explains_aggregate_requirement_ownership() -> None:
+    contract = build_research_coverage_contract([
+        HumanMessage(content=(
+            "分别比较能力 A、能力 B；至少提供 6 个官方链接。"
+        ))
+    ])
+
+    rendered = deep_researcher._render_supervisor_coverage_contract(contract)
+
+    assert "exactly one primary owner" in rendered
+    assert "Aggregate final-output requirements" in rendered
+    assert "must not be assigned to every parallel task" in rendered
+
+
+def test_unique_coverage_ordinal_repairs_only_hash_suffix() -> None:
+    contract = build_research_coverage_contract([
+        HumanMessage(content="比较能力 A、能力 B，并仅使用官方来源。")
+    ])
+    allowed = list(contract.requirement_ids())
+    target = allowed[0]
+    ordinal, _separator, suffix = target.rpartition("-")
+    typo = f"{ordinal}-{'0' if suffix[-1] != '0' else '1'}{suffix[:-1]}"
+
+    normalized = deep_researcher._canonicalize_coverage_requirement_ids(
+        [typo, "COV-99-deadbeef"],
+        contract,
+    )
+
+    assert normalized[0] == target
+    assert normalized[1] == "COV-99-deadbeef"
+
+
+@pytest.mark.asyncio
+async def test_official_only_tool_gate_projects_out_third_party_candidates(
+    monkeypatch,
+) -> None:
+    contract = build_research_coverage_contract([
+        HumanMessage(content=(
+            "请仅依据 PostgreSQL 官方文档说明 skip scan，"
+            "不得引用第三方来源。"
+        ))
+    ])
+    captured: dict = {}
+
+    async def capture_evaluation(
+        _schema,
+        _system_prompt,
+        payload,
+        _config,
+        **_kwargs,
+    ):
+        captured.update(payload)
+        return ToolResultAssessment(
+            decision="complete",
+            relevance=5,
+            source_quality=5,
+            evidence_coverage=5,
+            corroboration=5,
+            reason="Official evidence is complete.",
+        )
+
+    async def ignore_activity(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "open_deep_research.quality._evaluate_json",
+        capture_evaluation,
+    )
+    monkeypatch.setattr(
+        "open_deep_research.quality.publish_task_activity",
+        ignore_activity,
+    )
+    records = [
+        {
+            "evidence_id": "EV-OFFICIAL",
+            "claim": "PostgreSQL 18 supports skip scan.",
+            "supporting_excerpt": "Support for skip scan lookups.",
+            "source_url": "https://www.postgresql.org/docs/release/18.0/",
+            "security_status": "accepted",
+        },
+        {
+            "evidence_id": "EV-BLOG",
+            "claim": "A third-party explanation.",
+            "supporting_excerpt": "Blog text.",
+            "source_url": "https://example.com/postgresql-skip-scan",
+            "security_status": "accepted",
+        },
+    ]
+    tool_results = [{
+        "name": "web_research",
+        "content": json.dumps({"evidence": records}),
+        "error": False,
+    }]
+
+    result = await evaluate_tool_results(
+        "Advisory PostgreSQL task.",
+        tool_results,
+        {
+            "configurable": {
+                "quality_evaluation_min_sources": 1,
+                "quality_evaluation_fail_open": False,
+            },
+            "metadata": {
+                "quality_policy_version": "quality-gate-v4",
+                "runtime_config_frozen": True,
+                "run_id": "postgresql-source-scope",
+            },
+        },
+        evidence_registry=records,
+        coverage_contract=contract,
+        requirement_ids=list(contract.requirement_ids()),
+    )
+
+    assert result.decision == "complete"
+    assert captured["source_scope_enforced"] is True
+    assert captured["deterministic_checks"]["source_count"] == 1
+    assert [
+        item["evidence_id"] for item in captured["cumulative_evidence"]
+    ] == ["EV-OFFICIAL"]
+    assert "example.com" not in json.dumps(captured["tool_results"])
 
 
 def test_run3_artifact_replay_binds_acceptance_to_original_query() -> None:
@@ -551,6 +693,393 @@ async def test_v4_fail_open_evaluator_error_does_not_admit_empty_coverage(
     assert result.evaluator_error == "quality judge unavailable"
     assert "quality_evaluator_unavailable" in result.hard_rejection_reasons
     assert "free-text handoff is not admitted" in result.reason
+
+
+@pytest.mark.asyncio
+async def test_v4_fail_open_does_not_bypass_required_coverage(
+    monkeypatch,
+) -> None:
+    """An outer judge outage must not admit free text without coverage mapping."""
+    contract = build_research_coverage_contract(
+        [HumanMessage(content="说明 LangGraph 的 checkpoint 恢复机制。")]
+    )
+    requirement_id = contract.requirements[0].requirement_id
+
+    async def fail_judge(*_args, **_kwargs):
+        raise TimeoutError("quality judge unavailable")
+
+    monkeypatch.setattr(
+        "open_deep_research.quality._build_quality_model",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "open_deep_research.quality.invoke_model_with_retry_observability",
+        fail_judge,
+    )
+    handoff = {
+        "compressed_research": "Detailed checkpoint evidence. " * 20,
+        "evidence_registry": [
+            {
+                "evidence_id": "ev-a",
+                "claim": "Checkpoint state is persisted.",
+                "supporting_excerpt": "Checkpoint state is persisted.",
+                "source_url": "https://docs.example/checkpoints",
+                "source_title": "Official checkpoints",
+                "security_status": "accepted",
+            },
+            {
+                "evidence_id": "ev-b",
+                "claim": "Resume restores persisted state.",
+                "supporting_excerpt": "Resume restores persisted state.",
+                "source_url": "https://api.example/checkpoints",
+                "source_title": "Official API",
+                "security_status": "accepted",
+            },
+        ],
+        "metrics": {"sources_read": 2},
+        "result_assessment": {
+            "decision": "complete",
+            "relevance": 5,
+            "source_quality": 5,
+            "evidence_coverage": 4,
+            "corroboration": 4,
+            "deterministic_checks": {"passed": True},
+            "evaluator_error": None,
+        },
+    }
+    config = {
+        "configurable": {
+            "quality_evaluation_fail_open": True,
+            "quality_evaluation_min_sources": 2,
+            "quality_caveat_admission_enabled": True,
+        },
+        "metadata": {
+            "quality_policy_version": "quality-gate-v4",
+            "runtime_config_frozen": True,
+            "run_id": "v4-fail-open-inner-assessment",
+        },
+    }
+
+    result = await evaluate_subagent_handoff(
+        "Advisory checkpoint task.",
+        handoff,
+        config,
+        coverage_contract=contract,
+        requirement_ids=[requirement_id],
+    )
+
+    assert result.accepted is False
+    assert result.admission_status is AdmissionStatus.REJECTED
+    assert result.evaluator_error == "quality judge unavailable"
+    assert any(
+        reason.startswith("required_coverage_missing:")
+        for reason in result.hard_rejection_reasons
+    )
+
+
+@pytest.mark.asyncio
+async def test_v4_successful_handoff_judge_does_not_add_unavailable_caveat(
+    monkeypatch,
+) -> None:
+    contract = build_research_coverage_contract(
+        [HumanMessage(content="说明 LangGraph 的 checkpoint 恢复机制。")]
+    )
+    requirement_id = contract.requirements[0].requirement_id
+
+    async def pass_judge(*_args, **_kwargs):
+        return HandoffAssessment(
+            accepted=True,
+            admission_status="accepted",
+            relevance=5,
+            source_quality=5,
+            evidence_coverage=5,
+            groundedness=5,
+            requirement_coverage=[
+                {
+                    "requirement_id": requirement_id,
+                    "status": "supported",
+                    "evidence_ids": ["ev-a"],
+                    "explanation": "The official evidence supports it.",
+                }
+            ],
+            reason="All owned requirements are supported.",
+        )
+
+    monkeypatch.setattr(
+        "open_deep_research.quality._evaluate_json",
+        pass_judge,
+    )
+    handoff = {
+        "compressed_research": "Detailed checkpoint evidence. " * 20,
+        "evidence_registry": [
+            {
+                "evidence_id": "ev-a",
+                "claim": "Checkpoint state is persisted.",
+                "supporting_excerpt": "Checkpoint state is persisted.",
+                "source_url": "https://docs.example/checkpoints",
+                "source_title": "Official checkpoints",
+                "security_status": "accepted",
+            },
+            {
+                "evidence_id": "ev-b",
+                "claim": "Resume restores persisted state.",
+                "supporting_excerpt": "Resume restores persisted state.",
+                "source_url": "https://api.example/checkpoints",
+                "source_title": "Official API",
+                "security_status": "accepted",
+            },
+        ],
+        "metrics": {"sources_read": 2},
+        "result_assessment": {
+            "decision": "complete",
+            "relevance": 5,
+            "source_quality": 5,
+            "evidence_coverage": 5,
+            "corroboration": 5,
+            "deterministic_checks": {"passed": True},
+            "evaluator_error": None,
+        },
+    }
+    config = {
+        "configurable": {
+            "quality_evaluation_fail_open": True,
+            "quality_evaluation_min_sources": 2,
+            "quality_caveat_admission_enabled": True,
+        },
+        "metadata": {
+            "quality_policy_version": "quality-gate-v4",
+            "runtime_config_frozen": True,
+            "run_id": "v4-success-with-fail-open-enabled",
+        },
+    }
+
+    result = await evaluate_subagent_handoff(
+        "Advisory checkpoint task.",
+        handoff,
+        config,
+        coverage_contract=contract,
+        requirement_ids=[requirement_id],
+    )
+
+    assert result.accepted is True
+    assert result.admission_status is AdmissionStatus.ACCEPTED
+    assert result.evaluator_error is None
+    assert "quality_evaluator_unavailable" not in result.caveats
+    assert result.hard_rejection_reasons == []
+
+
+@pytest.mark.asyncio
+async def test_v4_structural_requirements_do_not_need_external_evidence_ids(
+    monkeypatch,
+) -> None:
+    contract = build_research_coverage_contract([
+        HumanMessage(content=(
+            "把下列内容作为一个不可拆分的单一研究任务；"
+            "核验 PostgreSQL 18 skip scan；不得引用第三方来源。"
+        ))
+    ])
+    factual_requirement = next(
+        item for item in contract.requirements if "skip scan" in item.text
+    )
+    structural_ids = {
+        item.requirement_id
+        for item in contract.requirements
+        if item.requirement_id != factual_requirement.requirement_id
+    }
+    captured: dict = {}
+
+    async def pass_judge(_schema, _prompt, payload, _config, **_kwargs):
+        captured.update(payload)
+        return HandoffAssessment(
+            accepted=True,
+            admission_status="accepted",
+            relevance=5,
+            source_quality=5,
+            evidence_coverage=5,
+            groundedness=5,
+            requirement_coverage=[
+                {
+                    "requirement_id": item.requirement_id,
+                    "status": "supported",
+                    "evidence_ids": (
+                        ["ev-a"]
+                        if item.requirement_id
+                        == factual_requirement.requirement_id
+                        else []
+                    ),
+                    "explanation": "Satisfied by evidence or output structure.",
+                }
+                for item in contract.requirements
+            ],
+            reason="All requirements are supported.",
+        )
+
+    monkeypatch.setattr(
+        "open_deep_research.quality._evaluate_json",
+        pass_judge,
+    )
+    handoff = {
+        "compressed_research": "Grounded PostgreSQL skip scan evidence. " * 20,
+        "evidence_registry": [
+            {
+                "evidence_id": "ev-a",
+                "claim": "PostgreSQL 18 supports skip scan.",
+                "supporting_excerpt": "Support for skip scan lookups.",
+                "source_url": "https://www.postgresql.org/docs/release/18.0/",
+                "security_status": "accepted",
+            }
+        ],
+        "metrics": {"sources_read": 1},
+    }
+    result = await evaluate_subagent_handoff(
+        "Advisory task.",
+        handoff,
+        {
+            "configurable": {
+                "quality_evaluation_fail_open": False,
+                "quality_evaluation_min_sources": 1,
+            },
+            "metadata": {
+                "quality_policy_version": "quality-gate-v4",
+                "runtime_config_frozen": True,
+            },
+        },
+        coverage_contract=contract,
+        requirement_ids=list(contract.requirement_ids()),
+    )
+
+    assert result.accepted is True
+    assert result.admission_status is AdmissionStatus.ACCEPTED
+    assert set(captured["evidence_optional_requirement_ids"]) == structural_ids
+    assert captured["owned_requirement_ids"] == [
+        factual_requirement.requirement_id
+    ]
+    assert result.hard_rejection_reasons == []
+
+
+@pytest.mark.asyncio
+async def test_v4_parallel_delegation_and_final_table_are_run_level(
+    monkeypatch,
+) -> None:
+    contract = build_research_coverage_contract([
+        HumanMessage(content=(
+            "最终修复后 E2E：请并行委派两个 Subagent；"
+            "A 仅根据 https://peps.python.org/pep-0703/ 总结状态与风险；"
+            "不得引用其他 URL；最终用中文给出对照表；"
+            "用中文输出；每个事实结论都附来源。"
+        ))
+    ])
+    factual_requirement = next(
+        item for item in contract.requirements if "peps.python.org" in item.text
+    )
+    citation_requirement = next(
+        item for item in contract.requirements if "每个事实" in item.text
+    )
+    run_level_ids = {
+        item.requirement_id
+        for item in contract.requirements
+        if (
+            "并行委派" in item.text
+            or "不得引用其他 URL" in item.text
+            or "对照表" in item.text
+            or "用中文输出" in item.text
+        )
+    }
+    captured: dict = {}
+
+    async def pass_judge(_schema, _prompt, payload, _config, **_kwargs):
+        captured.update(payload)
+        return HandoffAssessment(
+            accepted=True,
+            admission_status="accepted",
+            relevance=5,
+            source_quality=5,
+            evidence_coverage=5,
+            groundedness=5,
+            requirement_coverage=[
+                {
+                    "requirement_id": factual_requirement.requirement_id,
+                    "status": "supported",
+                    "evidence_ids": ["ev-a"],
+                    "explanation": "Grounded leaf-task finding.",
+                },
+                {
+                    "requirement_id": citation_requirement.requirement_id,
+                    "status": "supported",
+                    "evidence_ids": ["ev-a"],
+                    "explanation": "Every factual leaf finding is cited.",
+                },
+            ],
+            reason="The factual leaf requirement is supported.",
+        )
+
+    monkeypatch.setattr(
+        "open_deep_research.quality._evaluate_json",
+        pass_judge,
+    )
+    result = await evaluate_subagent_handoff(
+        "Advisory task A.",
+        {
+            "compressed_research": "Grounded PEP 703 finding [ev-a]. " * 20,
+            "evidence_registry": [
+                {
+                    "evidence_id": "ev-a",
+                    "claim": "PEP 703 defines the free-threading design.",
+                    "source_url": "https://peps.python.org/pep-0703/",
+                    "security_status": "accepted",
+                }
+            ],
+            "metrics": {"sources_read": 1},
+        },
+        {
+            "configurable": {
+                "quality_evaluation_fail_open": False,
+                "quality_evaluation_min_sources": 1,
+            },
+            "metadata": {
+                "quality_policy_version": "quality-gate-v4",
+                "runtime_config_frozen": True,
+            },
+        },
+        coverage_contract=contract,
+        requirement_ids=list(contract.requirement_ids()),
+    )
+
+    assert result.accepted is True
+    assert run_level_ids <= set(captured["evidence_optional_requirement_ids"])
+    assert captured["owned_requirement_ids"] == [
+        factual_requirement.requirement_id,
+        citation_requirement.requirement_id,
+    ]
+
+
+def test_explicit_url_leaf_handoff_does_not_require_global_source_floor() -> None:
+    contract = build_research_coverage_contract([
+        HumanMessage(content=(
+            "A 仅根据 https://peps.python.org/pep-0703/ 总结状态；"
+            "B 仅根据 https://numpy.org/doc/2.1/release/2.1.0-notes.html "
+            "总结支持情况；不得引用其他 URL。"
+        ))
+    ])
+    checks = deterministic_handoff_checks(
+        {
+            "compressed_research": "Grounded finding [ev-a]. " * 20,
+            "evidence_registry": [
+                {
+                    "evidence_id": "ev-a",
+                    "claim": "PEP 703 defines the design.",
+                    "source_url": "https://peps.python.org/pep-0703/",
+                    "security_status": "accepted",
+                }
+            ],
+        },
+        min_sources=3,
+        coverage_contract=contract,
+    )
+
+    assert checks["passed"] is True
+    assert checks["source_count"] == 1
+    assert checks["required_source_count"] == 1
 
 
 @pytest.mark.asyncio
