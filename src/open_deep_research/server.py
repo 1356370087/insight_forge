@@ -651,7 +651,7 @@ async def get_capabilities(
         for key in FRONTEND_EDITABLE_CONFIG_KEYS
         if key in properties
     }
-    defaults = Configuration().model_dump(mode="json")
+    defaults = Configuration.from_runnable_config(None).model_dump(mode="json")
     return {
         "public_event_schema_version": PUBLIC_EVENT_SCHEMA_VERSION,
         "public_task_activity_schema_version": PUBLIC_TASK_ACTIVITY_SCHEMA_VERSION,

@@ -35,6 +35,25 @@ def test_capabilities_exposes_only_explicit_frontend_fields():
     assert payload["config_schema"]["additionalProperties"] is False
 
 
+def test_capabilities_defaults_reflect_effective_environment(monkeypatch):
+    monkeypatch.setenv("RESEARCH_MODEL", "openai:deepseek-v4-flash")
+    monkeypatch.setenv(
+        "QUALITY_EVALUATION_MODEL",
+        "openai:deepseek-v4-flash",
+    )
+    client = _client("user-1")
+    try:
+        payload = client.get("/capabilities").json()
+    finally:
+        server.app.dependency_overrides.clear()
+
+    assert payload["defaults"]["research_model"] == "openai:deepseek-v4-flash"
+    assert (
+        payload["defaults"]["quality_evaluation_model"]
+        == "openai:deepseek-v4-flash"
+    )
+
+
 def test_run_history_is_owner_scoped_sorted_and_legacy_title_falls_back(
     tmp_path, monkeypatch
 ):
