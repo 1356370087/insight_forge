@@ -122,6 +122,7 @@ FastAPI 部署时的认证 dependency：
 
 ## 开发注意事项
 
+- 每次执行完E2E验证后，需要关闭验证时启动的前端与后端工作进程，否则可能导致端口占用或资源泄漏
 - `configurable_model` 在模块顶层通过 `init_chat_model(configurable_fields=...)` 创建，每次调用时通过 `.with_config()` 传入具体模型配置
 - Researcher 由 `ResearcherQueryEngine` 以干净上下文窗口运行，在 supervisor_tools 中通过 `asyncio.gather` 并行调用
 - API 密钥获取：`get_api_key_for_model()` 根据 `GET_API_KEYS_FROM_CONFIG` 环境变量决定从环境变量还是 `RunnableConfig` 中读取（OAP 部署时需要设为 `true`）
