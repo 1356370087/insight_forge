@@ -8,16 +8,34 @@ from enum import Enum
 from typing import Any, Iterable, cast
 from urllib.parse import urlsplit
 
-SOURCE_SCOPE_POLICY_VERSION = "evidence-source-scope-v1"
+SOURCE_SCOPE_POLICY_VERSION = "evidence-source-scope-v2"
 
 _EXCLUSIVE_OFFICIAL_SOURCE_RE = re.compile(
     r"(?:"
     r"based\s+(?:solely|only|exclusively)\s+on|"
     r"(?:solely|only|exclusively)\s+(?:use|using|from)|"
     r"(?:use|using)\s+only|"
-    r"仅(?:基于|使用)|只(?:基于|使用)"
+    r"仅(?:允许)?(?:基于|使用|依据)|"
+    r"只(?:允许)?(?:基于|使用|依据)"
     r").{0,240}(?:official|first[- ]party|官方)",
     flags=re.IGNORECASE | re.DOTALL,
+)
+_EXCLUSIVE_EXPLICIT_URL_RE = re.compile(
+    r"(?:only|solely|exclusively|只(?:允许)?|仅(?:允许)?).{0,160}"
+    r"(?:urls?|links?|网址|链接)",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_CONTRACT_URL_RE = re.compile(
+    # Coverage requirements can contain JSON-escaped line breaks (``\\n``).
+    # A backslash is not whitespace, so exclude it before the next list item
+    # accidentally becomes part of the URL path.
+    r"https?://[^\s\\，。；、\]\[()<>\"'`]+",
+    flags=re.IGNORECASE,
+)
+_NEGATED_SOURCE_CLAUSE_RE = re.compile(
+    r"(?:do\s+not|don't|must\s+not|never|exclude|prohibit|"
+    r"禁止|不得|不要|排除|不允许)",
+    flags=re.IGNORECASE,
 )
 _TEMPORARY_HOST_SUFFIXES = (
     ".mintlify.app",
@@ -42,6 +60,7 @@ class SourceKind(str, Enum):
     FIRST_PARTY_DOCS = "first_party_docs"
     OFFICIAL_REPO_SOURCE = "official_repo_source"
     COMMUNITY_ISSUE = "community_issue"
+    EXPLICIT_URL = "explicit_url"
     OUT_OF_SCOPE = "out_of_scope"
 
 
@@ -65,6 +84,25 @@ class SourceScopeDecision:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceScope:
+    """Structured source contract compiled once from coverage requirements."""
+
+    official_only: bool
+    explicit_url_only: bool
+    allowed_urls: frozenset[str]
+    denied_urls: frozenset[str]
+
+    @property
+    def constrained(self) -> bool:
+        """Return whether any source inclusion or exclusion rule is active."""
+        return bool(
+            self.official_only
+            or self.explicit_url_only
+            or self.denied_urls
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class _OfficialSourceProfile:
     aliases: tuple[str, ...]
     documentation_paths: tuple[tuple[str, str], ...]
@@ -81,6 +119,16 @@ _OFFICIAL_SOURCE_PROFILES = (
             ("langchain-ai.github.io", "/langgraph"),
         ),
         repositories=(("langchain-ai", "langgraph"),),
+    ),
+    _OfficialSourceProfile(
+        aliases=("postgresql", "postgresql.org"),
+        documentation_paths=(
+            ("www.postgresql.org", "/docs"),
+            ("postgresql.org", "/docs"),
+            ("www.postgresql.org", "/about"),
+            ("postgresql.org", "/about"),
+        ),
+        repositories=(("postgres", "postgres"),),
     ),
 )
 
@@ -108,7 +156,7 @@ def eligible_evidence_records(records: Iterable[object]) -> list[dict[str, Any]]
     ]
 
 
-def _contract_requirement_text(coverage_contract: object) -> str:
+def _contract_requirement_texts(coverage_contract: object) -> tuple[str, ...]:
     if isinstance(coverage_contract, dict):
         requirements = coverage_contract.get("requirements", ())
     else:
@@ -121,7 +169,11 @@ def _contract_requirement_text(coverage_contract: object) -> str:
             text = getattr(requirement, "text", None)
         if text:
             texts.append(str(text))
-    return "\n".join(texts)
+    return tuple(texts)
+
+
+def _contract_requirement_text(coverage_contract: object) -> str:
+    return "\n".join(_contract_requirement_texts(coverage_contract))
 
 
 def contract_requires_official_sources(coverage_contract: object) -> bool:
@@ -131,6 +183,69 @@ def contract_requires_official_sources(coverage_contract: object) -> bool:
             _contract_requirement_text(coverage_contract)
         )
     )
+
+
+def _url_is_negated(requirement_text: str, match_start: int) -> bool:
+    """Return whether a URL is in the current clause's explicit deny context."""
+    prefix = requirement_text[:match_start]
+    clause_start = max(
+        prefix.rfind(separator)
+        for separator in ("\n", ".", "。", ";", "；", "!", "！", "?", "？")
+    )
+    return bool(_NEGATED_SOURCE_CLAUSE_RE.search(prefix[clause_start + 1 :]))
+
+
+def _canonical_scope_url(value: str) -> str:
+    """Canonicalize one explicit scope URL without broadening its path."""
+    try:
+        parsed = urlsplit(value.strip())
+    except ValueError:
+        return ""
+    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.hostname:
+        return ""
+    host = parsed.hostname.casefold().rstrip(".")
+    try:
+        parsed_port = parsed.port
+    except ValueError:
+        return ""
+    port = f":{parsed_port}" if parsed_port else ""
+    path = parsed.path or "/"
+    if path != "/":
+        path = path.rstrip("/")
+    return f"{parsed.scheme.casefold()}://{host}{port}{path}"
+
+
+def compile_source_scope(coverage_contract: object) -> SourceScope:
+    """Compile official, exact-URL, and deny rules into one deterministic scope."""
+    requirement_text = _contract_requirement_text(coverage_contract)
+    explicit_url_only = bool(
+        _EXCLUSIVE_EXPLICIT_URL_RE.search(requirement_text)
+    )
+    allowed_urls: set[str] = set()
+    denied_urls: set[str] = set()
+    for text in _contract_requirement_texts(coverage_contract):
+        for match in _CONTRACT_URL_RE.finditer(text):
+            canonical = _canonical_scope_url(match.group(0))
+            if not canonical:
+                continue
+            if _url_is_negated(text, match.start()):
+                denied_urls.add(canonical)
+            else:
+                allowed_urls.add(canonical)
+    allowed_urls.difference_update(denied_urls)
+    return SourceScope(
+        official_only=contract_requires_official_sources(coverage_contract),
+        explicit_url_only=explicit_url_only,
+        allowed_urls=(
+            frozenset(allowed_urls) if explicit_url_only else frozenset()
+        ),
+        denied_urls=frozenset(denied_urls),
+    )
+
+
+def contract_has_source_constraints(coverage_contract: object) -> bool:
+    """Return whether the coverage contract contains any source scope rule."""
+    return compile_source_scope(coverage_contract).constrained
 
 
 def _matching_official_profiles(
@@ -202,15 +317,41 @@ def classify_evidence_source(
     host = (parsed.hostname or "").casefold()
     path = parsed.path.casefold()
     path_parts = tuple(part for part in path.split("/") if part)
-    constrained = contract_requires_official_sources(coverage_contract)
+    scope = compile_source_scope(coverage_contract)
+    canonical_url = _canonical_scope_url(url)
+
+    if canonical_url in scope.denied_urls:
+        return SourceScopeDecision(
+            source_kind=SourceKind.OUT_OF_SCOPE,
+            source_scope_status=SourceScopeStatus.OUT_OF_SCOPE,
+            reason="inside_explicit_url_denylist",
+        )
+    if scope.explicit_url_only:
+        if canonical_url not in scope.allowed_urls:
+            return SourceScopeDecision(
+                source_kind=SourceKind.OUT_OF_SCOPE,
+                source_scope_status=SourceScopeStatus.OUT_OF_SCOPE,
+                reason="outside_explicit_url_allowlist",
+            )
+        return SourceScopeDecision(
+            source_kind=SourceKind.EXPLICIT_URL,
+            source_scope_status=SourceScopeStatus.IN_SCOPE,
+            reason="matched_explicit_url_allowlist",
+        )
+
+    permitted_status = (
+        SourceScopeStatus.IN_SCOPE
+        if scope.denied_urls
+        else SourceScopeStatus.NOT_CONSTRAINED
+    )
 
     if _is_community_github_url(url):
         return SourceScopeDecision(
             source_kind=SourceKind.COMMUNITY_ISSUE,
             source_scope_status=(
                 SourceScopeStatus.OUT_OF_SCOPE
-                if constrained
-                else SourceScopeStatus.NOT_CONSTRAINED
+                if scope.official_only
+                else permitted_status
             ),
             reason="community_github_surface",
         )
@@ -219,8 +360,8 @@ def classify_evidence_source(
             source_kind=SourceKind.OUT_OF_SCOPE,
             source_scope_status=(
                 SourceScopeStatus.OUT_OF_SCOPE
-                if constrained
-                else SourceScopeStatus.NOT_CONSTRAINED
+                if scope.official_only
+                else permitted_status
             ),
             reason="temporary_host_not_first_party_verified",
         )
@@ -230,7 +371,7 @@ def classify_evidence_source(
                 source_kind=SourceKind.FIRST_PARTY_DOCS,
                 source_scope_status=(
                     SourceScopeStatus.IN_SCOPE
-                    if constrained
+                    if scope.constrained
                     else SourceScopeStatus.NOT_CONSTRAINED
                 ),
                 reason="matched_versioned_official_docs_profile",
@@ -244,7 +385,7 @@ def classify_evidence_source(
                 source_kind=SourceKind.OFFICIAL_REPO_SOURCE,
                 source_scope_status=(
                     SourceScopeStatus.IN_SCOPE
-                    if constrained
+                    if scope.constrained
                     else SourceScopeStatus.NOT_CONSTRAINED
                 ),
                 reason="matched_versioned_official_repository_profile",
@@ -253,12 +394,12 @@ def classify_evidence_source(
         source_kind=SourceKind.OUT_OF_SCOPE,
         source_scope_status=(
             SourceScopeStatus.UNVERIFIED
-            if constrained
-            else SourceScopeStatus.NOT_CONSTRAINED
+            if scope.official_only
+            else permitted_status
         ),
         reason=(
             "official_ownership_not_verified"
-            if constrained
+            if scope.official_only
             else "source_scope_not_constrained"
         ),
     )
@@ -269,7 +410,7 @@ def source_scoped_evidence_records(
     coverage_contract: object,
 ) -> list[dict[str, Any]]:
     """Annotate evidence and fail closed under exclusive source constraints."""
-    constrained = contract_requires_official_sources(coverage_contract)
+    constrained = contract_has_source_constraints(coverage_contract)
     scoped: list[dict[str, Any]] = []
     for record in eligible_evidence_records(records):
         decision = classify_evidence_source(record, coverage_contract)
