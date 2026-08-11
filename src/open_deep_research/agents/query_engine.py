@@ -387,11 +387,16 @@ class QueryEngine:
         return "finalizing"
 
     async def _publish_public_cancelled(self) -> None:
+        termination_reason = (
+            self.cancellation_scope.reason
+            if self.cancellation_scope.is_cancelled
+            else "cancel_requested"
+        )
         await self._publish_public(
             "run.cancelled",
             payload={
                 "status": "cancelled",
-                "termination_reason": "cancel_requested",
+                "termination_reason": termination_reason,
                 "result_status": "cancelled",
                 "permission_denial_count": len(self.permission_denials),
             },

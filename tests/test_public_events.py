@@ -4,6 +4,7 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
+from open_deep_research.agents.query_engine import QueryEngine
 from open_deep_research.public_events import (
     PublicEventLogCorrupted,
     RunEventStore,
@@ -14,6 +15,27 @@ from open_deep_research.public_events import (
 )
 from open_deep_research.run_context import RunContextStore
 from open_deep_research.run_control import RunControlStore
+
+
+@pytest.mark.asyncio
+async def test_cancelled_public_event_preserves_lease_lost_reason(tmp_path):
+    engine = QueryEngine({
+        "configurable": {"runs_dir": str(tmp_path)},
+        "metadata": {"run_id": "lease-lost-public-event"},
+    })
+    captured: dict = {}
+
+    async def capture(event_type, *, payload, **_kwargs):
+        captured["event_type"] = event_type
+        captured["payload"] = payload
+
+    engine._publish_public = capture
+    engine.cancellation_scope.request("lease_lost")
+
+    await engine._publish_public_cancelled()
+
+    assert captured["event_type"] == "run.cancelled"
+    assert captured["payload"]["termination_reason"] == "lease_lost"
 
 
 @pytest.mark.asyncio
