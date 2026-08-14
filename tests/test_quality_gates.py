@@ -12,6 +12,7 @@ from open_deep_research.quality import (
     TOOL_RESULT_EVALUATION_PROMPT,
     ToolResultAssessment,
     _bounded_evidence_records,
+    _bounded_tool_results,
     _build_quality_model,
     _evaluate_json,
     _evidence_optional_requirement_ids,
@@ -97,6 +98,36 @@ def test_deterministic_tool_checks_require_traceable_search_sources() -> None:
 
     assert passed["passed"] is True
     assert failed["failures"] == ["insufficient_traceable_sources"]
+
+
+def test_deterministic_tool_checks_ignore_null_json_error_field() -> None:
+    checks = deterministic_tool_checks(
+        [{
+            "name": "structured_tool",
+            "content": json.dumps({"error": None, "data": "usable result"}),
+            "error": False,
+        }],
+        min_sources=0,
+    )
+
+    assert checks["passed"] is True
+    assert checks["error_count"] == 0
+
+
+def test_bounded_tool_results_accounts_for_json_list_separator() -> None:
+    item = {"name": "tool", "content": "ok", "error": False}
+    encoded_item = json.dumps(item, ensure_ascii=False)
+    max_chars = 2 + (2 * len(encoded_item)) + 1
+
+    bounded = _bounded_tool_results([item, item], max_chars=max_chars)
+
+    assert len(json.dumps(bounded, ensure_ascii=False)) <= max_chars
+
+
+def test_quality_score_normalization_rounds_halves_up() -> None:
+    normalized = _normalize_quality_payload({"relevance": 2.5})
+
+    assert normalized["relevance"] == 3
 
 
 def test_deterministic_tool_checks_use_cumulative_evidence_sources() -> None:
@@ -796,6 +827,47 @@ async def test_assessment_node_routes_complete_to_compression(monkeypatch) -> No
     assert command.goto == "compress_research"
 
 
+@pytest.mark.asyncio
+async def test_assessment_feedback_is_bounded_and_remains_json(monkeypatch) -> None:
+    async def fake_evaluate(*_args, **_kwargs):
+        return ToolResultAssessment(
+            decision="retry",
+            relevance=4,
+            source_quality=4,
+            evidence_coverage=2,
+            corroboration=2,
+            missing_information=["missing " + ("x" * 10_000)],
+            suggested_queries=["query " + ("y" * 10_000)],
+            reason="reason " + ("z" * 10_000),
+        )
+
+    monkeypatch.setattr(deep_researcher, "evaluate_tool_results", fake_evaluate)
+    state = {
+        "research_topic": "topic",
+        "tool_call_iterations": 1,
+        "pending_tool_results": [{
+            "name": "web_search",
+            "content": "Evidence https://a.example and https://b.example",
+            "error": False,
+        }],
+    }
+
+    command = await deep_researcher.assess_research_results(
+        state,
+        {
+            "configurable": {
+                "max_react_tool_calls": 10,
+                "quality_evaluation_max_input_chars": 3_000,
+            }
+        },
+    )
+
+    feedback = command.update["researcher_messages"][0].content
+    assert len(feedback) <= 1_500
+    payload = json.loads(feedback.split("\n", 1)[1])
+    assert payload["truncated"] is True
+
+
 def _protocol_config(*, fail_open: bool) -> dict:
     return {
         "configurable": {
@@ -873,6 +945,178 @@ async def test_contradictory_retry_is_repaired_once(monkeypatch) -> None:
     assert result.evaluator_model == "openai:qwen3.7-max"
     assert result.policy_version == "quality-gate-v2"
     assert result.evaluation_epoch == "epoch-17"
+
+
+@pytest.mark.asyncio
+async def test_tool_gate_malformed_contract_follows_fail_open_boundary(
+    monkeypatch,
+) -> None:
+    async def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("invalid contracts must not reach the Judge")
+
+    async def ignore_activity(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "open_deep_research.quality._evaluate_json",
+        fail_if_called,
+    )
+    monkeypatch.setattr(
+        "open_deep_research.quality.publish_task_activity",
+        ignore_activity,
+    )
+
+    result = await evaluate_tool_results(
+        "topic",
+        [{"name": "tool", "content": "usable", "error": False}],
+        {
+            "configurable": {
+                "quality_evaluation_fail_open": True,
+                "quality_evaluation_min_sources": 0,
+            },
+            "metadata": {"quality_policy_version": "quality-gate-v4"},
+        },
+        coverage_contract={"requirements": "not-a-list"},
+        requirement_ids=["COV-01"],
+    )
+
+    assert result.decision == "continue"
+    assert result.evaluator_error == "coverage_contract_invalid"
+
+
+@pytest.mark.asyncio
+async def test_tool_gate_payload_closes_total_input_budget(monkeypatch) -> None:
+    captured: dict = {}
+
+    async def capture_evaluation(_schema, _prompt, payload, _config, **_kwargs):
+        captured.update(payload)
+        return ToolResultAssessment(
+            decision="continue",
+            relevance=4,
+            source_quality=4,
+            evidence_coverage=3,
+            corroboration=3,
+            missing_information=["more evidence"],
+            reason="Continue.",
+        )
+
+    async def ignore_activity(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "open_deep_research.quality._evaluate_json",
+        capture_evaluation,
+    )
+    monkeypatch.setattr(
+        "open_deep_research.quality.publish_task_activity",
+        ignore_activity,
+    )
+    contract = ResearchCoverageContract.model_validate({
+        "schema_version": 1,
+        "original_query_sha256": "a" * 64,
+        "requirements": [{
+            "requirement_id": "COV-01",
+            "text": "requirement " + ("r" * 8_000),
+            "source_message_index": 0,
+            "source_start": 0,
+            "source_end": 8_000,
+        }],
+    })
+    limit = 2_000
+
+    await evaluate_tool_results(
+        "topic " + ("t" * 8_000),
+        [{"name": "tool", "content": "result " + ("x" * 8_000), "error": False}],
+        {
+            "configurable": {
+                "quality_evaluation_max_input_chars": limit,
+                "quality_evaluation_min_sources": 0,
+            },
+            "metadata": {"quality_policy_version": "quality-gate-v4"},
+        },
+        coverage_contract=contract,
+        requirement_ids=["COV-01"],
+    )
+
+    assert len(json.dumps(captured, ensure_ascii=False)) <= limit
+
+
+@pytest.mark.asyncio
+async def test_handoff_payload_marks_text_truncation(monkeypatch) -> None:
+    captured: dict = {}
+
+    async def capture_evaluation(_schema, _prompt, payload, _config, **_kwargs):
+        captured.update(payload)
+        return {
+            "accepted": True,
+            "relevance": 5,
+            "source_quality": 5,
+            "evidence_coverage": 5,
+            "groundedness": 5,
+            "reason": "Accepted.",
+        }
+
+    monkeypatch.setattr(
+        "open_deep_research.quality._evaluate_json",
+        capture_evaluation,
+    )
+
+    await evaluate_subagent_handoff(
+        "topic",
+        {
+            "compressed_research": "c" * 8_000,
+            "raw_notes": ["n" * 2_000],
+            "evidence_registry": [],
+            "metrics": {"sources_read": 1},
+        },
+        {
+            "configurable": {
+                "quality_evaluation_max_input_chars": 1_000,
+                "quality_evaluation_min_sources": 0,
+            }
+        },
+    )
+
+    assert captured["compressed_research_truncated"] is True
+    assert captured["raw_notes_truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_tool_quality_activity_dedupe_key_is_stable(monkeypatch) -> None:
+    dedupe_keys: list[str] = []
+
+    async def fake_evaluation(*_args, **_kwargs):
+        return ToolResultAssessment(
+            decision="complete",
+            relevance=5,
+            source_quality=5,
+            evidence_coverage=5,
+            corroboration=5,
+            reason="Complete.",
+        )
+
+    async def capture_activity(*_args, **kwargs):
+        dedupe_keys.append(kwargs["dedupe_key"])
+
+    monkeypatch.setattr(
+        "open_deep_research.quality._evaluate_json",
+        fake_evaluation,
+    )
+    monkeypatch.setattr(
+        "open_deep_research.quality.publish_task_activity",
+        capture_activity,
+    )
+    args = (
+        "topic",
+        [{"name": "tool", "content": "usable", "error": False}],
+        {"configurable": {"quality_evaluation_min_sources": 0}},
+    )
+
+    await evaluate_tool_results(*args)
+    await evaluate_tool_results(*args)
+
+    assert len(dedupe_keys) == 2
+    assert dedupe_keys[0] == dedupe_keys[1]
 
 
 @pytest.mark.asyncio

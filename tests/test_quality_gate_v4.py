@@ -10,9 +10,13 @@ from langchain_core.messages import HumanMessage
 
 from open_deep_research.agents import deep_researcher
 from open_deep_research.quality import (
+    HANDOFF_EVALUATION_PROMPT_V4,
+    TOOL_RESULT_EVALUATION_PROMPT,
     HandoffAssessment,
     ToolResultAssessment,
+    _bounded_quality_payload,
     deterministic_handoff_checks,
+    deterministic_tool_checks,
     evaluate_subagent_handoff,
     evaluate_tool_results,
 )
@@ -23,6 +27,7 @@ from open_deep_research.quality_contract import (
     RequirementCoverage,
     build_research_coverage_contract,
     classify_research_risk,
+    merge_coverage_ledger,
     resolve_handoff_admission,
 )
 from open_deep_research.state import ResearchQuestion
@@ -44,6 +49,53 @@ def test_contract_splits_final_chinese_conjunction_in_explicit_list() -> None:
         "B-tree skip scan" in text and "虚拟生成列" in text
         for text in texts
     )
+
+
+def test_contract_fallback_never_copies_an_unbounded_full_message() -> None:
+    original = "请比较成<b>本</b>、安全性。" + ("补充背景信息" * 300)
+
+    contract = build_research_coverage_contract([
+        HumanMessage(content=original)
+    ])
+
+    assert contract.requirements
+    assert all(len(item.text) <= 500 for item in contract.requirements)
+    assert all(item.text != original for item in contract.requirements)
+    unlocated = next(item for item in contract.requirements if "成 本" in item.text)
+    assert unlocated.source_start == unlocated.source_end == 0
+    assert unlocated.source_located is False
+
+
+def test_quality_prompts_explain_all_payload_truncation_markers() -> None:
+    assert "input_truncated" in TOOL_RESULT_EVALUATION_PROMPT
+    assert "input_truncated" in HANDOFF_EVALUATION_PROMPT_V4
+    assert "compressed_research_truncated" in HANDOFF_EVALUATION_PROMPT_V4
+    assert "raw_notes_truncated" in HANDOFF_EVALUATION_PROMPT_V4
+
+
+def test_payload_budget_preserves_source_urls() -> None:
+    source_url = "https://example.test/" + ("source/" * 110)
+    payload = {
+        "research_topic": "topic " + ("t" * 700),
+        "evidence_registry": [{"source_url": source_url}],
+    }
+
+    bounded = _bounded_quality_payload(payload, max_chars=1_150)
+
+    assert bounded["evidence_registry"][0]["source_url"] == source_url
+    assert bounded["input_truncated"] is True
+
+
+def test_payload_budget_fails_closed_instead_of_truncating_reason_codes() -> None:
+    payload = {
+        "deterministic_checks": {
+            "failures": ["insufficient_traceable_sources"]
+        }
+    }
+    encoded_chars = len(json.dumps({**payload, "input_truncated": False}))
+
+    with pytest.raises(ValueError, match="quality_payload_budget_too_small"):
+        _bounded_quality_payload(payload, max_chars=encoded_chars - 1)
 
 
 def test_supervisor_contract_explains_aggregate_requirement_ownership() -> None:
@@ -76,6 +128,64 @@ def test_unique_coverage_ordinal_repairs_only_hash_suffix() -> None:
 
     assert normalized[0] == target
     assert normalized[1] == "COV-99-deadbeef"
+
+
+def test_supervisor_fills_missing_requirement_ownership_without_duplication() -> None:
+    contract = build_research_coverage_contract([
+        HumanMessage(content="分别研究能力 A、能力 B、能力 C。")
+    ])
+    first, *remaining = contract.requirement_ids()
+    tool_calls = [
+        {
+            "id": "task-explicit",
+            "name": "ConductResearch",
+            "args": {
+                "research_topic": "能力 A",
+                "requirement_ids": [first],
+            },
+        },
+        {
+            "id": "task-fallback",
+            "name": "ConductResearch",
+            "args": {"research_topic": "其余能力"},
+        },
+    ]
+
+    normalized = deep_researcher._canonicalize_supervisor_tool_call_requirements(
+        tool_calls,
+        contract,
+    )
+
+    assert normalized[0]["args"]["requirement_ids"] == [first]
+    assert normalized[1]["args"]["requirement_ids"] == remaining
+
+
+def test_accepted_empty_coverage_records_partial_ledger_entry() -> None:
+    assessment = HandoffAssessment(
+        accepted=True,
+        admission_status=AdmissionStatus.ACCEPTED,
+        relevance=5,
+        source_quality=5,
+        evidence_coverage=5,
+        groundedness=5,
+        reason="Legacy-compatible accepted handoff.",
+    )
+
+    ledger = merge_coverage_ledger(
+        {},
+        task_id="task-1",
+        assessment=assessment,
+        owned_requirement_ids=("COV-01",),
+    )
+
+    assert ledger == {
+        "COV-01": {
+            "status": "partial",
+            "evidence_ids": [],
+            "task_ids": ["task-1"],
+            "caveats": ["coverage_mapping_missing"],
+        }
+    }
 
 
 @pytest.mark.asyncio
@@ -622,6 +732,49 @@ def test_high_risk_keyword_disables_caveat_admission() -> None:
     assert "high_risk_caveats_disallowed" in result.hard_rejection_reasons
 
 
+def test_trade_economics_is_not_misclassified_as_personal_finance_risk() -> None:
+    economics = classify_research_risk(
+        "Compare international trade flows and trading volumes in economic history.",
+        mode="auto",
+    )
+    advice = classify_research_risk(
+        "Recommend a trading strategy and whether I should buy or sell today.",
+        mode="auto",
+    )
+
+    assert economics.level == "standard"
+    assert advice.level == "high"
+    assert "finance.trading" in advice.matched_rule_ids
+
+
+def test_finance_risk_handles_securities_without_flagging_laptop_purchase() -> None:
+    securities = classify_research_risk(
+        "Should I buy or sell these securities?",
+        mode="auto",
+    )
+    laptop = classify_research_risk(
+        "Compare reviews before I buy a laptop now.",
+        mode="auto",
+    )
+
+    assert securities.level == "high"
+    assert laptop.level == "standard"
+
+
+def test_plain_text_none_error_type_is_not_a_tool_failure() -> None:
+    checks = deterministic_tool_checks(
+        [{
+            "name": "legacy_tool",
+            "content": 'prefix {"error_type": "none"} suffix',
+            "error": False,
+        }],
+        min_sources=0,
+    )
+
+    assert checks["passed"] is True
+    assert checks["error_count"] == 0
+
+
 @pytest.mark.asyncio
 async def test_v4_fail_open_evaluator_error_does_not_admit_empty_coverage(
     monkeypatch,
@@ -775,6 +928,74 @@ async def test_v4_fail_open_does_not_bypass_required_coverage(
         reason.startswith("required_coverage_missing:")
         for reason in result.hard_rejection_reasons
     )
+    assert "quality_evaluator_unavailable" in result.hard_rejection_reasons
+    assert "admitting with caveats" not in result.reason
+
+
+@pytest.mark.asyncio
+async def test_v4_policy_without_contract_fails_closed_on_judge_outage(
+    monkeypatch,
+) -> None:
+    async def fail_judge(*_args, **_kwargs):
+        raise TimeoutError("quality judge unavailable")
+
+    monkeypatch.setattr(
+        "open_deep_research.quality._evaluate_json",
+        fail_judge,
+    )
+    result = await evaluate_subagent_handoff(
+        "Advisory checkpoint task.",
+        {
+            "compressed_research": "Detailed checkpoint evidence. " * 20,
+            "evidence_registry": [],
+            "metrics": {"sources_read": 2},
+        },
+        {
+            "configurable": {
+                "quality_evaluation_fail_open": True,
+                "quality_evaluation_min_sources": 0,
+            },
+            "metadata": {"quality_policy_version": "quality-gate-v4"},
+        },
+    )
+
+    assert result.accepted is False
+    assert result.admission_status is AdmissionStatus.REJECTED
+    assert "quality_evaluator_unavailable" in result.hard_rejection_reasons
+
+
+@pytest.mark.asyncio
+async def test_v4_malformed_handoff_contract_is_rejected_not_raised(
+    monkeypatch,
+) -> None:
+    async def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("invalid contracts must not reach the Judge")
+
+    monkeypatch.setattr(
+        "open_deep_research.quality._evaluate_json",
+        fail_if_called,
+    )
+    result = await evaluate_subagent_handoff(
+        "Advisory task.",
+        {
+            "compressed_research": "Grounded handoff. " * 30,
+            "evidence_registry": [],
+            "metrics": {"sources_read": 2},
+        },
+        {
+            "configurable": {
+                "quality_evaluation_fail_open": True,
+                "quality_evaluation_min_sources": 0,
+            },
+            "metadata": {"quality_policy_version": "quality-gate-v4"},
+        },
+        coverage_contract={"requirements": "not-a-list"},
+        requirement_ids=["COV-01"],
+    )
+
+    assert result.accepted is False
+    assert result.admission_status is AdmissionStatus.REJECTED
+    assert "coverage_contract_invalid" in result.hard_rejection_reasons
 
 
 @pytest.mark.asyncio
