@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import os
 import re
-import uuid
 from collections.abc import Callable, Mapping
 from datetime import date
 from typing import Any, Literal
@@ -47,7 +48,17 @@ from open_deep_research.quality_policy import (
 from open_deep_research.tool_taxonomy import classify_tool_name
 
 _URL_RE = re.compile(r"https?://[^\s\]\[()<>\"']+", re.IGNORECASE)
-_ERROR_MARKERS = ('"error_type"', '"error":', "error:", "tool execution failed")
+logger = logging.getLogger(__name__)
+
+_TOOL_EXECUTION_FAILED_RE = re.compile(
+    r"\btool execution failed\b",
+    re.IGNORECASE,
+)
+_PLAIN_TEXT_ERROR_FIELD_RE = re.compile(
+    r"(?:^|[{\[,]\s*)[\"']?(?:error|error_type)[\"']?\s*:\s*"
+    r"(?P<value>[^,}\]\r\n]+)",
+    re.IGNORECASE | re.MULTILINE,
+)
 _QUALITY_EVIDENCE_FIELD_LIMITS = {
     "evidence_id": 160,
     "claim": 1_200,
@@ -194,6 +205,8 @@ or compact artifact reference.
 The payload's runtime_current_date is authoritative. Do not reject a source merely because its
 publication date is later than your training cutoff or unfamiliar to you. Judge traceability and
 support from the supplied evidence, and report uncertainty instead of claiming non-existence.
+input_truncated=true means oversized prose was shortened to fit the complete payload budget;
+machine-readable failure codes, requirement/evidence IDs, and source URLs remain authoritative.
 """
 
 
@@ -256,6 +269,8 @@ enough evidence for downstream synthesis, and does not present major unsupported
 The payload's runtime_current_date is authoritative. Do not reject a citation merely because its
 publication date is later than your training cutoff or unfamiliar to you. Mark a claim unsupported
 only when the supplied handoff and source trail do not substantiate it; otherwise report uncertainty.
+input_truncated, compressed_research_truncated, or raw_notes_truncated=true means the corresponding
+prose was shortened for the evaluator budget; do not treat truncation alone as a quality failure.
 """
 
 HANDOFF_EVALUATION_PROMPT_V4 = """You are the Supervisor's coverage-bound research handoff quality gate.
@@ -274,6 +289,7 @@ Return exactly one JSON object with:
 Use only owned_requirement_ids in requirement_coverage. Every supported factual requirement must cite at least one evidence_id present in evidence_registry. Requirements listed in evidence_optional_requirement_ids are process or deliverable-format checks; they may use an empty evidence_ids array when their explanation points to compressed_research structure or deterministic_checks. Do not invent IDs.
 The candidate compressed_research is available only to evaluate its deliverable structure, explicit guarantee/inference labels, limitations, and requested checklist. Treat every factual statement in it as unsupported unless it is grounded by an evidence_id in the source-scoped evidence_registry. A URL in compressed_research that violates the user's source constraint is a deterministic rejection; do not use it as support.
 evidence_registry is a size-bounded, citation-prioritized projection. evidence_registry_stats.truncated=true means unrelated eligible records were omitted and is not, by itself, a gap. explicit_citation_count and explicit_citation_included_count report whether IDs explicitly cited by the handoff fit; priority_matched_count and priority_included_count report broader claim/excerpt matches. Continue to require an included evidence_id for every factual claim you mark supported.
+input_truncated, compressed_research_truncated, or raw_notes_truncated=true means oversized prose was shortened for the evaluator budget. Machine-readable failure codes, requirement/evidence IDs, and source URLs remain authoritative; truncation alone is not a coverage gap.
 
 Use these scoring anchors:
 - 1 = requirement not satisfied
@@ -316,6 +332,8 @@ def _is_dashscope_qwen(configurable: Configuration) -> bool:
 def _quality_api_key(
     configurable: Configuration,
     config: RunnableConfig,
+    *,
+    dashscope_qwen: bool | None = None,
 ) -> str | None:
     """Resolve credentials for the selected provider without cross-provider leakage."""
     configurable_keys = (config or {}).get("configurable", {}).get("apiKeys", {})
@@ -331,7 +349,12 @@ def _quality_api_key(
 
     provider, _model = _model_provider(configurable.quality_evaluation_model)
     candidates: tuple[str, ...]
-    if _is_dashscope_qwen(configurable):
+    is_dashscope_qwen = (
+        _is_dashscope_qwen(configurable)
+        if dashscope_qwen is None
+        else dashscope_qwen
+    )
+    if is_dashscope_qwen:
         candidates = ("DASHSCOPE_API_KEY",)
     else:
         candidates = {
@@ -363,31 +386,39 @@ def _build_quality_model(configurable: Configuration, config: RunnableConfig):
     Other providers rely on the strict JSON system prompt so OpenAI-only request
     fields are not leaked into native Anthropic, Google, or other clients.
     """
-    qwen_thinking = _is_dashscope_qwen(
-        configurable
-    ) and dashscope_qwen_enable_thinking(configurable.quality_evaluation_model)
+    is_dashscope_qwen = _is_dashscope_qwen(configurable)
+    qwen_thinking = (
+        is_dashscope_qwen
+        and dashscope_qwen_enable_thinking(
+            configurable.quality_evaluation_model
+        )
+    )
     kwargs: dict[str, Any] = {"model": configurable.quality_evaluation_model}
     if not qwen_thinking:
         kwargs["max_tokens"] = configurable.quality_evaluation_model_max_tokens
-    api_key = _quality_api_key(configurable, config)
+    api_key = _quality_api_key(
+        configurable,
+        config,
+        dashscope_qwen=is_dashscope_qwen,
+    )
     if api_key:
         kwargs["api_key"] = api_key
     base_url = configurable.quality_evaluation_base_url
-    if not base_url and _is_dashscope_qwen(configurable):
+    if not base_url and is_dashscope_qwen:
         base_url = (
             os.getenv("DASHSCOPE_BASE_URL")
             or "https://dashscope.aliyuncs.com/compatible-mode/v1"
         )
     if base_url:
         kwargs["base_url"] = base_url
-    if _is_dashscope_qwen(configurable):
+    if is_dashscope_qwen:
         kwargs["extra_body"] = {"enable_thinking": qwen_thinking}
         if qwen_thinking:
             kwargs["extra_body"]["thinking_budget"] = (
                 configurable.quality_evaluation_model_max_tokens
             )
     model = init_chat_model(**kwargs)
-    if _is_dashscope_qwen(configurable):
+    if is_dashscope_qwen:
         return model.bind(response_format={"type": "json_object"})
     return model
 
@@ -414,6 +445,173 @@ def _content_text(content: Any) -> str:
     stripped = text.strip()
     fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", stripped, re.DOTALL)
     return fenced.group(1).strip() if fenced else stripped
+
+
+def _resolve_coverage_contract(
+    coverage_contract: ResearchCoverageContract | dict[str, Any] | None,
+) -> tuple[ResearchCoverageContract | None, str | None]:
+    """Parse an optional contract without letting malformed state escape a gate."""
+    if isinstance(coverage_contract, ResearchCoverageContract):
+        return coverage_contract, None
+    if not isinstance(coverage_contract, dict) or not coverage_contract:
+        return None, None
+    try:
+        return ResearchCoverageContract.model_validate(coverage_contract), None
+    except (TypeError, ValueError):
+        logger.warning(
+            "Ignoring malformed research coverage contract at quality boundary",
+        )
+        return None, "coverage_contract_invalid"
+
+
+def _json_contains_error_signal(value: Any) -> bool:
+    """Return whether structured tool output contains a meaningful error value."""
+    def meaningful_error(item: Any) -> bool:
+        if item is None or item is False or item == 0:
+            return False
+        if isinstance(item, str):
+            return item.strip().lower() not in {
+                "",
+                "null",
+                "none",
+                "false",
+                "0",
+            }
+        return True
+
+    if isinstance(value, Mapping):
+        for raw_key, item in value.items():
+            key = str(raw_key).strip().lower()
+            if key in {"error", "error_type"} and meaningful_error(item):
+                return True
+            if _json_contains_error_signal(item):
+                return True
+        return False
+    if isinstance(value, list | tuple):
+        return any(_json_contains_error_signal(item) for item in value)
+    return False
+
+
+def tool_result_content_has_error(content: Any) -> bool:
+    """Detect actual tool failures without treating ``error: null`` as failure."""
+    text = str(content or "").strip()
+    if not text:
+        return False
+    try:
+        parsed = json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        if _TOOL_EXECUTION_FAILED_RE.search(text):
+            return True
+        for match in _PLAIN_TEXT_ERROR_FIELD_RE.finditer(text):
+            value = match.group("value").strip().strip("\"'").strip().lower()
+            if value not in {"", "null", "none", "false", "0"}:
+                return True
+        return False
+    return _json_contains_error_signal(parsed)
+
+
+_PAYLOAD_IDENTITY_KEYS = {
+    "admission_status",
+    "decision",
+    "evidence_id",
+    "original_query_sha256",
+    "requirement_id",
+    "runtime_current_date",
+    "schema_version",
+    "source_url",
+    "status",
+}
+
+
+def _bounded_quality_payload(
+    payload: dict[str, Any],
+    *,
+    max_chars: int,
+) -> dict[str, Any]:
+    """Bound the complete JSON payload while preserving protocol identifiers."""
+    bounded = json.loads(json.dumps(payload, ensure_ascii=False, default=str))
+    bounded["input_truncated"] = False
+
+    def encoded_length() -> int:
+        return len(json.dumps(bounded, ensure_ascii=False, default=str))
+
+    def string_slots(
+        value: Any,
+        *,
+        parent_key: str = "",
+    ) -> list[tuple[Any, Any, str]]:
+        slots: list[tuple[Any, Any, str]] = []
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if (
+                    isinstance(item, str)
+                    and key not in _PAYLOAD_IDENTITY_KEYS
+                    and len(item) > 8
+                ):
+                    slots.append((value, key, item))
+                else:
+                    slots.extend(string_slots(item, parent_key=str(key)))
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                if (
+                    isinstance(item, str)
+                    and parent_key not in {
+                        "allowed_urls",
+                        "owned_requirement_ids",
+                        "evidence_optional_requirement_ids",
+                        "failures",
+                        "hard_rejection_reasons",
+                        "protocol_errors",
+                        "source_urls",
+                    }
+                    and len(item) > 8
+                ):
+                    slots.append((value, index, item))
+                else:
+                    slots.extend(string_slots(item, parent_key=parent_key))
+        return slots
+
+    while encoded_length() > max_chars:
+        slots = string_slots(bounded)
+        if not slots:
+            break
+        container, key, value = max(slots, key=lambda item: len(item[2]))
+        excess = encoded_length() - max_chars
+        keep = max(8, len(value) - excess - 1)
+        replacement = value[:keep] + "…"
+        if len(replacement) >= len(value):
+            replacement = value[:8]
+        container[key] = replacement
+        bounded["input_truncated"] = True
+
+    if encoded_length() > max_chars:
+        raise ValueError("quality_payload_budget_too_small")
+    return bounded
+
+
+def _quality_activity_dedupe_key(
+    research_topic: str,
+    tool_results: list[dict[str, Any]],
+    config: RunnableConfig,
+) -> str:
+    """Build an idempotent key for replaying the same quality evaluation."""
+    identity = {
+        "evaluation_epoch": config.get("metadata", {}).get(
+            "quality_evaluation_epoch"
+        ),
+        "task_id": config.get("metadata", {}).get("task_id"),
+        "research_topic": research_topic,
+        "tool_results": tool_results,
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()[:24]
+    return f"activity:quality:tool-result:{digest}"
 
 
 async def _evaluate_json(
@@ -598,7 +796,7 @@ def _normalize_quality_payload(payload: dict[str, Any]) -> dict[str, Any]:
             numeric_value = float(value)
         except (TypeError, ValueError):
             continue
-        normalized[key] = min(5, max(1, round(numeric_value)))
+        normalized[key] = min(5, max(1, int(numeric_value + 0.5)))
 
     decision = normalized.get("decision")
     if isinstance(decision, str):
@@ -658,35 +856,6 @@ def _normalize_quality_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 f"{value:g} {count_only_gap_labels[key]} without itemized details."
             ]
     return normalized
-
-
-def _trusted_inner_assessment_scores(
-    handoff: Mapping[str, Any],
-    policy: QualityRigorPolicy,
-) -> tuple[int, int, int, int] | None:
-    """Return validated inner-gate scores suitable for fail-open admission."""
-    assessment = handoff.get("result_assessment")
-    if not isinstance(assessment, Mapping):
-        return None
-    if assessment.get("decision") != "complete" or assessment.get("evaluator_error"):
-        return None
-    deterministic = assessment.get("deterministic_checks")
-    if not isinstance(deterministic, Mapping) or deterministic.get("passed") is not True:
-        return None
-    score_keys = (
-        "relevance",
-        "source_quality",
-        "evidence_coverage",
-        "corroboration",
-    )
-    values: list[int] = []
-    for key in score_keys:
-        value = assessment.get(key)
-        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 5:
-            return None
-        values.append(value)
-    scores = (values[0], values[1], values[2], values[3])
-    return scores if scores_meet_runtime_policy(scores, policy) else None
 
 
 def _fit_projected_evidence_record(
@@ -1124,7 +1293,7 @@ def _bounded_tool_results(
             "error": bool(result.get("error", False)),
         }
         encoded = json.dumps(projected, ensure_ascii=False, default=str)
-        separator_chars = 1 if bounded else 0
+        separator_chars = 2 if bounded else 0
         if used_chars + separator_chars + len(encoded) > max_chars:
             available = max(0, max_chars - used_chars - separator_chars - 128)
             projected["content"] = projected["content"][:available]
@@ -1171,7 +1340,7 @@ def deterministic_tool_checks(
     contents = [str(item.get("content", "")).strip() for item in evidence]
     combined = "\n".join(contents)
     error_count = sum(
-        bool(item.get("error")) or any(marker in content.lower() for marker in _ERROR_MARKERS)
+        bool(item.get("error")) or tool_result_content_has_error(content)
         for item, content in zip(evidence, contents)
     )
     fetched_source_urls: set[str] = set()
@@ -1488,22 +1657,21 @@ async def evaluate_tool_results(
     """Evaluate one tool batch and apply deterministic overrides."""
     configurable = Configuration.from_runnable_config(config)
     policy = _quality_policy(configurable, config)
-    resolved_contract = (
+    resolved_contract, contract_error = _resolve_coverage_contract(
         coverage_contract
-        if isinstance(coverage_contract, ResearchCoverageContract)
-        else ResearchCoverageContract.model_validate(coverage_contract)
-        if isinstance(coverage_contract, dict) and coverage_contract
-        else None
     )
-    use_v4_contract = (
-        resolved_contract is not None
-        and str(
+    v4_policy_requested = (
+        str(
             config.get("metadata", {}).get(
                 "quality_policy_version",
                 QUALITY_POLICY_VERSION,
             )
         )
         == "quality-gate-v4"
+    )
+    use_v4_contract = (
+        resolved_contract is not None
+        and v4_policy_requested
     )
     source_scope_enforced = (
         use_v4_contract
@@ -1551,7 +1719,7 @@ async def evaluate_tool_results(
         "deterministic_checks": checks,
         "source_scope_enforced": source_scope_enforced,
     }
-    if use_v4_contract:
+    if use_v4_contract and resolved_contract is not None:
         payload.update(
             {
                 "coverage_contract": resolved_contract.model_dump(
@@ -1567,8 +1735,19 @@ async def evaluate_tool_results(
                 ),
             }
         )
+    evaluation_input_error = contract_error
+    if evaluation_input_error is None:
+        try:
+            payload = _bounded_quality_payload(
+                payload,
+                max_chars=input_limit,
+            )
+        except ValueError as exc:
+            evaluation_input_error = str(exc)
     evaluator_failed = False
     try:
+        if evaluation_input_error is not None:
+            raise ValueError(evaluation_input_error)
         result = await _evaluate_json(
             ToolResultAssessment,
             TOOL_RESULT_EVALUATION_PROMPT,
@@ -1668,7 +1847,11 @@ async def evaluate_tool_results(
             },
             "gap_count": len(result.missing_information),
         },
-        dedupe_key=f"activity:quality:tool-result:{uuid.uuid4().hex}",
+        dedupe_key=_quality_activity_dedupe_key(
+            research_topic,
+            tool_results,
+            config,
+        ),
         update_run_summary=True,
     )
     return result
@@ -1687,25 +1870,24 @@ async def evaluate_subagent_handoff(
     configurable = Configuration.from_runnable_config(config)
     policy = _quality_policy(configurable, config)
     resolved_risk = risk_profile or ResearchRiskProfile(level="standard")
-    resolved_contract = (
+    resolved_contract, contract_error = _resolve_coverage_contract(
         coverage_contract
-        if isinstance(coverage_contract, ResearchCoverageContract)
-        else ResearchCoverageContract.model_validate(coverage_contract)
-        if isinstance(coverage_contract, dict)
-        else None
     )
     owned_requirement_ids = tuple(
         dict.fromkeys(str(item) for item in (requirement_ids or ()))
     )
-    use_v4_contract = (
-        resolved_contract is not None
-        and str(
+    v4_policy_requested = (
+        str(
             config.get("metadata", {}).get(
                 "quality_policy_version",
                 QUALITY_POLICY_VERSION,
             )
         )
         == "quality-gate-v4"
+    )
+    use_v4_contract = (
+        resolved_contract is not None
+        and v4_policy_requested
     )
     evidence_optional_requirement_ids = (
         _evidence_optional_requirement_ids(resolved_contract)
@@ -1745,14 +1927,6 @@ async def evaluate_subagent_handoff(
             resolved_contract if source_scope_enforced else None
         ),
     )
-    trusted_inner_scores = _trusted_inner_assessment_scores(handoff, policy)
-    fail_open_inner_admission = (
-        configurable.quality_evaluation_fail_open
-        and configurable.quality_caveat_admission_enabled
-        and not resolved_risk.high_risk
-        and checks["passed"]
-        and trusted_inner_scores is not None
-    )
     limit = configurable.quality_evaluation_max_input_chars
     full_compressed_research = str(
         scoped_handoff.get("compressed_research", "")
@@ -1787,9 +1961,13 @@ async def evaluate_subagent_handoff(
         "approval_thresholds": policy.as_dict(),
         "research_topic": research_topic,
         "compressed_research": compressed_research,
+        "compressed_research_truncated": (
+            len(compressed_research) < len(full_compressed_research)
+        ),
         "evidence_registry": evidence_registry,
         "evidence_registry_stats": evidence_stats,
         "raw_notes": raw_notes,
+        "raw_notes_truncated": len(raw_notes) < len(raw_notes_text),
         "deterministic_checks": checks,
     }
     if use_v4_contract and resolved_contract is not None:
@@ -1809,8 +1987,19 @@ async def evaluate_subagent_handoff(
                 ),
             }
         )
+    evaluation_input_error = contract_error
+    if evaluation_input_error is None:
+        try:
+            payload = _bounded_quality_payload(
+                payload,
+                max_chars=limit,
+            )
+        except ValueError as exc:
+            evaluation_input_error = str(exc)
     evaluator_failed = False
     try:
+        if evaluation_input_error is not None:
+            raise ValueError(evaluation_input_error)
         result = await _evaluate_json(
             HandoffAssessment,
             (
@@ -1832,25 +2021,11 @@ async def evaluate_subagent_handoff(
         evaluator_failed = True
         protocol_errors = _protocol_errors_from_exception(exc)
         if configurable.quality_evaluation_fail_open:
-            if use_v4_contract and fail_open_inner_admission:
-                assert trusted_inner_scores is not None
-                result = HandoffAssessment(
-                    accepted=True,
-                    admission_status=AdmissionStatus.ACCEPTED_WITH_CAVEATS,
-                    relevance=trusted_inner_scores[0],
-                    source_quality=trusted_inner_scores[1],
-                    evidence_coverage=trusted_inner_scores[2],
-                    groundedness=trusted_inner_scores[3],
-                    caveats=["quality_evaluator_unavailable"],
-                    reason=(
-                        "Supervisor quality evaluator unavailable; admitting "
-                        "with caveats because the task's inner quality gate and "
-                        "deterministic evidence checks both passed."
-                    ),
-                    evaluator_error=str(exc),
-                    protocol_errors=protocol_errors,
+            if v4_policy_requested:
+                rejection_code = (
+                    evaluation_input_error
+                    or "quality_evaluator_unavailable"
                 )
-            elif use_v4_contract:
                 result = HandoffAssessment(
                     accepted=False,
                     admission_status=AdmissionStatus.REJECTED,
@@ -1858,11 +2033,9 @@ async def evaluate_subagent_handoff(
                     source_quality=3,
                     evidence_coverage=3,
                     groundedness=3,
-                    missing_information=["quality_evaluator_unavailable"],
+                    missing_information=[rejection_code],
                     follow_up_tasks=["reassess_sha_verified_artifact"],
-                    hard_rejection_reasons=[
-                        "quality_evaluator_unavailable"
-                    ],
+                    hard_rejection_reasons=[rejection_code],
                     reason=(
                         "Quality evaluator unavailable; the research run may "
                         "continue under fail-open policy, but the free-text "
@@ -1925,10 +2098,9 @@ async def evaluate_subagent_handoff(
         if (
             evaluator_failed
             and configurable.quality_evaluation_fail_open
-            and not fail_open_inner_admission
         ):
             v4_protocol_failures.append(
-                "quality_evaluator_unavailable"
+                evaluation_input_error or "quality_evaluator_unavailable"
             )
         normalized_coverage: list[RequirementCoverage] = []
         for coverage in result.requirement_coverage:
@@ -1949,17 +2121,6 @@ async def evaluate_subagent_handoff(
                 continue
             if coverage.status.value == "supported":
                 if (
-                    coverage.requirement_id
-                    in evidence_optional_requirement_ids
-                ):
-                    coverage = coverage.model_copy(update={
-                        "evidence_ids": tuple(
-                            evidence_id
-                            for evidence_id in coverage.evidence_ids
-                            if evidence_id in valid_evidence_ids
-                        )
-                    })
-                elif (
                     not coverage.evidence_ids
                     or any(
                         evidence_id not in valid_evidence_ids

@@ -1199,7 +1199,15 @@ class Configuration(BaseModel):
         },
     )
     quality_evaluation_min_sources: int = Field(default=2, ge=0, le=20)
-    quality_evaluation_max_input_chars: int = Field(default=30000, ge=1000)
+    quality_evaluation_max_input_chars: int = Field(
+        default=30000,
+        ge=1000,
+        description=(
+            "Hard character limit for the complete serialized JSON payload sent "
+            "to a runtime quality evaluator. Oversized semantic fields are "
+            "truncated with an explicit input_truncated marker."
+        ),
+    )
     quality_risk_mode: Literal["auto", "high", "standard"] = Field(
         default="auto",
         description=(
