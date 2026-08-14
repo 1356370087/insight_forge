@@ -85,6 +85,7 @@ from open_deep_research.quality import (
     _bounded_evidence_records,
     evaluate_subagent_handoff,
     evaluate_tool_results,
+    tool_result_content_has_error,
 )
 from open_deep_research.quality_contract import (
     AdmissionStatus,
@@ -795,17 +796,16 @@ def _canonicalize_supervisor_tool_call_requirements(
     tool_calls: list[dict[str, Any]],
     contract: ResearchCoverageContract | None,
 ) -> list[dict[str, Any]]:
-    """Normalize safe requirement-ID near misses before governance validation."""
+    """Normalize IDs and assign still-unowned requirements deterministically."""
     if contract is None:
         return tool_calls
     normalized_calls: list[dict[str, Any]] = []
     for tool_call in tool_calls:
         args = tool_call.get("args")
-        requirement_ids = (
-            args.get("requirement_ids")
-            if isinstance(args, dict)
-            else None
-        )
+        if not isinstance(args, dict):
+            normalized_calls.append(tool_call)
+            continue
+        requirement_ids = args.get("requirement_ids")
         if not isinstance(requirement_ids, list):
             normalized_calls.append(tool_call)
             continue
@@ -819,6 +819,46 @@ def _canonicalize_supervisor_tool_call_requirements(
                 ),
             },
         })
+    allowed = tuple(contract.requirement_ids())
+    allowed_set = set(allowed)
+    claimed = {
+        str(requirement_id)
+        for tool_call in normalized_calls
+        if tool_call.get("name") in {"ConductResearch", "StartResearchTask"}
+        for requirement_id in (
+            tool_call.get("args", {}).get("requirement_ids", [])
+            if isinstance(tool_call.get("args"), dict)
+            else []
+        )
+        if str(requirement_id) in allowed_set
+    }
+    missing_indexes = [
+        index
+        for index, tool_call in enumerate(normalized_calls)
+        if tool_call.get("name") in {"ConductResearch", "StartResearchTask"}
+        and isinstance(tool_call.get("args"), dict)
+        and not tool_call["args"].get("requirement_ids")
+    ]
+    assignments: list[list[str]] = [[] for _ in missing_indexes]
+    if assignments:
+        for offset, requirement_id in enumerate(
+            item for item in allowed if item not in claimed
+        ):
+            assignments[offset % len(assignments)].append(requirement_id)
+    for call_index, requirement_ids in zip(
+        missing_indexes,
+        assignments,
+    ):
+        if not requirement_ids:
+            continue
+        tool_call = normalized_calls[call_index]
+        normalized_calls[call_index] = {
+            **tool_call,
+            "args": {
+                **tool_call["args"],
+                "requirement_ids": requirement_ids,
+            },
+        }
     return normalized_calls
 
 
@@ -1796,6 +1836,7 @@ async def _finalize_async_research_outputs(
                 coverage_ledger,
                 task_id=task_id,
                 assessment=assessment,
+                owned_requirement_ids=output.get("requirement_ids", []),
             )
             output["handoff_assessment"] = assessment.model_dump()
         elif snapshot is not None:
@@ -2815,6 +2856,15 @@ async def _execute_supervisor_tools(
                 coverage_ledger,
                 task_id=str(call_id),
                 assessment=assessment,
+                owned_requirement_ids=next(
+                    (
+                        call.get("args", {}).get("requirement_ids", [])
+                        for call in tool_calls
+                        if str(call.get("id")) == str(call_id)
+                        and isinstance(call.get("args"), dict)
+                    ),
+                    [],
+                ),
             )
     if coverage_ledger:
         update_payload["coverage_ledger"] = coverage_ledger
@@ -3233,6 +3283,77 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
     )
 
 
+def _bounded_assessment_feedback(
+    assessment: Any,
+    *,
+    max_chars: int,
+) -> str:
+    """Return valid, bounded JSON for untrusted evaluator feedback."""
+    payload = assessment.model_dump(mode="json")
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    if len(encoded) <= max_chars:
+        return encoded
+
+    def bounded_items(field: str) -> list[str]:
+        values = payload.get(field, [])
+        if not isinstance(values, list):
+            return []
+        return [str(value)[:160] for value in values[:3]]
+
+    summary: dict[str, Any] = {
+        "decision": payload.get("decision", "continue"),
+        "scores": {
+            key: payload.get(key)
+            for key in (
+                "relevance",
+                "source_quality",
+                "evidence_coverage",
+                "corroboration",
+            )
+        },
+        "unresolved_conflicts": bounded_items("unresolved_conflicts"),
+        "missing_information": bounded_items("missing_information"),
+        "suggested_queries": bounded_items("suggested_queries"),
+        "reason": str(payload.get("reason", ""))[:240],
+        "truncated": True,
+    }
+
+    def render() -> str:
+        return json.dumps(
+            summary,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    encoded = render()
+    while len(encoded) > max_chars:
+        slots: list[tuple[Any, Any, str]] = []
+        for key, value in summary.items():
+            if isinstance(value, str) and len(value) > 8:
+                slots.append((summary, key, value))
+            elif isinstance(value, list):
+                slots.extend(
+                    (value, index, item)
+                    for index, item in enumerate(value)
+                    if isinstance(item, str) and len(item) > 8
+                )
+        if not slots:
+            break
+        container, key, value = max(slots, key=lambda item: len(item[2]))
+        excess = len(encoded) - max_chars
+        keep = max(8, len(value) - excess - 1)
+        container[key] = value[:keep] + "…"
+        encoded = render()
+    if len(encoded) > max_chars:
+        summary = {
+            "decision": payload.get("decision", "continue"),
+            "reason": "Quality feedback exceeded the bounded context budget.",
+            "truncated": True,
+        }
+        encoded = render()
+    return encoded
+
+
 async def assess_research_results(
     state: ResearcherState,
     config: RunnableConfig,
@@ -3254,7 +3375,7 @@ async def assess_research_results(
             {
                 "name": message.name or "tool",
                 "content": str(message.content),
-                "error": '"error_type"' in str(message.content).lower(),
+                "error": tool_result_content_has_error(message.content),
             }
             for message in state.get("researcher_messages", [])
             if isinstance(message, ToolMessage)
@@ -3274,7 +3395,17 @@ async def assess_research_results(
         coverage_contract=state.get("coverage_contract"),
         requirement_ids=list(state.get("requirement_ids", [])),
     )
-    assessment_json = assessment.model_dump_json()
+    feedback_limit = max(
+        512,
+        min(
+            8_000,
+            configurable.quality_evaluation_max_input_chars // 3,
+        ),
+    )
+    assessment_json = _bounded_assessment_feedback(
+        assessment,
+        max_chars=feedback_limit,
+    )
     update = {
         "researcher_messages": [HumanMessage(
             content=(

@@ -43,6 +43,7 @@ class CoverageRequirement(BaseModel):
     source_message_index: int = Field(ge=0)
     source_start: int = Field(ge=0)
     source_end: int = Field(ge=0)
+    source_located: bool = True
 
 
 class ResearchCoverageContract(BaseModel):
@@ -131,9 +132,16 @@ _HIGH_RISK_RULES: dict[str, tuple[tuple[str, str], ...]] = {
     ),
     "finance": (
         ("finance.investment", r"\binvest(?:ment|ing)\b|投资建议|证券"),
-        ("finance.trading", r"\btrad(?:e|ing)\b|交易策略|买入|卖出"),
+        (
+            "finance.trading",
+            r"\b(?:trade|trading)\s+(?:advice|recommendation|strategy|signal)s?\b|"
+            r"\b(?:buy|sell)\b.{0,48}\b(?:stocks?|securit(?:y|ies)|"
+            r"crypto(?:currenc(?:y|ies))?|funds?|bonds?|shares?|options?|futures?)\b|"
+            r"交易策略|交易建议|买入|卖出",
+        ),
         ("finance.credit", r"\bcredit\b|\bloan\b|信贷|贷款"),
-        ("finance.tax", r"\btax advice\b|税务建议|保险建议"),
+        ("finance.tax", r"\btax advice\b|税务建议"),
+        ("finance.insurance", r"\binsurance advice\b|保险建议"),
     ),
 }
 
@@ -216,7 +224,11 @@ def _locate_requirement_source(
             start, end = match.span()
             return content[start:end], start, end
 
-    return content, 0, len(content)
+    # The checklist extractor already bounds semantic items to 500 characters.
+    # If normalization removed markup or prefixes so thoroughly that no honest
+    # source span can be recovered, retain that bounded item and mark the span
+    # as unavailable instead of duplicating the entire user message.
+    return requirement[:500], 0, 0
 
 
 def build_research_coverage_contract(
@@ -280,6 +292,7 @@ def build_research_coverage_contract(
                     source_message_index=message_index,
                     source_start=start,
                     source_end=end,
+                    source_located=end > start,
                 )
             )
             ordinal += 1
@@ -295,7 +308,8 @@ def build_research_coverage_contract(
                 text=fallback,
                 source_message_index=human_payloads[0][0],
                 source_start=0,
-                source_end=len(human_payloads[0][1]),
+                source_end=len(fallback),
+                source_located=True,
             )
         )
     advisories = tuple(
@@ -442,6 +456,7 @@ def merge_coverage_ledger(
     *,
     task_id: str,
     assessment: Any,
+    owned_requirement_ids: Iterable[str] = (),
 ) -> dict[str, dict[str, Any]]:
     """Merge an admitted assessment into a reducer-safe coverage ledger."""
     merged = {
@@ -466,8 +481,15 @@ def merge_coverage_ledger(
     assessment_caveats = [
         str(item) for item in getattr(assessment, "caveats", [])
     ]
+    statuses = {
+        CoverageStatus.UNSUPPORTED.value: 0,
+        CoverageStatus.PARTIAL.value: 1,
+        CoverageStatus.SUPPORTED.value: 2,
+    }
+    mapped_requirement_ids: set[str] = set()
     for coverage in getattr(assessment, "requirement_coverage", []):
         requirement_id = str(coverage.requirement_id)
+        mapped_requirement_ids.add(requirement_id)
         current = merged.setdefault(
             requirement_id,
             {
@@ -477,11 +499,6 @@ def merge_coverage_ledger(
                 "caveats": [],
             },
         )
-        statuses = {
-            CoverageStatus.UNSUPPORTED.value: 0,
-            CoverageStatus.PARTIAL.value: 1,
-            CoverageStatus.SUPPORTED.value: 2,
-        }
         new_status = coverage.status.value
         if statuses[new_status] >= statuses.get(str(current["status"]), 0):
             current["status"] = new_status
@@ -498,5 +515,33 @@ def merge_coverage_ledger(
         )
         current["caveats"] = list(
             dict.fromkeys([*current["caveats"], *assessment_caveats])
+        )
+    for requirement_id in dict.fromkeys(
+        str(item) for item in owned_requirement_ids if str(item)
+    ):
+        if requirement_id in mapped_requirement_ids:
+            continue
+        current = merged.setdefault(
+            requirement_id,
+            {
+                "status": CoverageStatus.UNSUPPORTED.value,
+                "evidence_ids": [],
+                "task_ids": [],
+                "caveats": [],
+            },
+        )
+        if statuses.get(str(current["status"]), 0) < statuses[
+            CoverageStatus.PARTIAL.value
+        ]:
+            current["status"] = CoverageStatus.PARTIAL.value
+        current["task_ids"] = list(
+            dict.fromkeys([*current["task_ids"], task_id])
+        )
+        current["caveats"] = list(
+            dict.fromkeys([
+                *current["caveats"],
+                *assessment_caveats,
+                "coverage_mapping_missing",
+            ])
         )
     return merged
