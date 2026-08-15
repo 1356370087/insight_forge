@@ -4,7 +4,7 @@
 
 InsightForge 是一个面向深度研究任务的可配置多 Agent 运行时。它使用手写的 `QueryEngine/query` 双层 Agent Loop，将用户问题转化为研究计划，调度多个专职 Researcher 搜索与核验证据，并最终生成带来源的结构化研究报告。
 
-项目同时提供 FastAPI 服务和 Python 运行时，覆盖持久化恢复、人工审批、任务协调、质量门禁、长期记忆、安全治理与可观测性，适合构建市场扫描、竞争情报、技术调研、政策追踪和战略决策支持系统。
+项目同时提供 Next.js 研究控制台、FastAPI 服务和 Python 运行时，覆盖持久化恢复、人工审批、任务协调、质量门禁、长期记忆、安全治理与可观测性，适合构建市场扫描、竞争情报、技术调研、政策追踪和战略决策支持系统。
 
 - 主仓库：[Gitee](https://gitee.com/zeng-haozhe/open_deep_research)
 - 镜像仓库：[GitHub](https://github.com/1356370087/open_deep_research)
@@ -19,11 +19,13 @@ InsightForge 是一个面向深度研究任务的可配置多 Agent 运行时。
 - 同步与异步调度：支持同步 `ConductResearch` 并行调用，也支持文件状态、Mailbox、Teammate Pool 和检查点驱动的异步研究任务。
 - 可追溯 Web 证据：在 `enforced` 模式下执行 Search → Top-K Fetch → Extract → Evidence，最终引用仅允许来自已抓取、可验证的证据。
 - 多模型与多工具：支持 OpenAI、Anthropic、Google、DeepSeek、Groq 等模型接入，支持 Tavily、原生 Web Search、MCP 和可选 Playwright MCP。
+- 覆盖与来源契约：从用户消息编译稳定的需求清单（Coverage Contract）和来源准入范围（Source Contract），支持显式 URL 白/黑名单与"仅官方来源"约束，范围外证据不会进入报告。
 - 人机协作：支持研究计划审批、报告大纲审批、修改、取消、中途方向反馈和面向具体任务的证据追问。
-- 质量门禁：结合确定性规则与独立 Judge 模型评估工具结果和研究交接，支持多档质量严格度及失败恢复。
+- 质量门禁：结合确定性规则与独立 Judge 模型评估工具结果和研究交接，按需求维护覆盖账本，支持多档质量严格度、评估输入预算及失败恢复。
+- 研究控制台：内置 Next.js 前端，提供研究任务创建、SSE 实时进度、HITL 审批、Subagent 执行详情、本地账号登录和管理后台。
 - 报告编排：支持综合报告、执行摘要、决策简报、FAQ、对比矩阵、优劣分析和文献综述等报告类型。
 - 可恢复运行：研究摘要、状态增量、公开事件、任务工件和稳定检查点持久化到本地文件，可显式恢复中断任务。
-- 安全与治理：包含 JWT 认证、租户隔离、工具权限、参数校验、域名审批、SSRF 防护、外部内容隔离和可选 Docker 沙箱。
+- 安全与治理：包含自有 IAM/RBAC（本地账号、角色权限、审计）、工具权限、参数校验、域名审批、SSRF 防护、外部内容隔离和可选 Docker 沙箱。
 - 可观测性：内置 SQLite Trace Store，可选接入 Langfuse、Prometheus/Grafana 和 Helicone。
 - 长期记忆：可选接入 Mem0，支持用户偏好、领域画像、项目记忆、研究洞察、反思和软遗忘。
 
@@ -35,7 +37,9 @@ InsightForge 是一个面向深度研究任务的可配置多 Agent 运行时。
 - [uv](https://docs.astral.sh/uv/)
 - 至少一个可用的模型 API Key
 - 使用 Tavily 搜索时需要 `TAVILY_API_KEY`
-- Docker 仅在启用 Researcher 沙箱时需要
+- 启用完整 IAM 认证时需要 PostgreSQL；仅本地开发旁路或 Docker 演示模式不需要
+- 运行研究控制台前端需要 Node.js 与 [pnpm](https://pnpm.io/)
+- Docker 仅在容器化部署或启用 Researcher 沙箱时需要
 
 ### 安装
 
@@ -80,13 +84,14 @@ WEB_PIPELINE_MODE=enforced
 
 ### 启动本地服务
 
-FastAPI 默认要求 Supabase Bearer Token。仅在可信的本地开发环境中，可以启用显式认证绕过：
+后端默认启用自有 IAM 认证：需要配置 `IAM_DATABASE_URL`（PostgreSQL）、执行数据库迁移，并通过 CLI 创建首位管理员（见[安全与沙箱](#安全与沙箱)）。仅在可信的本地开发环境中，可以启用显式认证旁路：
 
 ```env
+APP_ENV=development
 LOCAL_DEV_AUTH_BYPASS=true
 ```
 
-不要在共享环境或生产部署中启用该选项。
+旁路仅在 `APP_ENV=development` 时生效，所有请求会获得一个合成的 researcher/developer 身份，不包含 IAM 管理权限。不要在共享环境或生产部署中启用该选项。
 
 启动服务：
 
@@ -100,6 +105,35 @@ uv run uvicorn open_deep_research.server:app --reload --host 127.0.0.1 --port 20
 - OpenAPI 文档：`http://127.0.0.1:2024/docs`
 - 内置观测页面：`http://127.0.0.1:2024/observability/ui`
 - Prometheus 指标：`http://127.0.0.1:2024/metrics`
+
+### 启动研究控制台前端
+
+仓库内置基于 Next.js 的研究控制台，提供任务创建、实时进度、HITL 审批、Subagent 执行详情抽屉、账号设置与管理后台：
+
+```bash
+cd frontend
+cp .env.example .env.local   # Windows PowerShell: Copy-Item .env.example .env.local
+pnpm install
+pnpm dev
+```
+
+访问 `http://localhost:3000`。浏览器只连接 Next.js BFF（`/api/research`、`/api/auth`、`/api/iam`）；Access/Refresh Token 保存在 HttpOnly Cookie 中，由服务端代理注入 `Authorization` 头，浏览器不接触 JWT。
+
+前端回源地址等变量见 `frontend/.env.example`：
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `RESEARCH_API_ORIGIN` | `http://127.0.0.1:2024` | BFF 服务端回源地址 |
+| `NEXT_PUBLIC_RESEARCH_API_BASE` | `/api/research` | 浏览器端 API 前缀 |
+| `NEXT_PUBLIC_LOCAL_DEV_AUTH_BYPASS` | `false` | 前端本地开发鉴权旁路，需与后端旁路同时开启 |
+
+### Docker Compose 一键部署
+
+```bash
+docker compose up --build
+```
+
+该编排启动三个服务：FastAPI API（容器内 2024）、Next.js 前端（容器内 3000）和 Nginx 代理（宿主机 `http://localhost:8080`）。默认以 `LOCAL_DEV_AUTH_BYPASS=true` 的本地演示模式运行，无需 PostgreSQL；如需完整认证，将 compose 中的旁路开关改为 `"false"` 并提供 `IAM_DATABASE_URL`。
 
 ### 创建后台研究任务
 
@@ -167,10 +201,15 @@ curl -N "http://127.0.0.1:2024/runs/<run_id>/events" \
 
 公开事件经过字段白名单、URL 规范化和敏感信息清理，只暴露阶段、任务进度、来源摘要、审批请求和最终状态；内部恢复 Journal 不会直接暴露给客户端。
 
-生产环境请求需要增加认证头：
+生产环境请求需要增加认证头。Access Token 通过 `POST /auth/login` 获取：
 
 ```bash
--H "Authorization: Bearer <odr-access-token>"
+curl -X POST "http://127.0.0.1:2024/auth/login" \
+  -H "Content-Type: application/json" \
+  -d '{"email": "user@example.com", "password": "..."}'
+
+# 后续请求携带返回的 access token
+-H "Authorization: Bearer <access-token>"
 ```
 
 ### Python 调用
@@ -215,7 +254,7 @@ asyncio.run(main())
 
 ```mermaid
 flowchart TD
-    Client["HTTP / SSE / Python 客户端"] --> API["FastAPI 服务"]
+    Client["研究控制台 / HTTP / SSE / Python 客户端"] --> API["FastAPI 服务"]
     API --> Lead["QueryEngine / Lead Agent"]
 
     Lead --> Prepare["消息压缩 · 记忆召回 · 澄清 · Research Brief"]
@@ -377,6 +416,16 @@ curl -X POST "http://127.0.0.1:2024/runs/<run_id>/feedback" \
 
 设置 `quality_evaluation_enabled=true` 后，运行时会使用独立 Judge 模型评估 Researcher 工具结果和提交给 Supervisor 的研究交接。
 
+**覆盖契约与覆盖账本**：运行开始时从用户消息编译覆盖契约（Coverage Contract），研究需求被切分为最多 20 条清单项，每条获得稳定可复现的需求 ID（`COV-NN-<hash>`）。Supervisor 委派任务时会把需求子集分配给对应 Researcher，质量门禁只对归属需求做硬覆盖检查；未被认领的需求会被兜底轮询分配，避免需求在调度中丢失。覆盖账本（Coverage Ledger）按需求 ID 跨任务合并状态（`supported`/`partial`/`unsupported`，只单调提升），并记录支撑证据与任务来源，供报告合成阶段消费。
+
+**来源契约**：用户消息中的来源约束会被编译为来源准入范围（Source Contract）：
+
+- 显式 URL 白名单：例如"只使用以下 URL/链接 …"，范围外来源一律拒绝
+- 显式 URL 黑名单：例如"不得使用 / 排除 …"，命中即拒绝
+- 仅官方来源：只有命中内置官方源 Profile（如 PostgreSQL 官方文档与仓库）或显式白名单的证据可准入，无法验证归属的来源标记为不可信
+
+受限契约下证据准入 fail-closed；显式 URL 白名单模式下最少来源数放宽为 1，多样性留到运行合并层评估；压缩文本中出现范围外 URL 会触发硬拒。
+
 `quality_evaluation_rigor` 支持：
 
 - `very_relaxed`
@@ -390,12 +439,14 @@ curl -X POST "http://127.0.0.1:2024/runs/<run_id>/feedback" \
 - 外部证据安全检查
 - 工具执行和用户约束合规性
 - 研究工件 SHA 完整性
-- 已抓取证据准入
+- 已抓取证据准入与来源契约范围校验
 - `quality_evaluation_min_sources` 最少来源要求
+
+**评估输入预算**：Judge 输入受 `quality_evaluation_max_input_chars`（默认 30000 字符）硬预算约束。超长语义字段按身份保护规则截断并加 `input_truncated` 标记；证据注册表按引用优先级做有界投影，被压缩研究显式引用的证据最先保留。
 
 每个运行会冻结质量严格度、策略版本、Judge 模型和评估纪元。旧配置 `QUALITY_EVALUATION_MIN_SCORE=1..5` 仅用于兼容迁移，并分别映射到五档严格度；新部署应使用 `QUALITY_EVALUATION_RIGOR`。
 
-Judge 传输或解析失败是否放行由 `quality_evaluation_fail_open` 控制，但确定性证据硬门禁始终有效。若完整交接被拒绝，运行时会尝试从 SHA 校验且已准入的证据中恢复部分报告；不存在合格证据时，任务以 `insufficient_evidence` 失败。
+Judge 传输或解析失败是否放行由 `quality_evaluation_fail_open` 控制，但确定性证据硬门禁始终有效：内层（工具批次）评估失败时按策略放行或停止研究支出；外层（交接门禁）评估失败时，v4 策略会拒绝该份自由文本交接，但允许确定性校验通过的运行继续。若完整交接被拒绝，运行时会尝试从 SHA 校验且已准入的证据中恢复部分报告；不存在合格证据时，任务以 `insufficient_evidence` 失败。
 
 ### 持久化、恢复与任务租约
 
@@ -474,7 +525,24 @@ curl -X POST "http://127.0.0.1:2024/runs/<run_id>/cancel"
 
 ### 安全与沙箱
 
-HTTP 服务默认使用 Supabase JWT 认证，并把身份写入运行 owner 元数据。查询、恢复、事件订阅、控制和可观测接口都会校验运行所有权。
+HTTP 服务使用自有 IAM 与 RBAC 子系统认证（位于 `src/security/rbac`），不依赖外部身份提供商：
+
+- 本地账号体系：Argon2 密码哈希、邮箱验证、注册审批、密码重置与会话管理
+- EdDSA（Ed25519）签名的 Access/Refresh 双 Token：独立密钥与 kid，Refresh Token 一次性轮换并检测重用，`authz_version` 支持权限变更后即时吊销旧令牌
+- 角色与权限：4 个系统角色（`viewer`、`researcher`、`developer`、`admin`）加自定义角色，基于封闭的权限目录（研究域 + IAM 域）构建权限矩阵；长连接 SSE 会周期性重新授权
+- 内置登录、注册、邮件与重置限流，以及 IAM 审计事件
+- 认证身份写入运行 owner 元数据，查询、恢复、事件订阅、控制和可观测接口都会校验运行所有权
+
+启用完整认证需要 PostgreSQL 和数据库迁移，并创建首位管理员：
+
+```bash
+# 配置 IAM_DATABASE_URL 后执行迁移
+uv run alembic upgrade head
+
+# 创建首位管理员（幂等，授予 admin + researcher 角色）
+uv run python -m security.cli bootstrap-admin \
+  --email admin@example.com --password '...'
+```
 
 主要安全边界包括：
 
@@ -535,6 +603,9 @@ Trace Payload 默认为 `preview`，常见凭据和 Bearer Token 默认脱敏。
 
 | 方法 | 路径 | 作用 |
 |---|---|---|
+| `GET` | `/capabilities` | 查询运行能力与配置投影，供前端渲染 |
+| `POST` | `/auth/login` 等 `/auth/*` | 本地账号登录、注册、邮箱验证、Token 刷新、注销、会话与密码管理 |
+| `GET`/`PATCH` 等 | `/admin/*` | IAM 管理接口：用户审批、角色与权限目录、审计事件（需 admin 权限） |
 | `POST` | `/runs` | 创建后台研究任务 |
 | `POST` | `/runs/stream` | 创建任务并通过 SSE 返回持久化公开事件 |
 | `GET` | `/runs/{run_id}` | 获取当前状态、进度投影和最终结果 |
@@ -543,6 +614,8 @@ Trace Payload 默认为 `preview`，常见凭据和 Bearer Token 默认脱敏。
 | `POST` | `/runs/{run_id}/cancel` | 取消活动或持久化任务 |
 | `POST` | `/runs/{run_id}/human-actions/{action_id}` | 审批、修改或取消 HITL 动作 |
 | `POST` | `/runs/{run_id}/feedback` | 提交中途方向或证据追问 |
+| `GET` | `/runs/{run_id}/tasks/{task_id}/activity` | 查询子代理任务的活动事件（安全投影） |
+| `GET` | `/runs/{run_id}/tasks/{task_id}/activity/stream` | 以 SSE 订阅子代理任务活动 |
 | `GET` | `/observability/runs` | 查询当前用户的观测运行列表 |
 | `GET` | `/observability/runs/{run_id}` | 查询单次运行观测摘要 |
 | `GET` | `/observability/runs/{run_id}/spans` | 查询 Span 树 |
@@ -602,9 +675,13 @@ Trace Payload 默认为 `preview`，常见凭据和 Bearer Token 默认脱敏。
 | `query_session_persistence_enabled` | `true` | 持久化 Query 会话与恢复工件 |
 | `runs_dir` | `.runs` | 运行、事件、任务和观测数据目录 |
 | `quality_evaluation_enabled` | `false` | 开启运行时 Judge |
+| `quality_evaluation_model` | `openai:qwen3.7-plus` | Judge 评估模型 |
 | `quality_evaluation_rigor` | `balanced` | Judge 语义严格度 |
 | `quality_evaluation_min_sources` | `2` | 质量门禁最少来源 |
 | `quality_evaluation_fail_open` | `true` | Judge 传输失败是否放行 |
+| `quality_evaluation_max_input_chars` | `30000` | Judge 评估输入字符预算 |
+| `quality_gap_recovery_max_attempts` | `1` | 质量缺口恢复追加轮数 |
+| `task_timeout_seconds` | `600` | 研究子任务基础超时，质量门禁在其上叠加宽限 |
 | `enable_memory` | `false` | 开启 Mem0 长期记忆 |
 
 ### 报告与可观测性
@@ -621,9 +698,26 @@ Trace Payload 默认为 `preview`，常见凭据和 Bearer Token 默认脱敏。
 | `langfuse_enabled` | `false` | 镜像 Trace 到 Langfuse |
 | `prometheus_enabled` | `false` | 输出 Prometheus 指标 |
 
+### 身份与访问控制（IAM）
+
+IAM 配置通过环境变量设置，完整清单见 [`.env.example`](.env.example) 的 IAM 配置段：
+
+| 环境变量 | 默认值 | 说明 |
+|---|---:|---|
+| `APP_ENV` | `development` | 运行环境；`production` 下强制显式签名密钥与 SMTP |
+| `IAM_DATABASE_URL` | 空 | IAM PostgreSQL 连接串（asyncpg），关闭旁路时必填 |
+| `LOCAL_DEV_AUTH_BYPASS` | `false` | 本地开发认证旁路，仅 `APP_ENV=development` 生效 |
+| `IAM_JWT_ACCESS_SIGNING_KEY` / `IAM_JWT_REFRESH_SIGNING_KEY` | 空 | Ed25519 签名私钥（PEM）；开发环境可自动生成临时密钥 |
+| `IAM_TOKEN_DIGEST_SECRET` | 空 | Refresh Token 摘要 HMAC 密钥，生产必填 |
+| `IAM_ACCESS_TOKEN_TTL` | `900` | Access Token 有效期（秒） |
+| `IAM_REFRESH_IDLE_TTL` / `IAM_SESSION_ABSOLUTE_TTL` | `2592000` / `7776000` | 会话空闲与绝对有效期（秒） |
+| `IAM_MAIL_BACKEND` | `console` | `console` 或 `smtp`，生产强制 `smtp` |
+| `IAM_OPEN_REGISTRATION` | `false` | 是否开放注册；关闭时新用户需管理员审批 |
+| `IAM_LOGIN_RATE_LIMIT` 等 | 见 `.env.example` | 登录、注册、邮件与密码重置限流 |
+
 ## MCP、Browser MCP 与 Skills
 
-`mcp_config` 可配置一个外部 MCP Server 的 URL、允许工具列表和认证要求。支持 Supabase JWT 到 MCP Access Token 的交换与 Token 缓存。
+`mcp_config` 可配置一个外部 MCP Server 的 URL、允许工具列表和认证要求。支持通过 OAuth Token Exchange（RFC 8693）以服务端管理的 Subject Token 换取 MCP Access Token，并缓存 Token。
 
 `browser_mcp_enabled=true` 时可加载 Playwright MCP。若未提供显式配置，运行时使用默认的 stdio Playwright MCP 启动方式。Browser MCP 主要用于普通 HTTP 抓取不足时的页面渲染与交互探索。
 
@@ -696,6 +790,14 @@ uv run pytest
 ```
 
 测试覆盖 Query Runtime、并行研究、持久化恢复、Lease、Mailbox、HITL、工具治理、Web 证据、提示注入防护、报告 Profile、质量门禁、长期记忆、可观测性和认证。
+
+前端测试（单元 + E2E）：
+
+```bash
+cd frontend
+pnpm test        # Vitest 单元测试
+pnpm test:e2e    # Playwright E2E，覆盖桌面/平板/移动视口
+```
 
 ## 研究评估
 
