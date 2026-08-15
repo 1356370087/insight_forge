@@ -7,6 +7,9 @@ services:
     environment:
       RUNS_DIR: /data/runs
       FRONTEND_ALLOWED_ORIGINS: http://localhost:8080
+      # 本地部署免 IAM：跳过自托管认证（无需 IAM_DATABASE_URL）。
+      # 如需完整认证，改为 "false" 并提供 Postgres 的 IAM_DATABASE_URL。
+      LOCAL_DEV_AUTH_BYPASS: "true"
     volumes:
       - research-runs:/data/runs
 
@@ -15,7 +18,8 @@ services:
       context: frontend
       args:
         NEXT_PUBLIC_RESEARCH_API_BASE: /api/research
-        NEXT_PUBLIC_LOCAL_DEV_AUTH_BYPASS: ${LOCAL_DEV_AUTH_BYPASS:-false}
+        # 与 api 服务的 LOCAL_DEV_AUTH_BYPASS 保持一致，前端跳过登录页。
+        NEXT_PUBLIC_LOCAL_DEV_AUTH_BYPASS: "true"
     depends_on: [api]
 
   proxy:

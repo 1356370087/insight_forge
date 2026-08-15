@@ -1,0 +1,9 @@
+# 后端镜像只需要构建元数据与 src/，其余全部排除，
+# 避免 .venv/.git/缓存目录进入构建上下文拖慢构建。
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!src
+src/**/__pycache__
+src/**/*.pyc
