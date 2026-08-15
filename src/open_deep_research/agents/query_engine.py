@@ -2126,6 +2126,7 @@ class QueryEngine:
                     dict(state.get("coverage_ledger", {})),
                     task_id=str(task_id),
                     assessment=assessment,
+                    owned_requirement_ids=artifact.get("requirement_ids", []),
                 )
         state["handoff_assessments"] = assessments
 
@@ -2353,6 +2354,7 @@ class QueryEngine:
                     dict(state.get("coverage_ledger", {})),
                     task_id=str(task_id),
                     assessment=HandoffAssessment.model_validate(latest),
+                    owned_requirement_ids=artifact.get("requirement_ids", []),
                 )
                 admitted_task_ids.append(str(task_id))
                 if (
@@ -2419,6 +2421,7 @@ class QueryEngine:
                     dict(state.get("coverage_ledger", {})),
                     task_id=str(task_id),
                     assessment=reassessment,
+                    owned_requirement_ids=artifact.get("requirement_ids", []),
                 )
                 admitted_task_ids.append(str(task_id))
                 if (

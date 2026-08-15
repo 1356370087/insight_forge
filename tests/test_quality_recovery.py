@@ -93,7 +93,7 @@ async def test_automatic_reassessment_admits_sha_verified_artifact(
     monkeypatch,
 ) -> None:
     engine = _engine(tmp_path, "reassess-accepted")
-    artifact = _artifact()
+    artifact = {**_artifact(), "requirement_ids": ["req-001"]}
     digest = engine.context_store.persist_task_result("task-1", artifact)
     state = _termination_state({
         "path": "context/artifacts/research_tasks/task-1.json",
@@ -125,6 +125,64 @@ async def test_automatic_reassessment_admits_sha_verified_artifact(
     assert state["handoff_assessments"][-1]["trigger"] == (
         "automatic_termination_reassessment"
     )
+    assert state["coverage_ledger"] == {
+        "req-001": {
+            "status": "partial",
+            "evidence_ids": [],
+            "task_ids": ["task-1"],
+            "caveats": ["coverage_mapping_missing"],
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_persisted_accepted_assessment_backfills_owned_coverage_ledger(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    engine = _engine(tmp_path, "reassess-persisted-accepted")
+    artifact = {**_artifact(), "requirement_ids": ["req-001"]}
+    digest = engine.context_store.persist_task_result("task-1", artifact)
+    accepted = HandoffAssessment(
+        accepted=True,
+        relevance=5,
+        source_quality=5,
+        evidence_coverage=5,
+        groundedness=5,
+        reason="Persisted assessment accepted the artifact.",
+    )
+    state = _termination_state({
+        "path": "context/artifacts/research_tasks/task-1.json",
+        "sha256": digest,
+    })
+    state["handoff_assessments"] = [
+        {
+            "tool_call_id": "task-1",
+            "trigger": "artifact_read_reassessment",
+            "artifact_sha256": digest,
+            **accepted.model_dump(mode="json"),
+        }
+    ]
+
+    async def unexpected_reassessment(*_args, **_kwargs):
+        raise AssertionError("persisted accepted assessments must use the fast path")
+
+    monkeypatch.setattr(
+        "open_deep_research.agents.query_engine.evaluate_subagent_handoff",
+        unexpected_reassessment,
+    )
+
+    outcome = await engine._recover_quality_gate_termination(state)
+
+    assert outcome["mode"] == "accepted"
+    assert state["coverage_ledger"] == {
+        "req-001": {
+            "status": "partial",
+            "evidence_ids": [],
+            "task_ids": ["task-1"],
+            "caveats": ["coverage_mapping_missing"],
+        }
+    }
 
 
 @pytest.mark.asyncio
@@ -636,7 +694,8 @@ async def test_legacy_migration_reassesses_sha_artifacts_in_new_epoch(
     monkeypatch,
 ) -> None:
     engine = _engine(tmp_path, "legacy-reassessment")
-    digest = engine.context_store.persist_task_result("task-1", _artifact())
+    artifact = {**_artifact(), "requirement_ids": ["req-001"]}
+    digest = engine.context_store.persist_task_result("task-1", artifact)
     state = {
         **_termination_state(
             {
@@ -677,5 +736,13 @@ async def test_legacy_migration_reassesses_sha_artifacts_in_new_epoch(
     assert {item["evidence_id"] for item in state["evidence_registry"]} == {
         "ev-a",
         "ev-b",
+    }
+    assert state["coverage_ledger"] == {
+        "req-001": {
+            "status": "partial",
+            "evidence_ids": [],
+            "task_ids": ["task-1"],
+            "caveats": ["coverage_mapping_missing"],
+        }
     }
     assert "legacy note" not in state["notes"]
