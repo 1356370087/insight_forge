@@ -126,8 +126,14 @@ def test_anthropic_judge_uses_native_client_without_openai_extra_body(
     }
 
 
-def test_unknown_judge_provider_is_rejected(monkeypatch) -> None:
+def test_judge_provider_parsing_uses_shared_provider_superset(monkeypatch) -> None:
     monkeypatch.setenv("EVALUATION_MODEL", "unknown:model")
+    monkeypatch.setenv("UNKNOWN_API_KEY", "unknown-key")
 
-    with pytest.raises(ValueError, match="Unsupported evaluation provider"):
-        judge.JudgeConfig.from_env()
+    resolved = judge.JudgeConfig.from_env()
+
+    assert resolved.provider == "unknown"
+    assert resolved.model == "model"
+    assert resolved.api_key == "unknown-key"
+    with pytest.raises(ValueError, match="Unsupported evaluation provider: unknown"):
+        judge.build_judge_model(resolved)
