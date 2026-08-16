@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import re
 from collections.abc import Callable, Mapping
 from datetime import date
@@ -26,7 +25,11 @@ from open_deep_research.evidence import (
     is_evidence_eligible,
     source_scoped_evidence_records,
 )
-from open_deep_research.model_capabilities import dashscope_qwen_enable_thinking
+from open_deep_research.model_fallback import invoke_with_model_fallback
+from open_deep_research.model_resolution import (
+    build_model_config,
+    is_dashscope_qwen,
+)
 from open_deep_research.observability import (
     get_trace_recorder,
     invoke_model_with_retry_observability,
@@ -305,78 +308,6 @@ Propose rejected for unsupported user requirements, unsupported claims, failed d
 """
 
 
-def _model_provider(model_spec: str) -> tuple[str, str]:
-    provider, separator, model = model_spec.partition(":")
-    if separator:
-        return provider.strip().lower(), model.strip()
-    lowered = model_spec.lower()
-    if lowered.startswith("claude"):
-        return "anthropic", model_spec
-    if lowered.startswith(("gemini", "gemma")):
-        return "google_genai", model_spec
-    if "deepseek" in lowered:
-        return "deepseek", model_spec
-    return "openai", model_spec
-
-
-def _is_dashscope_qwen(configurable: Configuration) -> bool:
-    provider, model = _model_provider(configurable.quality_evaluation_model)
-    base_url = (configurable.quality_evaluation_base_url or "").lower()
-    return provider == "openai" and (
-        model.lower().startswith("qwen")
-        or "dashscope.aliyuncs.com" in base_url
-        or ".maas.aliyuncs.com" in base_url
-    )
-
-
-def _quality_api_key(
-    configurable: Configuration,
-    config: RunnableConfig,
-    *,
-    dashscope_qwen: bool | None = None,
-) -> str | None:
-    """Resolve credentials for the selected provider without cross-provider leakage."""
-    configurable_keys = (config or {}).get("configurable", {}).get("apiKeys", {})
-    key_source: Mapping[str, Any]
-    if os.getenv("GET_API_KEYS_FROM_CONFIG", "false").lower() == "true":
-        key_source = configurable_keys if isinstance(configurable_keys, Mapping) else {}
-    else:
-        key_source = os.environ
-
-    explicit_key = key_source.get("QUALITY_EVALUATION_API_KEY")
-    if explicit_key:
-        return str(explicit_key)
-
-    provider, _model = _model_provider(configurable.quality_evaluation_model)
-    candidates: tuple[str, ...]
-    is_dashscope_qwen = (
-        _is_dashscope_qwen(configurable)
-        if dashscope_qwen is None
-        else dashscope_qwen
-    )
-    if is_dashscope_qwen:
-        candidates = ("DASHSCOPE_API_KEY",)
-    else:
-        candidates = {
-            "anthropic": ("ANTHROPIC_API_KEY",),
-            "azure_openai": ("AZURE_OPENAI_API_KEY", "OPENAI_API_KEY"),
-            "cohere": ("COHERE_API_KEY",),
-            "deepseek": ("DEEPSEEK_API_KEY", "OPENAI_API_KEY"),
-            "google": ("GOOGLE_API_KEY",),
-            "google_genai": ("GOOGLE_API_KEY",),
-            "google_vertexai": ("GOOGLE_API_KEY",),
-            "groq": ("GROQ_API_KEY",),
-            "mistralai": ("MISTRAL_API_KEY",),
-            "openai": ("OPENAI_API_KEY",),
-            "xai": ("XAI_API_KEY",),
-        }.get(provider, (f"{provider.upper()}_API_KEY",))
-    for name in candidates:
-        value = key_source.get(name)
-        if value:
-            return str(value)
-    return None
-
-
 def _build_quality_model(configurable: Configuration, config: RunnableConfig):
     """Create a provider-isolated evaluator model.
 
@@ -386,39 +317,21 @@ def _build_quality_model(configurable: Configuration, config: RunnableConfig):
     Other providers rely on the strict JSON system prompt so OpenAI-only request
     fields are not leaked into native Anthropic, Google, or other clients.
     """
-    is_dashscope_qwen = _is_dashscope_qwen(configurable)
-    qwen_thinking = (
-        is_dashscope_qwen
-        and dashscope_qwen_enable_thinking(
-            configurable.quality_evaluation_model
-        )
-    )
-    kwargs: dict[str, Any] = {"model": configurable.quality_evaluation_model}
-    if not qwen_thinking:
-        kwargs["max_tokens"] = configurable.quality_evaluation_model_max_tokens
-    api_key = _quality_api_key(
-        configurable,
+    model_spec = configurable.quality_evaluation_model
+    configured_base_url = configurable.quality_evaluation_base_url
+    is_dashscope = is_dashscope_qwen(model_spec, configured_base_url)
+    kwargs = build_model_config(
+        model_spec,
+        configurable.quality_evaluation_model_max_tokens,
         config,
-        dashscope_qwen=is_dashscope_qwen,
+        role="quality_evaluation",
+        tags=False,
+        configured_base_url=configured_base_url,
     )
-    if api_key:
-        kwargs["api_key"] = api_key
-    base_url = configurable.quality_evaluation_base_url
-    if not base_url and is_dashscope_qwen:
-        base_url = (
-            os.getenv("DASHSCOPE_BASE_URL")
-            or "https://dashscope.aliyuncs.com/compatible-mode/v1"
-        )
-    if base_url:
-        kwargs["base_url"] = base_url
-    if is_dashscope_qwen:
-        kwargs["extra_body"] = {"enable_thinking": qwen_thinking}
-        if qwen_thinking:
-            kwargs["extra_body"]["thinking_budget"] = (
-                configurable.quality_evaluation_model_max_tokens
-            )
+    if kwargs.get("api_key") is None:
+        kwargs.pop("api_key")
     model = init_chat_model(**kwargs)
-    if is_dashscope_qwen:
+    if is_dashscope:
         return model.bind(response_format={"type": "json_object"})
     return model
 
@@ -624,7 +537,6 @@ async def _evaluate_json(
     protocol_validator: Callable[[BaseModel], list[str]] | None = None,
 ) -> BaseModel:
     configurable = Configuration.from_runnable_config(config)
-    model = _build_quality_model(configurable, config)
     messages = [
         SystemMessage(content=system_prompt),
         HumanMessage(
@@ -633,16 +545,37 @@ async def _evaluate_json(
         ),
     ]
     encountered_protocol_errors: list[str] = []
+    # A protocol-repair attempt is a new logical request, so it deliberately
+    # restarts at the configured primary before traversing the fallback chain.
     for attempt in range(2):
-        response = await invoke_model_with_retry_observability(
-            model,
+        async def invoke_quality_candidate(
+            candidate_model: str,
+            request_messages: list,
+        ):
+            candidate_configurable = configurable.model_copy(
+                update={"quality_evaluation_model": candidate_model}
+            )
+            model = _build_quality_model(candidate_configurable, config)
+            return await invoke_model_with_retry_observability(
+                model,
+                request_messages,
+                config,
+                span_name=(
+                    span_name
+                    if attempt == 0
+                    else f"{span_name}.protocol_repair"
+                ),
+                agent_role="quality_evaluator",
+                model_name=candidate_model,
+            )
+
+        response = await invoke_with_model_fallback(
+            invoke_quality_candidate,
             messages,
-            config,
-            span_name=(
-                span_name if attempt == 0 else f"{span_name}.protocol_repair"
-            ),
-            agent_role="quality_evaluator",
-            model_name=configurable.quality_evaluation_model,
+            primary_model=configurable.quality_evaluation_model,
+            model_fallbacks=configurable.model_fallbacks,
+            role="quality_evaluation",
+            config=config,
         )
         response_text = _content_text(response.content)
         try:

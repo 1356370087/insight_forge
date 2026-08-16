@@ -160,16 +160,12 @@ def _resolve_quality_rigor(
 
 
 def get_model_compatibility_kwargs(model_name: str) -> dict[str, Any]:
-    """Return provider-specific request options for a configured model.
+    """Compatibility shim for the shared model-resolution layer."""
+    from open_deep_research.model_resolution import (
+        resolve_compatibility_kwargs,
+    )
 
-    DeepSeek V4 enables thinking by default. The handwritten agent runtime uses
-    forced tool choices for structured output, which DeepSeek rejects while
-    thinking is enabled, so OpenAI-compatible DeepSeek models run in
-    non-thinking mode.
-    """
-    if model_name.strip().lower().startswith("openai:deepseek"):
-        return {"extra_body": {"thinking": {"type": "disabled"}}}
-    return {}
+    return resolve_compatibility_kwargs(model_name)
 
 class MCPConfig(BaseModel):
     """Configuration for Model Context Protocol (MCP) servers."""

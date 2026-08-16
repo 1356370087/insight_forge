@@ -31,7 +31,6 @@ from open_deep_research.agents.query_engine import QueryEngine, ResearcherQueryE
 from open_deep_research.agents.research_context import offload_tool_message
 from open_deep_research.configuration import (
     Configuration,
-    get_model_compatibility_kwargs,
 )
 from open_deep_research.evidence import (
     SourceScopeStatus,
@@ -58,6 +57,11 @@ from open_deep_research.memory.store import (
     MemoryStatus,
     NoopMemoryStore,
     create_memory_store,
+)
+from open_deep_research.model_fallback import invoke_with_model_fallback
+from open_deep_research.model_resolution import (
+    build_model_config,
+    get_configurable_model_template,
 )
 from open_deep_research.observability import (
     apply_helicone_config,
@@ -171,13 +175,23 @@ from open_deep_research.tools.governance import (
 )
 from open_deep_research.tools.utils import (
     get_all_tools,
-    get_model_connection_kwargs,
     get_model_token_limit,
     get_notes_from_tool_calls,
     get_today_str,
     is_token_limit_exceeded,
     think_tool,
 )
+from open_deep_research.tools.utils import (
+    get_model_connection_kwargs as _get_model_connection_kwargs,
+)
+
+
+def get_model_connection_kwargs(
+    model_name: str,
+    config: RunnableConfig,
+) -> dict[str, str | None]:
+    """Preserve the legacy patch point while delegating to shared resolution."""
+    return _get_model_connection_kwargs(model_name, config)
 
 
 def _bind_run_context_fence(
@@ -197,9 +211,7 @@ def _bind_run_context_fence(
     return store
 
 # Initialize a configurable model that we will use throughout the agent
-configurable_model = init_chat_model(
-    configurable_fields=("model", "max_tokens", "api_key", "base_url", "default_headers", "headers", "extra_body"),
-)
+configurable_model = get_configurable_model_template()
 
 
 def _format_conversation_summary(summary: str | None) -> str:
@@ -312,25 +324,40 @@ async def compact_query_context(
         f"Messages to compact:\n{get_buffer_string(older)}"
     )
     summary_model_name = configurable.message_summary_model or configurable.summarization_model
-    summary_model_config = apply_helicone_config({
-        "model": summary_model_name,
-        "max_tokens": configurable.query_context_summary_max_tokens,
-        **get_model_connection_kwargs(summary_model_name, config),
-        "tags": ["langsmith:nostream"],
-        **get_model_compatibility_kwargs(summary_model_name),
-    }, config, span_name=f"{channel}.compact_query_context", agent_role=channel)
-    summary_model = configurable_model.with_config(summary_model_config)
-
     last_error: Exception | None = None
     for _attempt in range(3):
         try:
-            response = await invoke_model_with_retry_observability(
-                summary_model,
+            async def invoke_summary_candidate(
+                candidate_model: str,
+                request_messages: list[BaseMessage],
+            ) -> BaseMessage:
+                candidate_config = apply_helicone_config(
+                    build_model_config(
+                        candidate_model,
+                        configurable.query_context_summary_max_tokens,
+                        config,
+                        role="message_summary",
+                    ),
+                    config,
+                    span_name=f"{channel}.compact_query_context",
+                    agent_role=channel,
+                )
+                return await invoke_model_with_retry_observability(
+                    configurable_model.with_config(candidate_config),
+                    request_messages,
+                    config,
+                    span_name=f"{channel}.compact_query_context",
+                    agent_role=channel,
+                    model_name=candidate_model,
+                )
+
+            response = await invoke_with_model_fallback(
+                invoke_summary_candidate,
                 [HumanMessage(content=prompt)],
-                config,
-                span_name=f"{channel}.compact_query_context",
-                agent_role=channel,
-                model_name=summary_model_name,
+                primary_model=summary_model_name,
+                model_fallbacks=configurable.model_fallbacks,
+                role="message_summary",
+                config=config,
             )
             summary = str(response.content)
             if inspect_untrusted_content(summary):
@@ -656,13 +683,17 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
     
     # Step 2: Prepare the model for structured clarification analysis
     messages = state["messages"]
-    model_config = apply_helicone_config({
-        "model": configurable.research_model,
-        "max_tokens": configurable.research_model_max_tokens,
-        **get_model_connection_kwargs(configurable.research_model, config),
-        "tags": ["langsmith:nostream"],
-        **get_model_compatibility_kwargs(configurable.research_model),
-    }, config, span_name="lead.clarify_with_user", agent_role="lead")
+    model_config = apply_helicone_config(
+        build_model_config(
+            configurable.research_model,
+            configurable.research_model_max_tokens,
+            config,
+            role="supervisor",
+        ),
+        config,
+        span_name="lead.clarify_with_user",
+        agent_role="lead",
+    )
     
     # Configure model with structured output (retry is handled by the
     # observability retry wrapper at the call site).
@@ -878,13 +909,17 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
     """
     # Step 1: Set up the research model for structured output
     configurable = Configuration.from_runnable_config(config)
-    research_model_config = apply_helicone_config({
-        "model": configurable.research_model,
-        "max_tokens": configurable.research_model_max_tokens,
-        **get_model_connection_kwargs(configurable.research_model, config),
-        "tags": ["langsmith:nostream"],
-        **get_model_compatibility_kwargs(configurable.research_model),
-    }, config, span_name="lead.write_research_brief", agent_role="lead")
+    research_model_config = apply_helicone_config(
+        build_model_config(
+            configurable.research_model,
+            configurable.research_model_max_tokens,
+            config,
+            role="supervisor",
+        ),
+        config,
+        span_name="lead.write_research_brief",
+        agent_role="lead",
+    )
     
     # Configure model for structured research question generation (retry is
     # handled by the observability retry wrapper at the call site).
@@ -982,13 +1017,17 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
     """
     # Step 1: Configure the supervisor model with available tools
     configurable = Configuration.from_runnable_config(config)
-    research_model_config = apply_helicone_config({
-        "model": configurable.research_model,
-        "max_tokens": configurable.research_model_max_tokens,
-        **get_model_connection_kwargs(configurable.research_model, config),
-        "tags": ["langsmith:nostream"],
-        **get_model_compatibility_kwargs(configurable.research_model),
-    }, config, span_name="supervisor.model", agent_role="supervisor")
+    research_model_config = apply_helicone_config(
+        build_model_config(
+            configurable.research_model,
+            configurable.research_model_max_tokens,
+            config,
+            role="supervisor",
+        ),
+        config,
+        span_name="supervisor.model",
+        agent_role="supervisor",
+    )
     
     # Available tools: conditional — async or sync. Built as StructuredTools via
     # the shared registry builder so they carry origin/retryable metadata, then
@@ -2964,13 +3003,17 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
         )
     
     # Step 2: Configure the researcher model with tools
-    research_model_config = apply_helicone_config({
-        "model": configurable.research_model,
-        "max_tokens": configurable.research_model_max_tokens,
-        **get_model_connection_kwargs(configurable.research_model, config),
-        "tags": ["langsmith:nostream"],
-        **get_model_compatibility_kwargs(configurable.research_model),
-    }, config, span_name="researcher.model", agent_role="researcher")
+    research_model_config = apply_helicone_config(
+        build_model_config(
+            configurable.research_model,
+            configurable.research_model_max_tokens,
+            config,
+            role="researcher",
+        ),
+        config,
+        span_name="researcher.model",
+        agent_role="researcher",
+    )
     
     # Prepare system prompt with MCP context if available
     memory_context = state.get("memory_context") or ""
@@ -3787,15 +3830,6 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
     """
     # Step 1: Configure the compression model
     configurable = Configuration.from_runnable_config(config)
-    compression_model_config = apply_helicone_config({
-        "model": configurable.compression_model,
-        "max_tokens": configurable.compression_model_max_tokens,
-        **get_model_connection_kwargs(configurable.compression_model, config),
-        "tags": ["langsmith:nostream"],
-        **get_model_compatibility_kwargs(configurable.compression_model),
-    }, config, span_name="researcher.compress", agent_role="researcher")
-    synthesizer_model = configurable_model.with_config(compression_model_config)
-    
     # Step 2: Prepare an evidence-only input. Replaying the complete researcher
     # dialogue can cause tool-oriented models to continue the agent loop instead
     # of synthesizing the already collected evidence.
@@ -3827,54 +3861,77 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
                 )),
             ]
             
-            async def call_compression_model(
-                request_messages: list[BaseMessage],
-                max_tokens_override: int | None,
+            async def invoke_compression_candidate(
+                candidate_model: str,
+                candidate_messages: list[BaseMessage],
             ) -> BaseMessage:
-                model = (
-                    configurable_model.with_config(
-                        cast(
-                            RunnableConfig,
-                            {
-                                **compression_model_config,
-                                "max_tokens": max_tokens_override,
-                            },
-                        )
-                    )
-                    if max_tokens_override is not None
-                    else synthesizer_model
-                )
-                return await asyncio.wait_for(
-                    invoke_model_with_retry_observability(
-                        model,
-                        request_messages,
+                candidate_config = apply_helicone_config(
+                    build_model_config(
+                        candidate_model,
+                        configurable.compression_model_max_tokens,
                         config,
-                        span_name="researcher.compress",
-                        agent_role="researcher",
-                        model_name=configurable.compression_model,
+                        role="compression",
                     ),
-                    timeout=configurable.model_call_timeout_seconds,
+                    config,
+                    span_name="researcher.compress",
+                    agent_role="researcher",
                 )
 
-            response = await invoke_with_output_recovery(
-                call_compression_model,
-                messages,
-                requested_output_tokens=(
-                    configurable.compression_model_max_tokens
-                ),
-                maximum_output_tokens=resolve_model_max_output_tokens(
-                    configurable.compression_model,
-                    requested=configurable.compression_model_max_tokens,
-                    overrides=(
-                        configurable.model_max_output_tokens_overrides
+                async def call_compression_model(
+                    request_messages: list[BaseMessage],
+                    max_tokens_override: int | None,
+                ) -> BaseMessage:
+                    model_config = dict(candidate_config)
+                    extra_body = model_config.get("extra_body")
+                    thinking_enabled = (
+                        isinstance(extra_body, dict)
+                        and extra_body.get("enable_thinking") is True
+                    )
+                    if max_tokens_override is not None and not thinking_enabled:
+                        model_config["max_tokens"] = max_tokens_override
+                    model = configurable_model.with_config(
+                        cast(RunnableConfig, model_config)
+                    )
+                    return await asyncio.wait_for(
+                        invoke_model_with_retry_observability(
+                            model,
+                            request_messages,
+                            config,
+                            span_name="researcher.compress",
+                            agent_role="researcher",
+                            model_name=candidate_model,
+                        ),
+                        timeout=configurable.model_call_timeout_seconds,
+                    )
+
+                return await invoke_with_output_recovery(
+                    call_compression_model,
+                    candidate_messages,
+                    requested_output_tokens=(
+                        configurable.compression_model_max_tokens
                     ),
-                ),
-                escalation_enabled=(
-                    configurable.output_token_escalation_enabled
-                ),
-                continuation_max_attempts=(
-                    configurable.output_continuation_max_attempts
-                ),
+                    maximum_output_tokens=resolve_model_max_output_tokens(
+                        candidate_model,
+                        requested=configurable.compression_model_max_tokens,
+                        overrides=(
+                            configurable.model_max_output_tokens_overrides
+                        ),
+                    ),
+                    escalation_enabled=(
+                        configurable.output_token_escalation_enabled
+                    ),
+                    continuation_max_attempts=(
+                        configurable.output_continuation_max_attempts
+                    ),
+                )
+
+            response = await invoke_with_model_fallback(
+                invoke_compression_candidate,
+                messages,
+                primary_model=configurable.compression_model,
+                model_fallbacks=configurable.model_fallbacks,
+                role="compression",
+                config=config,
             )
             if _compression_output_is_invalid(response):
                 raise ValueError(

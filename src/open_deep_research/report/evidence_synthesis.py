@@ -14,14 +14,17 @@ from langchain_core.messages.utils import count_tokens_approximately
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
-from open_deep_research.agents.model_recovery import (
-    resolve_model_context_window,
-)
+from open_deep_research.agents.model_recovery import resolve_model_context_window
 from open_deep_research.agents.research_context import (
     response_was_truncated,
 )
 from open_deep_research.configuration import Configuration
 from open_deep_research.evidence import source_scoped_evidence_records
+from open_deep_research.model_fallback import invoke_with_model_fallback
+from open_deep_research.model_resolution import (
+    build_model_config,
+    get_configurable_model_template,
+)
 from open_deep_research.observability import (
     invoke_model_with_retry_observability,
 )
@@ -268,41 +271,46 @@ async def _invoke_draft(
     config: RunnableConfig,
 ) -> EvidenceSynthesisDraft:
     """Invoke the configured report writer without exposing rejected prose."""
-    from open_deep_research.agents.deep_researcher import (
-        configurable_model,
-        get_model_compatibility_kwargs,
-        get_model_connection_kwargs,
-    )
-
     configurable = Configuration.from_runnable_config(config)
     model_name = configurable.final_report_model
-    model = configurable_model.with_config(
-        cast(
-            RunnableConfig,
-            {
-                "model": model_name,
-                "max_tokens": configurable.final_report_model_max_tokens,
-                **get_model_connection_kwargs(model_name, config),
-                "tags": ["langsmith:nostream"],
-                **get_model_compatibility_kwargs(model_name),
-            },
+    messages = [
+        SystemMessage(content=_draft_system_prompt()),
+        HumanMessage(
+            content=(
+                "Write the evidence-limited draft from this JSON payload:\n"
+                + json.dumps(payload, ensure_ascii=False)
+            )
+        ),
+    ]
+
+    async def invoke_candidate(candidate_model: str, request_messages: list):
+        model = get_configurable_model_template().with_config(
+            cast(
+                RunnableConfig,
+                build_model_config(
+                    candidate_model,
+                    configurable.final_report_model_max_tokens,
+                    config,
+                    role="final_report",
+                ),
+            )
         )
-    )
-    response = await invoke_model_with_retry_observability(
-        model,
-        [
-            SystemMessage(content=_draft_system_prompt()),
-            HumanMessage(
-                content=(
-                    "Write the evidence-limited draft from this JSON payload:\n"
-                    + json.dumps(payload, ensure_ascii=False)
-                )
-            ),
-        ],
-        config,
-        span_name="lead.evidence_limited_writer",
-        agent_role="lead",
-        model_name=model_name,
+        return await invoke_model_with_retry_observability(
+            model,
+            request_messages,
+            config,
+            span_name="lead.evidence_limited_writer",
+            agent_role="lead",
+            model_name=candidate_model,
+        )
+
+    response = await invoke_with_model_fallback(
+        invoke_candidate,
+        messages,
+        primary_model=model_name,
+        model_fallbacks=configurable.model_fallbacks,
+        role="final_report",
+        config=config,
     )
     if response_was_truncated(response):
         raise ValueError("evidence_synthesis_writer_truncated")

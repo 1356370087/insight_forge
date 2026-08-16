@@ -21,13 +21,15 @@ from open_deep_research.agents.model_recovery import (
     invoke_with_output_recovery,
     resolve_model_max_output_tokens,
 )
-from open_deep_research.configuration import (
-    Configuration,
-    get_model_compatibility_kwargs,
-)
+from open_deep_research.configuration import Configuration
 from open_deep_research.evidence import (
     contract_has_source_constraints,
     source_scoped_evidence_records,
+)
+from open_deep_research.model_fallback import invoke_with_model_fallback
+from open_deep_research.model_resolution import (
+    build_model_config,
+    get_configurable_model_template,
 )
 from open_deep_research.observability import (
     apply_helicone_config,
@@ -41,7 +43,6 @@ from open_deep_research.prompts import (
 )
 from open_deep_research.skills import get_skill_report_context
 from open_deep_research.tools.utils import (
-    get_model_connection_kwargs,
     get_model_token_limit,
     get_today_str,
     is_token_limit_exceeded,
@@ -51,13 +52,7 @@ from .coverage import derive_state_coverage_checklist, render_coverage_checklist
 from .models import ReportOutline, SectionSpec, SourceRef, WrittenSection
 from .profiles import AssemblyMode, ReportProfile
 
-# A configurable model template equivalent to the one in
-# ``agents/deep_researcher.py``. Defined locally here to avoid an import cycle
-# (``deep_researcher`` imports this package). ``with_config`` fully
-# parameterizes it per call, so behavior is identical.
-_writer_model_template = init_chat_model(
-    configurable_fields=("model", "max_tokens", "api_key", "base_url", "default_headers", "headers", "extra_body"),
-)
+_writer_model_template = get_configurable_model_template()
 
 
 def _format_conversation_summary(summary: Optional[str]) -> str:
@@ -196,22 +191,24 @@ class ReportContext:
         """Resolve the profile's prompt-constant name to the actual template."""
         return getattr(_prompts, self.profile.prompt_template)
 
-    def build_writer_model(self, max_tokens: int | None = None):
+    def build_writer_model(
+        self,
+        max_tokens: int | None = None,
+        *,
+        model_name: str | None = None,
+    ):
         """Construct the writer model, configured for the lead.final_report span."""
-        writer_model_config = {
-            "model": self.configurable.final_report_model,
-            "max_tokens": (
+        resolved_model = model_name or self.configurable.final_report_model
+        writer_model_config = build_model_config(
+            resolved_model,
+            (
                 max_tokens
                 if max_tokens is not None
                 else self.configurable.final_report_model_max_tokens
             ),
-            **get_model_connection_kwargs(
-                self.configurable.final_report_model,
-                self.config,
-            ),
-            "tags": ["langsmith:nostream"],
-            **get_model_compatibility_kwargs(self.configurable.final_report_model),
-        }
+            self.config,
+            role="final_report",
+        )
         return _writer_model_template.with_config(
             cast(RunnableConfig, apply_helicone_config(
                 writer_model_config,
@@ -221,22 +218,19 @@ class ReportContext:
             ))
         )
 
-    def build_structured_model(self, schema):
+    def build_structured_model(self, schema, *, model_name: str | None = None):
         """Construct a writer model bound to a Pydantic schema for structured output.
 
         Mirrors the webpage-summarization pattern in ``tools/utils.py``: build a
         chat model via ``init_chat_model`` then bind ``.with_structured_output``.
         """
-        model = init_chat_model(
-            model=self.configurable.final_report_model,
-            max_tokens=self.configurable.final_report_model_max_tokens,
-            **get_model_connection_kwargs(
-                self.configurable.final_report_model,
-                self.config,
-            ),
-            tags=["langsmith:nostream"],
-            **get_model_compatibility_kwargs(self.configurable.final_report_model),
-        )
+        resolved_model = model_name or self.configurable.final_report_model
+        model = init_chat_model(**build_model_config(
+            resolved_model,
+            self.configurable.final_report_model_max_tokens,
+            self.config,
+            role="final_report",
+        ))
         return model.with_structured_output(schema, method="function_calling")
 
     async def invoke_writer_with_output_recovery(
@@ -247,38 +241,87 @@ class ReportContext:
     ) -> BaseMessage:
         """Invoke a report writer without accepting truncated output."""
 
-        async def call_model(
-            request_messages: list[BaseMessage],
-            max_tokens_override: int | None,
+        async def invoke_writer_candidate(
+            candidate_model: str,
+            candidate_messages: list[BaseMessage],
         ) -> BaseMessage:
+            async def call_model(
+                request_messages: list[BaseMessage],
+                max_tokens_override: int | None,
+            ) -> BaseMessage:
+                return await invoke_model_with_retry_observability(
+                    self.build_writer_model(
+                        max_tokens_override,
+                        model_name=candidate_model,
+                    ),
+                    request_messages,
+                    self.config,
+                    span_name=span_name,
+                    agent_role="lead",
+                    model_name=candidate_model,
+                )
+
+            return await invoke_with_output_recovery(
+                call_model,
+                candidate_messages,
+                requested_output_tokens=(
+                    self.configurable.final_report_model_max_tokens
+                ),
+                maximum_output_tokens=resolve_model_max_output_tokens(
+                    candidate_model,
+                    requested=self.configurable.final_report_model_max_tokens,
+                    overrides=(
+                        self.configurable.model_max_output_tokens_overrides
+                    ),
+                ),
+                escalation_enabled=(
+                    self.configurable.output_token_escalation_enabled
+                ),
+                continuation_max_attempts=(
+                    self.configurable.output_continuation_max_attempts
+                ),
+            )
+
+        return await invoke_with_model_fallback(
+            invoke_writer_candidate,
+            messages,
+            primary_model=self.configurable.final_report_model,
+            model_fallbacks=self.configurable.model_fallbacks,
+            role="final_report",
+            config=self.config,
+        )
+
+    async def invoke_structured_with_fallback(
+        self,
+        schema,
+        messages: list[BaseMessage],
+        *,
+        span_name: str,
+    ):
+        """Invoke a structured report stage through the final-report chain."""
+        async def invoke_candidate(
+            candidate_model: str,
+            request_messages: list[BaseMessage],
+        ):
             return await invoke_model_with_retry_observability(
-                self.build_writer_model(max_tokens_override),
+                self.build_structured_model(
+                    schema,
+                    model_name=candidate_model,
+                ),
                 request_messages,
                 self.config,
                 span_name=span_name,
                 agent_role="lead",
-                model_name=self.configurable.final_report_model,
+                model_name=candidate_model,
             )
 
-        return await invoke_with_output_recovery(
-            call_model,
+        return await invoke_with_model_fallback(
+            invoke_candidate,
             messages,
-            requested_output_tokens=(
-                self.configurable.final_report_model_max_tokens
-            ),
-            maximum_output_tokens=resolve_model_max_output_tokens(
-                self.configurable.final_report_model,
-                requested=self.configurable.final_report_model_max_tokens,
-                overrides=(
-                    self.configurable.model_max_output_tokens_overrides
-                ),
-            ),
-            escalation_enabled=(
-                self.configurable.output_token_escalation_enabled
-            ),
-            continuation_max_attempts=(
-                self.configurable.output_continuation_max_attempts
-            ),
+            primary_model=self.configurable.final_report_model,
+            model_fallbacks=self.configurable.model_fallbacks,
+            role="final_report",
+            config=self.config,
         )
 
     def build_prompt(self, findings: str) -> str:
@@ -436,14 +479,10 @@ class SectionedStrategy:
             date=get_today_str(),
         )
         prompt = ctx.with_skill_report_context(prompt)
-        model = ctx.build_structured_model(ReportOutline)
-        outline = await invoke_model_with_retry_observability(
-            model,
+        outline = await ctx.invoke_structured_with_fallback(
+            ReportOutline,
             [HumanMessage(content=prompt)],
-            ctx.config,
             span_name="lead.report_outline",
-            agent_role="lead",
-            model_name=ctx.configurable.final_report_model,
         )
         outline.sections = list(outline.sections)[:_MAX_SECTIONS]
         if not outline.sections:

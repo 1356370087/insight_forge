@@ -11,7 +11,6 @@ from typing import Any
 
 import portalocker
 from dotenv import load_dotenv
-from langchain.chat_models import init_chat_model
 
 from open_deep_research.configuration import Configuration
 from open_deep_research.memory.lifecycle import (
@@ -19,6 +18,11 @@ from open_deep_research.memory.lifecycle import (
     maintain_user_memories,
 )
 from open_deep_research.memory.store import create_memory_store
+from open_deep_research.model_resolution import get_configurable_model_template
+
+# Backward-compatible patch point for tests and integrations.  The implementation
+# now delegates to the shared lazy template instead of constructing a second one.
+init_chat_model = get_configurable_model_template
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -42,17 +46,7 @@ async def _run_daily(args: argparse.Namespace, config: Configuration) -> dict[st
     if not user_ids:
         raise RuntimeError("No users returned by Mem0; OSS maintenance requires --user-id")
 
-    model = init_chat_model(
-        configurable_fields=(
-            "model",
-            "max_tokens",
-            "api_key",
-            "base_url",
-            "default_headers",
-            "headers",
-            "extra_body",
-        ),
-    )
+    model = get_configurable_model_template()
     runnable_config: dict[str, Any] = {
         "configurable": {},
         "metadata": {"run_id": "memory-maintenance-daily"},

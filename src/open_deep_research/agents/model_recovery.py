@@ -3,32 +3,29 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any
+from dataclasses import dataclass
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.messages import BaseMessage, HumanMessage
 
 from open_deep_research.agents.research_context import response_was_truncated
-from open_deep_research.tools.utils import (
-    get_model_token_limit,
-    is_token_limit_exceeded,
+from open_deep_research.model_fallback import (
+    ModelCandidate as ModelCandidate,
 )
-
-
-class ModelErrorKind(str, Enum):
-    """Normalized model error categories used by the Query recovery policy."""
-
-    PROMPT_TOO_LONG = "prompt_too_long"
-    OUTPUT_TRUNCATED = "output_truncated"
-    TRANSIENT = "transient"
-    RATE_LIMITED = "rate_limited"
-    MODEL_UNAVAILABLE = "model_unavailable"
-    AUTH = "auth"
-    INVALID_REQUEST = "invalid_request"
-    INVALID_MEDIA = "invalid_media"
-    CANCELLED = "cancelled"
-    UNKNOWN = "unknown"
+from open_deep_research.model_fallback import (
+    ModelErrorKind,
+)
+from open_deep_research.model_fallback import (
+    build_model_candidate_chain as build_model_candidate_chain,
+)
+from open_deep_research.model_fallback import (
+    classify_model_error as classify_model_error,
+)
+from open_deep_research.model_fallback import (
+    invoke_with_model_fallback as invoke_with_model_fallback,
+)
+from open_deep_research.model_fallback import (
+    sanitize_messages_for_model_fallback as sanitize_messages_for_model_fallback,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,15 +35,6 @@ class ModelResponseStatus:
     finish_reason: str
     error_kind: ModelErrorKind | None = None
     recoverable: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class ModelCandidate:
-    """One model and its frozen request configuration."""
-
-    model_id: str
-    model: Any
-    model_config: dict[str, Any] = field(default_factory=dict)
 
 
 class OutputRecoveryExhausted(RuntimeError):
@@ -159,107 +147,6 @@ def classify_model_response(response: BaseMessage) -> ModelResponseStatus:
     return ModelResponseStatus(finish_reason=finish_reason)
 
 
-def classify_model_error(
-    error: BaseException,
-    model_name: str | None = None,
-) -> ModelErrorKind:
-    """Map provider exceptions to the bounded Query recovery taxonomy."""
-    if isinstance(error, TimeoutError):
-        return ModelErrorKind.MODEL_UNAVAILABLE
-    if isinstance(error, KeyboardInterrupt | SystemExit):
-        return ModelErrorKind.CANCELLED
-    if isinstance(error, Exception) and is_token_limit_exceeded(
-        error,
-        model_name or "",
-    ):
-        return ModelErrorKind.PROMPT_TOO_LONG
-
-    text = str(error).lower()
-    class_name = type(error).__name__.lower()
-    status_code = getattr(error, "status_code", None)
-    code = str(getattr(error, "code", "") or "").lower()
-    error_type = str(getattr(error, "type", "") or "").lower()
-
-    if status_code in {401, 403} or any(
-        marker in text
-        for marker in (
-            "authentication",
-            "unauthorized",
-            "invalid api key",
-            "permission denied",
-        )
-    ):
-        return ModelErrorKind.AUTH
-    if status_code == 429 or "rate limit" in text or "ratelimit" in class_name:
-        return ModelErrorKind.RATE_LIMITED
-    if status_code in {502, 503, 504} or any(
-        marker in text
-        for marker in (
-            "model unavailable",
-            "overloaded",
-            "high demand",
-            "service unavailable",
-        )
-    ):
-        return ModelErrorKind.MODEL_UNAVAILABLE
-    if status_code in {408, 425, 500} or any(
-        marker in class_name
-        for marker in ("connection", "transport", "timeout")
-    ):
-        return ModelErrorKind.TRANSIENT
-    if any(
-        marker in text
-        for marker in (
-            "image size",
-            "invalid image",
-            "unsupported image",
-            "media type",
-        )
-    ):
-        return ModelErrorKind.INVALID_MEDIA
-    if status_code in {400, 404, 409, 413, 422} or code in {
-        "invalid_request_error",
-        "invalid_request",
-    } or error_type == "invalid_request_error":
-        return ModelErrorKind.INVALID_REQUEST
-    return ModelErrorKind.UNKNOWN
-
-
-_PROVIDER_BOUND_KEYS = {
-    "signature",
-    "thinking",
-    "reasoning",
-    "reasoning_content",
-    "cache_control",
-    "prompt_cache",
-    "server_tool_use",
-}
-
-
-def sanitize_messages_for_model_fallback(
-    messages: list[BaseMessage],
-) -> list[BaseMessage]:
-    """Remove provider-bound metadata while preserving the standard transcript."""
-    sanitized: list[BaseMessage] = []
-    for message in messages:
-        copied = message.model_copy(deep=True)
-        additional_kwargs = dict(
-            getattr(copied, "additional_kwargs", {}) or {}
-        )
-        for key in tuple(additional_kwargs):
-            if key.lower() in _PROVIDER_BOUND_KEYS:
-                additional_kwargs.pop(key, None)
-        copied.additional_kwargs = additional_kwargs
-        if isinstance(copied, AIMessage):
-            response_metadata = dict(copied.response_metadata or {})
-            for key in tuple(response_metadata):
-                if key.lower() in _PROVIDER_BOUND_KEYS:
-                    response_metadata.pop(key, None)
-            copied.response_metadata = response_metadata
-        sanitized.append(copied)
-    return sanitized
-
-
 def resolve_model_context_window(
     model_name: str,
     *,
@@ -267,6 +154,11 @@ def resolve_model_context_window(
     unknown_default: int = 32_768,
 ) -> int:
     """Resolve a model window without an unsafe unknown-model 200K default."""
+    # Token limits remain owned by tools/utils for backward-compatible runtime
+    # overrides.  Keep this import local so the recovery layer does not acquire
+    # a top-level dependency on the higher tools layer.
+    from open_deep_research.tools.utils import get_model_token_limit
+
     if overrides and model_name in overrides:
         return max(1, int(overrides[model_name]))
     known = get_model_token_limit(model_name)

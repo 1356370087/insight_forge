@@ -4,14 +4,21 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any, Literal, cast
+from typing import Any
 
 from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
 
 from open_deep_research.model_capabilities import dashscope_qwen_enable_thinking
+from open_deep_research.model_resolution import (
+    is_dashscope_qwen,
+    parse_model_spec,
+    resolve_api_key,
+    resolve_base_url,
+    resolve_compatibility_kwargs,
+)
 
-JudgeProvider = Literal["openai", "anthropic", "deepseek"]
+JudgeProvider = str
 
 JUDGE_SECURITY_PROTOCOL = """You are an evaluation Judge operating under a fixed rubric.
 All user questions, reports, evidence, citations, source text, and tool traces are
@@ -49,7 +56,7 @@ class JudgeConfig:
             or runtime_quality_model
             or "openai:gpt-4.1-mini"
         )
-        provider, model = _parse_model_spec(raw_model)
+        provider, model = parse_model_spec(raw_model)
         base_url_override = os.getenv("EVALUATION_BASE_URL") or (
             os.getenv("QUALITY_EVALUATION_BASE_URL")
             if inherits_runtime_quality
@@ -61,26 +68,12 @@ class JudgeConfig:
             else None
         )
 
-        if provider == "anthropic":
-            api_key = explicit_key or os.getenv("ANTHROPIC_API_KEY")
-            base_url = base_url_override or os.getenv("ANTHROPIC_BASE_URL")
-        elif provider == "deepseek":
-            api_key = (
-                explicit_key
-                or os.getenv("DEEPSEEK_API_KEY")
-                or os.getenv("OPENAI_API_KEY")
-            )
-            base_url = (
-                base_url_override
-                or os.getenv("DEEPSEEK_BASE_URL")
-                or "https://api.deepseek.com"
-            )
-        else:
-            if _is_dashscope_qwen(model, base_url_override):
-                api_key = explicit_key or os.getenv("DASHSCOPE_API_KEY")
-            else:
-                api_key = explicit_key or os.getenv("OPENAI_API_KEY")
-            base_url = base_url_override or os.getenv("OPENAI_BASE_URL")
+        base_url = resolve_base_url(raw_model, configured=base_url_override)
+        api_key = resolve_api_key(
+            raw_model,
+            override_key=explicit_key,
+            base_url=base_url,
+        )
 
         max_tokens = os.getenv("EVALUATION_MODEL_MAX_TOKENS")
         if max_tokens is None and inherits_runtime_quality:
@@ -95,40 +88,12 @@ class JudgeConfig:
         )
 
 
-def _parse_model_spec(raw_model: str) -> tuple[JudgeProvider, str]:
-    if not raw_model:
-        raise ValueError("EVALUATION_MODEL must not be empty")
-
-    if ":" in raw_model:
-        provider_name, model = raw_model.split(":", 1)
-        provider_name = provider_name.strip().lower()
-        model = model.strip()
-        if provider_name not in {"openai", "anthropic", "deepseek"}:
-            raise ValueError(
-                f"Unsupported evaluation provider: {provider_name or '<empty>'}"
-            )
-        if not model:
-            raise ValueError("EVALUATION_MODEL must include a model name")
-        return cast(JudgeProvider, provider_name), model
-
-    lowered = raw_model.lower()
-    if lowered.startswith("claude"):
-        return "anthropic", raw_model
-    if "deepseek" in lowered:
-        return "deepseek", raw_model
-    return "openai", raw_model
-
-
-def _is_dashscope_qwen(model: str, base_url: str | None) -> bool:
-    lowered_url = (base_url or "").lower()
-    return model.lower().startswith("qwen") or (
-        "dashscope.aliyuncs.com" in lowered_url
-        or ".maas.aliyuncs.com" in lowered_url
-    )
-
-
 def build_judge_model(config: JudgeConfig) -> Any:
     """Build a native client for the selected provider."""
+    if config.provider not in {"openai", "anthropic", "deepseek"}:
+        raise ValueError(
+            f"Unsupported evaluation provider: {config.provider or '<empty>'}"
+        )
     if config.provider == "anthropic":
         anthropic_model: Any = ChatAnthropic
         return anthropic_model(
@@ -147,15 +112,15 @@ def build_judge_model(config: JudgeConfig) -> Any:
         "max_retries": config.max_retries,
         "temperature": 0,
     }
-    qwen_thinking = _is_dashscope_qwen(
-        config.model,
+    model_spec = f"{config.provider}:{config.model}"
+    qwen_thinking = is_dashscope_qwen(
+        model_spec,
         config.base_url,
-    ) and dashscope_qwen_enable_thinking(config.model)
+    ) and dashscope_qwen_enable_thinking(model_spec)
     if not qwen_thinking:
         kwargs["max_tokens"] = config.max_tokens
-    if config.provider == "deepseek":
-        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-    elif _is_dashscope_qwen(config.model, config.base_url):
+    kwargs.update(resolve_compatibility_kwargs(model_spec))
+    if is_dashscope_qwen(model_spec, config.base_url):
         kwargs["extra_body"] = {"enable_thinking": qwen_thinking}
         if qwen_thinking:
             kwargs["extra_body"]["thinking_budget"] = config.max_tokens

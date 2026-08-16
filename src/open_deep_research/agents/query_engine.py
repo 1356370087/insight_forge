@@ -23,7 +23,9 @@ from langchain_core.messages import (
 )
 from langchain_core.runnables import RunnableConfig
 
-from open_deep_research.agents.model_recovery import ModelCandidate
+from open_deep_research.agents.model_recovery import (
+    build_model_candidate_chain,
+)
 from open_deep_research.agents.query import (
     BeforeTurnHookResult,
     ContextPolicy,
@@ -3017,44 +3019,14 @@ class QueryEngine:
                 graph.AgentRole.SUPERVISOR,
                 self.config,
             )
-            model_config = {
-                "model": configurable.research_model,
-                "max_tokens": configurable.research_model_max_tokens,
-                **graph.get_model_connection_kwargs(
-                    configurable.research_model,
-                    self.config,
-                ),
-                "tags": ["langsmith:nostream"],
-                **graph.get_model_compatibility_kwargs(configurable.research_model),
-            }
-            model_candidates = [
-                ModelCandidate(
-                    model_id=configurable.research_model,
-                    model=graph.configurable_model,
-                    model_config=model_config,
-                )
-            ]
-            for fallback_model in configurable.model_fallbacks.get(
-                "supervisor", []
-            ):
-                if fallback_model == configurable.research_model:
-                    continue
-                model_candidates.append(ModelCandidate(
-                    model_id=fallback_model,
-                    model=graph.configurable_model,
-                    model_config={
-                        "model": fallback_model,
-                        "max_tokens": configurable.research_model_max_tokens,
-                        **graph.get_model_connection_kwargs(
-                            fallback_model,
-                            self.config,
-                        ),
-                        "tags": ["langsmith:nostream"],
-                        **graph.get_model_compatibility_kwargs(
-                            fallback_model
-                        ),
-                    },
-                ))
+            model_candidates = build_model_candidate_chain(
+                configurable.research_model,
+                configurable.model_fallbacks.get("supervisor", []),
+                max_tokens=configurable.research_model_max_tokens,
+                config=self.config,
+                role="supervisor",
+                model=graph.configurable_model,
+            )
 
             async def before_turn(
                 messages: list[BaseMessage],
@@ -3253,7 +3225,7 @@ class QueryEngine:
                 tools=model_tools,
                 role=graph.AgentRole.SUPERVISOR,
                 model_span_name="supervisor.model",
-                model_config=model_config,
+                model_config=model_candidates[0].model_config,
                 initial_turn=completed_turn,
                 max_tool_description_chars=configurable.max_mcp_description_chars,
                 context_policy=ContextPolicy(
@@ -4001,13 +3973,15 @@ class ResearcherQueryEngine:
                     ),
                 )
 
-            model_config = {
-                "model": configurable.research_model,
-                "max_tokens": configurable.research_model_max_tokens,
-                **graph.get_model_connection_kwargs(configurable.research_model, cfg),
-                "tags": ["langsmith:nostream"],
-                **graph.get_model_compatibility_kwargs(configurable.research_model),
-            }
+            model_candidates = build_model_candidate_chain(
+                configurable.research_model,
+                configurable.model_fallbacks.get("researcher", []),
+                max_tokens=configurable.research_model_max_tokens,
+                config=cfg,
+                role="researcher",
+                model=graph.configurable_model,
+            )
+            model_config = model_candidates[0].model_config
             task_id = str(cfg.get("metadata", {}).get("task_id") or "")
             researcher_state_key = (
                 f"researcher:{task_id}"
@@ -4070,34 +4044,6 @@ class ResearcherQueryEngine:
                 quality_recovery_state = (
                     restored_query_state.quality_recovery
                 )
-            model_candidates = [
-                ModelCandidate(
-                    model_id=configurable.research_model,
-                    model=graph.configurable_model,
-                    model_config=model_config,
-                )
-            ]
-            for fallback_model in configurable.model_fallbacks.get(
-                "researcher", []
-            ):
-                if fallback_model == configurable.research_model:
-                    continue
-                model_candidates.append(ModelCandidate(
-                    model_id=fallback_model,
-                    model=graph.configurable_model,
-                    model_config={
-                        "model": fallback_model,
-                        "max_tokens": configurable.research_model_max_tokens,
-                        **graph.get_model_connection_kwargs(
-                            fallback_model,
-                            cfg,
-                        ),
-                        "tags": ["langsmith:nostream"],
-                        **graph.get_model_compatibility_kwargs(
-                            fallback_model
-                        ),
-                    },
-                ))
             completed_messages = runtime_messages
             completed_turn = int(researcher_state.get("tool_call_iterations", 0) or 0)
             async for event in query(QueryParams(

@@ -120,6 +120,7 @@ _PAYLOAD_KEYS: dict[str, set[str]] = {
     },
     "clarification.resolved": {"action_id", "action", "status"},
     "feedback.received": {"feedback_id", "feedback_type", "task_id", "status"},
+    "query.model_fallback": {"turn", "from_model", "to_model", "reason"},
     "system.warning": {"warning_code", "message"},
 }
 
@@ -277,15 +278,14 @@ async def summarize_public_findings(
         from langchain.chat_models import init_chat_model
         from langchain_core.messages import HumanMessage
 
-        from open_deep_research.configuration import get_model_compatibility_kwargs
-        from open_deep_research.tools.utils import get_model_connection_kwargs
+        from open_deep_research.model_resolution import build_model_config
 
-        model = init_chat_model(
-            model=configurable.summarization_model,
-            max_tokens=min(configurable.summarization_model_max_tokens, 800),
-            **get_model_connection_kwargs(configurable.summarization_model, config),
-            **get_model_compatibility_kwargs(configurable.summarization_model),
-        ).with_structured_output(PublicFindingsSummary, method="function_calling")
+        model = init_chat_model(**build_model_config(
+            configurable.summarization_model,
+            min(configurable.summarization_model_max_tokens, 800),
+            config,
+            role="summarization",
+        )).with_structured_output(PublicFindingsSummary, method="function_calling")
         response = await model.ainvoke([
             HumanMessage(content=(
                 "Summarize the completed research into at most three concise user-visible findings. "
