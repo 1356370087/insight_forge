@@ -640,6 +640,7 @@ Trace Payload 默认为 `preview`，常见凭据和 Bearer Token 默认脱敏。
 | `research_model` / `RESEARCH_MODEL` | `openai:gpt-4.1` | Researcher 模型 |
 | `compression_model` / `COMPRESSION_MODEL` | `openai:gpt-4.1` | 研究压缩模型 |
 | `final_report_model` / `FINAL_REPORT_MODEL` | `openai:gpt-4.1` | 报告写作模型 |
+| `model_fallbacks` / `MODEL_FALLBACKS` | `{}` | 按七个模型角色配置候选链；默认关闭，仅在限流、瞬态错误或模型不可用时切换 |
 | `search_api` / `SEARCH_API` | `tavily` | `tavily`、`openai`、`anthropic` 或 `none` |
 | `max_concurrent_research_units` | `5` | 同步研究单元最大并发 |
 | `max_researcher_iterations` | `6` | Supervisor 最大研究迭代 |
@@ -647,6 +648,10 @@ Trace Payload 默认为 `preview`，常见凭据和 Bearer Token 默认脱敏。
 | `allow_clarification` | `true` | 是否允许研究前向用户澄清 |
 
 所选 Researcher 模型必须与搜索方式兼容，并支持 Tool Calling；参与结构化计划、摘要或质量评估的模型还需要支持相应的 Structured Output。
+
+模型标识、provider 推断、API key/base URL 和兼容参数统一由 `model_resolution.py` 解析。`model_fallbacks` 可配置 `supervisor`、`researcher`、`summarization`、`message_summary`、`compression`、`final_report`、`quality_evaluation`；候选链在运行开始时冻结，跨 provider 切换前会清理专有消息元数据。切换会记录到 Trace，并以 `query.model_fallback` 公共事件暴露 `{turn, from_model, to_model, reason}`。
+
+需要按角色隔离凭据时，可使用 `SUPERVISOR_API_KEY`、`RESEARCHER_API_KEY`、`SUMMARIZATION_API_KEY`、`MESSAGE_SUMMARY_API_KEY`、`COMPRESSION_API_KEY`、`FINAL_REPORT_API_KEY` 和 `QUALITY_EVALUATION_API_KEY` 覆盖对应 provider 的通用 Key。启用 `GET_API_KEYS_FROM_CONFIG=true` 后，这些同名字段应放入 `configurable.apiKeys`，不会回退读取进程环境变量。
 
 ### Web、预算与执行
 
