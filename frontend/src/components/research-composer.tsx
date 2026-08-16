@@ -23,7 +23,7 @@ export function ResearchComposer() {
   const runtime = useLocalRuntime(adapter);
   return <AssistantRuntimeProvider runtime={runtime}>
     <ComposerPrimitive.Root className="research-composer">
-      <ComposerPrimitive.Input asChild><textarea aria-label="研究问题" placeholder="描述一个值得彻底调查的问题……\n例如：比较 2026 年主要端侧推理框架的性能、生态和部署风险。" /></ComposerPrimitive.Input>
+      <ComposerPrimitive.Input asChild><textarea aria-label="研究问题" placeholder={"描述一个值得彻底调查的问题……\n例如：比较 2026 年主要端侧推理框架的性能、生态和部署风险。"} /></ComposerPrimitive.Input>
       <div className="composer-footer"><span>ENTER 发送 · SHIFT+ENTER 换行</span><ComposerPrimitive.Send asChild><Button>启动研究 <ArrowUpRight size={16} /></Button></ComposerPrimitive.Send></div>
     </ComposerPrimitive.Root>
   </AssistantRuntimeProvider>;
