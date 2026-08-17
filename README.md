@@ -337,7 +337,7 @@ Supervisor 只接收压缩结果和 SHA 校验后的研究工件。启用质量�
 |---|---|
 | [`agents`](src/open_deep_research/agents) | QueryEngine、通用 query 循环、Lead/Supervisor/Researcher 节点与提示词协议 |
 | [`web`](src/open_deep_research/web) | 候选来源规范化、排序、抓取、HTML/PDF 提取、分块、证据抽取与缺口分析 |
-| [`tools`](src/open_deep_research/tools) | 搜索与 MCP 工具装配、统一 Tool 协议、权限治理、参数校验、重试和错误分类 |
+| [`tools`](src/open_deep_research/tools) | 按工具目录组织的协议声明、统一 registry、动态提示词、MCP 子包、权限治理、参数校验、重试和错误分类 |
 | [`tasks`](src/open_deep_research/tasks) | 异步任务、Teammate Pool、文件状态、Mailbox、Lease、恢复、事件与域名审批 |
 | [`report`](src/open_deep_research/report) | 报告 Profile、一次性/分节组装、引用恢复、覆盖率检查和多格式渲染 |
 | [`memory`](src/open_deep_research/memory) | Mem0 Store、记忆候选策略、检索排序、画像、反思、衰减和维护 |
@@ -345,6 +345,8 @@ Supervisor 只接收压缩结果和 SHA 校验后的研究工件。启用质量�
 | [`security`](src/open_deep_research/security) | HTTP 输入边界、外部内容保护、SSRF 与网络目标校验 |
 | [`sandbox`](src/open_deep_research/sandbox) | Docker Researcher 工作区、资源限制、网络策略和清理 |
 | [`observability`](src/open_deep_research/observability) | TraceRecorder、SQLite Span Store、Langfuse Bridge 和 Prometheus 指标 |
+
+工具系统以 `tools/registry.py` 作为唯一装配入口。每个工具目录通过 `definition.py` 声明协议对象，并由 `prompt.py` 提供与工具生命周期一致的模型指导；Researcher 和 Supervisor 的 `<Available Tools>` 均从最终通过启用条件与权限裁剪的工具集动态生成。MCP 装载、OAuth 与内置浏览器能力集中在 `tools/mcp/`，Supervisor 工具通过冻结的 `SupervisorToolDeps` 注入运行依赖。`max_tool_description_chars` 控制投影给模型的单工具描述预算。
 
 ## 关键机制
 

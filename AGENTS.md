@@ -131,16 +131,19 @@ START → researcher → researcher_tools → researcher (循环) 或 → assess
 
 ### 6. 工具系统（tools/）
 
-工具代码位于 `src/open_deep_research/tools/`（`adapters.py` 统一 Tool 协议、`governance.py` 权限治理与 MCP 装配、`token_store.py` Token 缓存、`utils.py` 工具实现）：
+工具代码位于 `src/open_deep_research/tools/`，每个用户可见工具使用独立目录，目录内以 `definition.py` 声明协议对象、以 `prompt.py` 提供模型指导；`tools/utils.py` 只保留弃用兼容导出，不再承担工具装配职责：
 
-- **搜索工具**：`get_search_tool()` 根据 `SearchAPI` 枚举返回不同的搜索工具实现（Tavily 结构化工具、OpenAI `web_search_preview`、Anthropic 原生 Web Search）
-- **MCP 工具**：`load_mcp_tools()` 通过 `MultiServerMCPClient` 加载外部 MCP 服务器工具，支持 OAuth Token Exchange（RFC 8693，服务端管理的 Subject Token → MCP access token）
-- **think_tool**：反思工具，用于在研究步骤之间进行战略分析
-- **tavily_search**：Tavily 搜索工具，包含并行搜索、去重、LLM 摘要三个步骤。摘要预算 120 秒（含重试），失败时隔离外部内容
+- **统一协议**：`base.py` 的 Tool 协议覆盖 `name`、`input_schema`、`origin`、`retryable`、`description`、`prompt`、`is_enabled`、`egress_urls`、`max_output_chars`、`effect`、`concurrency_safe` 与 `call`；`adapters.py` 负责 LangChain/结构化工具适配
+- **统一装配**：`registry.py` 是 Researcher、Supervisor、MCP 与内置浏览器工具的唯一装配入口，统一执行启用条件、名称唯一性、权限过滤、描述预算投影和动态工具提示词生成
+- **搜索与 Web 工具**：`tavily_search/`、`openai_web_search/`、`anthropic_web_search/`、`web_research/`、`fetch_url/`、`fetch_webpage/` 等目录分别声明工具；`get_search_tool()` 由 registry 按 `SearchAPI` 和 `web_pipeline_mode` 选择
+- **MCP 子包**：`mcp/loader.py` 负责 `MultiServerMCPClient` 装载，`mcp/oauth.py` 负责 OAuth Token Exchange（RFC 8693），`mcp/browser.py` 负责内置浏览器工具；外部网络目标通过工具的 `egress_urls` 声明进入治理管线
+- **Supervisor 工具**：`supervisor/` 下按工具分目录；`SupervisorToolDeps` 是冻结依赖对象，`deep_researcher.py` 只负责注入当前状态并请求装配，不再内嵌工具调用闭包
+- **动态提示词**：Researcher 与 Supervisor 的系统提示词从最终可用工具集动态渲染 `<Available Tools>`，因此禁用、权限裁剪或配置切换后的工具不会残留在提示词中
+- **tavily_search**：包含并行搜索、去重、LLM 摘要三个步骤。摘要预算 120 秒（含重试），失败时隔离外部内容
 - **token 限制检测**：`is_token_limit_exceeded()` 根据模型提供商（OpenAI/Anthropic/Google）检测不同的 token 超限错误模式
-- **模型解析层**：`model_resolution.py` 统一 provider 推断、API key/base URL、兼容参数、模型配置和惰性模板；`configuration.py` 与 `tools/utils.py` 中的旧入口仅保留兼容 shim
+- **模型解析层**：`model_resolution.py` 统一 provider 推断、API key/base URL、兼容参数、模型配置和惰性模板；`configuration.py` 与 `tools/legacy_shims.py` 中的旧入口仅保留兼容 shim
 - **模型回退底层**：`model_fallback.py` 与 `model_errors.py` 位于 `agents`/`tools` 之下，统一负责候选链、错误分类、跨 provider 消息清洗和 `query.model_fallback` 公共事件；禁止从这两个低层模块顶层反向导入 `agents` 或 `tools`
-- **MODEL_TOKEN_LIMITS**：硬编码的模型 token 限制表，用于计算截断阈值；查找采用精确键优先、再按键长度降序的最长子串匹配。注意：此表需要手动维护
+- **MODEL_TOKEN_LIMITS**：位于 `tools/model_limits.py`，用于计算截断阈值；查找采用精确键优先、再按键长度降序的最长子串匹配。注意：此表需要手动维护
 
 ### 7. 质量与证据（quality.py / evidence.py / quality_contract.py）
 
@@ -177,11 +180,11 @@ FastAPI 部署时的认证与授权（Supabase 已完全移除；`src/security/a
 - 每次执行完E2E验证后，需要关闭验证时启动的前端与后端工作进程，否则可能导致端口占用或资源泄漏
 - `configurable_model` 由 `model_resolution.get_configurable_model_template()` 提供进程级惰性单例，每次调用时通过 `.with_config()` 传入具体模型配置
 - Researcher 由 `ResearcherQueryEngine` 以干净上下文窗口运行，在 supervisor_tools 中通过 `asyncio.gather` 并行调用
-- API 密钥获取：统一由 `model_resolution.resolve_api_key()` 处理；`tools/utils.py:get_api_key_for_model()` 是兼容 shim。`GET_API_KEYS_FROM_CONFIG` 决定从环境变量还是 `RunnableConfig` 读取（OAP 部署时需要设为 `true`）
+- API 密钥获取：统一由 `model_resolution.resolve_api_key()` 处理；`tools/legacy_shims.py:get_api_key_for_model()` 是兼容 shim，`tools/utils.py` 仅作弃用转发。`GET_API_KEYS_FROM_CONFIG` 决定从环境变量还是 `RunnableConfig` 读取（OAP 部署时需要设为 `true`）
 - 七个模型角色支持同名角色级 API Key 覆盖：`SUPERVISOR_API_KEY`、`RESEARCHER_API_KEY`、`SUMMARIZATION_API_KEY`、`MESSAGE_SUMMARY_API_KEY`、`COMPRESSION_API_KEY`、`FINAL_REPORT_API_KEY`、`QUALITY_EVALUATION_API_KEY`
 - 模型 fallback：`model_fallbacks` 支持 `supervisor`、`researcher`、`summarization`、`message_summary`、`compression`、`final_report`、`quality_evaluation` 七个角色，仅对限流、瞬态错误和模型不可用切换
 - Token 超限处理：压缩阶段通过 `remove_up_to_last_ai_message()` 移除最近的消息；最终报告阶段（`report/assembly.py`）通过渐进截断重试（最多 3 次）
-- 添加新模型时，需要在 `MODEL_TOKEN_LIMITS` 字典（`tools/utils.py`）中注册其 token 限制
+- 添加新模型时，需要在 `MODEL_TOKEN_LIMITS` 字典（`tools/model_limits.py`）中注册其 token 限制
 - Tavily 搜索的摘要模型独立于研究模型，由 `summarization_model` 配置
 - 评估脚本 `run_evaluate.py` 中的模型和参数是硬编码的，每次运行前需要手动调整
 - ruff 配置使用 Google 风格的 docstring 规范（`convention = "google"`），测试文件忽略 D 和 UP 规则
