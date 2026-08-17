@@ -1,4 +1,5 @@
 """Main hand-written runtime implementation for the Deep Research agent."""
+# ruff: noqa: F401
 
 import asyncio
 import json
@@ -58,6 +59,7 @@ from open_deep_research.memory.store import (
     NoopMemoryStore,
     create_memory_store,
 )
+from open_deep_research.model_errors import is_token_limit_exceeded
 from open_deep_research.model_fallback import invoke_with_model_fallback
 from open_deep_research.model_resolution import (
     build_model_config,
@@ -116,29 +118,11 @@ from open_deep_research.skills import get_skill_researcher_context
 from open_deep_research.state import (
     AgentState,
     ClarifyWithUser,
-    ConductResearch,
-    ReadResearchArtifact,
-    ResearchComplete,
     ResearcherState,
     ResearchQuestion,
     SupervisorState,
 )
-from open_deep_research.tasks.async_tools import (
-    ApproveResearchDomain,
-    CancelResearchTask,
-    CheckResearchTask,
-    ListResearchTasks,
-    StartResearchTask,
-    UpdateResearchTask,
-    WaitForResearchUpdates,
-    collect_completed_task_outputs,
-    handle_approve_research_domain,
-    handle_cancel_research_task,
-    handle_check_research_task,
-    handle_list_research_tasks,
-    handle_start_research_task,
-    handle_update_research_task,
-)
+from open_deep_research.tasks.async_tools import collect_completed_task_outputs
 from open_deep_research.tasks.coordination import claim_lead_updates, get_mailbox
 from open_deep_research.tasks.events import EventType, JSONLEventWriter, ResearchEvent
 from open_deep_research.tasks.lease import PROCESS_INSTANCE_ID
@@ -173,17 +157,21 @@ from open_deep_research.tools.governance import (
     filter_tools_by_permission,
     resolve_allowed_tools,
 )
-from open_deep_research.tools.utils import (
-    get_all_tools,
-    get_model_token_limit,
-    get_notes_from_tool_calls,
-    get_today_str,
-    is_token_limit_exceeded,
-    think_tool,
-)
-from open_deep_research.tools.utils import (
+from open_deep_research.tools.legacy_shims import (
     get_model_connection_kwargs as _get_model_connection_kwargs,
 )
+from open_deep_research.tools.legacy_shims import (
+    get_notes_from_tool_calls,
+    get_today_str,
+)
+from open_deep_research.tools.model_limits import get_model_token_limit
+from open_deep_research.tools.registry import (
+    get_all_tools,
+    prepare_existing_toolset,
+    prepare_toolset,
+    render_tool_guidance,
+)
+from open_deep_research.tools.think_tool import think_tool
 
 
 def get_model_connection_kwargs(
@@ -958,9 +946,19 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
     )
 
     # Step 3: Initialize supervisor with research brief and instructions
+    supervisor_prompt_state: SupervisorState = {
+        "enable_async_research": configurable.enable_async_research,
+        "coverage_contract": coverage_contract.model_dump(mode="json"),
+        "research_risk_profile": risk_profile.model_dump(mode="json"),
+    }
+    supervisor_tool_guidance = render_tool_guidance(
+        build_supervisor_tools(supervisor_prompt_state),
+        config,
+    )
     if configurable.enable_async_research:
         supervisor_system_prompt = lead_researcher_async_prompt.format(
             date=get_today_str(),
+            tool_guidance=supervisor_tool_guidance,
             max_concurrent_research_units=configurable.max_persistent_teammates,
             max_researcher_iterations=configurable.max_researcher_iterations,
             max_react_tool_calls=configurable.max_react_tool_calls,
@@ -968,6 +966,7 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
     else:
         supervisor_system_prompt = lead_researcher_prompt.format(
             date=get_today_str(),
+            tool_guidance=supervisor_tool_guidance,
             max_concurrent_research_units=configurable.max_concurrent_research_units,
             max_researcher_iterations=configurable.max_researcher_iterations,
             max_react_tool_calls=configurable.max_react_tool_calls,
@@ -1034,14 +1033,12 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
     # filtered to what this supervisor is permitted to bind *before* exposing
     # them to the model. Disallowed tool names/schemas are never shown; the
     # execution-time gate remains as a second line of defense.
-    sup_registry = build_supervisor_tool_registry(state)
-    lead_researcher_tools = filter_tools_by_permission(
-        list(sup_registry.values()), AgentRole.SUPERVISOR, config,
+    supervisor_assembly = await prepare_toolset(
+        AgentRole.SUPERVISOR,
+        config,
+        supervisor_tools=build_supervisor_tools(state),
     )
-    lead_researcher_tool_definitions = await tools_to_model_definitions(
-        lead_researcher_tools,
-        max_description_chars=configurable.max_mcp_description_chars,
-    )
+    lead_researcher_tool_definitions = supervisor_assembly.definitions
 
     # Configure model with tools (retry is handled by the observability retry
     # wrapper at the call site).
@@ -1202,7 +1199,14 @@ def _protect_web_pipeline_output(
 
 
 def build_supervisor_tools(state: SupervisorState) -> list[Tool]:
-    """Build fully executable supervisor tools with runtime dependencies injected."""
+    """Build Supervisor tools through the folder-owned dependency seam."""
+    from open_deep_research.tools.supervisor import (
+        SupervisorToolDeps,
+    )
+    from open_deep_research.tools.supervisor import (
+        build_supervisor_tools as build_injected_supervisor_tools,
+    )
+
     coverage_payload = state.get("coverage_contract")
     coverage_contract = (
         ResearchCoverageContract.model_validate(coverage_payload)
@@ -1215,491 +1219,21 @@ def build_supervisor_tools(state: SupervisorState) -> list[Tool]:
         if isinstance(risk_payload, dict) and risk_payload
         else ResearchRiskProfile(level="standard")
     )
-
-    async def complete_call(input, context, on_progress=None):
-        del input, context, on_progress
-        return ToolResult(output="Research complete.")
-
-    complete_tool = build_tool(
-        name="ResearchComplete",
-        description=ResearchComplete.__doc__ or "Signal that research is complete.",
-        input_schema=ResearchComplete,
-        call=complete_call,
-        origin=ToolOrigin.SYSTEM,
+    deps = SupervisorToolDeps(
+        enable_async_research=bool(state.get("enable_async_research", False)),
+        coverage_contract=coverage_contract,
+        risk_profile=risk_profile,
+        memory_context=state.get("memory_context"),
+        research_artifact_refs=dict(state.get("research_artifact_refs", {})),
+        handoff_assessments=tuple(
+            item
+            for item in state.get("handoff_assessments", [])
+            if isinstance(item, dict)
+        ),
+        researcher_ainvoke=researcher_runtime.ainvoke,
+        evaluate_handoff=evaluate_subagent_handoff,
     )
-    reflection_tool = think_tool
-
-    if not state.get("enable_async_research", False):
-        async def conduct_call(input, context, on_progress=None):
-            del on_progress
-            configurable = Configuration.from_runnable_config(context.config)
-            run_id = str(context.config.get("metadata", {}).get("run_id", "default"))
-            task_id = context.tool_call_id
-            requirement_ids = list(
-                dict.fromkeys(str(item) for item in input.requirement_ids)
-            )
-            if (
-                coverage_contract is not None
-                and str(
-                    context.config.get("metadata", {}).get(
-                        "quality_policy_version",
-                        "",
-                    )
-                )
-                == "quality-gate-v4"
-            ):
-                known_requirement_ids = set(
-                    coverage_contract.requirement_ids()
-                )
-                if not requirement_ids:
-                    raise ValueError(
-                        "coverage_requirement_ids_required"
-                    )
-                unknown_requirement_ids = [
-                    item
-                    for item in requirement_ids
-                    if item not in known_requirement_ids
-                ]
-                if unknown_requirement_ids:
-                    raise ValueError(
-                        "unknown_coverage_requirement_ids:"
-                        + ",".join(unknown_requirement_ids)
-                    )
-            researcher_config = {
-                **context.config,
-                "metadata": {
-                    **context.config.get("metadata", {}),
-                    "task_id": context.tool_call_id,
-                },
-            }
-            context_store = _bind_run_context_fence(
-                RunContextStore(
-                    run_id,
-                    runs_dir=configurable.runs_dir,
-                    inline_content_max_chars=(
-                        configurable.query_journal_inline_content_max_chars
-                    ),
-                ),
-                context.config,
-            )
-            existing_ref = state.get("research_artifact_refs", {}).get(task_id, {})
-            if existing_ref.get("sha256"):
-                try:
-                    existing = context_store.load_task_result(
-                        task_id,
-                        expected_sha256=str(existing_ref["sha256"]),
-                    )
-                    return ToolResult(output={
-                        "task_id": task_id,
-                        "research_topic": input.research_topic,
-                        "requirement_ids": requirement_ids,
-                        "compressed_research": str(existing.get("compressed_research", "")),
-                        "artifact_ref": existing_ref,
-                        "metrics": dict(existing.get("metrics", {})),
-                    })
-                except (FileNotFoundError, ValueError):
-                    pass
-            observation = await researcher_runtime.ainvoke(
-                {
-                    "researcher_messages": [
-                        HumanMessage(content=input.research_topic)
-                    ],
-                    "research_topic": input.research_topic,
-                    "requirement_ids": requirement_ids,
-                    "coverage_contract": (
-                        coverage_contract.model_dump(mode="json")
-                        if coverage_contract is not None
-                        else {}
-                    ),
-                    "research_risk_profile": risk_profile.model_dump(
-                        mode="json"
-                    ),
-                    "memory_context": state.get("memory_context"),
-                },
-                researcher_config,
-            )
-            artifact = {
-                "schema_version": 2,
-                "task_id": task_id,
-                "research_topic": input.research_topic,
-                "requirement_ids": requirement_ids,
-                "coverage_contract": (
-                    coverage_contract.model_dump(mode="json")
-                    if coverage_contract is not None
-                    else {}
-                ),
-                "research_risk_profile": risk_profile.model_dump(
-                    mode="json"
-                ),
-                "compressed_research": str(observation.get("compressed_research", "")),
-                "researcher_messages": [
-                    message_to_dict(message)
-                    if isinstance(message, BaseMessage)
-                    else message
-                    for message in observation.get("researcher_messages", [])
-                ],
-                "raw_notes": list(observation.get("raw_notes", [])),
-                "candidate_registry": list(observation.get("candidate_registry", [])),
-                "document_registry": list(observation.get("document_registry", [])),
-                "evidence_registry": list(observation.get("evidence_registry", [])),
-                "web_research_iterations": list(
-                    observation.get("web_research_iterations", [])
-                ),
-                "result_assessment": observation.get("result_assessment", {}),
-                "metrics": dict(observation.get("metrics", {})),
-            }
-            digest = context_store.persist_task_result(task_id, artifact)
-            relative_path = f"context/artifacts/research_tasks/{task_id}.json"
-            artifact_path = context_store.run_dir / relative_path
-            available_sections = [
-                key
-                for key in (
-                    "researcher_messages",
-                    "raw_notes",
-                    "candidate_registry",
-                    "document_registry",
-                    "evidence_registry",
-                    "web_research_iterations",
-                    "result_assessment",
-                )
-                if artifact.get(key)
-            ]
-            return ToolResult(output={
-                "task_id": task_id,
-                "research_topic": input.research_topic,
-                "requirement_ids": requirement_ids,
-                "compressed_research": artifact["compressed_research"],
-                "artifact_ref": {
-                    "path": relative_path,
-                    "sha256": digest,
-                    "content_bytes": artifact_path.stat().st_size,
-                    "available_sections": available_sections,
-                },
-                "metrics": artifact["metrics"],
-            })
-
-        conduct_tool = build_tool(
-            name="ConductResearch",
-            description=ConductResearch.__doc__ or "Delegate a research topic.",
-            input_schema=_coverage_bound_input_schema(
-                ConductResearch,
-                coverage_contract,
-            ),
-            call=conduct_call,
-            origin=ToolOrigin.SYSTEM,
-        )
-
-        async def read_artifact_call(input, context, on_progress=None):
-            del on_progress
-            configurable = Configuration.from_runnable_config(context.config)
-            run_id = str(context.config.get("metadata", {}).get("run_id", "default"))
-            context_store = RunContextStore(
-                run_id,
-                runs_dir=configurable.runs_dir,
-                inline_content_max_chars=(
-                    configurable.query_journal_inline_content_max_chars
-                ),
-            )
-            artifact = context_store.load_task_result(
-                input.task_id,
-                expected_sha256=input.artifact_sha256,
-            )
-            if input.section not in artifact:
-                raise ValueError(
-                    f"Section {input.section!r} is unavailable for task {input.task_id}"
-                )
-            section = artifact[input.section]
-            content = (
-                section
-                if isinstance(section, str)
-                else json.dumps(section, ensure_ascii=False, default=str)
-            )
-            start = min(input.offset, len(content))
-            end = min(start + input.max_chars, len(content))
-            truncated = end < len(content)
-            output: dict[str, Any] = {
-                "task_id": input.task_id,
-                "section": input.section,
-                "offset": start,
-                "content": content[start:end],
-                "truncated": truncated,
-                "next_offset": end if truncated else None,
-                "total_chars": len(content),
-                "artifact_ref": {
-                    "path": (
-                        f"context/artifacts/research_tasks/{input.task_id}.json"
-                    ),
-                    "sha256": input.artifact_sha256,
-                },
-            }
-            assessment_history = [
-                item
-                for item in state.get("handoff_assessments", [])
-                if isinstance(item, dict)
-                and str(item.get("tool_call_id", "")) == input.task_id
-            ]
-            latest_assessment = (
-                assessment_history[-1] if assessment_history else None
-            )
-            if (
-                configurable.quality_evaluation_enabled
-                and latest_assessment is not None
-                and latest_assessment.get("accepted") is False
-            ):
-                quality_handoff = dict(artifact)
-                selected_excerpt = json.dumps(
-                    {
-                        "section": input.section,
-                        "offset": start,
-                        "content": content[start:end],
-                    },
-                    ensure_ascii=False,
-                    default=str,
-                )
-                quality_handoff["raw_notes"] = [
-                    (
-                        "Supervisor-selected excerpt from the SHA-verified "
-                        f"research artifact:\n{selected_excerpt}"
-                    ),
-                    *[
-                        str(note)
-                        for note in artifact.get("raw_notes", [])
-                    ],
-                ]
-                reassessment = await evaluate_subagent_handoff(
-                    str(artifact.get("research_topic", "")),
-                    quality_handoff,
-                    context.config,
-                    **(
-                        {
-                            "coverage_contract": artifact[
-                                "coverage_contract"
-                            ],
-                            "requirement_ids": list(
-                                artifact.get("requirement_ids", [])
-                            ),
-                            "risk_profile": (
-                                ResearchRiskProfile.model_validate(
-                                    artifact.get(
-                                        "research_risk_profile",
-                                        {},
-                                    )
-                                    or {"level": "standard"}
-                                )
-                            ),
-                        }
-                        if artifact.get("coverage_contract")
-                        else {}
-                    ),
-                )
-                output.update({
-                    "status": (
-                        "accepted_after_artifact_reassessment"
-                        if reassessment.accepted
-                        else "rejected_after_artifact_reassessment"
-                    ),
-                    "admission_status": (
-                        reassessment.admission_status.value
-                        if reassessment.admission_status is not None
-                        else "accepted"
-                        if reassessment.accepted
-                        else "rejected"
-                    ),
-                    "reassessment": reassessment.model_dump(),
-                })
-            return ToolResult(output=output)
-
-        read_artifact_tool = build_tool(
-            name="ReadResearchArtifact",
-            description=(
-                "Read a bounded section of a completed Researcher's persisted evidence. "
-                "Use the task id and SHA-256 returned by ConductResearch, and only call "
-                "this when the compressed findings are insufficient. Reading a previously "
-                "rejected artifact triggers a quality reassessment; read evidence_registry "
-                "to prioritize exact, source-located evidence for possible re-admission."
-            ),
-            input_schema=ReadResearchArtifact,
-            call=read_artifact_call,
-            origin=ToolOrigin.SYSTEM,
-        )
-        return [conduct_tool, read_artifact_tool, complete_tool, reflection_tool]
-
-    async def start_call(input, context, on_progress=None):
-        del on_progress
-        configurable = Configuration.from_runnable_config(context.config)
-        requirement_ids = list(
-            dict.fromkeys(str(item) for item in input.requirement_ids)
-        )
-        if coverage_contract is not None:
-            known_requirement_ids = set(
-                coverage_contract.requirement_ids()
-            )
-            if not requirement_ids:
-                raise ValueError("coverage_requirement_ids_required")
-            unknown_requirement_ids = [
-                item
-                for item in requirement_ids
-                if item not in known_requirement_ids
-            ]
-            if unknown_requirement_ids:
-                raise ValueError(
-                    "unknown_coverage_requirement_ids:"
-                    + ",".join(unknown_requirement_ids)
-                )
-        registry = get_task_registry()
-        run_id = context.config.get("metadata", {}).get("run_id", "default")
-        writer = _event_writer(configurable, run_id)
-        pool = get_teammate_pool(context.config, registry, researcher_runtime.ainvoke)
-        try:
-            message = await handle_start_research_task(
-                _tool_call_payload("StartResearchTask", input, context),
-                context.config,
-                registry,
-                launch_task=lambda record, _cfg: pool.submit(record),
-                event_writer=writer,
-                memory_context=state.get("memory_context"),
-                coverage_contract=(
-                    coverage_contract.model_dump()
-                    if coverage_contract is not None
-                    else None
-                ),
-                research_risk_profile=risk_profile.model_dump(),
-            )
-            return ToolResult(output=message.content)
-        finally:
-            if writer is not None:
-                writer.close()
-
-    async def check_call(input, context, on_progress=None):
-        del on_progress
-        configurable = Configuration.from_runnable_config(context.config)
-        registry = get_task_registry()
-        run_id = context.config.get("metadata", {}).get("run_id", "default")
-        writer = _event_writer(configurable, run_id)
-        try:
-            message = await handle_check_research_task(
-                _tool_call_payload("CheckResearchTask", input, context),
-                registry,
-                writer,
-                get_task_state_store(configurable),
-                run_id=run_id,
-            )
-            return ToolResult(output=message.content)
-        finally:
-            if writer is not None:
-                writer.close()
-
-    async def list_call(input, context, on_progress=None):
-        del on_progress
-        configurable = Configuration.from_runnable_config(context.config)
-        run_id = context.config.get("metadata", {}).get("run_id", "default")
-        message = await handle_list_research_tasks(
-            _tool_call_payload("ListResearchTasks", input, context),
-            get_task_registry(),
-            run_id=run_id,
-            state_store=get_task_state_store(configurable),
-        )
-        return ToolResult(output=message.content)
-
-    async def update_call(input, context, on_progress=None):
-        del on_progress
-        configurable = Configuration.from_runnable_config(context.config)
-        run_id = context.config.get("metadata", {}).get("run_id", "default")
-        writer = _event_writer(configurable, run_id)
-        try:
-            message = await handle_update_research_task(
-                _tool_call_payload("UpdateResearchTask", input, context),
-                get_task_registry(),
-                writer,
-                get_task_state_store(configurable),
-                run_id=run_id,
-                fence_token=int(
-                    context.config.get("metadata", {}).get("run_fence_token", 0) or 0
-                ),
-            )
-            return ToolResult(output=message.content)
-        finally:
-            if writer is not None:
-                writer.close()
-
-    async def cancel_call(input, context, on_progress=None):
-        del on_progress
-        configurable = Configuration.from_runnable_config(context.config)
-        run_id = context.config.get("metadata", {}).get("run_id", "default")
-        writer = _event_writer(configurable, run_id)
-        try:
-            message = await handle_cancel_research_task(
-                _tool_call_payload("CancelResearchTask", input, context),
-                get_task_registry(),
-                writer,
-                get_task_state_store(configurable),
-                configurable,
-                run_id=run_id,
-                fence_token=int(
-                    context.config.get("metadata", {}).get("run_fence_token", 0) or 0
-                ),
-            )
-            return ToolResult(output=message.content)
-        finally:
-            if writer is not None:
-                writer.close()
-
-    async def approve_call(input, context, on_progress=None):
-        del on_progress
-        configurable = Configuration.from_runnable_config(context.config)
-        run_id = context.config.get("metadata", {}).get("run_id", "default")
-        writer = _event_writer(configurable, run_id)
-        try:
-            message = await handle_approve_research_domain(
-                _tool_call_payload("ApproveResearchDomain", input, context),
-                context.config,
-                get_task_registry(),
-                writer,
-                get_task_state_store(configurable),
-            )
-            return ToolResult(output=message.content)
-        finally:
-            if writer is not None:
-                writer.close()
-
-    async def wait_call(input, context, on_progress=None):
-        del on_progress
-        configurable = Configuration.from_runnable_config(context.config)
-        run_id = context.config.get("metadata", {}).get("run_id", "default")
-        from open_deep_research.tasks.teammate_pool import find_active_teammate_pool
-
-        pool = find_active_teammate_pool(run_id)
-        if pool is not None and not await pool.lease.is_owner():
-            raise RuntimeError(f"This process does not own the Lead lease for run {run_id}")
-        mailbox = get_mailbox(configurable, run_id)
-        deadline = asyncio.get_running_loop().time() + input.timeout_seconds
-        while asyncio.get_running_loop().time() < deadline:
-            stats = await mailbox.stats("lead")
-            if stats["available"]:
-                return ToolResult(output=f"{stats['available']} mailbox update(s) are ready.")
-            await asyncio.sleep(configurable.mailbox_poll_interval_ms / 1000)
-        return ToolResult(output="No new research updates before the timeout.")
-
-    definitions = [
-        (_coverage_bound_input_schema(StartResearchTask, coverage_contract), start_call),
-        (CheckResearchTask, check_call),
-        (ListResearchTasks, list_call),
-        (UpdateResearchTask, update_call),
-        (CancelResearchTask, cancel_call),
-        (ApproveResearchDomain, approve_call),
-        (WaitForResearchUpdates, wait_call),
-    ]
-    tools = [
-        build_tool(
-            name=model.__name__,
-            description=model.__doc__ or model.__name__,
-            input_schema=model,
-            call=call,
-            origin=ToolOrigin.SYSTEM,
-        )
-        for model, call in definitions
-    ]
-    return [*tools, complete_tool, reflection_tool]
+    return build_injected_supervisor_tools(deps)
 
 
 def build_supervisor_tool_registry(state: SupervisorState) -> dict[str, Tool]:
@@ -2956,7 +2490,11 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
     return await _execute_supervisor_tools(state, config)
 
 
-def build_researcher_system_prompt(configurable: Configuration) -> str:
+def build_researcher_system_prompt(
+    configurable: Configuration,
+    tools: list[Tool] | None = None,
+    config: RunnableConfig | None = None,
+) -> str:
     """Build the role prompt shared by legacy and unified Researcher runtimes."""
     tool_prompt_parts = [configurable.mcp_prompt or ""]
     if configurable.browser_mcp_enabled and configurable.browser_mcp_prompt:
@@ -2965,7 +2503,10 @@ def build_researcher_system_prompt(configurable: Configuration) -> str:
     if skill_researcher_context:
         tool_prompt_parts.append(skill_researcher_context)
     tool_prompt = "\n\n".join(part for part in tool_prompt_parts if part)
+    tool_config = config or {"configurable": configurable.model_dump(mode="python")}
+    tool_guidance = render_tool_guidance(tools or [], tool_config)
     return research_system_prompt.format(
+        tool_guidance=tool_guidance,
         mcp_prompt=tool_prompt,
         date=get_today_str(),
     )
@@ -2990,17 +2531,13 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
     researcher_messages = state.get("researcher_messages", [])
     
     # Get all available research tools (search, MCP, think_tool)
-    tools = await get_all_tools(config)
-    # Filter to the tools this researcher is permitted to bind *before* exposing
-    # them to the model, so disallowed tool names/schemas are never shown. The
-    # execution-time gate remains as a second line of defense.
-    tools = filter_tools_by_permission(tools, AgentRole.RESEARCHER, config)
-    if len(tools) == 0:
-        raise ValueError(
-            "No tools found to conduct research: Please configure either your "
-            "search API or add MCP tools to your configuration, and ensure the "
-            "researcher tool whitelist/origin filter does not exclude all tools."
-        )
+    all_tools = await get_all_tools(config)
+    researcher_assembly = await prepare_existing_toolset(
+        all_tools,
+        AgentRole.RESEARCHER,
+        config,
+    )
+    tools = researcher_assembly.tools
     
     # Step 2: Configure the researcher model with tools
     research_model_config = apply_helicone_config(
@@ -3017,14 +2554,11 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
     
     # Prepare system prompt with MCP context if available
     memory_context = state.get("memory_context") or ""
-    researcher_prompt = build_researcher_system_prompt(configurable)
+    researcher_prompt = build_researcher_system_prompt(configurable, tools, config)
     
     # Configure model with tools (retry is handled by the observability retry
     # wrapper at the call site).
-    model_tool_definitions = await tools_to_model_definitions(
-        tools,
-        max_description_chars=configurable.max_mcp_description_chars,
-    )
+    model_tool_definitions = researcher_assembly.definitions
     research_model = (
         configurable_model
         .bind_tools(model_tool_definitions)
@@ -3249,7 +2783,7 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
         return Command(goto="compress_research")
 
     # Step 2: Handle other tool calls (search, MCP tools, etc.)
-    # Tools are assembled with origin tags (see utils.get_all_tools); build the
+    # Tools are assembled with origin tags by tools.registry; build the
     # name->tool map and a parallel origin index for provider-native search dicts.
     tools = await get_all_tools(config)
     tools_by_name = build_tool_registry(tools)

@@ -154,10 +154,7 @@ def resolve_model_context_window(
     unknown_default: int = 32_768,
 ) -> int:
     """Resolve a model window without an unsafe unknown-model 200K default."""
-    # Token limits remain owned by tools/utils for backward-compatible runtime
-    # overrides.  Keep this import local so the recovery layer does not acquire
-    # a top-level dependency on the higher tools layer.
-    from open_deep_research.tools.utils import get_model_token_limit
+    from open_deep_research.tools.model_limits import get_model_token_limit
 
     if overrides and model_name in overrides:
         return max(1, int(overrides[model_name]))

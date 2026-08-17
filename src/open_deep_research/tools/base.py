@@ -68,6 +68,11 @@ class ToolResult(Generic[OutputT]):
 
 ProgressCallback = Callable[[ProgressT], Union[Awaitable[None], None]]
 DescriptionFn = Callable[[Optional[InputT]], Union[str, Awaitable[str]]]
+PromptFn = Callable[[RunnableConfig], Optional[str]]
+EnabledFn = Callable[[RunnableConfig], bool]
+EgressUrlsFn = Callable[[dict[str, Any]], list[str]]
+
+
 @runtime_checkable
 class Tool(Protocol, Generic[InputT, OutputT, ProgressT_co]):
     """Structural interface implemented by every executable project tool."""
@@ -90,6 +95,33 @@ class Tool(Protocol, Generic[InputT, OutputT, ProgressT_co]):
     @property
     def retryable(self) -> bool:
         """Return whether transient failures may be retried."""
+        ...
+
+    @property
+    def effect(self) -> ToolEffect:
+        """Return the externally visible effect of an invocation."""
+        ...
+
+    @property
+    def concurrency_safe(self) -> bool:
+        """Return whether independent calls may execute concurrently."""
+        ...
+
+    @property
+    def max_output_chars(self) -> Optional[int]:
+        """Return the per-tool serialized output budget, if configured."""
+        ...
+
+    def prompt(self, config: RunnableConfig) -> Optional[str]:
+        """Return detailed model guidance for this tool, if any."""
+        ...
+
+    def is_enabled(self, config: RunnableConfig) -> bool:
+        """Return whether this tool is enabled for the supplied run config."""
+        ...
+
+    def egress_urls(self, input: dict[str, Any]) -> list[str]:
+        """Extract outbound URLs whose hosts must pass egress governance."""
         ...
 
     async def description(self, input: Optional[InputT] = None) -> str:
@@ -117,7 +149,11 @@ class BuiltTool(Generic[InputT, OutputT, ProgressT]):
     retryable: bool
     concurrency_safe: bool
     supports_idempotency: bool
+    max_output_chars: Optional[int]
     _description: Callable[[Optional[InputT]], Union[str, Awaitable[str]]]
+    _prompt: PromptFn
+    _is_enabled: EnabledFn
+    _egress_urls: EgressUrlsFn
     _call: Callable[
         [InputT, ToolContext, Optional[ProgressCallback[ProgressT]]],
         Union[ToolResult[OutputT], Awaitable[ToolResult[OutputT]]],
@@ -129,6 +165,22 @@ class BuiltTool(Generic[InputT, OutputT, ProgressT]):
         if inspect.isawaitable(value):
             value = await value
         return str(value)
+
+    def prompt(self, config: RunnableConfig) -> Optional[str]:
+        """Resolve detailed model guidance for the supplied run config."""
+        value = self._prompt(config)
+        return None if value is None else str(value)
+
+    def is_enabled(self, config: RunnableConfig) -> bool:
+        """Resolve declarative availability for the supplied run config."""
+        return bool(self._is_enabled(config))
+
+    def egress_urls(self, input: dict[str, Any]) -> list[str]:
+        """Return declared egress URLs for validated raw invocation arguments."""
+        urls = self._egress_urls(input)
+        if not isinstance(urls, list) or any(not isinstance(url, str) for url in urls):
+            raise TypeError(f"Tool '{self.name}' egress_urls() must return list[str]")
+        return urls
 
     async def call(
         self,
@@ -162,6 +214,10 @@ def build_tool(
     retryable: bool = False,
     concurrency_safe: bool = False,
     supports_idempotency: bool = False,
+    prompt: Union[str, PromptFn, None] = None,
+    is_enabled: Optional[EnabledFn] = None,
+    egress_urls: Optional[EgressUrlsFn] = None,
+    max_output_chars: Optional[int] = None,
 ) -> Tool[InputT, OutputT, ProgressT]:
     """Build a tool with conservative defaults and eager contract checks."""
     if not name or not name.strip():
@@ -181,6 +237,32 @@ def build_tool(
         description_fn = description
     else:
         raise TypeError("description must be a string or callable")
+    if isinstance(prompt, str):
+        static_prompt = prompt
+
+        def render_prompt(_: RunnableConfig) -> str:
+            return static_prompt
+
+        prompt_fn: PromptFn = render_prompt
+    elif prompt is None:
+        def no_prompt(_: RunnableConfig) -> None:
+            return None
+
+        prompt_fn = no_prompt
+    elif callable(prompt):
+        prompt_fn = prompt
+    else:
+        raise TypeError("prompt must be a string, callable, or None")
+    if is_enabled is not None and not callable(is_enabled):
+        raise TypeError("is_enabled must be callable or None")
+    if egress_urls is not None and not callable(egress_urls):
+        raise TypeError("egress_urls must be callable or None")
+    if max_output_chars is not None and (
+        isinstance(max_output_chars, bool)
+        or not isinstance(max_output_chars, int)
+        or max_output_chars <= 0
+    ):
+        raise ValueError("max_output_chars must be a positive integer or None")
     return BuiltTool(
         name=name.strip(),
         input_schema=input_schema,
@@ -189,7 +271,11 @@ def build_tool(
         retryable=bool(retryable),
         concurrency_safe=bool(concurrency_safe),
         supports_idempotency=bool(supports_idempotency),
+        max_output_chars=max_output_chars,
         _description=description_fn,
+        _prompt=prompt_fn,
+        _is_enabled=is_enabled or (lambda _: True),
+        _egress_urls=egress_urls or (lambda _: []),
         _call=call,
     )
 

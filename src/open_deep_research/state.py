@@ -1,7 +1,7 @@
 """Graph state definitions and data structures for the Deep Research agent."""
 
 import operator
-from typing import Annotated, Literal, Optional
+from typing import Annotated, Optional
 
 from langchain_core.messages import MessageLikeRepresentation
 from pydantic import BaseModel, Field
@@ -11,63 +11,6 @@ from typing_extensions import TypedDict
 ###################
 # Structured Outputs
 ###################
-class ConductResearch(BaseModel):
-    """Call this tool to conduct research on a specific topic."""
-    research_topic: str = Field(
-        description=(
-            "A complete, self-contained research objective focused on one independent direction. "
-            "Describe what the sub-agent needs to learn and any essential context. This is a "
-            "research objective, not a search-engine query to copy verbatim; the sub-agent will "
-            "begin with short, broad queries and narrow them based on evidence."
-        ),
-    )
-    display_title: Optional[str] = Field(
-        default=None,
-        max_length=160,
-        description="Short user-visible label for this delegated research task.",
-    )
-    requirement_ids: list[str] = Field(
-        default_factory=list,
-        description=(
-            "Coverage requirement IDs owned by this task. Quality-gate v4 "
-            "requires at least one ID from the original user coverage contract."
-        ),
-    )
-
-
-class ReadResearchArtifact(BaseModel):
-    """Read one bounded section from a persisted Researcher artifact."""
-
-    task_id: str = Field(
-        min_length=1,
-        max_length=128,
-        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
-        description="Task id returned by ConductResearch.",
-    )
-    artifact_sha256: str = Field(
-        pattern=r"^[0-9a-f]{64}$",
-        description="Artifact digest returned by ConductResearch.",
-    )
-    section: Literal[
-        "researcher_messages",
-        "raw_notes",
-        "candidate_registry",
-        "document_registry",
-        "evidence_registry",
-        "web_research_iterations",
-        "result_assessment",
-    ] = Field(description="Artifact section to inspect.")
-    offset: int = Field(default=0, ge=0, description="Character offset for pagination.")
-    max_chars: int = Field(
-        default=12_000,
-        ge=1,
-        le=30_000,
-        description="Maximum number of characters returned in this call.",
-    )
-
-class ResearchComplete(BaseModel):
-    """Call this tool to indicate that the research is complete."""
-
 class Summary(BaseModel):
     """Research summary with key findings."""
     

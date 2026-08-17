@@ -109,7 +109,7 @@ class DomainApprovalRegistry:
                 if req is not None and req.future is not None and not req.future.done():
                     req.future.cancel()
         # Keep all run-scoped web resources aligned with approval lifetime.
-        from open_deep_research.tools.utils import clear_run_web_budget
+        from open_deep_research.tools.legacy_shims import clear_run_web_budget
         from open_deep_research.web.pipeline import clear_run_web_cache
 
         clear_run_web_budget(run_id)

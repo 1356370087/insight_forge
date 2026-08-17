@@ -871,11 +871,16 @@ def _egress_host_for_tool(
 ) -> Optional[str]:
     """Return the egress host a URL-bearing tool targets, or ``None`` to skip.
 
-    Only URL-bearing tools are intercepted (per the allowlist design): MCP tools
-    (host from ``mcp_config.url``) and the ``fetch_webpage`` tool (host from
-    ``args["url"]``). Search/model/think tools are skipped because their hosts are
-    already statically derived in :func:`allowed_domains`.
+    Project tools declare URL extraction through ``Tool.egress_urls``. Browser
+    tools retain a schema-key fallback because their remote schemas are not
+    controlled here, while MCP retains its configured server URL fallback.
     """
+    extract_urls = getattr(tool, "egress_urls", None)
+    if callable(extract_urls):
+        for url in extract_urls(args):
+            host = egress_host_from_url(url)
+            if host is not None:
+                return host
     origin = get_tool_origin(tool)
     if origin is ToolOrigin.BROWSER:
         for key in ("url", "target_url", "href"):
@@ -887,12 +892,25 @@ def _egress_host_for_tool(
         if configurable.mcp_config and configurable.mcp_config.url:
             return egress_host_from_url(configurable.mcp_config.url)
         return None
-    if tool.name == "fetch_webpage":
-        url = args.get("url")
-        if isinstance(url, str):
-            return egress_host_from_url(url)
-        return None
     return None
+
+
+def _serialize_governed_output(
+    tool: Tool,
+    output: Any,
+    configurable: Configuration,
+) -> str:
+    """Serialize output and apply the strictest global/per-tool character budget."""
+    content = serialize_tool_output(output)
+    declared_limit = getattr(tool, "max_output_chars", None)
+    limit = min(
+        declared_limit or configurable.max_mcp_output_chars,
+        configurable.max_mcp_output_chars,
+    )
+    if len(content) <= limit:
+        return content
+    omitted = len(content) - limit
+    return f"{content[:limit]}\n[truncated {omitted} chars]"
 
 
 def _find_task_for_run(
@@ -1171,7 +1189,7 @@ async def execute_governed_tool_call(
             )
         )
 
-    # Egress domain allowlist for URL-bearing tools (MCP + fetch_webpage). May
+    # Egress domain allowlist for URL-bearing tools. May
     # block inline (in-process) until a supervisor decision arrives.
     egress_err = await check_egress_domain(tool_call, tool, args, config)
     if egress_err is not None:
@@ -1208,7 +1226,7 @@ async def execute_governed_tool_call(
             result = await tool.call(validated_input, context)
             return GovernedToolCallResult(
                 message=ToolMessage(
-                    content=serialize_tool_output(result.output),
+                    content=_serialize_governed_output(tool, result.output, configurable),
                     name=name,
                     tool_call_id=tool_call_id,
                 ),
@@ -1234,7 +1252,7 @@ async def execute_governed_tool_call(
         )
         return GovernedToolCallResult(
             message=ToolMessage(
-                content=serialize_tool_output(result.output),
+                content=_serialize_governed_output(tool, result.output, configurable),
                 name=name,
                 tool_call_id=tool_call_id,
             ),

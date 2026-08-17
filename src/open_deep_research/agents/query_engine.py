@@ -3014,11 +3014,12 @@ class QueryEngine:
             raise RuntimeError(f"Unknown supervisor step: {next_step}")
 
         if next_step != END:
-            model_tools = graph.filter_tools_by_permission(
+            supervisor_assembly = await graph.prepare_existing_toolset(
                 list(graph.build_supervisor_tool_registry(supervisor_state).values()),
                 graph.AgentRole.SUPERVISOR,
                 self.config,
             )
+            model_tools = supervisor_assembly.tools
             model_candidates = build_model_candidate_chain(
                 configurable.research_model,
                 configurable.model_fallbacks.get("supervisor", []),
@@ -3227,7 +3228,7 @@ class QueryEngine:
                 model_span_name="supervisor.model",
                 model_config=model_candidates[0].model_config,
                 initial_turn=completed_turn,
-                max_tool_description_chars=configurable.max_mcp_description_chars,
+                max_tool_description_chars=configurable.max_tool_description_chars,
                 context_policy=ContextPolicy(
                     max_tool_result_chars=configurable.max_mcp_output_chars,
                 ),
@@ -3536,17 +3537,12 @@ class ResearcherQueryEngine:
             attributes={"research_topic": topic[:500]},
         ):
             all_tools = await graph.get_all_tools(cfg)
-            tools = graph.filter_tools_by_permission(
+            researcher_assembly = await graph.prepare_existing_toolset(
                 all_tools,
                 graph.AgentRole.RESEARCHER,
                 cfg,
             )
-            if not tools:
-                raise ValueError(
-                    "No tools found to conduct research: Please configure either your "
-                    "search API or add MCP tools to your configuration, and ensure the "
-                    "researcher tool whitelist/origin filter does not exclude all tools."
-                )
+            tools = researcher_assembly.tools
 
             memory_context = str(researcher_state.get("memory_context") or "")
             runtime_messages: list[BaseMessage] = []
@@ -4048,7 +4044,11 @@ class ResearcherQueryEngine:
             completed_turn = int(researcher_state.get("tool_call_iterations", 0) or 0)
             async for event in query(QueryParams(
                 messages=runtime_messages,
-                system_prompt=graph.build_researcher_system_prompt(configurable),
+                system_prompt=graph.build_researcher_system_prompt(
+                    configurable,
+                    tools,
+                    cfg,
+                ),
                 model=graph.configurable_model,
                 config=cfg,
                 tools=tools,
@@ -4061,7 +4061,7 @@ class ResearcherQueryEngine:
                     + configurable.quality_gap_recovery_max_attempts
                 ),
                 initial_turn=completed_turn,
-                max_tool_description_chars=configurable.max_mcp_description_chars,
+                max_tool_description_chars=configurable.max_tool_description_chars,
                 context_policy=ContextPolicy(
                     max_tool_result_chars=configurable.max_mcp_output_chars,
                 ),

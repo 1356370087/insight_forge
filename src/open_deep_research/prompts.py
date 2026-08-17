@@ -84,15 +84,7 @@ When you are completely satisfied with the research findings returned from the t
 </Task>
 
 <Available Tools>
-You have access to four main tools:
-1. **ConductResearch**: Delegate research tasks to specialized sub-agents
-2. **ReadResearchArtifact**: Read a bounded section of a sub-agent's persisted evidence when its compressed findings are insufficient
-3. **ResearchComplete**: Indicate that research is complete
-4. **think_tool**: For reflection and strategic planning during research
-
-ConductResearch returns compressed findings plus an artifact reference, not the full search transcript. Prefer the compressed findings. Call ReadResearchArtifact only to resolve a specific evidence gap, conflict, or missing citation; request the smallest relevant section and page.
-
-**CRITICAL: Use think_tool before calling ConductResearch to plan your approach, and after each ConductResearch to assess progress. Do not call think_tool with any other tools in parallel.**
+{tool_guidance}
 </Available Tools>
 
 <Instructions>
@@ -168,19 +160,12 @@ Example of good decomposition for a semiconductor shortage study: one task owns 
 lead_researcher_async_prompt = """You are a research supervisor using async SubAgents. Your job is to launch and manage background research tasks. For context, today's date is {date}.
 
 <Task>
-You have access to **9 tools** for async research orchestration:
-1. **StartResearchTask**: Queue a background research task. A persistent teammate receives it when capacity is available; each task still starts with a clean research context.
-2. **CheckResearchTask**: Refresh one or more tasks by task_id on demand. Returns current status and, if the task has completed, the full research findings.
-3. **ListResearchTasks**: Refresh all tracked tasks and their current statuses at a glance.
-4. **UpdateResearchTask**: Send additional or corrective instructions to a running task without stopping it.
-5. **CancelResearchTask**: Cancel one or more running tasks you no longer need.
-6. **ApproveResearchDomain**: Approve or deny a domain requested by a paused teammate.
-7. **WaitForResearchUpdates**: Wait for Mailbox updates without spending another model call. Use it when tasks are active and there is no other useful orchestration work.
-8. **ResearchComplete**: Call this when ALL necessary research tasks have finished and you have retrieved their results.
-9. **think_tool**: Strategic reflection — use before launching tasks and after collecting results.
-
-**CRITICAL: Use think_tool before calling StartResearchTask to plan your approach. Do not call think_tool with any other tools in parallel.**
+Coordinate background research tasks until the required evidence has been collected.
 </Task>
+
+<Available Tools>
+{tool_guidance}
+</Available Tools>
 
 <Critical Rules>
 1. **Non-blocking launch**: StartResearchTask returns immediately. Launch other independent tasks, then use WaitForResearchUpdates instead of repeatedly polling with model calls.
@@ -247,12 +232,9 @@ You can use any of the tools provided to you to find resources that can help ans
 </Task>
 
 <Available Tools>
-Your core research workflow uses these tools when they are available at runtime:
-1. **Configured search tool / web tool**: In enforced mode, use web_research for the complete Search → Top-K Fetch → Evidence pipeline and fetch_url only for a specific known URL. In legacy/shadow mode, use the configured search tool provided by the selected search backend.
-2. **think_tool**: For reflection and strategic planning during research
-{mcp_prompt}
+{tool_guidance}
 
-**CRITICAL: Use think_tool after each search to reflect on results and plan next steps. Do not call think_tool with a search tool or any other tools. It should be used only after the search to reflect on its results.**
+{mcp_prompt}
 </Available Tools>
 
 <Instructions>

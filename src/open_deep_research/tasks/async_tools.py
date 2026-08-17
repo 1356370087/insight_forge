@@ -13,7 +13,6 @@ from typing import Any, Callable, Coroutine, Optional
 
 from langchain_core.messages import ToolMessage
 from langchain_core.runnables import RunnableConfig
-from pydantic import BaseModel, Field
 
 from open_deep_research.configuration import Configuration
 from open_deep_research.observability import current_span_ids, get_trace_recorder
@@ -44,118 +43,6 @@ def _run_fence_token(config: RunnableConfig | None) -> int:
     """Read the current run ownership epoch from propagated metadata."""
     value = ((config or {}).get("metadata") or {}).get("run_fence_token", 0)
     return int(value or 0)
-
-# ---------------------------------------------------------------------------
-# Pydantic tool models (bound to the supervisor LLM)
-# ---------------------------------------------------------------------------
-
-
-class StartResearchTask(BaseModel):
-    """Launch an async background research task.
-
-    Returns a task_id immediately so you can continue working.
-    The task runs independently — use CheckResearchTask later to
-    retrieve its results.
-    """
-
-    research_topic: str = Field(
-        description=(
-            "A complete, self-contained research objective focused on one independent direction. "
-            "Describe what the sub-agent needs to learn and any essential context. This is a "
-            "research objective, not a search-engine query to copy verbatim; the sub-agent will "
-            "begin with short, broad queries and narrow them based on evidence."
-        ),
-    )
-    requirement_ids: list[str] = Field(
-        default_factory=list,
-        description=(
-            "Coverage requirement IDs owned by this task. For quality-gate-v4 "
-            "runs every ID must exist in the user coverage contract."
-        ),
-    )
-    display_title: Optional[str] = Field(
-        default=None,
-        max_length=160,
-        description="Short user-visible label for this delegated research task.",
-    )
-
-
-class CheckResearchTask(BaseModel):
-    """Check status and/or retrieve completed results for one or more tasks.
-
-    For completed tasks the compressed research findings are returned.
-    For running tasks you get the current phase and progress counts.
-    """
-
-    task_ids: list[str] = Field(
-        description="List of task IDs to check. You can check multiple at once.",
-    )
-
-
-class ListResearchTasks(BaseModel):
-    """List all tracked research tasks with their statuses.
-
-    Use this before launching new tasks to check available capacity,
-    or to see overall progress.
-    """
-
-    status_filter: Optional[str] = Field(
-        default=None,
-        description="Optional: filter by status ('running', 'completed', 'failed', 'cancelled').",
-    )
-
-
-class UpdateResearchTask(BaseModel):
-    """Send updated or additional instructions to a running research task.
-
-    The instruction is appended to the task's context and will
-    influence its next research actions. Does not interrupt the
-    task — the new guidance takes effect at the next iteration.
-    """
-
-    task_id: str = Field(description="Task ID to update.")
-    instruction: str = Field(
-        description="Additional or corrected instruction for the running task."
-    )
-
-
-class CancelResearchTask(BaseModel):
-    """Cancel one or more running research tasks.
-
-    Cancelled tasks do not contribute to the final report.
-    Use this when a task becomes unnecessary or is producing
-    low-quality results.
-    """
-
-    task_ids: list[str] = Field(description="List of task IDs to cancel.")
-    reason: Optional[str] = Field(
-        default=None, description="Optional reason for cancellation."
-    )
-
-
-class ApproveResearchDomain(BaseModel):
-    """Approve or deny a domain that a research task is waiting to fetch.
-
-    When a researcher tool targets a host not on the egress allowlist, the task
-    pauses as ``waiting_for_confirmation``. Use this tool to allow or deny that
-    domain. The decision is cached for the rest of the run, so subsequent fetches
-    of the same domain proceed (or are skipped) without asking again.
-    """
-
-    task_id: str = Field(description="Task ID that is waiting for confirmation.")
-    domain: str = Field(
-        description="Domain to approve or deny (e.g. 'example.com')."
-    )
-    allow: bool = Field(
-        description="True to allow the domain for this run, False to deny."
-    )
-
-
-class WaitForResearchUpdates(BaseModel):
-    """Wait for durable SubAgent mailbox updates without another model call."""
-
-    timeout_seconds: int = Field(default=15, ge=1, le=60)
-
 
 # Type alias for the function that actually launches a background researcher.
 LaunchTaskFn = Callable[

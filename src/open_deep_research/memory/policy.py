@@ -30,7 +30,7 @@ from open_deep_research.observability import (
     invoke_model_with_retry_observability,
 )
 from open_deep_research.security.content import inspect_untrusted_content
-from open_deep_research.tools.utils import get_today_str
+from open_deep_research.tools.legacy_shims import get_today_str
 
 # ---------------------------------------------------------------------------
 # Structured output model

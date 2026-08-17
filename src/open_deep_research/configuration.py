@@ -1269,6 +1269,7 @@ class Configuration(BaseModel):
     require_sensitive_tool_approval: bool = Field(default=True)
     max_external_content_bytes: int = Field(default=1_000_000, ge=1024)
     max_mcp_description_chars: int = Field(default=2_000, ge=64)
+    max_tool_description_chars: int = Field(default=2_000, ge=64)
     max_mcp_output_chars: int = Field(default=30_000, ge=256)
     allowed_mcp_servers: list[str] = Field(default_factory=list)
     allowed_model_endpoints: list[str] = Field(default_factory=list)

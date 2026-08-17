@@ -90,6 +90,8 @@ lint.ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["D", "UP"]
+"src/open_deep_research/tools/*/prompt.py" = ["D103"]
+"src/open_deep_research/tools/supervisor/*/*.py" = ["D100", "D103", "D104"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
