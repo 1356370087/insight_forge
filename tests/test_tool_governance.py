@@ -25,7 +25,6 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool as lc_tool
 
 from open_deep_research.configuration import Configuration
-from open_deep_research.state import ConductResearch, ResearchComplete
 from open_deep_research.tasks.registry import TaskStatus
 from open_deep_research.tools.adapters import adapt_langchain_tool
 from open_deep_research.tools.base import Tool, ToolContext, ToolEffect, ToolOrigin
@@ -50,6 +49,8 @@ from open_deep_research.tools.governance import (
 from open_deep_research.tools.governance import (
     invoke_tool_with_retry as _invoke_tool_with_retry,
 )
+from open_deep_research.tools.research_complete import ResearchComplete
+from open_deep_research.tools.supervisor.conduct_research import ConductResearch
 from open_deep_research.tools.utils import tavily_search, think_tool
 
 # ---------------------------------------------------------------------------
@@ -637,6 +638,26 @@ class TestExecuteGovernedToolCall:
         assert msg.name == "ok_tool"
 
     @pytest.mark.asyncio
+    async def test_per_tool_output_budget_is_applied_during_serialization(self):
+        async def long_output() -> str:
+            """Return content longer than the declared output budget."""
+            return "abcdefghij"
+
+        declared = adapt_langchain_tool(
+            lc_tool(long_output),
+            origin=ToolOrigin.SYSTEM,
+            max_output_chars=5,
+        )
+        result = await execute_governed_tool_call(
+            {"name": declared.name, "args": {}, "id": "tc-budget"},
+            {declared.name: declared},
+            AgentRole.RESEARCHER,
+            _config(),
+        )
+
+        assert result.content == "abcde\n[truncated 5 chars]"
+
+    @pytest.mark.asyncio
     async def test_search_tool_retryable_failure_returns_structured_error(self):
         # Arrange -- flaky_503 tagged as SEARCH + retryable
         search_503 = _make_tool(_flaky_503_fn, origin=ToolOrigin.SEARCH, retryable=True)
@@ -1042,8 +1063,10 @@ class TestSupervisorToolsIntegration:
     @pytest.mark.asyncio
     async def test_supervisor_dispatches_approve_research_domain(self):
         """In async mode an ApproveResearchDomain tool call is routed to its handler."""
-        import open_deep_research.agents.deep_researcher as mod
         from open_deep_research.agents.deep_researcher import supervisor_tools
+        from open_deep_research.tools.supervisor.approve_research_domain import (
+            definition as approve_definition,
+        )
 
         called: dict[str, Any] = {}
 
@@ -1056,8 +1079,8 @@ class TestSupervisorToolsIntegration:
                 content="approved", name="ApproveResearchDomain", tool_call_id=tool_call["id"]
             )
 
-        orig = mod.handle_approve_research_domain
-        mod.handle_approve_research_domain = fake_approve
+        orig = approve_definition.handle_approve_research_domain
+        approve_definition.handle_approve_research_domain = fake_approve
         try:
             ai_msg = AIMessage(content="", tool_calls=[{
                 "name": "ApproveResearchDomain",
@@ -1072,7 +1095,7 @@ class TestSupervisorToolsIntegration:
             config = _config(max_researcher_iterations=100)
             result = await supervisor_tools(state, config)
         finally:
-            mod.handle_approve_research_domain = orig
+            approve_definition.handle_approve_research_domain = orig
 
         assert called.get("tool_call_id") == "ard-1"
         assert called.get("domain") == "x.example"
@@ -1117,6 +1140,7 @@ def _fetch_tool() -> Any:
         t,
         origin=ToolOrigin.SYSTEM,
         retryable=True,
+        egress_urls=lambda args: [args["url"]],
     )
 
 

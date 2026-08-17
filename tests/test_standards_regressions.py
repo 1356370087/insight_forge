@@ -15,7 +15,6 @@ from open_deep_research.agents.query_engine import QueryEngine
 from open_deep_research.configuration import Configuration
 from open_deep_research.quality import HandoffAssessment
 from open_deep_research.run_context import RunContextStore
-from open_deep_research.state import ConductResearch
 from open_deep_research.tools import utils
 from open_deep_research.tools.base import (
     ToolContext,
@@ -23,6 +22,8 @@ from open_deep_research.tools.base import (
     ToolResult,
     build_tool,
 )
+from open_deep_research.tools.supervisor.conduct_research import ConductResearch
+from open_deep_research.tools.web_research import pipeline as tool_pipeline
 from open_deep_research.web import pipeline
 from open_deep_research.web.pipeline import WebPipelineSettings
 
@@ -705,11 +706,11 @@ async def test_fetch_budget_is_per_researcher_and_still_run_bounded(monkeypatch)
     utils.clear_run_web_budget("budget-run")
     base = {"configurable": {}, "metadata": {"run_id": "budget-run"}}
 
-    first, _ = await utils._reserve_fetch_budget(
+    first, _ = await tool_pipeline._reserve_fetch_budget(
         {**base, "metadata": {**base["metadata"], "task_id": "researcher-a"}},
         2,
     )
-    second, _ = await utils._reserve_fetch_budget(
+    second, _ = await tool_pipeline._reserve_fetch_budget(
         {**base, "metadata": {**base["metadata"], "task_id": "researcher-b"}},
         2,
     )
@@ -731,8 +732,16 @@ async def test_direct_fetch_does_not_apply_discovery_authority_threshold(
         return SimpleNamespace(fetches=[])
 
     monkeypatch.setattr(pipeline.WebResearchPipeline, "run", fake_run)
-    monkeypatch.setattr(utils, "_record_web_pipeline_metrics", lambda *_args: None)
-    monkeypatch.setattr(utils, "_compact_web_result", lambda _result: "{}")
+    monkeypatch.setattr(
+        tool_pipeline,
+        "_record_web_pipeline_metrics",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        tool_pipeline,
+        "_compact_web_result",
+        lambda _result: "{}",
+    )
 
     await utils.fetch_url.call(
         utils.fetch_url.input_schema(

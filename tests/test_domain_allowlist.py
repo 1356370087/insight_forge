@@ -142,8 +142,13 @@ class TestFetchWebpageTool:
     async def test_fetch_webpage_returns_content_no_summarize(self, monkeypatch):
         from open_deep_research.tools import utils
         from open_deep_research.tools.base import ToolContext
+        from open_deep_research.tools.fetch_webpage import definition
 
-        monkeypatch.setattr(utils.aiohttp, "ClientSession", _FakeSession)
+        monkeypatch.setattr(
+            definition.aiohttp,
+            "ClientSession",
+            _FakeSession,
+        )
         tool = utils.fetch_webpage
         config = {"configurable": {"search_api": "none"}, "metadata": {"run_id": "test"}}
         result = (
@@ -163,13 +168,18 @@ class TestFetchWebpageTool:
 
         from open_deep_research.tools import utils
         from open_deep_research.tools.base import ToolContext
+        from open_deep_research.tools.fetch_webpage import definition
 
         class _ErrSession(_FakeSession):
             def __init__(self, *a, **k):
                 super().__init__(*a, **k)
                 self.status = 404
 
-        monkeypatch.setattr(utils.aiohttp, "ClientSession", _ErrSession)
+        monkeypatch.setattr(
+            definition.aiohttp,
+            "ClientSession",
+            _ErrSession,
+        )
         with pytest.raises(ToolException):
             tool = utils.fetch_webpage
             config = {"configurable": {"search_api": "none"}, "metadata": {"run_id": "test"}}
@@ -259,6 +269,7 @@ class TestRunTaskPauseAndResume:
             langchain_fetch,
             origin=ToolOrigin.SYSTEM,
             retryable=True,
+            egress_urls=lambda args: [str(args["url"])],
         )
 
         record = registry.create("topic", run_id="run-e2e")

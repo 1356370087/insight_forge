@@ -13,7 +13,8 @@ import pytest
 from open_deep_research.configuration import Configuration
 from open_deep_research.quality import deterministic_tool_checks
 from open_deep_research.security.network import validate_connected_peer
-from open_deep_research.tools import utils
+from open_deep_research.tools.registry import get_all_tools
+from open_deep_research.tools.web_research import pipeline as utils
 from open_deep_research.web.models import (
     CandidateSource,
     DocumentChunk,
@@ -775,7 +776,7 @@ async def test_model_evidence_requires_complete_soft_wrapped_excerpt(
 
 @pytest.mark.asyncio
 async def test_enforced_mode_exposes_pipeline_tools_not_provider_search() -> None:
-    tools = await utils.get_all_tools(
+    tools = await get_all_tools(
         {
             "configurable": {
                 "web_pipeline_mode": "enforced",

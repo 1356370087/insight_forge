@@ -16,12 +16,15 @@ import aiohttp
 import pytest
 from langchain_core.runnables import RunnableConfig
 
-import open_deep_research.tools.utils as utils
 from open_deep_research.configuration import SearchAPI
 from open_deep_research.observability import SQLiteTraceStore, get_trace_recorder
+from open_deep_research.tools.anthropic_web_search import anthropic_web_search
 from open_deep_research.tools.base import ToolContext, ToolOrigin
 from open_deep_research.tools.governance import get_tool_origin, get_tool_retryable
-from open_deep_research.tools.utils import get_all_tools, get_search_tool
+from open_deep_research.tools.openai_web_search import openai_web_search
+from open_deep_research.tools.registry import get_all_tools, get_search_tool
+from open_deep_research.tools.tavily_search import summarization
+from open_deep_research.tools.web_research import providers
 
 
 def _config(trace_path, run_id: str = "search-run") -> RunnableConfig:
@@ -98,8 +101,10 @@ async def _fake_summarize(_model, text, *, config=None, model_name=None):
 
 def _patch_summarize(monkeypatch):
     """Avoid real LLM calls in the summarization step."""
-    monkeypatch.setattr(utils, "summarize_webpage", _fake_summarize)
-    monkeypatch.setattr(utils, "_build_summarization_model", lambda config: object())
+    monkeypatch.setattr(summarization, "summarize_webpage", _fake_summarize)
+    monkeypatch.setattr(
+        summarization, "build_summarization_model", lambda config: object()
+    )
 
 
 @pytest.mark.asyncio
@@ -125,11 +130,11 @@ async def test_openai_web_search_formats_sources_and_records_span(tmp_path, monk
     fake_client = _FakeOpenAIClient(
         lambda calls: _openai_response("Synthesized answer", sources, {"input_tokens": 10, "output_tokens": 20, "total_tokens": 30})
     )
-    monkeypatch.setattr(utils, "_build_openai_client", lambda cfg: fake_client)
+    monkeypatch.setattr(providers, "build_openai_client", lambda cfg: fake_client)
     _patch_summarize(monkeypatch)
 
     with recorder.start_run("search-run", user_id="user-1"):
-        tool = utils.openai_web_search
+        tool = openai_web_search
         result = (
             await tool.call(
                 tool.input_schema.model_validate({"queries": ["test query"]}),
@@ -165,11 +170,11 @@ async def test_anthropic_web_search_formats_sources_and_records_span(tmp_path, m
     fake_client = _FakeAnthropicClient(
         lambda calls: _anthropic_response("Synthesized answer", sources, {"input_tokens": 5, "output_tokens": 7, "total_tokens": 12})
     )
-    monkeypatch.setattr(utils, "_build_anthropic_client", lambda cfg: fake_client)
+    monkeypatch.setattr(providers, "build_anthropic_client", lambda cfg: fake_client)
     _patch_summarize(monkeypatch)
 
     with recorder.start_run("search-run", user_id="user-1"):
-        tool = utils.anthropic_web_search
+        tool = anthropic_web_search
         result = (
             await tool.call(
                 tool.input_schema.model_validate({"queries": ["test query"]}),
@@ -202,7 +207,7 @@ async def test_openai_web_search_retries_on_429(tmp_path, monkeypatch):
         return _openai_response("ok", [{"url": "https://example.com/c", "title": "C"}], {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})
 
     fake_client = _FakeOpenAIClient(responder)
-    monkeypatch.setattr(utils, "_build_openai_client", lambda cfg: fake_client)
+    monkeypatch.setattr(providers, "build_openai_client", lambda cfg: fake_client)
 
     async def _noop_sleep(_delay):
         return None
@@ -211,7 +216,7 @@ async def test_openai_web_search_retries_on_429(tmp_path, monkeypatch):
     _patch_summarize(monkeypatch)
 
     with recorder.start_run("search-run", user_id="user-1"):
-        tool = utils.openai_web_search
+        tool = openai_web_search
         result = (
             await tool.call(
                 tool.input_schema.model_validate({"queries": ["q"]}),

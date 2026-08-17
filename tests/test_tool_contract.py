@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from open_deep_research.tools.base import (
     Tool,
     ToolContext,
+    ToolEffect,
     ToolOrigin,
     ToolResult,
     build_tool,
@@ -50,6 +51,21 @@ def test_plain_structural_object_satisfies_tool_protocol():
         input_schema: type[BaseModel] = EchoInput
         origin: ToolOrigin = ToolOrigin.SYSTEM
         retryable: bool = False
+        effect: ToolEffect = ToolEffect.READ_ONLY
+        concurrency_safe: bool = False
+        max_output_chars: int | None = None
+
+        def prompt(self, config):
+            del config
+            return None
+
+        def is_enabled(self, config):
+            del config
+            return True
+
+        def egress_urls(self, input):
+            del input
+            return []
 
         async def description(self, input=None):
             return "plain"
@@ -108,3 +124,56 @@ async def test_model_projection_contains_schema_without_execution_hook():
 
 def test_non_string_output_uses_stable_json_serialization():
     assert serialize_tool_output({"z": 1, "a": 2}) == '{"a":2,"z":1}'
+
+
+def test_new_metadata_defaults_preserve_existing_behavior():
+    tool = _tool()
+
+    assert tool.effect is ToolEffect.READ_ONLY
+    assert tool.concurrency_safe is False
+    assert tool.prompt({}) is None
+    assert tool.is_enabled({}) is True
+    assert tool.egress_urls({"url": "https://example.com"}) == []
+    assert tool.max_output_chars is None
+
+
+def test_builder_accepts_declarative_prompt_availability_and_egress():
+    async def call(input, context, on_progress=None):
+        del context, on_progress
+        return ToolResult(output=input.text)
+
+    tool = build_tool(
+        name="declared",
+        description="Declared tool",
+        input_schema=EchoInput,
+        call=call,
+        origin=ToolOrigin.SYSTEM,
+        prompt=lambda config: f"mode={config['configurable']['mode']}",
+        is_enabled=lambda config: config["configurable"]["mode"] == "on",
+        egress_urls=lambda args: [args["url"]],
+        max_output_chars=512,
+    )
+    config = {"configurable": {"mode": "on"}}
+
+    assert tool.prompt(config) == "mode=on"
+    assert tool.is_enabled(config) is True
+    assert tool.egress_urls({"url": "https://example.com"}) == [
+        "https://example.com"
+    ]
+    assert tool.max_output_chars == 512
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "100"])
+def test_builder_rejects_invalid_output_budget(value):
+    async def call(input, context, on_progress=None):
+        return ToolResult(output=None)
+
+    with pytest.raises(ValueError, match="positive integer"):
+        build_tool(
+            name="bad-budget",
+            description="bad",
+            input_schema=EchoInput,
+            call=call,
+            origin=ToolOrigin.SYSTEM,
+            max_output_chars=value,
+        )

@@ -10,9 +10,11 @@ from langchain_core.tools import tool as lc_tool
 from open_deep_research.configuration import BrowserMCPConfig, Configuration
 from open_deep_research.prompts import research_system_prompt
 from open_deep_research.sandbox.policy import allowed_domains
-from open_deep_research.tools import utils
+from open_deep_research.tools import registry
 from open_deep_research.tools.governance import ToolOrigin, get_tool_origin
-from open_deep_research.tools.utils import get_all_tools, load_browser_mcp_tools
+from open_deep_research.tools.mcp import loader
+from open_deep_research.tools.mcp.loader import load_browser_mcp_tools
+from open_deep_research.tools.registry import get_all_tools
 
 
 @lc_tool
@@ -59,7 +61,7 @@ def test_browser_mcp_config_defaults_to_playwright_stdio() -> None:
 
 @pytest.mark.asyncio
 async def test_load_browser_mcp_tools_uses_stdio_connection_and_tags_origin(monkeypatch) -> None:
-    monkeypatch.setattr(utils, "MultiServerMCPClient", FakeMCPClient)
+    monkeypatch.setattr(loader, "MultiServerMCPClient", FakeMCPClient)
 
     tools = await load_browser_mcp_tools(
         {
@@ -94,7 +96,7 @@ async def test_browser_mcp_without_explicit_allowlist_does_not_discover(monkeypa
         def __init__(self, _connections):
             raise AssertionError("capability discovery must not run")
 
-    monkeypatch.setattr(utils, "MultiServerMCPClient", MustNotConnect)
+    monkeypatch.setattr(loader, "MultiServerMCPClient", MustNotConnect)
     tools = await load_browser_mcp_tools(
         {
             "configurable": {
@@ -114,7 +116,7 @@ async def test_http_surface_blocks_browser_stdio_before_discovery(monkeypatch) -
         def __init__(self, _connections):
             raise AssertionError("stdio discovery must not run on HTTP surface")
 
-    monkeypatch.setattr(utils, "MultiServerMCPClient", MustNotConnect)
+    monkeypatch.setattr(loader, "MultiServerMCPClient", MustNotConnect)
     tools = await load_browser_mcp_tools(
         {
             "configurable": {
@@ -141,7 +143,7 @@ async def test_instruction_shaped_mcp_description_is_not_bound(monkeypatch) -> N
         async def get_tools(self):
             return [malicious_browser_tool]
 
-    monkeypatch.setattr(utils, "MultiServerMCPClient", MaliciousClient)
+    monkeypatch.setattr(loader, "MultiServerMCPClient", MaliciousClient)
     tools = await load_browser_mcp_tools(
         {
             "configurable": {
@@ -167,8 +169,8 @@ async def test_get_all_tools_adds_browser_mcp_without_replacing_existing_mcp(mon
     async def fake_load_browser_mcp_tools(_config, _existing_tool_names):
         return [browser_navigate]
 
-    monkeypatch.setattr(utils, "load_mcp_tools", fake_load_mcp_tools)
-    monkeypatch.setattr(utils, "load_browser_mcp_tools", fake_load_browser_mcp_tools)
+    monkeypatch.setattr(registry, "load_mcp_tools", fake_load_mcp_tools)
+    monkeypatch.setattr(registry, "load_browser_mcp_tools", fake_load_browser_mcp_tools)
 
     tools = await get_all_tools(
         {
@@ -203,7 +205,11 @@ def test_allowed_domains_includes_browser_mcp_http_host() -> None:
 
 
 def test_research_prompt_describes_browser_exploration_fallback() -> None:
-    rendered = research_system_prompt.format(mcp_prompt="", date="June 24, 2026")
+    rendered = research_system_prompt.format(
+        tool_guidance="",
+        mcp_prompt="",
+        date="June 24, 2026",
+    )
 
     assert "browser exploration" in rendered
     assert "dynamic or JavaScript-rendered pages" in rendered

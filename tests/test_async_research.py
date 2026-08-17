@@ -398,39 +398,53 @@ class TestAsyncToolModels:
     """Verify Pydantic models construct and validate correctly."""
 
     def test_start_research_task_minimal(self):
-        from open_deep_research.tasks.async_tools import StartResearchTask
+        from open_deep_research.tools.supervisor.start_research_task import (
+            StartResearchTask,
+        )
         tool = StartResearchTask(research_topic="test topic")
         assert tool.research_topic == "test topic"
 
     def test_check_research_task(self):
-        from open_deep_research.tasks.async_tools import CheckResearchTask
+        from open_deep_research.tools.supervisor.check_research_task import (
+            CheckResearchTask,
+        )
         tool = CheckResearchTask(task_ids=["a", "b"])
         assert tool.task_ids == ["a", "b"]
 
     def test_list_research_tasks_no_filter(self):
-        from open_deep_research.tasks.async_tools import ListResearchTasks
+        from open_deep_research.tools.supervisor.list_research_tasks import (
+            ListResearchTasks,
+        )
         tool = ListResearchTasks()
         assert tool.status_filter is None
 
     def test_list_research_tasks_with_filter(self):
-        from open_deep_research.tasks.async_tools import ListResearchTasks
+        from open_deep_research.tools.supervisor.list_research_tasks import (
+            ListResearchTasks,
+        )
         tool = ListResearchTasks(status_filter="running")
         assert tool.status_filter == "running"
 
     def test_update_research_task(self):
-        from open_deep_research.tasks.async_tools import UpdateResearchTask
+        from open_deep_research.tools.supervisor.update_research_task import (
+            UpdateResearchTask,
+        )
         tool = UpdateResearchTask(task_id="x", instruction="add more sources")
         assert tool.task_id == "x"
         assert tool.instruction == "add more sources"
 
     def test_cancel_research_task(self):
-        from open_deep_research.tasks.async_tools import CancelResearchTask
+        from open_deep_research.tools.supervisor.cancel_research_task import (
+            CancelResearchTask,
+        )
         tool = CancelResearchTask(task_ids=["a"], reason="not needed")
         assert tool.task_ids == ["a"]
         assert tool.reason == "not needed"
 
     def test_approve_research_domain(self):
-        from open_deep_research.tasks.async_tools import ApproveResearchDomain
+        from open_deep_research.tools.supervisor.approve_research_domain import (
+            ApproveResearchDomain,
+        )
         tool = ApproveResearchDomain(task_id="x", domain="example.com", allow=True)
         assert tool.task_id == "x"
         assert tool.domain == "example.com"

@@ -14,7 +14,7 @@ from open_deep_research.model_resolution import (
     resolve_base_url,
     resolve_compatibility_kwargs,
 )
-from open_deep_research.tools import utils
+from open_deep_research.tools import model_limits
 
 
 @pytest.mark.parametrize(
@@ -142,7 +142,7 @@ def test_token_limit_prefers_exact_then_longest_match(
             ("openai:example[large]", 1_000),
         ]
     )
-    monkeypatch.setattr(utils, "MODEL_TOKEN_LIMITS", limits)
-    assert utils.get_model_token_limit("openai:example") == 100
-    assert utils.get_model_token_limit("openai:example[large]") == 1_000
-    assert utils.get_model_token_limit("proxy/openai:example[large]-v2") == 1_000
+    monkeypatch.setattr(model_limits, "MODEL_TOKEN_LIMITS", limits)
+    assert model_limits.get_model_token_limit("openai:example") == 100
+    assert model_limits.get_model_token_limit("openai:example[large]") == 1_000
+    assert model_limits.get_model_token_limit("proxy/openai:example[large]-v2") == 1_000

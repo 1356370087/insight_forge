@@ -22,10 +22,10 @@ from open_deep_research.security.inputs import (
     validate_http_metadata,
 )
 from open_deep_research.security.network import validate_public_http_url
-from open_deep_research.tools import utils as tool_utils
 from open_deep_research.tools.adapters import adapt_langchain_tool
 from open_deep_research.tools.base import ToolEffect, ToolOrigin
 from open_deep_research.tools.governance import AgentRole, execute_governed_tool_call
+from open_deep_research.tools.tavily_search import summarization
 
 
 def test_detects_multilingual_override_and_tool_inducement() -> None:
@@ -168,8 +168,12 @@ async def test_summarization_failure_never_returns_raw_external_content(monkeypa
     async def fail(*_args, **_kwargs):
         raise RuntimeError("model unavailable")
 
-    monkeypatch.setattr(tool_utils, "invoke_model_with_retry_observability", fail)
-    result = await tool_utils.summarize_webpage(object(), attack)
+    monkeypatch.setattr(
+        summarization,
+        "invoke_model_with_retry_observability",
+        fail,
+    )
+    result = await summarization.summarize_webpage(object(), attack)
 
     assert attack not in result
     assert "external_content_quarantined" in result

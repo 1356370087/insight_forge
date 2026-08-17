@@ -12,7 +12,7 @@ from open_deep_research import quality
 from open_deep_research.agents import deep_researcher
 from open_deep_research.report import assembly
 from open_deep_research.report.profiles import get_profile
-from open_deep_research.tools import utils
+from open_deep_research.tools.web_research import pipeline as tool_pipeline
 from open_deep_research.web.models import CandidateSource
 
 
@@ -139,7 +139,11 @@ async def test_web_rerank_entrypoint_uses_fallback(monkeypatch) -> None:
         title="A",
         snippet="Relevant source",
     )
-    monkeypatch.setattr(utils, "init_chat_model", lambda **_kwargs: _StructuredModelStub())
+    monkeypatch.setattr(
+        tool_pipeline,
+        "init_chat_model",
+        lambda **_kwargs: _StructuredModelStub(),
+    )
 
     async def fake_invoke(*_args, model_name=None, **_kwargs):
         calls.append(model_name)
@@ -156,8 +160,12 @@ async def test_web_rerank_entrypoint_uses_fallback(monkeypatch) -> None:
             ]
         )
 
-    monkeypatch.setattr(utils, "invoke_model_with_retry_observability", fake_invoke)
-    result = await utils._rerank_web_candidates(
+    monkeypatch.setattr(
+        tool_pipeline,
+        "invoke_model_with_retry_observability",
+        fake_invoke,
+    )
+    result = await tool_pipeline._rerank_web_candidates(
         "objective",
         [candidate],
         _fallback_config("summarization", "openai:primary", "anthropic:fallback"),

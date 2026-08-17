@@ -9,6 +9,7 @@ from open_deep_research.prompts import (
 def _render_supervisor_prompt(template: str) -> str:
     return template.format(
         date="2026-07-14",
+        tool_guidance="Dynamically rendered tools for this run.",
         max_concurrent_research_units=5,
         max_researcher_iterations=6,
         max_react_tool_calls=12,
