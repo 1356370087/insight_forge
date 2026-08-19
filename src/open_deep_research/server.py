@@ -33,7 +33,7 @@ from open_deep_research.logging_config import (
     configure_logging,
     current_request_id,
 )
-from open_deep_research.model_circuit import get_model_circuit_registry
+from open_deep_research.models.circuit import get_model_circuit_registry
 from open_deep_research.observability import SQLiteTraceStore, get_trace_recorder
 from open_deep_research.observability.telemetry import get_prometheus_metrics
 from open_deep_research.public_events import (

@@ -31,7 +31,7 @@ from langchain_core.messages import (
 from langchain_core.runnables import RunnableConfig
 
 from open_deep_research.configuration import Configuration
-from open_deep_research.model_circuit import (
+from open_deep_research.models.circuit import (
     CircuitFailureKind,
     CircuitOpenError,
     CircuitPermit,
@@ -1881,7 +1881,7 @@ async def invoke_model_with_retry_observability(
                 if not retryable or attempts_made >= max_attempts:
                     if circuit_breaker is not None and circuit_permit is not None:
                         try:
-                            from open_deep_research.model_fallback import (
+                            from open_deep_research.models.fallback import (
                                 classify_model_error,
                             )
 

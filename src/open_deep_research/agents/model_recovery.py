@@ -8,22 +8,22 @@ from dataclasses import dataclass
 from langchain_core.messages import BaseMessage, HumanMessage
 
 from open_deep_research.agents.research_context import response_was_truncated
-from open_deep_research.model_fallback import (
+from open_deep_research.models.fallback import (
     ModelCandidate as ModelCandidate,
 )
-from open_deep_research.model_fallback import (
+from open_deep_research.models.fallback import (
     ModelErrorKind,
 )
-from open_deep_research.model_fallback import (
+from open_deep_research.models.fallback import (
     build_model_candidate_chain as build_model_candidate_chain,
 )
-from open_deep_research.model_fallback import (
+from open_deep_research.models.fallback import (
     classify_model_error as classify_model_error,
 )
-from open_deep_research.model_fallback import (
+from open_deep_research.models.fallback import (
     invoke_with_model_fallback as invoke_with_model_fallback,
 )
-from open_deep_research.model_fallback import (
+from open_deep_research.models.fallback import (
     sanitize_messages_for_model_fallback as sanitize_messages_for_model_fallback,
 )
 
@@ -154,7 +154,7 @@ def resolve_model_context_window(
     unknown_default: int = 32_768,
 ) -> int:
     """Resolve a model window without an unsafe unknown-model 200K default."""
-    from open_deep_research.tools.model_limits import get_model_token_limit
+    from open_deep_research.models.limits import get_model_token_limit
 
     if overrides and model_name in overrides:
         return max(1, int(overrides[model_name]))

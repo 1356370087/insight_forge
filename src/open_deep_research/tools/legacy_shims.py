@@ -13,7 +13,7 @@ from langchain_core.messages import (
 )
 from langchain_core.runnables import RunnableConfig
 
-from open_deep_research.model_resolution import resolve_api_key, resolve_base_url
+from open_deep_research.models.resolution import resolve_api_key, resolve_base_url
 
 
 def clear_run_web_budget(run_id: str) -> None:

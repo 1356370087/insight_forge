@@ -10,7 +10,7 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import InjectedToolArg, tool
 
 from open_deep_research.configuration import Configuration, SearchAPI
-from open_deep_research.model_resolution import build_model_config
+from open_deep_research.models.resolution import build_model_config
 from open_deep_research.state import Summary
 from open_deep_research.tools.adapters import adapt_langchain_tool
 from open_deep_research.tools.availability import provider_search_enabled

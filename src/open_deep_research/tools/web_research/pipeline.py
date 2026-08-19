@@ -26,8 +26,8 @@ from open_deep_research.configuration import (
     Configuration,
     SearchAPI,
 )
-from open_deep_research.model_fallback import invoke_with_model_fallback
-from open_deep_research.model_resolution import build_model_config
+from open_deep_research.models.fallback import invoke_with_model_fallback
+from open_deep_research.models.resolution import build_model_config
 from open_deep_research.observability import (
     get_trace_recorder,
     invoke_model_with_retry_observability,

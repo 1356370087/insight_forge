@@ -23,7 +23,7 @@ from open_deep_research.memory.store import (
     MemoryRecord,
     MemorySourceKind,
 )
-from open_deep_research.model_resolution import build_model_config
+from open_deep_research.models.resolution import build_model_config
 from open_deep_research.observability import (
     apply_helicone_config,
     get_trace_recorder,

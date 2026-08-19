@@ -11,8 +11,8 @@ from langchain_core.messages import BaseMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 
 from open_deep_research.configuration import Configuration
-from open_deep_research.model_fallback import invoke_with_model_fallback
-from open_deep_research.model_resolution import build_model_config
+from open_deep_research.models.fallback import invoke_with_model_fallback
+from open_deep_research.models.resolution import build_model_config
 from open_deep_research.observability import invoke_model_with_retry_observability
 from open_deep_research.prompts import summarize_webpage_prompt
 from open_deep_research.state import Summary

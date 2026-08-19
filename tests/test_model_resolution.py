@@ -6,7 +6,8 @@ from collections import OrderedDict
 
 import pytest
 
-from open_deep_research.model_resolution import (
+from open_deep_research.models import limits as model_limits
+from open_deep_research.models.resolution import (
     build_model_config,
     get_configurable_model_template,
     parse_model_spec,
@@ -14,7 +15,6 @@ from open_deep_research.model_resolution import (
     resolve_base_url,
     resolve_compatibility_kwargs,
 )
-from open_deep_research.tools import model_limits
 
 
 @pytest.mark.parametrize(

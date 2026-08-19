@@ -53,7 +53,7 @@ from open_deep_research.budgets import (
     DeadlineExceeded,
 )
 from open_deep_research.configuration import Configuration
-from open_deep_research.model_circuit import (
+from open_deep_research.models.circuit import (
     get_model_circuit_registry,
     model_circuit_policy_from_configuration,
 )

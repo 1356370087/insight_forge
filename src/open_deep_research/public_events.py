@@ -283,7 +283,7 @@ async def summarize_public_findings(
         from langchain.chat_models import init_chat_model
         from langchain_core.messages import HumanMessage
 
-        from open_deep_research.model_resolution import build_model_config
+        from open_deep_research.models.resolution import build_model_config
 
         model = init_chat_model(**build_model_config(
             configurable.summarization_model,

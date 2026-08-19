@@ -7,13 +7,13 @@ from :mod:`open_deep_research.tools.registry`.
 
 from langchain.chat_models import init_chat_model
 
+from open_deep_research.models.limits import *  # noqa: F403
 from open_deep_research.tools.anthropic_web_search import anthropic_web_search
 from open_deep_research.tools.fetch_url import fetch_url
 from open_deep_research.tools.fetch_webpage import fetch_webpage
 from open_deep_research.tools.legacy_shims import *  # noqa: F403
 from open_deep_research.tools.mcp import load_browser_mcp_tools, load_mcp_tools
 from open_deep_research.tools.mcp.loader import MultiServerMCPClient
-from open_deep_research.tools.model_limits import *  # noqa: F403
 from open_deep_research.tools.openai_web_search import openai_web_search
 from open_deep_research.tools.registry import get_all_tools, get_search_tool
 from open_deep_research.tools.tavily_search import tavily_search

@@ -35,7 +35,7 @@ from open_deep_research.agents.query_state import (
 )
 from open_deep_research.agents.tool_protocol import validate_tool_transcript
 from open_deep_research.configuration import Configuration
-from open_deep_research.model_circuit import (
+from open_deep_research.models.circuit import (
     CircuitFailureKind,
     get_model_circuit_registry,
     model_circuit_policy_from_configuration,

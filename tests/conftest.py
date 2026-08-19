@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from dotenv import dotenv_values
 
-from open_deep_research.model_circuit import _reset_model_circuit_registry
+from open_deep_research.models.circuit import _reset_model_circuit_registry
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _ENV_AT_PYTEST_START = frozenset(os.environ)

@@ -20,8 +20,8 @@ from open_deep_research.agents.research_context import (
 )
 from open_deep_research.configuration import Configuration
 from open_deep_research.evidence import source_scoped_evidence_records
-from open_deep_research.model_fallback import invoke_with_model_fallback
-from open_deep_research.model_resolution import (
+from open_deep_research.models.fallback import invoke_with_model_fallback
+from open_deep_research.models.resolution import (
     build_model_config,
     get_configurable_model_template,
 )

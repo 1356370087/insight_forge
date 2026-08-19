@@ -13,7 +13,7 @@ from open_deep_research.configuration import (
     Configuration,
     freeze_run_config,
 )
-from open_deep_research.model_circuit import (
+from open_deep_research.models.circuit import (
     CircuitFailureKind,
     CircuitOpenError,
     ModelCircuitBreaker,
@@ -23,7 +23,7 @@ from open_deep_research.model_circuit import (
     get_model_circuit_registry,
     model_circuit_policy_from_configuration,
 )
-from open_deep_research.model_fallback import invoke_with_model_fallback
+from open_deep_research.models.fallback import invoke_with_model_fallback
 from open_deep_research.observability import core as observability_core
 from open_deep_research.observability import invoke_model_with_retry_observability
 from open_deep_research.public_events import sanitize_public_payload
@@ -292,7 +292,7 @@ def test_registry_policy_mismatch_fails_open_without_replacement(
     first = registry.get_or_create("openai:test", original)
 
     assert first is not None
-    with caplog.at_level("WARNING", logger="open_deep_research.model_circuit"):
+    with caplog.at_level("WARNING", logger="open_deep_research.models.circuit"):
         assert registry.get_or_create("openai:test", changed) is None
         assert registry.get_or_create("openai:test", changed) is None
     assert registry.get("openai:test") is first

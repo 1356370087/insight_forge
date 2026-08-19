@@ -9,8 +9,8 @@ from typing import Any
 from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
 
-from open_deep_research.model_capabilities import dashscope_qwen_enable_thinking
-from open_deep_research.model_resolution import (
+from open_deep_research.models.capabilities import dashscope_qwen_enable_thinking
+from open_deep_research.models.resolution import (
     is_dashscope_qwen,
     parse_model_spec,
     resolve_api_key,

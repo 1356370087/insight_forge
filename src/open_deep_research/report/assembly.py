@@ -26,9 +26,10 @@ from open_deep_research.evidence import (
     contract_has_source_constraints,
     source_scoped_evidence_records,
 )
-from open_deep_research.model_errors import is_token_limit_exceeded
-from open_deep_research.model_fallback import invoke_with_model_fallback
-from open_deep_research.model_resolution import (
+from open_deep_research.models.errors import is_token_limit_exceeded
+from open_deep_research.models.fallback import invoke_with_model_fallback
+from open_deep_research.models.limits import get_model_token_limit
+from open_deep_research.models.resolution import (
     build_model_config,
     get_configurable_model_template,
 )
@@ -44,7 +45,6 @@ from open_deep_research.prompts import (
 )
 from open_deep_research.skills import get_skill_report_context
 from open_deep_research.tools.legacy_shims import get_today_str
-from open_deep_research.tools.model_limits import get_model_token_limit
 
 from .coverage import derive_state_coverage_checklist, render_coverage_checklist
 from .models import ReportOutline, SectionSpec, SourceRef, WrittenSection

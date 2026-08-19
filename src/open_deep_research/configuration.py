@@ -188,7 +188,7 @@ def _resolve_quality_rigor(
 
 def get_model_compatibility_kwargs(model_name: str) -> dict[str, Any]:
     """Compatibility shim for the shared model-resolution layer."""
-    from open_deep_research.model_resolution import (
+    from open_deep_research.models.resolution import (
         resolve_compatibility_kwargs,
     )
 

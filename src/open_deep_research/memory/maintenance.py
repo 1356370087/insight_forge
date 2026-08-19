@@ -18,7 +18,7 @@ from open_deep_research.memory.lifecycle import (
     maintain_user_memories,
 )
 from open_deep_research.memory.store import NoopMemoryStore, create_memory_store
-from open_deep_research.model_resolution import get_configurable_model_template
+from open_deep_research.models.resolution import get_configurable_model_template
 
 # Backward-compatible patch point for tests and integrations.  The implementation
 # now delegates to the shared lazy template instead of constructing a second one.

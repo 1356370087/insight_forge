@@ -16,7 +16,7 @@ from pydantic import BaseModel
 
 from open_deep_research.configuration import Configuration
 from open_deep_research.evaluation import JudgeConfig, build_judge_model
-from open_deep_research.model_capabilities import dashscope_qwen_enable_thinking
+from open_deep_research.models.capabilities import dashscope_qwen_enable_thinking
 from open_deep_research.quality import (
     _build_quality_model,
     _content_text,
