@@ -958,6 +958,72 @@ class Configuration(BaseModel):
             }
         }
     )
+    inflight_run_memory_retention_seconds: float = Field(
+        default=600,
+        ge=0,
+        description="Seconds to retain a terminal run in process memory.",
+    )
+    max_inflight_runs_in_memory: int = Field(
+        default=100,
+        ge=1,
+        description="Maximum in-memory run records before terminal LRU eviction.",
+    )
+    inflight_event_buffer_size: int = Field(
+        default=200,
+        ge=1,
+        description="Maximum recent runtime events retained per in-memory run.",
+    )
+    shutdown_drain_timeout_seconds: float = Field(
+        default=30,
+        ge=0,
+        description="Total graceful-shutdown budget for interrupting live runs.",
+    )
+    run_recovery_sweep_on_startup: bool = Field(
+        default=True,
+        description="Mark non-terminal runs with expired leases interrupted at startup.",
+    )
+    runs_dir_max_bytes: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Advisory maximum size of runs_dir in bytes; zero disables quota alerts."
+        ),
+    )
+    retention_sweep_interval_seconds: float = Field(
+        default=3600,
+        ge=0,
+        description="Seconds between durable run retention sweeps; zero disables them.",
+    )
+    run_retention_days: float = Field(
+        default=30,
+        ge=0,
+        description="Days to retain terminal run directories; zero retains forever.",
+    )
+    trace_retention_days: float | None = Field(
+        default=None,
+        ge=0,
+        description="Days to retain SQLite traces; null follows run_retention_days.",
+    )
+    api_run_create_per_minute: int = Field(
+        default=10,
+        ge=0,
+        description="Per-principal run creation requests allowed per minute; zero disables.",
+    )
+    max_concurrent_runs_per_user: int = Field(
+        default=3,
+        ge=0,
+        description="Process-local active run cap per principal; zero disables.",
+    )
+    max_concurrent_sse_connections: int = Field(
+        default=50,
+        ge=0,
+        description="Process-local concurrent SSE connection cap; zero disables.",
+    )
+    max_request_body_bytes: int = Field(
+        default=2 * 1024 * 1024,
+        ge=1024,
+        description="Maximum HTTP request body size accepted by the API.",
+    )
     task_timeout_seconds: int = Field(
         default=600,
         metadata={
@@ -1524,11 +1590,15 @@ class Configuration(BaseModel):
     )
     memory_fail_open: bool = Field(
         default=True,
+        description=(
+            "Legacy compatibility switch. Post-report memory side effects are always "
+            "non-terminal so a completed report cannot be turned into a failed run."
+        ),
         metadata={
             "x_oap_ui_config": {
                 "type": "boolean",
                 "default": True,
-                "description": "If True, memory write failures are logged but never block the final report."
+                "description": "Compatibility setting; post-report memory failures never fail a completed run."
             }
         }
     )
@@ -1538,7 +1608,21 @@ class Configuration(BaseModel):
     )
     memory_decay_enabled: bool = Field(
         default=True,
-        description="Enable Mem0 Platform v3 project-level access decay when advanced memory is active.",
+        description="Deployment-level desired Mem0 Platform decay state; apply it explicitly with the maintenance CLI.",
+    )
+    memory_legacy_recall_enabled: bool = Field(
+        default=False,
+        description="Also recall immutable schema-v1 memories while schema-v2 is enabled.",
+    )
+    memory_run_end_maintenance_enabled: bool = Field(
+        default=False,
+        description="Schedule full reflection/profile/forgetting maintenance after a run; daily CLI maintenance is preferred.",
+    )
+    memory_mutation_lock_timeout_seconds: float = Field(
+        default=5.0,
+        ge=0.0,
+        le=30.0,
+        description="Maximum wait for a concurrent per-user memory writer before skipping advisory writes.",
     )
     memory_reflection_enabled: bool = Field(default=True)
     memory_profile_enabled: bool = Field(default=True)
@@ -1552,6 +1636,7 @@ class Configuration(BaseModel):
     memory_reflection_observation_threshold: int = Field(default=5, ge=1)
     memory_reflection_importance_threshold: int = Field(default=25, ge=1)
     memory_reflection_max_age_hours: int = Field(default=24, ge=1)
+    memory_maintenance_max_input_chars: int = Field(default=30000, ge=1000, le=200000)
     memory_profile_max_chars: int = Field(default=4000, ge=512, le=4000)
     memory_v2_app_suffix: str = Field(default=".v2", min_length=1, max_length=32)
     memory_half_life_days: dict[str, int] = Field(

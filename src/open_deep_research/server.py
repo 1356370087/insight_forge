@@ -9,21 +9,32 @@ import html
 import json
 import logging
 import os
+import re
+import shutil
 import time
+import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
 from open_deep_research.agents.query_engine import QueryEngine
+from open_deep_research.api_governance import ConnectionLimiter, FixedWindowRateLimiter
 from open_deep_research.configuration import Configuration
-from open_deep_research.observability import SQLiteTraceStore
+from open_deep_research.logging_config import (
+    bind_request_id,
+    configure_logging,
+    current_request_id,
+)
+from open_deep_research.observability import SQLiteTraceStore, get_trace_recorder
+from open_deep_research.observability.telemetry import get_prometheus_metrics
 from open_deep_research.public_events import (
     PUBLIC_EVENT_SCHEMA_VERSION,
     PublicEvent,
@@ -49,9 +60,11 @@ from open_deep_research.security.inputs import (
     validate_http_configurable,
     validate_http_metadata,
 )
+from open_deep_research.tasks.lease import LeaderLeaseManager, LeaseConflictError
 from security.rbac import (
     Principal,
     apply_principal_to_config,
+    check_database_connection,
     mount_rbac,
     register_ownership_checker,
     require_active_user,
@@ -74,6 +87,7 @@ from security.rbac.permissions import (
 from security.rbac.settings import get_settings as get_iam_settings
 
 load_dotenv()
+configure_logging()
 
 
 class RunRequest(BaseModel):
@@ -117,23 +131,100 @@ class RunRecord:
     run_id: str
     engine: QueryEngine
     status: str = "pending"
-    events: list[dict[str, Any]] = field(default_factory=list)
+    events: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=200))
     result: dict[str, Any] | None = None
     task: asyncio.Task | None = None
+    finished_at: float | None = None
 
 
 @contextlib.asynccontextmanager
 async def _lifespan(_app: FastAPI):
-    """Validate IAM before serving and release its pool on shutdown."""
+    """Run startup recovery and gracefully interrupt live work on shutdown."""
+    global _retention_sweep_task
+    _shutting_down.clear()
+    _sse_shutdown.clear()
     await startup_checks()
     await assert_schema_current()
+    configurable = Configuration.from_runnable_config(None)
+    if configurable.run_recovery_sweep_on_startup:
+        try:
+            await _run_recovery_sweep(configurable)
+        except Exception as exc:  # noqa: BLE001 - recovery is fail-open
+            logger.warning("run recovery sweep failed: %s", exc)
+    if configurable.retention_sweep_interval_seconds > 0:
+        _retention_sweep_task = asyncio.create_task(
+            _retention_sweep_loop(configurable)
+        )
     try:
         yield
     finally:
-        await shutdown_rbac()
+        _shutting_down.set()
+        try:
+            await _drain_inflight_runs(
+                configurable.shutdown_drain_timeout_seconds
+            )
+        finally:
+            _sse_shutdown.set()
+            if _retention_sweep_task is not None:
+                _retention_sweep_task.cancel()
+                await asyncio.gather(_retention_sweep_task, return_exceptions=True)
+                _retention_sweep_task = None
+            for task in list(_run_eviction_tasks.values()):
+                task.cancel()
+            if _run_eviction_tasks:
+                await asyncio.gather(
+                    *_run_eviction_tasks.values(),
+                    return_exceptions=True,
+                )
+            _run_eviction_tasks.clear()
+            await shutdown_rbac()
 
 
 app = FastAPI(title="Open Deep Research", version="0.1.0", lifespan=_lifespan)
+
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next: Any) -> Response:
+    """Bind and echo a gateway request ID for logs, runs, and traces."""
+    supplied = str(request.headers.get("X-Request-ID") or "").strip()
+    request_id = (
+        supplied
+        if 0 < len(supplied) <= 128
+        and re.fullmatch(r"[A-Za-z0-9._:-]+", supplied)
+        else str(uuid.uuid4())
+    )
+    bind_request_id(request_id)
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
+@app.middleware("http")
+async def request_body_limit_middleware(request: Request, call_next: Any) -> Response:
+    """Reject declared and streaming request bodies above the configured cap."""
+    if request.method not in {"POST", "PUT", "PATCH"}:
+        return await call_next(request)
+    limit = Configuration.from_runnable_config(None).max_request_body_bytes
+    content_length = request.headers.get("Content-Length")
+    if content_length is not None:
+        try:
+            if int(content_length) > limit:
+                return JSONResponse(
+                    {"detail": "request_body_too_large"},
+                    status_code=413,
+                )
+        except ValueError:
+            return JSONResponse({"detail": "invalid_content_length"}, status_code=400)
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > limit:
+            return JSONResponse(
+                {"detail": "request_body_too_large"},
+                status_code=413,
+            )
+    request._body = bytes(body)  # noqa: SLF001 - Starlette replays the bounded body
+    return await call_next(request)
 _allowed_origins = [
     item.strip()
     for item in os.environ.get(
@@ -146,7 +237,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "Last-Event-ID"],
 )
 
@@ -184,7 +275,151 @@ register_ownership_checker("task", _rbac_task_owner_checker)
 
 logger = logging.getLogger(__name__)
 _runs: dict[str, RunRecord] = {}
+_run_eviction_tasks: dict[str, asyncio.Task[None]] = {}
+_retention_sweep_task: asyncio.Task[None] | None = None
+_api_rate_limiter = FixedWindowRateLimiter()
+_sse_connection_limiter = ConnectionLimiter()
+_shutting_down = asyncio.Event()
+_sse_shutdown = asyncio.Event()
+_TERMINAL_RUN_STATUSES = frozenset(
+    {"success", "completed", "failed", "interrupted", "cancelled"}
+)
 _metrics_path = Configuration.from_runnable_config(None).prometheus_metrics_path
+
+
+def _new_run_record(
+    *,
+    run_id: str,
+    engine: QueryEngine,
+    status: str,
+    config: dict[str, Any] | None,
+) -> RunRecord:
+    """Build a run record with the configured bounded event buffer."""
+    configurable = Configuration.from_runnable_config(config)
+    return RunRecord(
+        run_id=run_id,
+        engine=engine,
+        status=status,
+        events=deque(maxlen=configurable.inflight_event_buffer_size),
+    )
+
+
+def _evict_run_record(
+    run_id: str,
+    *,
+    expected_finished_at: float,
+    reason: str,
+) -> bool:
+    """Evict the matching terminal record without touching a resumed replacement."""
+    record = _runs.get(run_id)
+    if (
+        record is None
+        or record.status not in _TERMINAL_RUN_STATUSES
+        or record.finished_at != expected_finished_at
+    ):
+        return False
+    _runs.pop(run_id, None)
+    eviction_task = _run_eviction_tasks.pop(run_id, None)
+    try:
+        current_task = asyncio.current_task()
+    except RuntimeError:
+        current_task = None
+    if eviction_task is not None and eviction_task is not current_task:
+        eviction_task.cancel()
+    logger.info(
+        "run.evicted actor=system action=run.evicted run_id=%s reason=%s",
+        run_id,
+        reason,
+        extra={
+            "actor": "system",
+            "action": "run.evicted",
+            "run_id": run_id,
+            "reason": reason,
+        },
+    )
+    return True
+
+
+def _enforce_run_memory_limit(maximum: int) -> None:
+    """Evict least-recently-finished terminal runs until the soft cap is met."""
+    while len(_runs) > maximum:
+        candidates = [
+            record
+            for record in _runs.values()
+            if record.status in _TERMINAL_RUN_STATUSES
+            and record.finished_at is not None
+        ]
+        if not candidates:
+            return
+        oldest = min(candidates, key=lambda item: item.finished_at or 0.0)
+        _evict_run_record(
+            oldest.run_id,
+            expected_finished_at=oldest.finished_at or 0.0,
+            reason="capacity",
+        )
+
+
+def _remember_run(record: RunRecord, config: dict[str, Any] | None) -> None:
+    """Register a live run and enforce the process-local record cap."""
+    configurable = Configuration.from_runnable_config(config)
+    if record.events.maxlen != configurable.inflight_event_buffer_size:
+        record.events = deque(
+            record.events,
+            maxlen=configurable.inflight_event_buffer_size,
+        )
+    stale_task = _run_eviction_tasks.pop(record.run_id, None)
+    if stale_task is not None:
+        stale_task.cancel()
+    _runs[record.run_id] = record
+    _enforce_run_memory_limit(configurable.max_inflight_runs_in_memory)
+
+
+async def _evict_run_after_delay(
+    run_id: str,
+    expected_finished_at: float,
+    delay_seconds: float,
+) -> None:
+    """Evict a terminal run after its configured in-memory grace period."""
+    try:
+        if delay_seconds > 0:
+            await asyncio.sleep(delay_seconds)
+        _evict_run_record(
+            run_id,
+            expected_finished_at=expected_finished_at,
+            reason="retention",
+        )
+    finally:
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
+        if _run_eviction_tasks.get(run_id) is current_task:
+            _run_eviction_tasks.pop(run_id, None)
+
+
+def _schedule_run_eviction(
+    record: RunRecord,
+    config: dict[str, Any] | None,
+) -> None:
+    """Mark a terminal record finished and schedule bounded retention."""
+    if record.status not in _TERMINAL_RUN_STATUSES:
+        return
+    if record.finished_at is None:
+        record.finished_at = time.time()
+    configurable = Configuration.from_runnable_config(config)
+    _enforce_run_memory_limit(configurable.max_inflight_runs_in_memory)
+    if _runs.get(record.run_id) is not record:
+        return
+    previous = _run_eviction_tasks.pop(record.run_id, None)
+    if previous is not None:
+        previous.cancel()
+    _run_eviction_tasks[record.run_id] = asyncio.create_task(
+        _evict_run_after_delay(
+            record.run_id,
+            record.finished_at,
+            configurable.inflight_run_memory_retention_seconds,
+        )
+    )
 
 FRONTEND_EDITABLE_CONFIG_KEYS = (
     "allow_clarification", "enable_async_research", "enable_human_in_loop",
@@ -206,18 +441,155 @@ FRONTEND_EDITABLE_CONFIG_KEYS = (
     "enable_memory", "memory_top_k", "memory_min_confidence", "memory_auto_write",
     "memory_write_after_report", "memory_fail_open", "memory_advanced_enabled",
     "memory_decay_enabled", "memory_reflection_enabled", "memory_profile_enabled",
+    "memory_legacy_recall_enabled", "memory_run_end_maintenance_enabled",
+    "memory_mutation_lock_timeout_seconds",
     "memory_soft_forgetting_enabled", "memory_verified_insights_enabled",
     "memory_search_threshold", "memory_search_rerank", "memory_importance_weight",
     "memory_relevance_weight", "memory_recency_weight",
     "memory_reflection_observation_threshold", "memory_reflection_importance_threshold",
-    "memory_reflection_max_age_hours", "memory_profile_max_chars", "memory_half_life_days",
+    "memory_reflection_max_age_hours", "memory_maintenance_max_input_chars",
+    "memory_profile_max_chars", "memory_half_life_days",
 )
+
+
+def _runs_dir_size_bytes(root: Path) -> int:
+    """Return durable artifact bytes without following symlinks outside runs_dir."""
+    if not root.exists():
+        return 0
+    total = 0
+    for path in root.rglob("*"):
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+            total += path.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+async def _refresh_operational_metrics() -> None:
+    """Refresh scrape-time gauges while keeping metrics export fail-open."""
+    configurable = Configuration.from_runnable_config(None)
+    metrics = get_prometheus_metrics(configurable)
+    if metrics is None:
+        return
+    try:
+        used_bytes = await asyncio.to_thread(
+            _runs_dir_size_bytes,
+            Path(configurable.runs_dir),
+        )
+        metrics.set_runs_dir_usage(used_bytes, configurable.runs_dir_max_bytes)
+    except Exception as exc:  # noqa: BLE001 - metrics must never block the API
+        with contextlib.suppress(Exception):
+            metrics.observe_export_error("prometheus", "runs_dir_usage")
+        logger.debug("Unable to refresh runs_dir metrics: %s", exc)
 
 
 @app.get(_metrics_path, include_in_schema=False)
 async def prometheus_metrics() -> Response:
     """Expose process-wide aggregate metrics for Prometheus scraping."""
+    await _refresh_operational_metrics()
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.get("/healthz", include_in_schema=False)
+async def healthz() -> dict[str, str]:
+    """Report process liveness without consulting dependencies."""
+    return {"status": "ok"}
+
+
+def _probe_runs_directory(configurable: Configuration) -> None:
+    """Raise unless the configured run directory supports create and delete."""
+    root = Path(configurable.runs_dir).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    probe = root / f".readiness-{uuid.uuid4().hex}.tmp"
+    try:
+        probe.write_bytes(b"ok")
+    finally:
+        with contextlib.suppress(OSError):
+            probe.unlink()
+
+
+def _search_readiness(configurable: Configuration) -> dict[str, str]:
+    """Describe search credential availability without making network calls."""
+    provider = getattr(configurable.search_api, "value", str(configurable.search_api))
+    if provider == "none":
+        return {"status": "disabled", "provider": provider}
+    key_name = {
+        "tavily": "TAVILY_API_KEY",
+        "openai": "OPENAI_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+    }.get(provider)
+    if key_name and os.environ.get(key_name):
+        return {"status": "ok", "provider": provider}
+    return {"status": "degraded", "provider": provider, "reason": "api_key_missing"}
+
+
+async def _readiness_report() -> tuple[dict[str, Any], bool]:
+    """Probe critical local dependencies and non-critical search credentials."""
+    configurable = Configuration.from_runnable_config(None)
+    components: dict[str, dict[str, Any]] = {}
+    critical_ok = True
+
+    if _shutting_down.is_set():
+        components["server"] = {"status": "failed", "reason": "shutting_down"}
+        critical_ok = False
+    else:
+        components["server"] = {"status": "ok"}
+
+    try:
+        await asyncio.to_thread(_probe_runs_directory, configurable)
+        components["runs_dir"] = {"status": "ok"}
+    except Exception as exc:  # noqa: BLE001 - readiness reports the failure
+        components["runs_dir"] = {
+            "status": "failed",
+            "error_type": type(exc).__name__,
+        }
+        critical_ok = False
+
+    if configurable.observability_enabled and configurable.sqlite_observability_enabled:
+        try:
+            store = await asyncio.to_thread(
+                SQLiteTraceStore,
+                configurable.trace_store_path,
+            )
+            await asyncio.to_thread(store.ping)
+            components["trace_store"] = {"status": "ok"}
+        except Exception as exc:  # noqa: BLE001 - readiness reports the failure
+            components["trace_store"] = {
+                "status": "failed",
+                "error_type": type(exc).__name__,
+            }
+            critical_ok = False
+    else:
+        components["trace_store"] = {"status": "disabled"}
+
+    iam_settings = get_iam_settings()
+    if iam_settings.database_url:
+        try:
+            await check_database_connection(iam_settings)
+            components["iam_database"] = {"status": "ok"}
+        except Exception as exc:  # noqa: BLE001 - readiness reports the failure
+            components["iam_database"] = {
+                "status": "failed",
+                "error_type": type(exc).__name__,
+            }
+            critical_ok = False
+    else:
+        components["iam_database"] = {"status": "disabled"}
+
+    components["search"] = _search_readiness(configurable)
+    overall_status = "ok" if critical_ok else "failed"
+    if critical_ok and components["search"]["status"] == "degraded":
+        overall_status = "degraded"
+    return {"status": overall_status, "components": components}, critical_ok
+
+
+@app.get("/readyz", include_in_schema=False)
+async def readyz() -> JSONResponse:
+    """Report whether this process can safely receive new traffic."""
+    report, ready = await _readiness_report()
+    return JSONResponse(report, status_code=200 if ready else 503)
 
 
 def _sse(event: PublicEvent) -> str:
@@ -256,6 +628,8 @@ async def _public_event_iterator(
     last_output_at = asyncio.get_running_loop().time()
     last_auth_at = last_output_at
     while True:
+        if _sse_shutdown.is_set():
+            return
         now = asyncio.get_running_loop().time()
         if (
             principal is not None
@@ -297,6 +671,8 @@ async def _task_activity_iterator(
     last_output_at = asyncio.get_running_loop().time()
     last_auth_at = last_output_at
     while True:
+        if _sse_shutdown.is_set():
+            return
         now = asyncio.get_running_loop().time()
         if (
             principal is not None
@@ -339,7 +715,11 @@ def _config_from_request(request: RunRequest, principal: Principal) -> dict[str,
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     config = {
         "configurable": dict(request.configurable),
-        "metadata": {**request.metadata, "deployment_surface": "http"},
+        "metadata": {
+            **request.metadata,
+            "deployment_surface": "http",
+            "request_id": current_request_id(),
+        },
     }
     return apply_principal_to_config(config, principal)
 
@@ -352,6 +732,130 @@ def _observability_store() -> SQLiteTraceStore:
 def _user_identity(user: Principal) -> str:
     """Return the normalized authenticated identity used by run ownership checks."""
     return user.user_id
+
+
+def _principal_kind(user: Principal) -> str:
+    """Return a bounded metric label for authenticated principal provenance."""
+    return "development" if user.user_id == "local-dev-user" else "authenticated"
+
+
+def _api_governance_metrics(configurable: Configuration) -> Any:
+    return get_prometheus_metrics(configurable)
+
+
+def _observe_rate_limited(
+    configurable: Configuration,
+    dimension: str,
+    user: Principal,
+) -> None:
+    metrics = _api_governance_metrics(configurable)
+    if metrics is not None:
+        with contextlib.suppress(Exception):
+            metrics.observe_api_rate_limited(dimension, _principal_kind(user))
+    logger.info(
+        "API request rate limited",
+        extra={
+            "actor": _user_identity(user),
+            "action": "api.rate_limited",
+            "dimension": dimension,
+            "principal_kind": _principal_kind(user),
+        },
+    )
+
+
+def _observe_limiter_error(
+    configurable: Configuration,
+    dimension: str,
+    exc: BaseException,
+) -> None:
+    metrics = _api_governance_metrics(configurable)
+    if metrics is not None:
+        with contextlib.suppress(Exception):
+            metrics.observe_rate_limiter_error(dimension)
+    logger.warning(
+        "API rate limiter failed open",
+        extra={"action": "api.rate_limiter_error", "dimension": dimension},
+        exc_info=exc,
+    )
+
+
+def _active_runs_for_user(user_id: str) -> int:
+    """Count process-local non-terminal runs owned by one principal."""
+    active = 0
+    for record in _runs.values():
+        if record.status in _TERMINAL_RUN_STATUSES:
+            continue
+        metadata = getattr(record.engine, "config", {}).get("metadata", {})
+        owner = metadata.get("owner") or metadata.get("user_id")
+        if str(owner or "") == user_id:
+            active += 1
+    return active
+
+
+def _enforce_run_create_limits(user: Principal, configurable: Configuration) -> None:
+    """Apply per-principal creation and active-run limits, failing open on bugs."""
+    identity = _user_identity(user)
+    try:
+        allowed, retry_after = _api_rate_limiter.allow(
+            f"run-create:{identity}",
+            configurable.api_run_create_per_minute,
+        )
+        if not allowed:
+            _observe_rate_limited(configurable, "run_create_rate", user)
+            raise HTTPException(
+                status_code=429,
+                detail="run_create_rate_limited",
+                headers={"Retry-After": str(retry_after)},
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 - business limiter is fail-open
+        _observe_limiter_error(configurable, "run_create_rate", exc)
+
+    try:
+        maximum = configurable.max_concurrent_runs_per_user
+        if maximum > 0 and _active_runs_for_user(identity) >= maximum:
+            _observe_rate_limited(configurable, "concurrent_runs", user)
+            raise HTTPException(
+                status_code=429,
+                detail="concurrent_run_limit_reached",
+                headers={"Retry-After": "5"},
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 - business limiter is fail-open
+        _observe_limiter_error(configurable, "concurrent_runs", exc)
+
+
+async def _reserve_sse_connection(
+    user: Principal,
+    configurable: Configuration,
+) -> int:
+    """Reserve one global SSE slot and return the release token (configured cap)."""
+    limit = configurable.max_concurrent_sse_connections
+    try:
+        allowed = await _sse_connection_limiter.acquire(limit)
+    except Exception as exc:  # noqa: BLE001 - business limiter is fail-open
+        _observe_limiter_error(configurable, "sse_connections", exc)
+        return 0
+    if not allowed:
+        _observe_rate_limited(configurable, "sse_connections", user)
+        raise HTTPException(
+            status_code=429,
+            detail="sse_connection_limit_reached",
+            headers={"Retry-After": "5"},
+        )
+    return limit
+
+
+async def _limited_sse(source: Any, release_token: int):
+    """Release a global SSE slot whenever iteration ends or disconnects."""
+    try:
+        async for item in source:
+            yield item
+    finally:
+        with contextlib.suppress(Exception):
+            await _sse_connection_limiter.release(release_token)
 
 
 def _request_query_preview(request: RunRequest) -> str:
@@ -378,7 +882,11 @@ def _runs_root(config: dict[str, Any] | None = None) -> Path:
 
 
 def _load_manifests(config: dict[str, Any] | None = None) -> list[Any]:
-    root = _runs_root(config)
+    return _load_manifests_from_root(_runs_root(config))
+
+
+def _load_manifests_from_root(root: Path) -> list[Any]:
+    """Load manifests from an already resolved root without re-reading env config."""
     if not root.exists():
         return []
     manifests = []
@@ -390,6 +898,509 @@ def _load_manifests(config: dict[str, Any] | None = None) -> list[Any]:
         except (ValueError, JournalCorruptedError, OSError):
             continue
     return manifests
+
+
+def _fenced_recovery_config(
+    manifest: Any,
+    configurable: Configuration,
+    lease_manager: LeaderLeaseManager,
+    fence_token: int,
+) -> dict[str, Any]:
+    """Build the minimal config needed for a fenced recovery event write."""
+    stored = manifest.config if isinstance(manifest.config, dict) else {}
+    return {
+        "configurable": {
+            **dict(stored.get("configurable") or {}),
+            "runs_dir": configurable.runs_dir,
+        },
+        "metadata": {
+            **dict(stored.get("metadata") or {}),
+            "run_id": manifest.run_id,
+            "run_fence_token": fence_token,
+            "run_lease_owner_id": lease_manager.owner_id,
+        },
+    }
+
+
+async def _renew_sweep_lease(
+    lease_manager: LeaderLeaseManager,
+    fence_token: int,
+    interval_seconds: float,
+) -> None:
+    """Keep the global recovery-sweep lease live for the whole scan."""
+    while True:
+        await asyncio.sleep(interval_seconds)
+        await lease_manager.renew(expected_fence_token=fence_token)
+
+
+async def _run_recovery_sweep(configurable: Configuration) -> int:
+    """Interrupt orphaned non-terminal manifests while preserving live owners."""
+    started_at = time.perf_counter()
+    sweep_lease = LeaderLeaseManager(
+        runs_dir=configurable.runs_dir,
+        run_id="system-recovery-sweep",
+        lease_seconds=configurable.leader_lease_seconds,
+        lock_timeout=configurable.mailbox_lock_timeout_seconds,
+    )
+    try:
+        global_lease = await sweep_lease.acquire()
+    except LeaseConflictError:
+        logger.info(
+            "run recovery sweep skipped actor=system action=run.recovery_sweep "
+            "reason=live_sweep_owner"
+        )
+        return 0
+
+    renew_task = asyncio.create_task(
+        _renew_sweep_lease(
+            sweep_lease,
+            global_lease.fence_token,
+            max(0.1, configurable.leader_heartbeat_seconds),
+        )
+    )
+    interrupted = 0
+    try:
+        for manifest in await asyncio.to_thread(
+            _load_manifests,
+            {"configurable": {"runs_dir": configurable.runs_dir}},
+        ):
+            if manifest.status in _TERMINAL_RUN_STATUSES:
+                continue
+            run_lease = LeaderLeaseManager(
+                runs_dir=configurable.runs_dir,
+                run_id=manifest.run_id,
+                lease_seconds=configurable.leader_lease_seconds,
+                lock_timeout=configurable.mailbox_lock_timeout_seconds,
+            )
+            try:
+                lease = await run_lease.acquire()
+            except LeaseConflictError:
+                continue
+            try:
+                store = RunContextStore(
+                    manifest.run_id,
+                    runs_dir=configurable.runs_dir,
+                )
+                await asyncio.to_thread(
+                    store.bind_fence_token,
+                    lease.fence_token,
+                    run_lease.owner_id,
+                )
+                await asyncio.to_thread(
+                    store._update_manifest,  # noqa: SLF001
+                    status="interrupted",
+                )
+                event_config = _fenced_recovery_config(
+                    manifest,
+                    configurable,
+                    run_lease,
+                    lease.fence_token,
+                )
+                interrupted += 1
+                try:
+                    await event_publisher_from_config(event_config).publish(
+                        "run.interrupted",
+                        payload={
+                            "status": "interrupted",
+                            "error_code": "startup_recovery_sweep",
+                            "message": "The previous process stopped before this run completed.",
+                            "termination_reason": "orphaned_run",
+                            "result_status": "interrupted",
+                        },
+                        dedupe_key=f"run:interrupted:startup:{manifest.run_id}",
+                    )
+                except Exception as exc:  # noqa: BLE001 - event export is fail-open
+                    logger.warning(
+                        "run recovery event write failed actor=system "
+                        "action=run.recovery_sweep run_id=%s error_type=%s",
+                        manifest.run_id,
+                        type(exc).__name__,
+                    )
+                try:
+                    await asyncio.to_thread(
+                        get_trace_recorder(event_config).finish_run,
+                        manifest.run_id,
+                        "interrupted",
+                    )
+                except Exception as exc:  # noqa: BLE001 - trace export is fail-open
+                    logger.warning(
+                        "run recovery trace write failed actor=system "
+                        "action=run.recovery_sweep run_id=%s error_type=%s",
+                        manifest.run_id,
+                        type(exc).__name__,
+                    )
+            except Exception as exc:  # noqa: BLE001 - one bad run cannot block startup
+                logger.warning(
+                    "run recovery failed actor=system action=run.recovery_sweep "
+                    "run_id=%s error_type=%s",
+                    manifest.run_id,
+                    type(exc).__name__,
+                )
+            finally:
+                with contextlib.suppress(Exception):
+                    await run_lease.release(
+                        expected_fence_token=lease.fence_token
+                    )
+    finally:
+        renew_task.cancel()
+        await asyncio.gather(renew_task, return_exceptions=True)
+        with contextlib.suppress(Exception):
+            await sweep_lease.release(
+                expected_fence_token=global_lease.fence_token
+            )
+
+    logger.info(
+        "run recovery sweep completed actor=system action=run.recovery_sweep "
+        "interrupted=%s duration_seconds=%.3f",
+        interrupted,
+        time.perf_counter() - started_at,
+    )
+    return interrupted
+
+
+def _run_finished_at(manifest: Any) -> float:
+    """Return the durable terminal timestamp, including legacy manifests."""
+    return float(manifest.ended_at or manifest.updated_at or manifest.created_at)
+
+
+def _run_directory(configurable: Configuration, run_id: str) -> Path:
+    """Resolve a run directory while preventing cleanup path traversal."""
+    root = Path(configurable.runs_dir).resolve()
+    target = (root / run_id).resolve()
+    if target == root or root not in target.parents:
+        raise ValueError("run_id escapes runs_dir")
+    return target
+
+
+def _lifecycle_metrics(configurable: Configuration) -> Any:
+    """Return enabled Prometheus collectors for fail-open lifecycle reporting."""
+    return get_prometheus_metrics(configurable)
+
+
+def _record_lifecycle_error(
+    configurable: Configuration,
+    operation: str,
+    exc: BaseException,
+) -> None:
+    """Report a cleanup failure without allowing metrics to mask the cause."""
+    metrics = _lifecycle_metrics(configurable)
+    if metrics is not None:
+        with contextlib.suppress(Exception):
+            metrics.observe_export_error("retention", operation)
+    logger.warning(
+        "run lifecycle cleanup failed actor=system action=%s error_type=%s",
+        operation,
+        type(exc).__name__,
+    )
+
+
+async def _purge_run_artifacts(
+    run_id: str,
+    configurable: Configuration,
+    *,
+    reason: str,
+    actor: str,
+    require_terminal: bool = True,
+) -> dict[str, Any]:
+    """Delete disk, trace, and memory state through one idempotent path."""
+    target = _run_directory(configurable, run_id)
+    record = _runs.get(run_id)
+    manifest = None
+    if target.exists():
+        try:
+            manifest = await asyncio.to_thread(
+                RunContextStore(run_id, runs_dir=configurable.runs_dir).load_manifest
+            )
+        except (JournalCorruptedError, OSError, ValueError):
+            manifest = None
+    status = record.status if record is not None else getattr(manifest, "status", None)
+    if require_terminal and status not in _TERMINAL_RUN_STATUSES:
+        raise RuntimeError("run_not_terminal")
+
+    logger.info(
+        "run purge started actor=%s action=run.purge run_id=%s reason=%s",
+        actor,
+        run_id,
+        reason,
+        extra={"actor": actor, "action": "run.purge", "run_id": run_id, "reason": reason},
+    )
+    trace_rows = await asyncio.to_thread(
+        SQLiteTraceStore(configurable.trace_store_path).delete_run,
+        run_id,
+    )
+    directory_existed = target.exists()
+    if directory_existed:
+        await asyncio.to_thread(shutil.rmtree, target)
+    eviction_task = _run_eviction_tasks.pop(run_id, None)
+    if eviction_task is not None:
+        eviction_task.cancel()
+    _runs.pop(run_id, None)
+    metrics = _lifecycle_metrics(configurable)
+    if metrics is not None:
+        with contextlib.suppress(Exception):
+            metrics.observe_run_purged(reason)
+    logger.info(
+        "run purge completed actor=%s action=run.purge run_id=%s reason=%s "
+        "trace_rows=%s directory_existed=%s",
+        actor,
+        run_id,
+        reason,
+        trace_rows,
+        directory_existed,
+        extra={"actor": actor, "action": "run.purge", "run_id": run_id, "reason": reason},
+    )
+    return {
+        "run_id": run_id,
+        "status": "deleted",
+        "reason": reason,
+        "directory_deleted": directory_existed,
+        "trace_rows_deleted": trace_rows,
+    }
+
+
+async def _run_retention_sweep(configurable: Configuration) -> dict[str, Any]:
+    """Apply age retention, trace retention, and quota fallback once."""
+    started_at = time.perf_counter()
+    metrics = _lifecycle_metrics(configurable)
+    deleted_by_age = 0
+    deleted_by_quota = 0
+    trace_runs_deleted = 0
+    sweep_lease = LeaderLeaseManager(
+        runs_dir=configurable.runs_dir,
+        run_id="system-retention-sweep",
+        lease_seconds=configurable.leader_lease_seconds,
+        lock_timeout=configurable.mailbox_lock_timeout_seconds,
+    )
+    try:
+        lease = await sweep_lease.acquire()
+    except LeaseConflictError:
+        return {
+            "status": "skipped",
+            "reason": "live_sweep_owner",
+            "deleted_by_age": 0,
+            "deleted_by_quota": 0,
+        }
+
+    try:
+        manifests = await asyncio.to_thread(
+            _load_manifests_from_root,
+            Path(configurable.runs_dir).resolve(),
+        )
+        terminal = [
+            item for item in manifests if item.status in _TERMINAL_RUN_STATUSES
+        ]
+        if configurable.run_retention_days > 0:
+            cutoff = time.time() - configurable.run_retention_days * 86400
+            for manifest in sorted(terminal, key=_run_finished_at):
+                if _run_finished_at(manifest) >= cutoff:
+                    continue
+                try:
+                    await _purge_run_artifacts(
+                        manifest.run_id,
+                        configurable,
+                        reason="retention",
+                        actor="system",
+                    )
+                    deleted_by_age += 1
+                except Exception as exc:  # noqa: BLE001 - sweep is fail-open
+                    _record_lifecycle_error(configurable, "retention_purge", exc)
+
+        trace_days = (
+            configurable.run_retention_days
+            if configurable.trace_retention_days is None
+            else configurable.trace_retention_days
+        )
+        trace_store = SQLiteTraceStore(configurable.trace_store_path)
+        if trace_days > 0:
+            trace_cutoff = time.time() - trace_days * 86400
+            try:
+                trace_runs_deleted = await asyncio.to_thread(
+                    trace_store.delete_runs_ended_before,
+                    trace_cutoff,
+                )
+            except Exception as exc:  # noqa: BLE001 - sweep is fail-open
+                _record_lifecycle_error(configurable, "trace_retention", exc)
+
+        quota = configurable.runs_dir_max_bytes
+        if quota > 0:
+            target_bytes = int(quota * 0.9)
+            used_bytes = await asyncio.to_thread(
+                _runs_dir_size_bytes,
+                Path(configurable.runs_dir),
+            )
+            quota_triggered = used_bytes > quota
+            if quota_triggered:
+                remaining = [
+                    item
+                    for item in terminal
+                    if _run_directory(configurable, item.run_id).exists()
+                ]
+                for manifest in sorted(remaining, key=_run_finished_at):
+                    if used_bytes <= target_bytes:
+                        break
+                    try:
+                        await _purge_run_artifacts(
+                            manifest.run_id,
+                            configurable,
+                            reason="quota",
+                            actor="system",
+                        )
+                        deleted_by_quota += 1
+                        await asyncio.to_thread(trace_store.checkpoint)
+                        used_bytes = await asyncio.to_thread(
+                            _runs_dir_size_bytes,
+                            Path(configurable.runs_dir),
+                        )
+                    except Exception as exc:  # noqa: BLE001 - sweep is fail-open
+                        _record_lifecycle_error(configurable, "quota_purge", exc)
+            quota_exceeded = quota_triggered and used_bytes > target_bytes
+            if metrics is not None:
+                with contextlib.suppress(Exception):
+                    metrics.set_runs_dir_usage(used_bytes, quota)
+                    metrics.set_retention_quota_exceeded(quota_exceeded)
+            if quota_exceeded:
+                logger.error(
+                    "run retention quota remains exceeded actor=system "
+                    "action=run.retention_sweep used_bytes=%s quota_bytes=%s",
+                    used_bytes,
+                    quota,
+                )
+        elif metrics is not None:
+            with contextlib.suppress(Exception):
+                metrics.set_retention_quota_exceeded(False)
+
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(trace_store.checkpoint)
+    finally:
+        with contextlib.suppress(Exception):
+            await sweep_lease.release(expected_fence_token=lease.fence_token)
+        duration = time.perf_counter() - started_at
+        if metrics is not None:
+            with contextlib.suppress(Exception):
+                metrics.observe_retention_sweep(duration)
+
+    logger.info(
+        "run retention sweep completed actor=system action=run.retention_sweep "
+        "deleted_by_age=%s deleted_by_quota=%s trace_runs_deleted=%s "
+        "duration_seconds=%.3f",
+        deleted_by_age,
+        deleted_by_quota,
+        trace_runs_deleted,
+        time.perf_counter() - started_at,
+        extra={"actor": "system", "action": "run.retention_sweep"},
+    )
+    return {
+        "status": "completed",
+        "deleted_by_age": deleted_by_age,
+        "deleted_by_quota": deleted_by_quota,
+        "trace_runs_deleted": trace_runs_deleted,
+    }
+
+
+async def _retention_sweep_loop(configurable: Configuration) -> None:
+    """Run lifecycle cleanup periodically until service shutdown."""
+    interval = configurable.retention_sweep_interval_seconds
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await _run_retention_sweep(configurable)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - maintenance remains fail-open
+            _record_lifecycle_error(configurable, "retention_sweep", exc)
+
+
+async def _interrupt_inflight_record(record: RunRecord) -> None:
+    """Persist and cancel one process-owned run during graceful shutdown."""
+    config = getattr(record.engine, "config", None) or {}
+    event_config = {
+        "configurable": dict(config.get("configurable") or {}),
+        "metadata": {
+            **dict(config.get("metadata") or {}),
+            "run_id": record.run_id,
+        },
+    }
+    store = getattr(record.engine, "context_store", None)
+    if store is not None and store.manifest_path.exists():
+        try:
+            await asyncio.to_thread(
+                store._update_manifest,  # noqa: SLF001
+                status="interrupted",
+            )
+        except Exception as exc:  # noqa: BLE001 - shutdown remains best-effort
+            logger.warning(
+                "run interrupt manifest write failed actor=system "
+                "action=run.interrupted run_id=%s error_type=%s",
+                record.run_id,
+                type(exc).__name__,
+            )
+    try:
+        await event_publisher_from_config(event_config).publish(
+            "run.interrupted",
+            payload={
+                "status": "interrupted",
+                "error_code": "server_shutdown",
+                "message": "The server stopped before this run completed.",
+                "termination_reason": "server_shutdown",
+                "result_status": "interrupted",
+            },
+            dedupe_key=f"run:interrupted:shutdown:{record.run_id}",
+        )
+    except Exception:
+        pass
+    try:
+        await asyncio.to_thread(
+            get_trace_recorder(event_config).finish_run,
+            record.run_id,
+            "interrupted",
+        )
+    except Exception as exc:  # noqa: BLE001 - observability must not block drain
+        logger.warning(
+            "run interrupt trace write failed actor=system "
+            "action=run.interrupted run_id=%s error_type=%s",
+            record.run_id,
+            type(exc).__name__,
+        )
+    record.status = "interrupted"
+    record.finished_at = time.time()
+    logger.info(
+        "run interrupted actor=system action=run.interrupted run_id=%s "
+        "reason=server_shutdown",
+        record.run_id,
+    )
+    if record.task is not None and not record.task.done():
+        record.task.cancel()
+        await asyncio.gather(record.task, return_exceptions=True)
+
+
+async def _drain_inflight_runs(timeout_seconds: float) -> None:
+    """Interrupt all live in-memory runs within one shutdown budget."""
+    records = [
+        record
+        for record in list(_runs.values())
+        if record.status not in _TERMINAL_RUN_STATUSES
+    ]
+
+    async def drain() -> None:
+        for record in records:
+            await _interrupt_inflight_record(record)
+
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            await drain()
+    except TimeoutError:
+        logger.error(
+            "run shutdown drain timed out actor=system action=run.interrupted "
+            "timeout_seconds=%s",
+            timeout_seconds,
+        )
+        for record in records:
+            if record.task is not None and not record.task.done():
+                record.task.cancel()
+        await asyncio.gather(
+            *(record.task for record in records if record.task is not None),
+            return_exceptions=True,
+        )
 
 
 def _find_idempotent_run(
@@ -575,12 +1586,14 @@ async def _run_background(record: RunRecord, request: RunRequest, config: dict[s
     finally:
         control_task.cancel()
         await asyncio.gather(control_task, return_exceptions=True)
+        _schedule_run_eviction(record, config)
 
 
 async def _run_resumed_background(record: RunRecord) -> None:
     """Continue a persisted Query run in the background."""
     record.status = "running"
-    control_task = asyncio.create_task(_run_control_listener(record, record.engine.config))
+    config = getattr(record.engine, "config", None)
+    control_task = asyncio.create_task(_run_control_listener(record, config or {}))
     try:
         async for event in record.engine.stream_resume():
             record.events.append(event)
@@ -594,7 +1607,7 @@ async def _run_resumed_background(record: RunRecord) -> None:
         record.result = {"result": {"status": "error", "error": str(exc)}}
         record.status = "failed"
         try:
-            await event_publisher_from_config(record.engine.config).publish(
+            await event_publisher_from_config(config).publish(
                 "run.failed",
                 payload={"status": "failed", "error_code": "run_execution_failed", "message": "Research failed."},
                 dedupe_key="run:terminal",
@@ -604,6 +1617,7 @@ async def _run_resumed_background(record: RunRecord) -> None:
     finally:
         control_task.cancel()
         await asyncio.gather(control_task, return_exceptions=True)
+        _schedule_run_eviction(record, config)
 
 
 async def _run_control_listener(record: RunRecord, config: dict[str, Any]) -> None:
@@ -735,27 +1749,47 @@ async def stream_run(
 ) -> StreamingResponse:
     """Run a research request and stream events with SSE."""
     config = _config_from_request(request, user)
-    engine = QueryEngine(config)
-    record = RunRecord(run_id=engine.run_id, engine=engine, status="running")
-    if engine.context_store is not None:
-        engine.context_store.initialize(_user_identity(user), config)
-        engine.context_store._update_manifest(  # noqa: SLF001
-            title=_run_title(request, engine.run_id),
-            query_preview=_request_query_preview(request),
+    configurable = Configuration.from_runnable_config(config)
+    _enforce_run_create_limits(user, configurable)
+    release_token = await _reserve_sse_connection(user, configurable)
+    try:
+        engine = QueryEngine(config)
+        record = _new_run_record(
+            run_id=engine.run_id,
+            engine=engine,
+            status="running",
+            config=config,
         )
-    await event_publisher_from_config(config).publish(
-        "run.created",
-        payload={"status": "pending"},
-        dedupe_key="run:created",
-    )
-    record.task = asyncio.create_task(_run_background(record, request, config))
-    _runs[record.run_id] = record
-    store = RunEventStore(
-        record.run_id,
-        runs_dir=Configuration.from_runnable_config(config).runs_dir,
-    )
+        if engine.context_store is not None:
+            engine.context_store.initialize(_user_identity(user), config)
+            engine.context_store._update_manifest(  # noqa: SLF001
+                title=_run_title(request, engine.run_id),
+                query_preview=_request_query_preview(request),
+            )
+        await event_publisher_from_config(config).publish(
+            "run.created",
+            payload={"status": "pending"},
+            dedupe_key="run:created",
+        )
+        record.task = asyncio.create_task(_run_background(record, request, config))
+        _remember_run(record, config)
+        logger.info(
+            "run created",
+            extra={
+                "actor": _user_identity(user),
+                "action": "run.created",
+                "run_id": record.run_id,
+            },
+        )
+        store = RunEventStore(record.run_id, runs_dir=configurable.runs_dir)
+    except Exception:
+        await _sse_connection_limiter.release(release_token)
+        raise
     return StreamingResponse(
-        _public_event_iterator(store, principal=user),
+        _limited_sse(
+            _public_event_iterator(store, principal=user),
+            release_token,
+        ),
         media_type="text/event-stream",
         headers=_sse_headers(),
     )
@@ -779,8 +1813,14 @@ async def create_run(
                 "last_event_id": existing.last_public_event_seq,
                 "idempotent_replay": True,
             }
+    _enforce_run_create_limits(user, Configuration.from_runnable_config(config))
     engine = QueryEngine(config)
-    record = RunRecord(run_id=engine.run_id, engine=engine, status="running")
+    record = _new_run_record(
+        run_id=engine.run_id,
+        engine=engine,
+        status="running",
+        config=config,
+    )
     if engine.context_store is not None:
         engine.context_store.initialize(_user_identity(user), config)
         engine.context_store._update_manifest(  # noqa: SLF001
@@ -794,7 +1834,11 @@ async def create_run(
         dedupe_key="run:created",
     )
     record.task = asyncio.create_task(_run_background(record, request, config))
-    _runs[record.run_id] = record
+    _remember_run(record, config)
+    logger.info(
+        "run created",
+        extra={"actor": _user_identity(user), "action": "run.created", "run_id": record.run_id},
+    )
     return {
         "run_id": record.run_id,
         "status": record.status,
@@ -909,6 +1953,7 @@ async def resume_run(
                 **request.metadata,
                 "run_id": run_id,
                 "deployment_surface": "http",
+                "request_id": current_request_id(),
             },
         },
         user,
@@ -943,9 +1988,19 @@ async def resume_run(
             raise HTTPException(status_code=409, detail="run_already_active") from None
         raise
 
-    record = RunRecord(run_id=run_id, engine=engine, status="running")
+    effective_config = getattr(engine, "config", config)
+    record = _new_run_record(
+        run_id=run_id,
+        engine=engine,
+        status="running",
+        config=effective_config,
+    )
     record.task = asyncio.create_task(_run_resumed_background(record))
-    _runs[run_id] = record
+    _remember_run(record, effective_config)
+    logger.info(
+        "run resumed",
+        extra={"actor": _user_identity(user), "action": "run.resumed", "run_id": run_id},
+    )
     return {"run_id": run_id, "status": "running"}
 
 
@@ -1101,8 +2156,12 @@ async def stream_task_activity(
         record is None or record.status in {"completed", "failed", "cancelled"}
     ):
         raise HTTPException(status_code=409, detail="activity_stream_unavailable_legacy_run")
+    release_token = await _reserve_sse_connection(user, configurable)
     return StreamingResponse(
-        _task_activity_iterator(store, after=cursor, principal=user),
+        _limited_sse(
+            _task_activity_iterator(store, after=cursor, principal=user),
+            release_token,
+        ),
         media_type="text/event-stream",
         headers=_sse_headers(),
     )
@@ -1143,8 +2202,12 @@ async def stream_run_events(
     current = await asyncio.to_thread(store.last_sequence)
     if cursor > current:
         raise HTTPException(status_code=409, detail="event_cursor_ahead")
+    release_token = await _reserve_sse_connection(user, configurable)
     return StreamingResponse(
-        _public_event_iterator(store, after=cursor, principal=user),
+        _limited_sse(
+            _public_event_iterator(store, after=cursor, principal=user),
+            release_token,
+        ),
         media_type="text/event-stream",
         headers=_sse_headers(),
     )
@@ -1333,4 +2396,90 @@ async def cancel_run(
             {},
             command_id=f"cancel-{run_id}",
         )
+    logger.info(
+        "run cancellation requested",
+        extra={"actor": _user_identity(user), "action": "run.cancel", "run_id": run_id},
+    )
     return {"run_id": run_id, "status": "cancelling"}
+
+
+async def _cancel_before_forced_purge(
+    run_id: str,
+    record: RunRecord | None,
+    configurable: Configuration,
+) -> None:
+    """Use the existing interrupt/control mechanisms before destructive purge."""
+    if record is not None:
+        record.engine.interrupt()
+        if record.task is not None and not record.task.done():
+            record.task.cancel()
+            await asyncio.gather(record.task, return_exceptions=True)
+        record.status = "cancelled"
+        record.finished_at = time.time()
+        store = getattr(record.engine, "context_store", None)
+        if store is not None and store.manifest_path.exists():
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(
+                    store._update_manifest,  # noqa: SLF001
+                    status="cancelled",
+                )
+        return
+    await RunControlStore(run_id, runs_dir=configurable.runs_dir).enqueue(
+        "cancel",
+        {},
+        command_id=f"cancel-before-purge-{run_id}",
+    )
+
+
+@app.delete("/runs/{run_id}")
+async def delete_run(
+    run_id: str,
+    force: bool = False,
+    dry_run: bool = False,
+    user: Principal = Depends(require_permissions(RESEARCH_RUN_CONTROL_OWN.code)),
+) -> dict[str, Any]:
+    """Permanently delete an owned run and all durable observability rows."""
+    is_admin = "admin" in user.roles
+    if is_admin:
+        record = _runs.get(run_id)
+        configurable = Configuration.from_runnable_config(
+            getattr(record.engine, "config", None) if record is not None else None
+        )
+        target = _run_directory(configurable, run_id)
+        trace_exists = await asyncio.to_thread(
+            SQLiteTraceStore(configurable.trace_store_path).get_run,
+            run_id,
+        )
+        if record is None and not target.exists() and trace_exists is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+    else:
+        record, configurable = _require_run_owner(run_id, user)
+        target = _run_directory(configurable, run_id)
+
+    manifest = None
+    if target.exists():
+        with contextlib.suppress(JournalCorruptedError, OSError, ValueError):
+            manifest = await asyncio.to_thread(
+                RunContextStore(run_id, runs_dir=configurable.runs_dir).load_manifest
+            )
+    status = record.status if record is not None else getattr(manifest, "status", None)
+    if status not in _TERMINAL_RUN_STATUSES and not force:
+        raise HTTPException(status_code=409, detail="run_is_active")
+    if dry_run:
+        return {
+            "run_id": run_id,
+            "status": "would_delete",
+            "run_status": status,
+            "force": force,
+            "directory": str(target),
+            "trace_store": configurable.trace_store_path,
+        }
+    if status not in _TERMINAL_RUN_STATUSES:
+        await _cancel_before_forced_purge(run_id, record, configurable)
+    return await _purge_run_artifacts(
+        run_id,
+        configurable,
+        reason="manual",
+        actor=_user_identity(user),
+        require_terminal=not force,
+    )

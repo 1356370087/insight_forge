@@ -91,6 +91,7 @@ class RunManifest(BaseModel):
     idempotency_key: Optional[str] = None
     created_at: float = Field(default_factory=time.time)
     updated_at: float = Field(default_factory=time.time)
+    ended_at: Optional[float] = None
     status: str = "pending"
     last_stable_stage: str = "received"
     next_stage: str = "summarize_messages"
@@ -435,6 +436,17 @@ class RunContextStore:
                     ):
                         continue
                     setattr(manifest, key, value)
+                requested_status = updates.get("status")
+                if requested_status is not None and manifest.status in {
+                    "success",
+                    "completed",
+                    "failed",
+                    "interrupted",
+                    "cancelled",
+                }:
+                    manifest.ended_at = manifest.ended_at or time.time()
+                elif requested_status is not None and manifest.status == "running":
+                    manifest.ended_at = None
                 manifest.updated_at = time.time()
                 self._write_json_atomic_path(
                     self.manifest_path,

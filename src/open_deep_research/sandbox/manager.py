@@ -39,6 +39,14 @@ SANDBOX_SECRET_ENV_KEYS = (
     "BEDROCK_AWS_REGION",
 )
 
+
+def _sandbox_secret_env_keys() -> tuple[str, ...]:
+    """Return configured sandbox secret names; an explicit empty value disables injection."""
+    configured = os.environ.get("SANDBOX_SECRET_ENV_KEYS")
+    if configured is None:
+        return SANDBOX_SECRET_ENV_KEYS
+    return tuple(key.strip() for key in configured.split(",") if key.strip())
+
 PROXY_ENV_KEYS = (
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -611,7 +619,7 @@ class DockerSandboxManager:
         }
 
         api_keys = config.get("configurable", {}).get("apiKeys", {}) if config else {}
-        for key in SANDBOX_SECRET_ENV_KEYS:
+        for key in _sandbox_secret_env_keys():
             value = api_keys.get(key) or os.getenv(key)
             if value:
                 env[key] = value
