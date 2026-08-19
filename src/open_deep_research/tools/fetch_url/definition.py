@@ -69,7 +69,7 @@ async def _fetch_url_call(
     consumed = sum(fetch.adapter != "run_cache" for fetch in result.fetches)
     await release_budget(reserved - consumed)
     pipeline._record_web_pipeline_metrics(result, config)
-    return pipeline._compact_web_result(result)
+    return pipeline._compact_web_result(result, config)
 
 
 fetch_url = adapt_langchain_tool(

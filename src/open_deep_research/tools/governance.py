@@ -1017,14 +1017,30 @@ async def check_egress_domain(
     registry = get_task_registry()
     record = _find_task_for_run(registry, run_id, task_id)
     if record is None:
+        if configurable.sandbox_network_mode == "allow-search-only":
+            # In this mode direct fetches are unavailable by design (only the
+            # governed search pipeline may fetch), so say that instead of
+            # hinting at a missing approval channel.
+            message = (
+                f"Domain '{host}' is not on the egress allowlist. Direct URL "
+                f"fetches are disabled in 'allow-search-only' mode; only the "
+                f"governed web_research pipeline may fetch. Add the domain to "
+                f"sandbox_allowed_domains to permit direct fetches."
+            )
+        else:
+            message = (
+                f"Domain '{host}' is not on the egress allowlist and no active "
+                f"task context is available to request approval."
+            )
         return ToolError(
             error_type=ToolErrorType.egress_domain_denied,
             tool_name=getattr(tool, "name", "unknown"),
-            message=(
-                f"Domain '{host}' is not on the egress allowlist and no active "
-                f"task context is available to request approval."
-            ),
-            detail={"domain": host, "run_id": run_id},
+            message=message,
+            detail={
+                "domain": host,
+                "run_id": run_id,
+                "network_mode": configurable.sandbox_network_mode,
+            },
         ).to_tool_message(tool_call_id)
 
     req = approvals.request_decision(run_id, host, getattr(tool, "name", "unknown"))

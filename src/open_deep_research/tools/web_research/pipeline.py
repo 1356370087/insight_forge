@@ -556,8 +556,44 @@ def _configured_external_extractors(configurable: Configuration, config: Runnabl
     ]
 
 
-def _compact_web_result(result) -> str:
-    """Serialize evidence and audit metadata without raw documents or chunk bodies."""
+#: Reserved for the ``_trust_notice`` that ``_protect_web_pipeline_output``
+#: appends, so the sanitized output also fits without shedding entries.
+_COMPACT_HEADROOM_CHARS = 256
+
+#: Audit lists carry no citable evidence and are shed first; each
+#: ``ranked_candidates`` entry embeds a full candidate copy, so it is usually
+#: the single largest redundant block in the payload.
+_COMPACT_AUDIT_KEYS = ("provider_syntheses", "ranked_candidates", "fetches")
+
+#: Progressive snippet clip budgets; whole candidates are dropped only after
+#: every tier (including 0) fails to bring the payload under budget.
+_COMPACT_SNIPPET_BUDGETS = (400, 160, 40, 0)
+
+
+def _shrink_candidate_text(payload: dict, snippet_chars: int) -> None:
+    """Clip candidate free-text fields to ``snippet_chars`` in place."""
+    for candidate in payload.get("candidates") or []:
+        if not isinstance(candidate, dict):
+            continue
+        for field in ("snippet", "content_hint"):
+            value = candidate.get(field)
+            if isinstance(value, str) and len(value) > snippet_chars:
+                candidate[field] = value[:snippet_chars]
+
+
+def _compact_web_result(result, config: RunnableConfig | None = None) -> str:
+    """Serialize evidence and audit metadata inside the governed char budget.
+
+    Slimming is structural and happens before serialization: audit lists
+    (``provider_syntheses`` / ``ranked_candidates`` / ``fetches``) are shed
+    first, candidate snippets shrink progressively next, and list entries are
+    dropped in the order ``chunks`` → ``errors`` → ``documents`` →
+    ``evidence`` so evidence records survive longest. The output therefore
+    always parses as JSON within the budget the governed serializer would
+    otherwise enforce with a JSON-corrupting hard cut — a cut that silently
+    broke both the evidence-registry loop and the quality gate. A ``None``
+    config keeps the legacy unbudgeted behavior for test doubles.
+    """
     payload = result.model_dump(
         mode="json",
         exclude={
@@ -566,7 +602,67 @@ def _compact_web_result(result) -> str:
             "provider_syntheses": {"__all__": {"text"}},
         },
     )
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    if config is None:
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+    configurable = Configuration.from_runnable_config(config)
+    # Neither web_research nor fetch_url declares a per-tool output cap, so the
+    # governed limit equals max_mcp_output_chars; keep headroom for the
+    # sanitizer's _trust_notice so it never needs to shed entries either.
+    budget = max(1, configurable.max_mcp_output_chars - _COMPACT_HEADROOM_CHARS)
+    dropped: dict[str, int] = {}
+
+    def render() -> str:
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+    def shed_list(key: str) -> None:
+        values = payload.get(key)
+        if not isinstance(values, list):
+            return
+        while values and len(render()) > budget:
+            values.pop()
+            dropped[key] = dropped.get(key, 0) + 1
+
+    if len(render()) > budget:
+        for key in _COMPACT_AUDIT_KEYS:
+            shed_list(key)
+            if len(render()) <= budget:
+                break
+    if len(render()) > budget:
+        for snippet_chars in _COMPACT_SNIPPET_BUDGETS:
+            _shrink_candidate_text(payload, snippet_chars)
+            if len(render()) <= budget:
+                break
+    if len(render()) > budget:
+        shed_list("candidates")
+    for key in ("chunks", "errors", "documents", "evidence"):
+        if len(render()) <= budget:
+            break
+        shed_list(key)
+
+    if dropped:
+        with_notice = dict(payload)
+        with_notice["_compaction"] = {"budget_chars": budget, "dropped": dropped}
+        if len(json.dumps(with_notice, ensure_ascii=False, sort_keys=True)) <= budget:
+            payload = with_notice
+    text = render()
+    if len(text) <= budget:
+        return text
+
+    # Degenerate budgets: keep only the small core fields; if even those do
+    # not fit, an empty object is still valid JSON for downstream parsers.
+    minimal = {
+        key: payload[key]
+        for key in ("request", "approval_batch", "gap_analysis")
+        if key in payload
+    }
+    minimal["_compaction"] = {
+        "budget_chars": budget,
+        "dropped": dropped,
+        "fallback": "minimal",
+    }
+    text = json.dumps(minimal, ensure_ascii=False, sort_keys=True)
+    return text if len(text) <= budget else "{}"
 
 
 def _record_web_pipeline_metrics(result, config: RunnableConfig) -> None:

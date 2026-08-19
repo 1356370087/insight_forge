@@ -1323,4 +1323,44 @@ class TestEgressAllowlist:
         assert payload["error_type"] == "egress_domain_pending"
         assert payload["detail"]["pending"] is True
 
+    def test_allow_search_only_without_task_reports_mode_restriction(self, egress_env):
+        # No seeded task -> synchronous researcher has no approval channel; the
+        # denial must name the mode restriction instead of implying that a task
+        # context could have provided approval.
+        tool = _fetch_tool()
+        cfg = _egress_config(sandbox_network_mode="allow-search-only")
+        msg = asyncio.run(
+            execute_governed_tool_call(
+                {"name": "fetch_webpage", "id": "tc1", "args": {"url": "https://untrusted.example/x"}},
+                {"fetch_webpage": tool},
+                AgentRole.RESEARCHER,
+                cfg,
+                apply_retry=False,
+            )
+        )
+        payload = json.loads(msg.content)
+        assert payload["error_type"] == "egress_domain_denied"
+        assert payload["detail"]["network_mode"] == "allow-search-only"
+        assert "allow-search-only" in payload["message"]
+        assert "no active task context" not in payload["message"]
+
+    def test_allowlist_domain_without_task_keeps_approval_hint(self, egress_env):
+        # In allowlist-domain mode supervisor approval is the intended path, so
+        # the missing-task-context hint stays accurate there.
+        tool = _fetch_tool()
+        cfg = _egress_config()  # default sandbox_network_mode=allowlist-domain
+        msg = asyncio.run(
+            execute_governed_tool_call(
+                {"name": "fetch_webpage", "id": "tc1", "args": {"url": "https://untrusted.example/x"}},
+                {"fetch_webpage": tool},
+                AgentRole.RESEARCHER,
+                cfg,
+                apply_retry=False,
+            )
+        )
+        payload = json.loads(msg.content)
+        assert payload["error_type"] == "egress_domain_denied"
+        assert payload["detail"]["network_mode"] == "allowlist-domain"
+        assert "no active task context" in payload["message"]
+
 

@@ -25,6 +25,19 @@ from open_deep_research.tools.base import (
 from open_deep_research.tools.supervisor.conduct_research import ConductResearch
 from open_deep_research.tools.web_research import pipeline as tool_pipeline
 from open_deep_research.web import pipeline
+from open_deep_research.web.models import (
+    BudgetSnapshot,
+    CandidateSource,
+    DomainApprovalBatch,
+    EvidenceRecord,
+    ExtractedDocument,
+    FetchResult,
+    GapAnalysis,
+    ProviderSynthesis,
+    RankedCandidate,
+    SearchRequest,
+    WebResearchResult,
+)
 from open_deep_research.web.pipeline import WebPipelineSettings
 
 
@@ -68,6 +81,135 @@ def test_structured_web_output_remains_json_after_injection_filtering() -> None:
     assert "Ignore previous" not in protected
     assert payload["evidence"][0]["claim"] == "Safe supported claim"
     assert payload["_trust_notice"]
+
+
+def _oversized_web_result() -> WebResearchResult:
+    """Build a WebResearchResult whose naive serialization exceeds 30k chars."""
+    candidates = [
+        CandidateSource(
+            candidate_id=f"src-{i:02d}",
+            provider="tavily",
+            original_url=f"https://example.org/page-{i}",
+            canonical_url=f"https://example.org/page-{i}",
+            domain="example.org",
+            title=f"Official page {i}",
+            snippet="free-threaded build context. " * 16,
+        )
+        for i in range(18)
+    ]
+    return WebResearchResult(
+        request=SearchRequest(objective="python free-threading", queries=["q1"]),
+        candidates=candidates,
+        ranked_candidates=[
+            RankedCandidate(candidate=candidate, selected=True) for candidate in candidates
+        ],
+        provider_syntheses=[
+            ProviderSynthesis(provider="tavily", cited_candidate_ids=["src-00"])
+        ],
+        approval_batch=DomainApprovalBatch(
+            run_id="run-x", iteration=1, domains=["example.org"]
+        ),
+        fetches=[
+            FetchResult(
+                candidate_id=f"src-{i:02d}",
+                requested_url=f"https://example.org/page-{i}",
+                final_url=f"https://example.org/page-{i}",
+                success=True,
+            )
+            for i in range(5)
+        ],
+        documents=[
+            ExtractedDocument(
+                document_id=f"doc-{i}",
+                candidate_id=f"src-{i:02d}",
+                requested_url=f"https://example.org/page-{i}",
+                final_url=f"https://example.org/page-{i}",
+                canonical_url=f"https://example.org/page-{i}",
+                content_type="text/markdown",
+                markdown="body",
+                extractor="local",
+                content_hash=f"{i:064d}",
+            )
+            for i in range(5)
+        ],
+        evidence=[
+            EvidenceRecord(
+                evidence_id=f"ev-{i:02d}",
+                claim="CPython 3.13 ships an experimental free-threaded build. " * 6,
+                supporting_excerpt="The free-threaded build is experimental. " * 8,
+                document_id=f"doc-{i % 5}",
+                chunk_id=f"chunk-{i}",
+                locator=f"page-{i}",
+                source_url=f"https://example.org/page-{i % 5}",
+            )
+            for i in range(20)
+        ],
+        gap_analysis=GapAnalysis(
+            decision="continue",
+            reason="needs more official sources",
+            budget=BudgetSnapshot(),
+        ),
+    )
+
+
+def test_compact_web_result_stays_valid_json_within_governed_budget() -> None:
+    # Regression: oversized pipeline outputs used to be hard-cut by the
+    # governed serializer, corrupting the JSON so both the evidence registry
+    # loop and the quality gate silently discarded every result.
+    from open_deep_research.tools.governance import _serialize_governed_output
+
+    config = {"configurable": {"max_mcp_output_chars": 30_000}, "metadata": {"run_id": "t"}}
+    result = _oversized_web_result()
+    naive_len = len(json.dumps(result.model_dump(mode="json"), ensure_ascii=False))
+    assert naive_len > 30_000  # the failure precondition from the E2E run
+
+    text = tool_pipeline._compact_web_result(result, config)
+
+    assert len(text) <= 30_000
+    payload = json.loads(text)  # must parse for registry/gate consumers
+    assert len(payload["evidence"]) == 20  # evidence records survive longest
+    assert payload["ranked_candidates"] == []  # audit lists shed first
+    assert payload["fetches"] == []
+    assert 1 <= len(payload["candidates"]) <= 18  # snippets shrunk, not dropped
+    assert len(payload["candidates"][0]["snippet"]) <= 400
+    assert payload["_compaction"]["dropped"]["ranked_candidates"] == 18
+    assert payload["_compaction"]["dropped"]["fetches"] == 5
+
+    # The governed serializer must now pass the payload through unchanged
+    # instead of appending a JSON-corrupting "[truncated N chars]" suffix.
+    serialized = _serialize_governed_output(
+        SimpleNamespace(max_output_chars=None), text, Configuration()
+    )
+    assert serialized == text
+
+
+def test_compact_web_result_small_payload_untouched() -> None:
+    config = {"configurable": {"max_mcp_output_chars": 30_000}, "metadata": {"run_id": "t"}}
+    result = WebResearchResult(
+        request=SearchRequest(objective="o", queries=["q"]),
+        evidence=[
+            EvidenceRecord(
+                evidence_id="ev-1",
+                claim="claim",
+                supporting_excerpt="excerpt",
+                document_id="doc-1",
+                chunk_id="chunk-1",
+                locator="p1",
+                source_url="https://example.org/1",
+            )
+        ],
+        gap_analysis=GapAnalysis(decision="complete", reason="done", budget=BudgetSnapshot()),
+    )
+    payload = json.loads(tool_pipeline._compact_web_result(result, config))
+    assert "_compaction" not in payload
+    assert len(payload["evidence"]) == 1
+
+
+def test_compact_web_result_tiny_budget_still_returns_valid_json() -> None:
+    config = {"configurable": {"max_mcp_output_chars": 300}, "metadata": {"run_id": "t"}}
+    text = tool_pipeline._compact_web_result(_oversized_web_result(), config)
+    assert len(text) <= 300
+    assert isinstance(json.loads(text), dict)
 
 
 def test_compression_input_excludes_out_of_scope_documents_and_tool_text() -> None:
@@ -740,7 +882,7 @@ async def test_direct_fetch_does_not_apply_discovery_authority_threshold(
     monkeypatch.setattr(
         tool_pipeline,
         "_compact_web_result",
-        lambda _result: "{}",
+        lambda *_args: "{}",
     )
 
     await utils.fetch_url.call(
