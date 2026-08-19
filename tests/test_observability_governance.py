@@ -28,6 +28,47 @@ def test_runs_dir_capacity_metrics_have_no_dynamic_labels() -> None:
     assert "odr_governance_capacity_test_runs_dir_bytes{" not in exposition
 
 
+def test_model_circuit_metrics_export_state_ttft_and_transitions() -> None:
+    metrics = PrometheusMetrics("odr_governance_circuit_test")
+    transition = SimpleNamespace(
+        model_id="openai:gpt-test",
+        from_state=SimpleNamespace(value="closed"),
+        to_state=SimpleNamespace(value="open"),
+        reason="failure_threshold:rate_limited",
+    )
+    snapshot = SimpleNamespace(
+        model_id="openai:gpt-test",
+        state=SimpleNamespace(value="open"),
+    )
+
+    metrics.observe_model_circuit_transition(transition)
+    metrics.observe_model_circuit_rejection(
+        "openai", "gpt-test", "cooldown_active"
+    )
+    metrics.observe_first_token(
+        provider="openai",
+        model="gpt-test",
+        agent_role="researcher",
+        operation="researcher.model",
+        duration_seconds=9.0,
+        probe_mode="shadow",
+        slow=True,
+    )
+    metrics.observe_streaming_fallback("openai", "gpt-test", "unsupported")
+    metrics.set_model_circuit_states([snapshot])
+
+    exposition = generate_latest().decode()
+    assert (
+        'odr_governance_circuit_test_model_circuit_state{model="gpt-test",'
+        'provider="openai",state="open"} 1.0'
+    ) in exposition
+    assert "odr_governance_circuit_test_model_circuit_rejected_total" in exposition
+    assert "odr_governance_circuit_test_model_circuit_transitions_total" in exposition
+    assert "odr_governance_circuit_test_llm_first_token_latency_seconds" in exposition
+    assert "odr_governance_circuit_test_model_slow_first_token_total" in exposition
+    assert "odr_governance_circuit_test_model_streaming_fallback_total" in exposition
+
+
 @pytest.mark.asyncio
 async def test_metrics_scrape_refreshes_runs_dir_capacity(tmp_path, monkeypatch) -> None:
     (tmp_path / "run-a").mkdir()
@@ -36,6 +77,7 @@ async def test_metrics_scrape_refreshes_runs_dir_capacity(tmp_path, monkeypatch)
     observed: list[tuple[int, int]] = []
     fake_metrics = SimpleNamespace(
         set_runs_dir_usage=lambda used, quota: observed.append((used, quota)),
+        set_model_circuit_states=lambda _snapshots: None,
         observe_export_error=lambda *_args: None,
     )
     config = SimpleNamespace(runs_dir=str(tmp_path), runs_dir_max_bytes=100)
@@ -56,6 +98,7 @@ async def test_metrics_capacity_refresh_is_fail_open(tmp_path, monkeypatch) -> N
     errors: list[tuple[str, str]] = []
     fake_metrics = SimpleNamespace(
         set_runs_dir_usage=lambda *_args: None,
+        set_model_circuit_states=lambda _snapshots: None,
         observe_export_error=lambda component, operation: errors.append(
             (component, operation)
         ),

@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import hashlib
+import inspect
 import json
 import logging
 import random
@@ -21,15 +22,31 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
-from langchain_core.messages import BaseMessage, get_buffer_string
+from langchain_core.messages import (
+    AIMessageChunk,
+    BaseMessage,
+    get_buffer_string,
+    message_chunk_to_message,
+)
 from langchain_core.runnables import RunnableConfig
 
 from open_deep_research.configuration import Configuration
+from open_deep_research.model_circuit import (
+    CircuitFailureKind,
+    CircuitOpenError,
+    CircuitPermit,
+    CircuitTransition,
+    ModelCircuitBreaker,
+    ModelCircuitState,
+    get_model_circuit_registry,
+    model_circuit_policy_from_configuration,
+)
 from open_deep_research.observability.telemetry import (
     create_langfuse_sink,
     get_prometheus_metrics,
     monotonic_time,
 )
+from open_deep_research.public_events import event_publisher_from_config
 from open_deep_research.public_task_activity import publish_task_activity
 from open_deep_research.security.redaction import redact_text as _redact_text
 
@@ -103,6 +120,89 @@ def _provider_model(model_name: str | None) -> tuple[str | None, str | None]:
         return None, model_name
     provider, model = model_name.split(":", 1)
     return provider, model
+
+
+_CIRCUIT_ROLE_STAGE = {
+    "supervisor": "planning",
+    "researcher": "researching",
+    "summarization": "researching",
+    "message_summary": "researching",
+    "compression": "synthesizing",
+    "final_report": "writing",
+    "quality_evaluator": "finalizing",
+    "quality_evaluation": "finalizing",
+}
+
+
+async def observe_model_circuit_transition(
+    transition: CircuitTransition | None,
+    config: RunnableConfig | None,
+    *,
+    agent_role: str | None = None,
+) -> None:
+    """Best-effort publish one circuit transition to every configured sink."""
+    if transition is None:
+        return
+    try:
+        recorder = get_trace_recorder(config)
+        if recorder.prometheus is not None:
+            recorder._safe(  # noqa: SLF001 - shared fail-open recorder boundary
+                recorder.prometheus.observe_model_circuit_transition,
+                transition,
+            )
+        provider, model = _provider_model(transition.model_id)
+        payload = {
+            "provider": provider or "unknown",
+            "model": model or transition.model_id,
+            "from_state": transition.from_state.value,
+            "to_state": transition.to_state.value,
+            "reason": transition.reason,
+            "failure_count": transition.failure_count,
+            "slow_count": transition.slow_count,
+            "sample_count": transition.sample_count,
+            "slow_ratio": transition.slow_ratio,
+            "cooldown_seconds": transition.cooldown_seconds,
+            "forced_probe": transition.forced_probe,
+        }
+        metadata = (config or {}).get("metadata") or {}
+        if metadata.get("run_id"):
+            await event_publisher_from_config(config or {}).publish(
+                "model.circuit_state",
+                stage=_CIRCUIT_ROLE_STAGE.get(agent_role or "", "researching"),
+                payload=payload,
+                dedupe_key=(
+                    f"model-circuit:{transition.model_id}:"
+                    f"{transition.timestamp}:{transition.to_state.value}"
+                ),
+            )
+        if metadata.get("task_id") and transition.to_state in {
+            ModelCircuitState.OPEN,
+            ModelCircuitState.CLOSED,
+        }:
+            recovered = transition.to_state is ModelCircuitState.CLOSED
+            await publish_task_activity(
+                config or {},
+                "model.circuit_recovered" if recovered else "model.circuit_open",
+                kind="model",
+                phase="reasoning",
+                status="success" if recovered else "warning",
+                title="模型线路已恢复" if recovered else "模型线路已暂时隔离",
+                summary=(
+                    "半开探针成功，后续调用已恢复。"
+                    if recovered
+                    else "连续可恢复故障达到阈值，后续调用将优先切换候选。"
+                ),
+                iteration=None,
+                duration_ms=None,
+                payload=payload,
+                dedupe_key=(
+                    f"activity:model-circuit:{transition.model_id}:"
+                    f"{transition.timestamp}:{transition.to_state.value}"
+                ),
+                update_run_summary=True,
+            )
+    except Exception as exc:  # noqa: BLE001 - circuit observability fails open
+        logger.debug("Model circuit transition publication failed open: %s", exc)
 
 
 def _message_preview(messages: Any, limit: int | None, *, redact: bool = True) -> str | None:
@@ -1392,17 +1492,170 @@ def _langchain_invoke_config(recorder: TraceRecorder, config: RunnableConfig | N
     return cast(RunnableConfig, invoke_config)
 
 
+@dataclass(frozen=True, slots=True)
+class _ModelInvocationResult:
+    """Carry a model response with optional first-packet probe metadata."""
+
+    response: Any
+    ttft_seconds: float | None = None
+    probe_status: str = "off"
+
+
+def _observe_first_packet_metrics(
+    recorder: TraceRecorder,
+    result: _ModelInvocationResult,
+    *,
+    provider: str | None,
+    model: str | None,
+    agent_role: str | None,
+    operation: str,
+) -> None:
+    """Best-effort record TTFT and safe streaming downgrade metrics."""
+    metrics = recorder.prometheus
+    if metrics is None:
+        return
+    if result.ttft_seconds is not None:
+        recorder._safe(  # noqa: SLF001 - shared fail-open recorder boundary
+            metrics.observe_first_token,
+            provider=provider or "unknown",
+            model=model or "unknown",
+            agent_role=agent_role or "unknown",
+            operation=operation,
+            duration_seconds=result.ttft_seconds,
+            probe_mode=recorder.configuration.model_first_packet_probe,
+            slow=(
+                result.ttft_seconds
+                > recorder.configuration.model_slow_first_packet_threshold_seconds
+            ),
+        )
+    if result.probe_status == "fallback":
+        recorder._safe(  # noqa: SLF001
+            metrics.observe_streaming_fallback,
+            provider or "unknown",
+            model or "unknown",
+            "unsupported",
+        )
+
+
+async def _call_model_ainvoke(
+    model: Any,
+    messages: list[BaseMessage],
+    invoke_config: RunnableConfig | None,
+) -> Any:
+    """Invoke a model while preserving the optional callback config."""
+    if invoke_config is None:
+        return await model.ainvoke(messages)
+    return await model.ainvoke(messages, config=invoke_config)
+
+
+def _streaming_unsupported(exc: BaseException) -> bool:
+    """Recognize bounded capability errors that are safe to downgrade."""
+    if isinstance(exc, NotImplementedError | AttributeError):
+        return True
+    text = _exc_message(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "astream not implemented",
+            "streaming is not supported",
+            "streaming not supported",
+            "does not support streaming",
+        )
+    )
+
+
+async def _close_async_iterator(iterator: Any) -> None:
+    """Best-effort close a model stream after success, error, or timeout."""
+    close = getattr(iterator, "aclose", None)
+    if callable(close):
+        try:
+            await close()
+        except Exception:  # noqa: BLE001 - cleanup must preserve the real outcome
+            pass
+
+
 async def _ainvoke_model(
     model: Any,
     messages: list[BaseMessage],
     recorder: TraceRecorder,
     config: RunnableConfig | None,
-) -> Any:
-    """Invoke a LangChain model with optional supplemental callback tracing."""
+) -> _ModelInvocationResult:
+    """Invoke with optional TTFT streaming and conservative fallback."""
     invoke_config = _langchain_invoke_config(recorder, config)
-    if invoke_config is None:
-        return await model.ainvoke(messages)
-    return await model.ainvoke(messages, config=invoke_config)
+    configuration = recorder.configuration
+    probe_mode = (
+        configuration.model_first_packet_probe
+        if configuration.model_circuit_breaker_enabled
+        else "off"
+    )
+    if probe_mode == "off":
+        return _ModelInvocationResult(
+            await _call_model_ainvoke(model, messages, invoke_config)
+        )
+
+    stream_method = getattr(model, "astream", None)
+    if not callable(stream_method):
+        return _ModelInvocationResult(
+            await _call_model_ainvoke(model, messages, invoke_config),
+            probe_status="fallback",
+        )
+
+    iterator: Any = None
+    received_first = False
+    started = monotonic_time()
+    try:
+        iterator = (
+            stream_method(messages)
+            if invoke_config is None
+            else stream_method(messages, config=invoke_config)
+        )
+        if inspect.isawaitable(iterator):
+            iterator = await iterator
+        try:
+            first = (
+                await asyncio.wait_for(
+                    anext(iterator),
+                    timeout=configuration.model_first_packet_timeout_seconds,
+                )
+                if probe_mode == "enforced"
+                else await anext(iterator)
+            )
+        except StopAsyncIteration as exc:
+            raise RuntimeError("model stream returned no chunks") from exc
+        received_first = True
+        first_elapsed = monotonic_time() - started
+
+        if isinstance(first, AIMessageChunk):
+            merged = first
+            async for chunk in iterator:
+                if not isinstance(chunk, AIMessageChunk):
+                    raise TypeError("model stream changed chunk type after first packet")
+                merged = merged + chunk
+            return _ModelInvocationResult(
+                message_chunk_to_message(merged),
+                ttft_seconds=max(0.0, first_elapsed),
+                probe_status="streamed",
+            )
+
+        trailing = [item async for item in iterator]
+        if trailing:
+            raise TypeError("non-message model stream yielded multiple values")
+        return _ModelInvocationResult(
+            first,
+            probe_status="non_streaming_wrapper",
+        )
+    except Exception as exc:
+        if not received_first and (
+            probe_mode == "shadow" or _streaming_unsupported(exc)
+        ):
+            return _ModelInvocationResult(
+                await _call_model_ainvoke(model, messages, invoke_config),
+                probe_status="fallback",
+            )
+        raise
+    finally:
+        if iterator is not None:
+            await _close_async_iterator(iterator)
 
 
 def apply_helicone_config(
@@ -1471,7 +1724,28 @@ async def invoke_model_with_observability(
         provider=provider,
         model=model_id or model_name,
     ) as span:
-        response = await _ainvoke_model(model, messages, recorder, config)
+        invocation_result = await _ainvoke_model(
+            model,
+            messages,
+            recorder,
+            config,
+        )
+        response = invocation_result.response
+        span.attributes["llm.first_token_probe_status"] = (
+            invocation_result.probe_status
+        )
+        if invocation_result.ttft_seconds is not None:
+            span.attributes["llm.first_token_latency_seconds"] = (
+                invocation_result.ttft_seconds
+            )
+        _observe_first_packet_metrics(
+            recorder,
+            invocation_result,
+            provider=provider,
+            model=model_id or model_name,
+            agent_role=agent_role,
+            operation=span_name,
+        )
         usage = TokenUsage.from_response(response)
         if hasattr(span, "add_usage"):
             span.add_usage(usage, provider, model_id or model_name)
@@ -1563,18 +1837,81 @@ async def invoke_model_with_retry_observability(
         provider=provider,
         model=model_id or model_name,
     ) as span:
+        circuit_breaker: ModelCircuitBreaker | None = None
+        circuit_permit: CircuitPermit | None = None
+        if configurable.model_circuit_breaker_enabled and model_name:
+            try:
+                circuit_breaker = get_model_circuit_registry().get_or_create(
+                    model_name,
+                    model_circuit_policy_from_configuration(configurable),
+                )
+                if circuit_breaker is not None:
+                    circuit_permit, transition = await circuit_breaker.before_call()
+                    await observe_model_circuit_transition(
+                        transition,
+                        config,
+                        agent_role=agent_role,
+                    )
+            except CircuitOpenError as exc:
+                span.record_outcome(error_type="model_circuit_open")
+                if recorder.prometheus is not None:
+                    recorder._safe(  # noqa: SLF001
+                        recorder.prometheus.observe_model_circuit_rejection,
+                        provider or "unknown",
+                        model_id or model_name or "unknown",
+                        exc.reason,
+                    )
+                raise
+            except Exception as exc:  # noqa: BLE001 - circuit governance fails open
+                circuit_breaker = None
+                circuit_permit = None
+                logger.debug("Model circuit before_call failed open: %s", exc)
         attempt = 0  # attempts made so far (0 == first try in progress)
         while True:
             try:
                 invocation = _ainvoke_model(model, messages, recorder, config)
-                response = await asyncio.wait_for(
+                invocation_result = await asyncio.wait_for(
                     invocation,
                     timeout=configurable.model_call_timeout_seconds,
                 )
+                response = invocation_result.response
             except Exception as exc:  # noqa: BLE001 -- classify then decide
                 error_type, retryable = classify_llm_retryable_error(exc)
                 attempts_made = attempt + 1
                 if not retryable or attempts_made >= max_attempts:
+                    if circuit_breaker is not None and circuit_permit is not None:
+                        try:
+                            from open_deep_research.model_fallback import (
+                                classify_model_error,
+                            )
+
+                            circuit_kind = classify_model_error(exc, model_name)
+                            transition = None
+                            if isinstance(exc, CircuitOpenError):
+                                pass
+                            elif circuit_kind.value in {
+                                kind.value for kind in CircuitFailureKind
+                            }:
+                                transition = await circuit_breaker.record_failure(
+                                    circuit_permit,
+                                    failure_kind=CircuitFailureKind(
+                                        circuit_kind.value
+                                    ),
+                                )
+                            else:
+                                transition = await circuit_breaker.record_inconclusive(
+                                    circuit_permit
+                                )
+                            await observe_model_circuit_transition(
+                                transition,
+                                config,
+                                agent_role=agent_role,
+                            )
+                        except Exception as circuit_exc:  # noqa: BLE001
+                            logger.debug(
+                                "Model circuit failure recording failed open: %s",
+                                circuit_exc,
+                            )
                     span.record_outcome(
                         error_type=error_type.value,
                         http_status=_safe_http_status(exc),
@@ -1634,6 +1971,34 @@ async def invoke_model_with_retry_observability(
                 await sleeper(delay)
                 attempt += 1
                 continue
+            if circuit_breaker is not None and circuit_permit is not None:
+                try:
+                    transition = await circuit_breaker.record_success(
+                        circuit_permit,
+                        ttft_seconds=invocation_result.ttft_seconds,
+                    )
+                    await observe_model_circuit_transition(
+                        transition,
+                        config,
+                        agent_role=agent_role,
+                    )
+                except Exception as exc:  # noqa: BLE001 - circuit governance fails open
+                    logger.debug("Model circuit success recording failed open: %s", exc)
+            span.attributes["llm.first_token_probe_status"] = (
+                invocation_result.probe_status
+            )
+            if invocation_result.ttft_seconds is not None:
+                span.attributes["llm.first_token_latency_seconds"] = (
+                    invocation_result.ttft_seconds
+                )
+            _observe_first_packet_metrics(
+                recorder,
+                invocation_result,
+                provider=provider,
+                model=model_id or model_name,
+                agent_role=agent_role,
+                operation=span_name,
+            )
             usage = TokenUsage.from_response(response)
             if hasattr(span, "add_usage"):
                 span.add_usage(usage, provider, model_id or model_name)

@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
+from pydantic import ValidationError
 
 from open_deep_research.agents.model_recovery import (
     build_model_candidate_chain,
     invoke_with_model_fallback,
 )
+from open_deep_research.configuration import Configuration
 from open_deep_research.public_events import event_store_from_config
 
 
@@ -104,3 +106,44 @@ def test_candidate_chain_is_deduplicated_and_uses_role_config() -> None:
     ]
     assert all(candidate.model is template for candidate in candidates)
     assert candidates[1].model_config["model"] == "anthropic:fallback"
+
+
+def test_model_fallbacks_env_json_configures_role_chains(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "MODEL_FALLBACKS",
+        '{"researcher": ["anthropic:fallback", "openai:secondary"]}',
+    )
+
+    configurable = Configuration.from_runnable_config({})
+
+    assert configurable.model_fallbacks == {
+        "researcher": ["anthropic:fallback", "openai:secondary"],
+    }
+    candidates = build_model_candidate_chain(
+        "openai:primary",
+        configurable.model_fallbacks.get("researcher", []),
+        max_tokens=4096,
+        config={},
+        role="researcher",
+        model=object(),
+    )
+    assert [candidate.model_id for candidate in candidates] == [
+        "openai:primary",
+        "anthropic:fallback",
+        "openai:secondary",
+    ]
+
+
+def test_model_fallbacks_env_empty_string_disables_fallback(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_FALLBACKS", "")
+
+    configurable = Configuration.from_runnable_config({})
+
+    assert configurable.model_fallbacks == {}
+
+
+def test_model_fallbacks_env_rejects_unknown_roles(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_FALLBACKS", '{"lead": ["openai:fallback"]}')
+
+    with pytest.raises(ValidationError, match="unknown model fallback roles"):
+        Configuration.from_runnable_config({})

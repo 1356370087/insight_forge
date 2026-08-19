@@ -53,11 +53,16 @@ from open_deep_research.budgets import (
     DeadlineExceeded,
 )
 from open_deep_research.configuration import Configuration
+from open_deep_research.model_circuit import (
+    get_model_circuit_registry,
+    model_circuit_policy_from_configuration,
+)
 from open_deep_research.observability import (
     TokenUsage,
     apply_helicone_config,
     get_trace_recorder,
     invoke_model_with_retry_observability,
+    observe_model_circuit_transition,
     observe_tool_call,
 )
 from open_deep_research.runtime import normalize_messages
@@ -774,6 +779,29 @@ async def query(params: QueryParams) -> AsyncIterator[QueryEvent]:
         raise ValueError("query_requires_model_candidate")
     if state.model_route.active_candidate_index >= len(candidates):
         raise ValueError("query_model_route_out_of_range")
+    if configurable.model_circuit_breaker_enabled:
+        try:
+            selected_index, _transition = (
+                await get_model_circuit_registry().select_candidate_index(
+                    [candidate.model_id for candidate in candidates],
+                    model_circuit_policy_from_configuration(configurable),
+                    start_index=state.model_route.active_candidate_index,
+                )
+            )
+            await observe_model_circuit_transition(
+                _transition,
+                params.config,
+                agent_role=params.role.value,
+            )
+            if selected_index != state.model_route.active_candidate_index:
+                state = replace(
+                    state,
+                    model_route=ModelRouteState(
+                        active_candidate_index=selected_index
+                    ),
+                )
+        except Exception:  # noqa: BLE001 - circuit routing fails open
+            pass
     compiler = params.context_compiler or ContextCompiler(
         model_context_window_overrides=(
             configurable.model_context_window_overrides
@@ -1255,6 +1283,29 @@ async def query(params: QueryParams) -> AsyncIterator[QueryEvent]:
                         and params.call_model is None
                         and candidate_index + 1 < len(candidates)
                     ):
+                        next_candidate_index = candidate_index + 1
+                        if configurable.model_circuit_breaker_enabled:
+                            try:
+                                next_candidate_index, _transition = (
+                                    await get_model_circuit_registry()
+                                    .select_candidate_index(
+                                        [
+                                            candidate.model_id
+                                            for candidate in candidates
+                                        ],
+                                        model_circuit_policy_from_configuration(
+                                            configurable
+                                        ),
+                                        start_index=next_candidate_index,
+                                    )
+                                )
+                                await observe_model_circuit_transition(
+                                    _transition,
+                                    params.config,
+                                    agent_role=params.role.value,
+                                )
+                            except Exception:  # noqa: BLE001
+                                next_candidate_index = candidate_index + 1
                         state = advance(
                             state,
                             QueryStateAction(
@@ -1267,9 +1318,7 @@ async def query(params: QueryParams) -> AsyncIterator[QueryEvent]:
                                         )
                                     ),
                                     "model_route": ModelRouteState(
-                                        active_candidate_index=(
-                                            candidate_index + 1
-                                        )
+                                        active_candidate_index=next_candidate_index
                                     ),
                                     "output_recovery": (
                                         OutputRecoveryState()
@@ -1285,7 +1334,7 @@ async def query(params: QueryParams) -> AsyncIterator[QueryEvent]:
                                 "turn": state.turn,
                                 "from_model": model_name,
                                 "to_model": candidates[
-                                    candidate_index + 1
+                                    next_candidate_index
                                 ].model_id,
                                 "reason": error_kind.value,
                             },

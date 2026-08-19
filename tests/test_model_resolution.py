@@ -119,6 +119,7 @@ def test_build_model_config_assembles_shared_fields(
     )
     assert config == {
         "model": "openai:qwen3.7-max",
+        "max_retries": 0,
         "api_key": "dashscope-key",
         "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "tags": ["langsmith:nostream"],

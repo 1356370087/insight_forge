@@ -34,6 +34,12 @@ from open_deep_research.agents.query_state import (
     advance,
 )
 from open_deep_research.agents.tool_protocol import validate_tool_transcript
+from open_deep_research.configuration import Configuration
+from open_deep_research.model_circuit import (
+    CircuitFailureKind,
+    get_model_circuit_registry,
+    model_circuit_policy_from_configuration,
+)
 from open_deep_research.run_context import (
     RunConfigurationError,
     RunContextStore,
@@ -1007,6 +1013,39 @@ async def test_model_fallback_only_for_allowed_error_and_sanitizes_metadata() ->
     assert "signature" not in replayed_ai.additional_kwargs
     assert "reasoning" not in replayed_ai.response_metadata
     assert any(event.type == "query.model_fallback" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_query_starts_with_first_non_open_model_candidate() -> None:
+    config = _config()
+    primary = _CandidateModel(AIMessage(content="must not run"))
+    fallback = _CandidateModel(AIMessage(content="done"))
+    policy = model_circuit_policy_from_configuration(
+        Configuration.from_runnable_config(config)
+    )
+    breaker = get_model_circuit_registry().get_or_create("primary", policy)
+    assert breaker is not None
+    for _ in range(policy.failure_threshold):
+        permit, _transition = await breaker.before_call()
+        await breaker.record_failure(
+            permit,
+            failure_kind=CircuitFailureKind.MODEL_UNAVAILABLE,
+        )
+
+    events = await _events(QueryParams(
+        messages=[HumanMessage(content="brief")],
+        system_prompt=None,
+        model=primary,
+        config=config,
+        model_candidates=[
+            ModelCandidate("primary", primary, {"model": "primary"}),
+            ModelCandidate("fallback", fallback, {"model": "fallback"}),
+        ],
+    ))
+
+    assert primary.calls == []
+    assert len(fallback.calls) == 1
+    assert any(event.type == "query.completed" for event in events)
 
 
 @pytest.mark.asyncio

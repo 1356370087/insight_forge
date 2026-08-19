@@ -16,11 +16,21 @@ from open_deep_research.quality_policy import (
     rigor_from_legacy_min_score,
 )
 
-RUN_CONFIG_SCHEMA_VERSION = 4
+RUN_CONFIG_SCHEMA_VERSION = 5
 QUALITY_POLICY_VERSION = "quality-gate-v4"
 RUN_CONFIG_FROZEN_FIELDS = (
     "max_structured_output_retries",
     "model_transport_max_attempts",
+    "model_circuit_breaker_enabled",
+    "model_circuit_failure_threshold",
+    "model_circuit_failure_window_seconds",
+    "model_circuit_open_cooldown_seconds",
+    "model_circuit_max_cooldown_seconds",
+    "model_circuit_slow_ratio_threshold",
+    "model_circuit_slow_min_samples",
+    "model_first_packet_probe",
+    "model_first_packet_timeout_seconds",
+    "model_slow_first_packet_threshold_seconds",
     "context_recovery_max_attempts",
     "output_token_escalation_enabled",
     "output_continuation_max_attempts",
@@ -72,6 +82,23 @@ RUN_CONFIG_FROZEN_FIELDS = (
     "task_timeout_seconds",
     "sandbox_timeout_seconds",
 )
+_MODEL_CIRCUIT_FROZEN_FIELDS = {
+    "model_circuit_breaker_enabled",
+    "model_circuit_failure_threshold",
+    "model_circuit_failure_window_seconds",
+    "model_circuit_open_cooldown_seconds",
+    "model_circuit_max_cooldown_seconds",
+    "model_circuit_slow_ratio_threshold",
+    "model_circuit_slow_min_samples",
+    "model_first_packet_probe",
+    "model_first_packet_timeout_seconds",
+    "model_slow_first_packet_threshold_seconds",
+}
+RUN_CONFIG_FROZEN_FIELDS_V4 = tuple(
+    field_name
+    for field_name in RUN_CONFIG_FROZEN_FIELDS
+    if field_name not in _MODEL_CIRCUIT_FROZEN_FIELDS
+)
 _QUALITY_V4_FROZEN_FIELDS = {
     "quality_risk_mode",
     "quality_caveat_admission_enabled",
@@ -79,7 +106,7 @@ _QUALITY_V4_FROZEN_FIELDS = {
 }
 RUN_CONFIG_FROZEN_FIELDS_V3 = tuple(
     field_name
-    for field_name in RUN_CONFIG_FROZEN_FIELDS
+    for field_name in RUN_CONFIG_FROZEN_FIELDS_V4
     if field_name not in _QUALITY_V4_FROZEN_FIELDS
 )
 _MODEL_RECOVERY_FROZEN_FIELDS = {
@@ -89,7 +116,7 @@ _MODEL_RECOVERY_FROZEN_FIELDS = {
     "model_context_window_overrides",
     "model_max_output_tokens_overrides",
     "unknown_model_context_window_tokens",
-}
+} | _MODEL_CIRCUIT_FROZEN_FIELDS
 RUN_CONFIG_FROZEN_FIELDS_V2 = tuple(
     field_name
     for field_name in RUN_CONFIG_FROZEN_FIELDS_V3
@@ -259,6 +286,23 @@ class Configuration(BaseModel):
         le=10,
         description="Maximum attempts for retryable model transport failures.",
     )
+    model_circuit_breaker_enabled: bool = Field(
+        default=True,
+        description="Enable process-local model circuits and first-packet probing.",
+    )
+    model_circuit_failure_threshold: int = Field(default=5, ge=1)
+    model_circuit_failure_window_seconds: float = Field(default=300, gt=0)
+    model_circuit_open_cooldown_seconds: float = Field(default=60, gt=0)
+    model_circuit_max_cooldown_seconds: float = Field(default=600, gt=0)
+    model_circuit_slow_ratio_threshold: float = Field(
+        default=0.5,
+        gt=0,
+        le=1,
+    )
+    model_circuit_slow_min_samples: int = Field(default=4, ge=1)
+    model_first_packet_probe: Literal["off", "shadow", "enforced"] = "shadow"
+    model_first_packet_timeout_seconds: float = Field(default=15, gt=0)
+    model_slow_first_packet_threshold_seconds: float = Field(default=8, gt=0)
     context_recovery_max_attempts: int = Field(
         default=3,
         ge=1,
@@ -1806,6 +1850,27 @@ class Configuration(BaseModel):
         return value
 
     @model_validator(mode="after")
+    def validate_model_circuit_thresholds(self) -> "Configuration":
+        """Ensure circuit cooldown and TTFT thresholds form valid ranges."""
+        if (
+            self.model_circuit_max_cooldown_seconds
+            < self.model_circuit_open_cooldown_seconds
+        ):
+            raise ValueError(
+                "model_circuit_max_cooldown_seconds must be greater than or "
+                "equal to model_circuit_open_cooldown_seconds"
+            )
+        if (
+            self.model_first_packet_timeout_seconds
+            <= self.model_slow_first_packet_threshold_seconds
+        ):
+            raise ValueError(
+                "model_first_packet_timeout_seconds must be greater than "
+                "model_slow_first_packet_threshold_seconds"
+            )
+        return self
+
+    @model_validator(mode="after")
     def validate_leader_lease_timing(self) -> "Configuration":
         """Ensure a live leader renews well before its lease can expire."""
         if self.leader_heartbeat_seconds * 3 > self.leader_lease_seconds:
@@ -1873,6 +1938,8 @@ def frozen_run_config_values(config: RunnableConfig) -> dict[str, Any]:
         if schema_version == 2
         else RUN_CONFIG_FROZEN_FIELDS_V3
         if schema_version == 3
+        else RUN_CONFIG_FROZEN_FIELDS_V4
+        if schema_version == 4
         else RUN_CONFIG_FROZEN_FIELDS
     )
     return {
@@ -1930,6 +1997,8 @@ def freeze_run_config(
             if schema_version == 2
             else RUN_CONFIG_FROZEN_FIELDS_V3
             if schema_version == 3
+            else RUN_CONFIG_FROZEN_FIELDS_V4
+            if schema_version == 4
             else RUN_CONFIG_FROZEN_FIELDS
         )
         missing = [

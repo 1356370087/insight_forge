@@ -80,6 +80,14 @@ _PAYLOAD_KEYS: dict[str, set[str]] = {
     },
     "model.retrying": {"provider", "model", "attempt", "error_code", "delay_ms"},
     "model.failed": {"provider", "model", "error_code", "retry_count"},
+    "model.circuit_open": {
+        "provider", "model", "reason", "cooldown_seconds", "failure_count",
+        "slow_count", "sample_count",
+    },
+    "model.circuit_recovered": {
+        "provider", "model", "reason", "cooldown_seconds", "failure_count",
+        "slow_count", "sample_count",
+    },
     "tool.started": {
         "tool_call_id", "tool_name", "tool_category", "args_summary", "args_keys",
     },

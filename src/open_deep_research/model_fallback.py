@@ -16,9 +16,18 @@ from typing import Any, TypeVar
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.runnables import RunnableConfig
 
+from open_deep_research.configuration import Configuration
+from open_deep_research.model_circuit import (
+    CircuitOpenError,
+    get_model_circuit_registry,
+    model_circuit_policy_from_configuration,
+)
 from open_deep_research.model_errors import is_token_limit_exceeded
 from open_deep_research.model_resolution import build_model_config
-from open_deep_research.observability import get_trace_recorder
+from open_deep_research.observability import (
+    get_trace_recorder,
+    observe_model_circuit_transition,
+)
 from open_deep_research.public_events import event_publisher_from_config
 
 logger = logging.getLogger(__name__)
@@ -126,6 +135,26 @@ async def invoke_with_model_fallback(
         if normalized and normalized not in chain:
             chain.append(normalized)
 
+    if config is not None:
+        try:
+            configuration = Configuration.from_runnable_config(config)
+            if configuration.model_circuit_breaker_enabled and chain:
+                selected, transition = (
+                    await get_model_circuit_registry().select_candidate_index(
+                        chain,
+                        model_circuit_policy_from_configuration(configuration),
+                    )
+                )
+                if transition is not None and selected:
+                    chain = [chain[selected], *chain[:selected], *chain[selected + 1 :]]
+                await observe_model_circuit_transition(
+                    transition,
+                    config,
+                    agent_role=role,
+                )
+        except Exception:
+            logger.debug("Model circuit fallback preflight failed open", exc_info=True)
+
     request_messages = list(messages)
     for index, model_id in enumerate(chain):
         try:
@@ -209,6 +238,8 @@ def classify_model_error(
     model_name: str | None = None,
 ) -> ModelErrorKind:
     """Map provider exceptions to the bounded Query recovery taxonomy."""
+    if isinstance(error, CircuitOpenError):
+        return ModelErrorKind.MODEL_UNAVAILABLE
     if isinstance(error, TimeoutError):
         return ModelErrorKind.MODEL_UNAVAILABLE
     if isinstance(error, KeyboardInterrupt | SystemExit):

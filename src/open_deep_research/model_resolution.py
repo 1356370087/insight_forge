@@ -25,6 +25,7 @@ _DASHSCOPE_DEFAULT_BASE_URL = (
 _CONFIGURABLE_MODEL_FIELDS = (
     "model",
     "max_tokens",
+    "max_retries",
     "api_key",
     "base_url",
     "default_headers",
@@ -224,6 +225,7 @@ def build_model_config(
     model_config: dict[str, Any] = {
         "model": model_spec,
         "max_tokens": max_tokens,
+        "max_retries": 0,
         "api_key": api_key,
     }
     if base_url := resolve_base_url(

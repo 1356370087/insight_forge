@@ -23,6 +23,14 @@ def _operation(name: str) -> str:
     return name
 
 
+def _provider_model(model_name: str) -> tuple[str, str]:
+    """Split one normalized model id into bounded metric labels."""
+    if ":" not in model_name:
+        return "unknown", model_name or "unknown"
+    provider, model = model_name.split(":", 1)
+    return provider or "unknown", model or "unknown"
+
+
 class PrometheusMetrics:
     """Record low-cardinality operational metrics from TraceRecorder spans."""
 
@@ -100,6 +108,43 @@ class PrometheusMetrics:
             buckets=(0, 0.01, 0.1, 0.25, 0.5, 0.75, 0.9, 1),
             namespace=namespace,
         )
+        self.model_circuit_state = Gauge(
+            "model_circuit_state",
+            "Current process-local model circuit state as a one-hot gauge.",
+            ["provider", "model", "state"],
+            namespace=namespace,
+        )
+        self.model_circuit_rejected = Counter(
+            "model_circuit_rejected_total",
+            "Model calls rejected by a process-local circuit.",
+            ["provider", "model", "reason"],
+            namespace=namespace,
+        )
+        self.model_circuit_transitions = Counter(
+            "model_circuit_transitions_total",
+            "Process-local model circuit state transitions.",
+            ["provider", "model", "from_state", "to_state", "reason"],
+            namespace=namespace,
+        )
+        self.llm_first_token_latency = Histogram(
+            "llm_first_token_latency_seconds",
+            "Latency until the first native model stream chunk.",
+            ["provider", "model", "agent_role", "operation"],
+            namespace=namespace,
+        )
+        self.model_slow_first_token = Counter(
+            "model_slow_first_token_total",
+            "Native model stream chunks slower than the configured threshold.",
+            ["provider", "model", "probe_mode"],
+            namespace=namespace,
+        )
+        self.model_streaming_fallback = Counter(
+            "model_streaming_fallback_total",
+            "First-packet probes downgraded to non-streaming invocation.",
+            ["provider", "model", "reason"],
+            namespace=namespace,
+        )
+        self._circuit_gauge_models: set[tuple[str, str]] = set()
         self.tool_calls = Counter(
             "tool_calls_total",
             "Completed tool calls.",
@@ -375,6 +420,85 @@ class PrometheusMetrics:
         self.retries.labels(*labels, error_type).inc()
         if error_type == "rate_limited":
             self.rate_limits.labels(*labels).inc()
+
+    def observe_model_circuit_rejection(
+        self,
+        provider: str,
+        model: str,
+        reason: str,
+    ) -> None:
+        """Count one local circuit rejection."""
+        self.model_circuit_rejected.labels(
+            provider or "unknown",
+            model or "unknown",
+            reason,
+        ).inc()
+
+    def observe_model_circuit_transition(self, transition: Any) -> None:
+        """Count one model circuit state transition."""
+        provider, model = _provider_model(str(transition.model_id))
+        self.model_circuit_transitions.labels(
+            provider,
+            model,
+            transition.from_state.value,
+            transition.to_state.value,
+            str(transition.reason),
+        ).inc()
+
+    def observe_first_token(
+        self,
+        *,
+        provider: str,
+        model: str,
+        agent_role: str,
+        operation: str,
+        duration_seconds: float,
+        probe_mode: str,
+        slow: bool,
+    ) -> None:
+        """Record one native first-token latency observation."""
+        self.llm_first_token_latency.labels(
+            provider or "unknown",
+            model or "unknown",
+            agent_role or "unknown",
+            _operation(operation),
+        ).observe(max(0.0, duration_seconds))
+        if slow:
+            self.model_slow_first_token.labels(
+                provider or "unknown",
+                model or "unknown",
+                probe_mode,
+            ).inc()
+
+    def observe_streaming_fallback(
+        self,
+        provider: str,
+        model: str,
+        reason: str,
+    ) -> None:
+        """Count one safe first-packet probe downgrade."""
+        self.model_streaming_fallback.labels(
+            provider or "unknown",
+            model or "unknown",
+            reason,
+        ).inc()
+
+    def set_model_circuit_states(self, snapshots: list[Any]) -> None:
+        """Refresh one-hot state gauges from registry snapshots."""
+        current: set[tuple[str, str]] = set()
+        states = ("closed", "open", "half_open")
+        for snapshot in snapshots:
+            provider, model = _provider_model(str(snapshot.model_id))
+            current.add((provider, model))
+            active = snapshot.state.value
+            for state in states:
+                self.model_circuit_state.labels(provider, model, state).set(
+                    1 if state == active else 0
+                )
+        for provider, model in self._circuit_gauge_models - current:
+            for state in states:
+                self.model_circuit_state.labels(provider, model, state).set(0)
+        self._circuit_gauge_models = current
 
     def observe_run(self, status: str, duration_seconds: float) -> None:
         """Publish one completed top-level run."""

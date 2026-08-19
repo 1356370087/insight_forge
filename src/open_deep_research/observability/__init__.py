@@ -11,6 +11,7 @@ from open_deep_research.observability.core import (
     get_trace_recorder,
     invoke_model_with_observability,
     invoke_model_with_retry_observability,
+    observe_model_circuit_transition,
     observe_tool_call,
 )
 
@@ -25,5 +26,6 @@ __all__ = [
     "get_trace_recorder",
     "invoke_model_with_observability",
     "invoke_model_with_retry_observability",
+    "observe_model_circuit_transition",
     "observe_tool_call",
 ]

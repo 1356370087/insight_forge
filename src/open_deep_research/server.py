@@ -33,6 +33,7 @@ from open_deep_research.logging_config import (
     configure_logging,
     current_request_id,
 )
+from open_deep_research.model_circuit import get_model_circuit_registry
 from open_deep_research.observability import SQLiteTraceStore, get_trace_recorder
 from open_deep_research.observability.telemetry import get_prometheus_metrics
 from open_deep_research.public_events import (
@@ -483,6 +484,14 @@ async def _refresh_operational_metrics() -> None:
         with contextlib.suppress(Exception):
             metrics.observe_export_error("prometheus", "runs_dir_usage")
         logger.debug("Unable to refresh runs_dir metrics: %s", exc)
+    try:
+        metrics.set_model_circuit_states(
+            await get_model_circuit_registry().snapshots()
+        )
+    except Exception as exc:  # noqa: BLE001 - metrics must never block the API
+        with contextlib.suppress(Exception):
+            metrics.observe_export_error("prometheus", "model_circuit_state")
+        logger.debug("Unable to refresh model circuit metrics: %s", exc)
 
 
 @app.get(_metrics_path, include_in_schema=False)

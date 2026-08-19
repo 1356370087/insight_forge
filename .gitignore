@@ -90,6 +90,7 @@ research_runs/
 docs/
 !docs/
 docs/*
+!docs/07-模型熔断与首包探测.md
 
 # 临时工具缓存与运行输出
 .playwright-cli/

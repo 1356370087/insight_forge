@@ -61,4 +61,16 @@ describe("reducePublicEvent", () => {
     expect(state.terminal).toBe(true);
     expect(state.connectionState).toBe("closed");
   });
+
+  it("recognizes model circuit events without unknown diagnostics", () => {
+    const opened = reducePublicEvent(emptyRunState("run-1"), event(1, "model.circuit_state", {
+      provider: "openai", model: "gpt-test", from_state: "closed", to_state: "open",
+    }));
+    expect(opened.diagnostics).toHaveLength(0);
+    expect(opened.warnings.at(-1)?.code).toBe("model_circuit_open");
+    const recovered = reducePublicEvent(opened, event(2, "model.circuit_state", {
+      provider: "openai", model: "gpt-test", from_state: "half_open", to_state: "closed",
+    }));
+    expect(recovered.diagnostics).toHaveLength(0);
+  });
 });

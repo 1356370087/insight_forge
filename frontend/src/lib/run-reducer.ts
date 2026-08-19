@@ -108,6 +108,13 @@ export function reducePublicEvent(state: ResearchRunState, event: PublicEvent): 
     next.status = "running";
   } else if (event.type === "system.warning") {
     next.warnings = [...state.warnings, { code: String(payload.warning_code ?? "warning"), message: String(payload.message ?? "") }];
+  } else if (event.type === "model.circuit_state") {
+    if (payload.to_state === "open") {
+      next.warnings = [...state.warnings, {
+        code: "model_circuit_open",
+        message: `Model ${String(payload.provider ?? "unknown")}:${String(payload.model ?? "unknown")} is temporarily isolated.`,
+      }];
+    }
   } else if (!TERMINAL.has(event.type) && !event.type.startsWith("report.") && !event.type.startsWith("feedback.")) {
     next.diagnostics = [...state.diagnostics, `Unknown event ${event.type} (v${event.schema_version})`].slice(-50);
   }

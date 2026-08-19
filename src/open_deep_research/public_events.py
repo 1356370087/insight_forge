@@ -121,6 +121,11 @@ _PAYLOAD_KEYS: dict[str, set[str]] = {
     "clarification.resolved": {"action_id", "action", "status"},
     "feedback.received": {"feedback_id", "feedback_type", "task_id", "status"},
     "query.model_fallback": {"turn", "from_model", "to_model", "reason"},
+    "model.circuit_state": {
+        "provider", "model", "from_state", "to_state", "reason",
+        "failure_count", "slow_count", "sample_count", "slow_ratio",
+        "cooldown_seconds", "forced_probe",
+    },
     "system.warning": {"warning_code", "message"},
 }
 

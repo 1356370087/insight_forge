@@ -151,6 +151,7 @@ class TestDashScopeQualityEvaluationConfiguration:
         expected_init = {
             "model": model_spec,
             "max_tokens": configurable.quality_evaluation_model_max_tokens,
+            "max_retries": 0,
             "api_key": values["DASHSCOPE_API_KEY"],
             "base_url": values["QUALITY_EVALUATION_BASE_URL"],
         }
