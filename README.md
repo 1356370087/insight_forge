@@ -853,6 +853,36 @@ uv run python tests/extract_langsmith_data.py \
 
 深度研究和 LLM-as-Judge 都会产生模型、搜索与抓取费用。运行完整数据集前，请先用少量问题验证模型配置、并发限制、Token 预算和预期成本。
 
+## 运维模型与后台维护
+
+当前生产部署推荐单个 Uvicorn worker。运行记录、API 固定窗口限流、SSE
+连接计数和后台保留清扫都包含进程内状态；多 worker 会分别计算这些状态。
+SQLite Trace Store 已配置 WAL、5 秒 busy timeout 和 NORMAL synchronous，能够
+降低并发写锁冲突，但多 worker 下 Trace 写入仍属于 best-effort，不应把它当作
+强一致审计数据库。
+
+启用高级记忆后，可通过系统定时器每天运行一次维护，或者使用持锁循环模式：
+
+```bash
+uv run python -m open_deep_research.memory.maintenance daily --loop --interval-hours 24
+```
+
+循环在整个生命周期持有 `.runs/memory-maintenance.lock`，第二个维护进程会立即
+退出；实际用户维护还会与 API 记忆写入共享 tenant/user 级锁，API 写入默认最多等待
+5 秒以吸收短暂竞争。项目级 Mem0 Decay 使用独立的
+`.runs/memory-configure-decay.lock`，因此无需停止 daily loop 即可显式变更，例如
+`uv run python -m open_deep_research.memory.maintenance configure-decay --enabled`，
+不会由运行级配置在请求路径中自动翻转。`docker-compose.yaml` 中提供了默认关闭的
+`memory-maintenance` 服务示例。
+
+## 沙箱密钥威胁模型
+
+Docker 沙箱提供资源和文件系统隔离，但不等于密钥隔离。通过
+`SANDBOX_SECRET_ENV_KEYS` 注入的变量可被容器内运行的不可信代码读取，因此只应
+注入研究任务必需且权限最小、可轮换的凭据。将环境变量显式设置为空字符串
+`SANDBOX_SECRET_ENV_KEYS=` 可完全关闭沙箱密钥注入；关闭后依赖这些凭据的沙箱
+搜索或模型调用会失败，需要改用宿主机代理或无密钥工具。
+
 ## 许可证
 
 本项目采用 [MIT License](LICENSE)。

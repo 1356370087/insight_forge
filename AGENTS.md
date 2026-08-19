@@ -190,3 +190,6 @@ FastAPI 部署时的认证与授权（Supabase 已完全移除；`src/security/a
 - ruff 配置使用 Google 风格的 docstring 规范（`convention = "google"`），测试文件忽略 D 和 UP 规则
 - `.runs` 目录包含运行数据与 Trace Store，已加入 `.gitignore`，不要提交
 - 前端统一使用 pnpm（不要用 npm/yarn 生成锁文件）；`NEXT_PUBLIC_*` 变量在构建期烧入客户端代码
+- 生产部署当前推荐单 Uvicorn worker；进程内 API 限流、SSE 连接数和运行表不会跨 worker 汇总，SQLite Trace 多 worker 写入仅为 best-effort
+- 高级记忆维护建议使用系统定时器每天执行一次，或运行 `python -m open_deep_research.memory.maintenance daily --loop --interval-hours 24`；循环会持有 `.runs/memory-maintenance.lock` 防止重复执行
+- 沙箱资源隔离不等于密钥隔离：容器内代码可读取 `SANDBOX_SECRET_ENV_KEYS` 指定的凭据；只注入最小权限密钥，设置 `SANDBOX_SECRET_ENV_KEYS=` 可禁用全部密钥注入
