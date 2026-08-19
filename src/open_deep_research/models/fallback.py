@@ -17,6 +17,7 @@ from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.runnables import RunnableConfig
 
 from open_deep_research.configuration import Configuration
+from open_deep_research.events.public import event_publisher_from_config
 from open_deep_research.models.circuit import (
     CircuitOpenError,
     get_model_circuit_registry,
@@ -28,7 +29,6 @@ from open_deep_research.observability import (
     get_trace_recorder,
     observe_model_circuit_transition,
 )
-from open_deep_research.public_events import event_publisher_from_config
 
 logger = logging.getLogger(__name__)
 _ModelResult = TypeVar("_ModelResult")

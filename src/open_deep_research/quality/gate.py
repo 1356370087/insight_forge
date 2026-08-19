@@ -17,6 +17,7 @@ from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field, model_validator
 
 from open_deep_research.configuration import QUALITY_POLICY_VERSION, Configuration
+from open_deep_research.events.task_activity import publish_task_activity
 from open_deep_research.evidence import (
     SourceScopeStatus,
     classify_evidence_source,
@@ -34,7 +35,6 @@ from open_deep_research.observability import (
     get_trace_recorder,
     invoke_model_with_retry_observability,
 )
-from open_deep_research.public_task_activity import publish_task_activity
 from open_deep_research.quality.contract import (
     AdmissionStatus,
     HandoffPolicyInput,

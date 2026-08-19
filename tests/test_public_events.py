@@ -5,7 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from open_deep_research.agents.query_engine import QueryEngine
-from open_deep_research.public_events import (
+from open_deep_research.events.public import (
     PublicEventLogCorrupted,
     RunEventStore,
     canonical_public_source,

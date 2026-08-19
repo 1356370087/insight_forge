@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 from open_deep_research import server
 from open_deep_research.configuration import Configuration
-from open_deep_research.public_events import RunEventStore
+from open_deep_research.events.public import RunEventStore
 from open_deep_research.run_context import RunContextStore
 from open_deep_research.tasks.lease import LeaderLeaseManager
 

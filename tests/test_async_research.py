@@ -1428,7 +1428,7 @@ class TestAsyncSupervisorTermination:
 
         from open_deep_research.agents import deep_researcher
         from open_deep_research.configuration import Configuration
-        from open_deep_research.public_events import RunEventStore
+        from open_deep_research.events.public import RunEventStore
         from open_deep_research.tasks.registry import get_task_registry
         from open_deep_research.tasks.state import get_task_state_store
 

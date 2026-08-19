@@ -5,8 +5,8 @@ import asyncio
 from fastapi.testclient import TestClient
 
 from open_deep_research import server
-from open_deep_research.public_events import RunEventStore
-from open_deep_research.public_task_activity import TaskActivityStore
+from open_deep_research.events.public import RunEventStore
+from open_deep_research.events.task_activity import TaskActivityStore
 from open_deep_research.run_context import RunContextStore
 from security.auth import get_current_user
 from tests.auth_helpers import research_principal

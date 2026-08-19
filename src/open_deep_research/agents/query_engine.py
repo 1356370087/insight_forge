@@ -56,17 +56,17 @@ from open_deep_research.configuration import (
     freeze_run_config,
 )
 from open_deep_research.evaluation import build_evaluation_snapshot
+from open_deep_research.events.public import (
+    PUBLIC_STAGES,
+    event_publisher_from_config,
+    extract_public_sources,
+)
+from open_deep_research.events.task_activity import publish_task_activity
 from open_deep_research.evidence import (
     eligible_evidence_records,
     source_scoped_evidence_records,
 )
 from open_deep_research.observability import get_trace_recorder
-from open_deep_research.public_events import (
-    PUBLIC_STAGES,
-    event_publisher_from_config,
-    extract_public_sources,
-)
-from open_deep_research.public_task_activity import publish_task_activity
 from open_deep_research.quality.contract import (
     AdmissionStatus,
     ResearchRiskProfile,

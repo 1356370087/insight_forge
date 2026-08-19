@@ -31,6 +31,8 @@ from langchain_core.messages import (
 from langchain_core.runnables import RunnableConfig
 
 from open_deep_research.configuration import Configuration
+from open_deep_research.events.public import event_publisher_from_config
+from open_deep_research.events.task_activity import publish_task_activity
 from open_deep_research.models.circuit import (
     CircuitFailureKind,
     CircuitOpenError,
@@ -46,8 +48,6 @@ from open_deep_research.observability.telemetry import (
     get_prometheus_metrics,
     monotonic_time,
 )
-from open_deep_research.public_events import event_publisher_from_config
-from open_deep_research.public_task_activity import publish_task_activity
 from open_deep_research.security.redaction import redact_text as _redact_text
 
 logger = logging.getLogger(__name__)

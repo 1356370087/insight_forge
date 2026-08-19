@@ -15,12 +15,12 @@ from langchain_core.messages import ToolMessage
 from langchain_core.runnables import RunnableConfig
 
 from open_deep_research.configuration import Configuration
-from open_deep_research.observability import current_span_ids, get_trace_recorder
-from open_deep_research.observability.telemetry import get_prometheus_metrics
-from open_deep_research.public_events import (
+from open_deep_research.events.public import (
     event_publisher_from_config,
     public_display_title,
 )
+from open_deep_research.observability import current_span_ids, get_trace_recorder
+from open_deep_research.observability.telemetry import get_prometheus_metrics
 from open_deep_research.sandbox.manager import stop_sandbox_container
 from open_deep_research.tasks.coordination import (
     FileDomainDecisionStore,

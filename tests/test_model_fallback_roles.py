@@ -11,7 +11,7 @@ from open_deep_research.agents.model_recovery import (
     invoke_with_model_fallback,
 )
 from open_deep_research.configuration import Configuration
-from open_deep_research.public_events import event_store_from_config
+from open_deep_research.events.public import event_store_from_config
 
 
 @pytest.mark.asyncio

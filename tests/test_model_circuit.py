@@ -13,6 +13,8 @@ from open_deep_research.configuration import (
     Configuration,
     freeze_run_config,
 )
+from open_deep_research.events.public import sanitize_public_payload
+from open_deep_research.events.task_activity import sanitize_task_activity_payload
 from open_deep_research.models.circuit import (
     CircuitFailureKind,
     CircuitOpenError,
@@ -26,8 +28,6 @@ from open_deep_research.models.circuit import (
 from open_deep_research.models.fallback import invoke_with_model_fallback
 from open_deep_research.observability import core as observability_core
 from open_deep_research.observability import invoke_model_with_retry_observability
-from open_deep_research.public_events import sanitize_public_payload
-from open_deep_research.public_task_activity import sanitize_task_activity_payload
 
 
 class FakeClock:

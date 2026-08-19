@@ -33,6 +33,13 @@ from open_deep_research.agents.research_context import offload_tool_message
 from open_deep_research.configuration import (
     Configuration,
 )
+from open_deep_research.events.public import (
+    event_publisher_from_config,
+    extract_public_sources,
+    public_display_title,
+    summarize_public_findings,
+)
+from open_deep_research.events.task_activity import publish_task_activity
 from open_deep_research.evidence import (
     SourceScopeStatus,
     classify_evidence_source,
@@ -83,13 +90,6 @@ from open_deep_research.prompts import (
     research_system_prompt,
     transform_messages_into_research_topic_prompt,
 )
-from open_deep_research.public_events import (
-    event_publisher_from_config,
-    extract_public_sources,
-    public_display_title,
-    summarize_public_findings,
-)
-from open_deep_research.public_task_activity import publish_task_activity
 from open_deep_research.quality.contract import (
     AdmissionStatus,
     ResearchCoverageContract,

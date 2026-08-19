@@ -1,8 +1,8 @@
 import asyncio
 import json
 
-from open_deep_research.public_events import RunEventStore
-from open_deep_research.public_task_activity import (
+from open_deep_research.events.public import RunEventStore
+from open_deep_research.events.task_activity import (
     TaskActivityPublisher,
     TaskActivityStore,
     activity_summary,

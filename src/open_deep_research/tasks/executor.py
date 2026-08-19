@@ -14,13 +14,13 @@ from langchain_core.messages import HumanMessage, message_to_dict
 from langchain_core.runnables import RunnableConfig
 
 from open_deep_research.configuration import Configuration
-from open_deep_research.observability.telemetry import get_prometheus_metrics
-from open_deep_research.public_events import (
+from open_deep_research.events.public import (
     event_publisher_from_config,
     extract_public_sources,
     summarize_public_findings,
 )
-from open_deep_research.public_task_activity import publish_task_activity
+from open_deep_research.events.task_activity import publish_task_activity
+from open_deep_research.observability.telemetry import get_prometheus_metrics
 from open_deep_research.run_context import RunContextStore
 from open_deep_research.sandbox.manager import DockerSandboxManager
 from open_deep_research.tasks.coordination import publish_task_update
