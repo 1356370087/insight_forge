@@ -262,6 +262,49 @@ class PrometheusMetrics:
             "Tasks currently executing or waiting for approval.",
             namespace=namespace,
         )
+        self.runs_dir_bytes = Gauge(
+            "runs_dir_bytes",
+            "Bytes currently occupied by durable run artifacts.",
+            namespace=namespace,
+        )
+        self.runs_dir_quota_bytes = Gauge(
+            "runs_dir_quota_bytes",
+            "Configured advisory byte quota for durable run artifacts; zero is unlimited.",
+            namespace=namespace,
+        )
+        self.runs_dir_quota_ratio = Gauge(
+            "runs_dir_quota_ratio",
+            "Fraction of the configured durable run artifact quota currently used.",
+            namespace=namespace,
+        )
+        self.runs_purged = Counter(
+            "runs_purged_total",
+            "Durable runs removed by lifecycle policy.",
+            ["reason"],
+            namespace=namespace,
+        )
+        self.retention_sweep_duration = Histogram(
+            "retention_sweep_duration_seconds",
+            "Duration of one durable run retention sweep.",
+            namespace=namespace,
+        )
+        self.retention_quota_exceeded = Gauge(
+            "retention_quota_exceeded",
+            "Whether runs_dir remains over quota after deleting eligible terminal runs.",
+            namespace=namespace,
+        )
+        self.api_rate_limited = Counter(
+            "api_rate_limited_total",
+            "API requests rejected by process-local admission controls.",
+            ["dimension", "principal_kind"],
+            namespace=namespace,
+        )
+        self.rate_limiter_errors = Counter(
+            "rate_limiter_errors_total",
+            "Fail-open errors raised by process-local admission controls.",
+            ["dimension"],
+            namespace=namespace,
+        )
 
     def observe_span(self, span: Any, status: str, duration_seconds: float) -> None:
         """Publish one completed LLM/tool span."""
@@ -395,6 +438,34 @@ class PrometheusMetrics:
         """Set queue gauges from the authoritative task-state store."""
         self.pending_tasks.set(max(0, pending))
         self.active_tasks.set(max(0, active))
+
+    def set_runs_dir_usage(self, used_bytes: int, quota_bytes: int) -> None:
+        """Set storage gauges without introducing path or run-id labels."""
+        used = max(0, int(used_bytes))
+        quota = max(0, int(quota_bytes))
+        self.runs_dir_bytes.set(used)
+        self.runs_dir_quota_bytes.set(quota)
+        self.runs_dir_quota_ratio.set(used / quota if quota else 0)
+
+    def observe_run_purged(self, reason: str) -> None:
+        """Count one lifecycle deletion using a bounded reason label."""
+        self.runs_purged.labels(reason).inc()
+
+    def observe_retention_sweep(self, duration_seconds: float) -> None:
+        """Record one lifecycle sweep duration."""
+        self.retention_sweep_duration.observe(max(0, duration_seconds))
+
+    def set_retention_quota_exceeded(self, exceeded: bool) -> None:
+        """Publish whether the configured quota still cannot be satisfied."""
+        self.retention_quota_exceeded.set(1 if exceeded else 0)
+
+    def observe_api_rate_limited(self, dimension: str, principal_kind: str) -> None:
+        """Count one bounded API admission rejection."""
+        self.api_rate_limited.labels(dimension, principal_kind).inc()
+
+    def observe_rate_limiter_error(self, dimension: str) -> None:
+        """Count one fail-open limiter implementation error."""
+        self.rate_limiter_errors.labels(dimension).inc()
 
 
 _prometheus_metrics: dict[str, PrometheusMetrics] = {}

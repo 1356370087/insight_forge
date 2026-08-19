@@ -31,6 +31,7 @@ from open_deep_research.observability.telemetry import (
     monotonic_time,
 )
 from open_deep_research.public_task_activity import publish_task_activity
+from open_deep_research.security.redaction import redact_text as _redact_text
 
 logger = logging.getLogger(__name__)
 
@@ -51,14 +52,6 @@ _current_span_ctx: contextvars.ContextVar["SpanContext | NoopSpanContext | None"
 _stores: dict[str, "SQLiteTraceStore"] = {}
 _stores_lock = threading.Lock()
 
-_SENSITIVE_TEXT_PATTERNS = (
-    re.compile(r"(?i)(authorization\s*[:=]\s*['\"]?bearer\s+)[^\s,'\"}]+"),
-    re.compile(
-        r"(?i)((?:api[_-]?key|access[_-]?token|refresh[_-]?token|secret|password)"
-        r"['\"]?\s*[:=]\s*['\"]?)[^\s,'\"}]+"
-    ),
-    re.compile(r"\b(?:sk|pk)-[A-Za-z0-9_-]{12,}\b"),
-)
 _current_langfuse_span_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "open_deep_research_langfuse_span_id",
     default=None,
@@ -110,17 +103,6 @@ def _provider_model(model_name: str | None) -> tuple[str | None, str | None]:
         return None, model_name
     provider, model = model_name.split(":", 1)
     return provider, model
-
-
-def _redact_text(text: str) -> str:
-    """Best-effort redaction for credentials that reach trace payloads."""
-    redacted = text
-    for pattern in _SENSITIVE_TEXT_PATTERNS:
-        if pattern.groups:
-            redacted = pattern.sub(r"\1[REDACTED]", redacted)
-        else:
-            redacted = pattern.sub("[REDACTED]", redacted)
-    return redacted
 
 
 def _message_preview(messages: Any, limit: int | None, *, redact: bool = True) -> str | None:
@@ -275,11 +257,51 @@ class SQLiteTraceStore:
         self._migrate()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
+        conn = sqlite3.connect(self.path, timeout=5)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
+
+    def ping(self) -> None:
+        """Raise when the trace database cannot execute a lightweight query."""
+        with self._lock, self._connect() as conn:
+            conn.execute("SELECT 1").fetchone()
+
+    @staticmethod
+    def _delete_run_rows(conn: sqlite3.Connection, run_id: str) -> int:
+        """Delete one run and all trace children within the caller transaction."""
+        deleted = 0
+        for table in ("retry_events", "usage_events", "spans", "runs"):
+            cursor = conn.execute(f"DELETE FROM {table} WHERE run_id = ?", (run_id,))
+            deleted += max(0, cursor.rowcount)
+        return deleted
+
+    def delete_run(self, run_id: str) -> int:
+        """Delete one run from all observability tables and return affected rows."""
+        with self._lock, self._connect() as conn:
+            return self._delete_run_rows(conn, run_id)
+
+    def delete_runs_ended_before(self, cutoff: float) -> int:
+        """Delete completed trace rows older than cutoff and return run count."""
+        with self._lock, self._connect() as conn:
+            run_ids = [
+                str(row["run_id"])
+                for row in conn.execute(
+                    "SELECT run_id FROM runs WHERE ended_at IS NOT NULL AND ended_at < ?",
+                    (cutoff,),
+                )
+            ]
+            for run_id in run_ids:
+                self._delete_run_rows(conn, run_id)
+            return len(run_ids)
+
+    def checkpoint(self) -> None:
+        """Checkpoint and truncate the WAL after lifecycle cleanup."""
+        with self._lock, self._connect() as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
 
     def _ensure_schema(self) -> None:
         with self._lock, self._connect() as conn:
