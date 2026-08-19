@@ -40,9 +40,10 @@ from open_deep_research.evidence import (
     source_scoped_evidence_records,
 )
 from open_deep_research.memory.lifecycle import (
-    configure_advanced_store,
+    advanced_app_id,
     list_v2_records,
     maintain_user_memories,
+    memory_user_lock,
     rank_legacy_memories,
     rank_v2_memories,
     reinforce_access,
@@ -55,6 +56,7 @@ from open_deep_research.memory.policy import (
 )
 from open_deep_research.memory.store import (
     MemoryKind,
+    MemoryRecord,
     MemoryStatus,
     NoopMemoryStore,
     create_memory_store,
@@ -200,6 +202,27 @@ def _bind_run_context_fence(
 
 # Initialize a configurable model that we will use throughout the agent
 configurable_model = get_configurable_model_template()
+_MEMORY_MAINTENANCE_TASKS: set[asyncio.Task[Any]] = set()
+
+
+def _schedule_memory_maintenance(awaitable: Awaitable[Any], config: RunnableConfig) -> None:
+    """Keep a strong reference to advisory run-end maintenance until it finishes."""
+    task = asyncio.create_task(awaitable, name="memory-run-end-maintenance")
+    _MEMORY_MAINTENANCE_TASKS.add(task)
+
+    def finalize(completed: asyncio.Task[Any]) -> None:
+        _MEMORY_MAINTENANCE_TASKS.discard(completed)
+        if completed.cancelled():
+            return
+        if completed.exception() is not None:
+            try:
+                get_trace_recorder(config).active_span().score("memory.maintenance_failed", True)
+            except Exception:
+                # Observability must not turn an advisory background task into an
+                # event-loop callback failure after the run has already completed.
+                pass
+
+    task.add_done_callback(finalize)
 
 
 def _format_conversation_summary(summary: str | None) -> str:
@@ -478,11 +501,10 @@ async def memory_recall(
         # boundaries fail closed rather than searching a shared default bucket.
         return Command(goto="clarify_with_user")
 
-    # Build query from user messages
-    summary_context = _format_conversation_summary(state.get("conversation_summary"))
-    user_query = get_buffer_string(state.get("messages", []))
-    if summary_context:
-        user_query = f"{summary_context}\n\n{user_query}"
+    # The latest user intent is a substantially better semantic-recall query
+    # than an embedding of the entire (possibly summarized) conversation.
+    human_messages = filter_messages(state.get("messages", []), include_types=["human"])
+    user_query = get_buffer_string(human_messages[-1:])
     if not user_query.strip():
         return Command(goto="clarify_with_user")
 
@@ -501,83 +523,103 @@ async def memory_recall(
             "project_id": configurable.memory_project_id,
             "app_id": configurable.memory_app_id,
         }
-        if not configurable.memory_advanced_enabled:
-            try:
-                await configure_advanced_store(store, configurable)
-            except Exception:
-                get_trace_recorder(config).active_span().score("memory.decay_disable_failed", True)
         if configurable.memory_advanced_enabled:
-            advanced_available = True
-            try:
-                await configure_advanced_store(store, configurable)
-            except Exception:
-                advanced_available = False
-                get_trace_recorder(config).active_span().score("memory.advanced_degraded", True)
-
-            legacy_call = store.search(
+            v2_call = store.search(
                 query=user_query,
                 user_id=user_id,
-                top_k=configurable.memory_top_k,
-                filters=legacy_filters,
+                top_k=max(configurable.memory_top_k * 3, configurable.memory_top_k + 10),
+                filters=v2_filters(configurable, status=MemoryStatus.ACTIVE.value),
+                threshold=configurable.memory_search_threshold,
+                rerank=configurable.memory_search_rerank,
+                reference_date=get_today_str(),
             )
-            if advanced_available:
-                v2_call = store.search(
+            legacy_call = (
+                store.search(
                     query=user_query,
                     user_id=user_id,
                     top_k=configurable.memory_top_k,
-                    filters=v2_filters(configurable, status=MemoryStatus.ACTIVE.value),
-                    threshold=configurable.memory_search_threshold,
-                    rerank=configurable.memory_search_rerank,
-                    reference_date=get_today_str(),
+                    filters=legacy_filters,
                 )
-                legacy_result: Any
-                v2_result: Any
-                legacy_result, v2_result = await asyncio.gather(
-                    legacy_call,
-                    v2_call,
-                    return_exceptions=True,
+                if configurable.memory_legacy_recall_enabled
+                else None
+            )
+            calls = [v2_call] + ([legacy_call] if legacy_call is not None else [])
+            recall_results = await asyncio.gather(*calls, return_exceptions=True)
+            v2_result = recall_results[0]
+            v2_raw = (
+                []
+                if isinstance(v2_result, BaseException)
+                else cast(list[dict[str, Any]], v2_result)
+            )
+            if isinstance(v2_result, BaseException):
+                get_trace_recorder(config).active_span().score("memory.advanced_degraded", True)
+            v2_selected = rank_v2_memories(v2_raw, configurable)
+            legacy_ranked: list[dict[str, Any]] = []
+            if len(recall_results) > 1 and not isinstance(recall_results[1], BaseException):
+                legacy_ranked = rank_legacy_memories(
+                    cast(list[dict[str, Any]], recall_results[1]),
+                    configurable,
                 )
-                legacy_raw = (
-                    []
-                    if isinstance(legacy_result, BaseException)
-                    else cast(list[dict[str, Any]], legacy_result)
+            results = sorted(
+                [*v2_selected, *legacy_ranked],
+                key=lambda item: float(item.get("score", 0.0) or 0.0),
+                reverse=True,
+            )[: configurable.memory_top_k]
+            selected_ids = {str(item.get("id", "")) for item in results}
+            v2_selected = [
+                item for item in v2_selected if str(item.get("id", "")) in selected_ids
+            ]
+            try:
+                canonical_profiles = await list_v2_records(
+                    store,
+                    user_id,
+                    configurable,
+                    kind=MemoryKind.PROFILE.value,
+                    status=MemoryStatus.ACTIVE.value,
+                    canonical=True,
                 )
-                v2_raw = (
-                    []
-                    if isinstance(v2_result, BaseException)
-                    else cast(list[dict[str, Any]], v2_result)
-                )
-                if isinstance(v2_result, BaseException):
-                    get_trace_recorder(config).active_span().score("memory.advanced_degraded", True)
-                legacy_ranked = rank_legacy_memories(legacy_raw, configurable)
-                v2_selected = rank_v2_memories(v2_raw, configurable)
-                results = sorted(
-                    [*legacy_ranked, *v2_selected],
-                    key=lambda item: float(item.get("score", 0.0) or 0.0),
+                canonical_profiles.sort(
+                    key=lambda record: (
+                        int(record.metadata.get("profile_version", 0) or 0),
+                        record.observed_at,
+                        record.memory_id,
+                    ),
                     reverse=True,
-                )[: configurable.memory_top_k]
-                selected_ids = {str(item.get("id", "")) for item in results}
-                v2_selected = [
-                    item for item in v2_selected if str(item.get("id", "")) in selected_ids
-                ]
-                try:
-                    records = await list_v2_records(store, user_id, configurable)
-                    canonical_profiles = [
-                        record for record in records
-                        if record.kind == MemoryKind.PROFILE
-                        and record.status == MemoryStatus.ACTIVE
-                        and bool(record.metadata.get("canonical", False))
-                    ]
-                    profiles = [{
-                        "id": record.memory_id,
-                        "content": record.content,
-                        "metadata": record.mem0_metadata(),
-                    } for record in canonical_profiles[:1]]
-                except Exception:
-                    profiles = []
-                await reinforce_access(store, v2_selected)
-            else:
-                results = rank_legacy_memories(await legacy_call, configurable)
+                )
+                profiles = [{
+                    "id": record.memory_id,
+                    "content": record.content,
+                    "metadata": record.mem0_metadata(),
+                } for record in canonical_profiles[:1]]
+                if not profiles and configurable.memory_profile_enabled:
+                    has_observation = False
+                    for item in v2_raw:
+                        try:
+                            record = MemoryRecord.from_mem0(item)
+                        except (TypeError, ValueError):
+                            continue
+                        if (
+                            record.kind == MemoryKind.OBSERVATION
+                            and record.status == MemoryStatus.ACTIVE
+                            and record.app_id == advanced_app_id(configurable)
+                            and record.project_id == configurable.memory_project_id
+                            and record.user_id == user_id
+                        ):
+                            has_observation = True
+                            break
+                    if has_observation:
+                        get_trace_recorder(config).active_span().score(
+                            "memory.profile_missing",
+                            True,
+                        )
+            except Exception:
+                profiles = []
+            await reinforce_access(
+                store,
+                v2_selected,
+                config=configurable,
+                user_id=user_id,
+            )
         else:
             results = await store.search(
                 query=user_query,
@@ -3650,77 +3692,90 @@ async def memory_extract_and_write(
     skipped_count = 0
     noop_count = 0
     decision_counts: dict[str, int] = {}
-    maintenance_result = None
+    maintenance_scheduled = False
     store_init_failed = False
     advanced_available = configurable.memory_advanced_enabled
     try:
         store = create_memory_store(configurable)
         if isinstance(store, NoopMemoryStore):
             raise RuntimeError("Configured memory backend is unavailable")
-        if advanced_available:
-            try:
-                await configure_advanced_store(store, configurable)
-            except Exception:
-                advanced_available = False
-                get_trace_recorder(config).active_span().score("memory.advanced_degraded", True)
     except Exception:
         store_init_failed = True
-        if not configurable.memory_fail_open:
-            raise
-
-    if configurable.memory_advanced_enabled and not advanced_available:
-        candidates = [
-            candidate for candidate in candidates
-            if candidate.category.value != "verified_research_insight"
-        ]
+        get_trace_recorder(config).active_span().score("memory.store_init_failed", True)
 
     if not store_init_failed:
-        for candidate in candidates:
-            try:
-                if advanced_available:
-                    async def decide(candidate_value, existing_values):
-                        return await decide_memory_conflict(
-                            candidate_value,
-                            existing_values,
-                            model=configurable_model,
-                            model_name=configurable.research_model,
-                            model_max_tokens=configurable.research_model_max_tokens,
-                            config=config,
-                        )
-
-                    action, _ = await write_observation(
-                        store,
-                        candidate,
-                        user_id=user_id,
-                        config=configurable,
-                        run_id=run_id,
-                        decide=decide,
+        async with memory_user_lock(
+            configurable,
+            user_id,
+            timeout=configurable.memory_mutation_lock_timeout_seconds,
+        ) as acquired:
+            if not acquired:
+                skipped_count = len(candidates)
+                get_trace_recorder(config).active_span().score("memory.mutation_busy", True)
+            else:
+                try:
+                    cached_records = (
+                        await list_v2_records(store, user_id, configurable)
+                        if advanced_available
+                        else None
                     )
-                    decision_counts[action] = decision_counts.get(action, 0) + 1
-                    if action == "NOOP":
-                        noop_count += 1
-                    else:
-                        written_count += 1
+                except Exception:
+                    cached_records = None
+                    skipped_count = len(candidates)
+                    get_trace_recorder(config).active_span().score(
+                        "memory.lifecycle_view_failed",
+                        True,
+                    )
+                if advanced_available and cached_records is None:
+                    candidates_to_write = []
                 else:
-                    await store.add(
-                        content=candidate.content,
-                        user_id=user_id,
-                        category=candidate.category,
-                        metadata={
-                            "source": candidate.source,
-                            "app_id": configurable.memory_app_id,
-                            "agent_id": configurable.memory_agent_id or "lead_researcher",
-                            "project_id": configurable.memory_project_id,
-                        },
-                    )
-                    written_count += 1
-            except Exception:
-                skipped_count += 1
-                if not configurable.memory_fail_open:
-                    raise
-        if advanced_available:
-            try:
-                maintenance_result = await maintain_user_memories(
+                    candidates_to_write = candidates
+                for candidate in candidates_to_write:
+                    try:
+                        if advanced_available:
+                            async def decide(candidate_value, existing_values):
+                                return await decide_memory_conflict(
+                                    candidate_value,
+                                    existing_values,
+                                    model=configurable_model,
+                                    model_name=configurable.research_model,
+                                    model_max_tokens=configurable.research_model_max_tokens,
+                                    config=config,
+                                    max_input_chars=configurable.memory_maintenance_max_input_chars,
+                                )
+
+                            action, _ = await write_observation(
+                                store,
+                                candidate,
+                                user_id=user_id,
+                                config=configurable,
+                                run_id=run_id,
+                                decide=decide,
+                                records=cached_records,
+                            )
+                            decision_counts[action] = decision_counts.get(action, 0) + 1
+                            if action == "NOOP":
+                                noop_count += 1
+                            else:
+                                written_count += 1
+                        else:
+                            await store.add(
+                                content=candidate.content,
+                                user_id=user_id,
+                                category=candidate.category,
+                                metadata={
+                                    "source": candidate.source,
+                                    "app_id": configurable.memory_app_id,
+                                    "agent_id": configurable.memory_agent_id or "lead_researcher",
+                                    "project_id": configurable.memory_project_id,
+                                },
+                            )
+                            written_count += 1
+                    except Exception:
+                        skipped_count += 1
+        if advanced_available and configurable.memory_run_end_maintenance_enabled:
+            _schedule_memory_maintenance(
+                maintain_user_memories(
                     store,
                     user_id=user_id,
                     config=configurable,
@@ -3728,11 +3783,10 @@ async def memory_extract_and_write(
                     model_name=configurable.research_model,
                     model_max_tokens=configurable.research_model_max_tokens,
                     runnable_config=config,
-                )
-            except Exception:
-                get_trace_recorder(config).active_span().score("memory.maintenance_failed", True)
-                if not configurable.memory_fail_open:
-                    raise
+                ),
+                config,
+            )
+            maintenance_scheduled = True
     else:
         skipped_count = len(candidates)
 
@@ -3741,13 +3795,7 @@ async def memory_extract_and_write(
     active_span.score("memory.written_count", written_count)
     active_span.score("memory.skipped_count", skipped_count)
     active_span.score("memory.noop_count", noop_count)
-    if maintenance_result is not None:
-        active_span.score("memory.reflections_generated", maintenance_result.reflections_generated)
-        active_span.score("memory.profile_updated", maintenance_result.profile_updated)
-        active_span.score("memory.archived_count", maintenance_result.archived)
-        active_span.score("memory.active_count", maintenance_result.status_counts.get("active", 0))
-        active_span.score("memory.superseded_count", maintenance_result.status_counts.get("superseded", 0))
-        active_span.score("memory.profile_version", maintenance_result.profile_version)
+    active_span.score("memory.maintenance_scheduled", maintenance_scheduled)
 
     # Emit events (summary only)
     if configurable.event_log_enabled:
@@ -3771,7 +3819,7 @@ async def memory_extract_and_write(
                 "skipped_count": skipped_count,
                 "noop_count": noop_count,
                 "decision_counts": decision_counts,
-                "maintenance": maintenance_result.model_dump() if maintenance_result else None,
+                "maintenance_scheduled": maintenance_scheduled,
             },
         ))
         if skipped_count > 0:

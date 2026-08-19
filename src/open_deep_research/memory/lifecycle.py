@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import math
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
+import portalocker
 from pydantic import BaseModel, Field
 
 from open_deep_research.memory.policy import (
@@ -26,8 +30,6 @@ from open_deep_research.memory.store import (
     utc_now_iso,
 )
 
-_PROJECT_DECAY_STATE: dict[tuple[str, str], bool] = {}
-
 
 class MaintenanceResult(BaseModel):
     """Summary returned by run-end and daily maintenance."""
@@ -40,6 +42,7 @@ class MaintenanceResult(BaseModel):
     status_counts: dict[str, int] = Field(default_factory=dict)
     category_counts: dict[str, int] = Field(default_factory=dict)
     profile_version: int = 0
+    skipped_busy: bool = False
 
 
 def advanced_app_id(config: Any) -> str:
@@ -110,6 +113,14 @@ def rank_v2_memories(
         record = MemoryRecord.from_mem0(item)
         if record.schema_version != MEMORY_SCHEMA_VERSION or record.status != MemoryStatus.ACTIVE:
             continue
+        if record.kind == MemoryKind.PROFILE:
+            # The canonical profile has a deterministic, non-semantic lookup
+            # path and must not be injected twice through general recall.
+            continue
+        if record.metadata.get("conflict_status") == "open":
+            # An unresolved contradiction is not safe personalization context.
+            # It remains durable for later resolution, but is fail-closed at recall.
+            continue
         relevance = max(0.0, min(1.0, float(item.get("score", 0.0) or 0.0)))
         importance = record.importance / 10
         freshness = recency_score(record, config, now)
@@ -166,16 +177,58 @@ def rank_legacy_memories(
     return ranked[: top_k or config.memory_top_k]
 
 
-async def configure_advanced_store(store: MemoryStore, config: Any) -> None:
-    """Synchronize Platform Decay with the advanced-memory feature state."""
+async def configure_advanced_store(
+    store: MemoryStore,
+    config: Any,
+    *,
+    decay: Optional[bool] = None,
+) -> None:
+    """Apply the deployment-level Platform decay setting explicitly.
+
+    This function must only be called by deployment or maintenance CLI flows.
+    Request/run paths deliberately do not mutate project-wide settings.
+    """
     if getattr(config, "memory_provider", "platform") != "platform":
         return
-    key = (config.memory_provider, config.memory_project_id)
-    desired = bool(config.memory_advanced_enabled and config.memory_decay_enabled)
-    if _PROJECT_DECAY_STATE.get(key) == desired:
-        return
+    desired = bool(config.memory_decay_enabled if decay is None else decay)
     await store.configure_project(decay=desired)
-    _PROJECT_DECAY_STATE[key] = desired
+
+
+@asynccontextmanager
+async def memory_user_lock(
+    config: Any,
+    user_id: str,
+    *,
+    timeout: float = 0,
+):
+    """Serialize memory mutations for one tenant/user across processes."""
+    identity = "|".join((
+        str(getattr(config, "memory_project_id", "")),
+        advanced_app_id(config),
+        user_id,
+    ))
+    digest = hashlib.sha256(identity.encode()).hexdigest()[:24]
+    lock_path = Path(config.runs_dir) / "memory-locks" / f"{digest}.lock"
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        yield False
+        return
+    lock = portalocker.Lock(str(lock_path), mode="a+b", timeout=timeout)
+    acquired = False
+    try:
+        try:
+            await asyncio.to_thread(lock.acquire)
+            acquired = True
+        except (OSError, portalocker.exceptions.LockException):
+            pass
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                await asyncio.to_thread(lock.release)
+            except OSError:
+                pass
 
 
 async def reinforce_access(
@@ -183,28 +236,50 @@ async def reinforce_access(
     results: list[dict[str, Any]],
     *,
     accessed_at: Optional[str] = None,
+    config: Any = None,
+    user_id: Optional[str] = None,
 ) -> int:
     """Persist access timestamps and counts for memories actually injected."""
-    updated = 0
-    timestamp = accessed_at or utc_now_iso()
-    for item in results:
-        record = MemoryRecord.from_mem0(item)
-        if not record.memory_id or record.schema_version != MEMORY_SCHEMA_VERSION:
-            continue
-        record.last_accessed_at = timestamp
-        record.access_count += 1
-        try:
-            await store.update(record.memory_id, metadata=record.mem0_metadata())
-            updated += 1
-        except Exception:
-            # Access reinforcement is advisory and must never break research.
-            continue
-    return updated
+    if getattr(store, "metadata_updates_reembed", False):
+        # OSS Mem0 rewrites content and recomputes embeddings even for a metadata
+        # update. Recall must not incur one embedding write per selected memory.
+        return 0
+
+    async def apply_updates() -> int:
+        updated = 0
+        timestamp = accessed_at or utc_now_iso()
+        current = _parse_datetime(timestamp, datetime.now(timezone.utc))
+        for item in results:
+            record = MemoryRecord.from_mem0(item)
+            if not record.memory_id or record.schema_version != MEMORY_SCHEMA_VERSION:
+                continue
+            last_accessed = _parse_datetime(record.last_accessed_at, current - timedelta(days=2))
+            if current - last_accessed < timedelta(hours=24):
+                continue
+            record.last_accessed_at = timestamp
+            record.access_count += 1
+            try:
+                await store.update(record.memory_id, metadata=record.mem0_metadata())
+                updated += 1
+            except Exception:
+                # Access reinforcement is advisory and must never break research.
+                continue
+        return updated
+
+    if config is not None and user_id:
+        async with memory_user_lock(config, user_id) as acquired:
+            return await apply_updates() if acquired else 0
+    return await apply_updates()
 
 
-async def list_v2_records(store: MemoryStore, user_id: str, config: Any) -> list[MemoryRecord]:
+async def list_v2_records(
+    store: MemoryStore,
+    user_id: str,
+    config: Any,
+    **extra_filters: Any,
+) -> list[MemoryRecord]:
     """List and normalize only records inside the exact v2 tenant boundary."""
-    raw = await store.list(user_id, filters=v2_filters(config))
+    raw = await store.list(user_id, filters=v2_filters(config, **extra_filters))
     records: list[MemoryRecord] = []
     for item in raw:
         try:
@@ -248,9 +323,10 @@ async def write_observation(
     decide: Optional[
         Callable[[MemoryCandidate, list[MemoryRecord]], Awaitable[MemoryConflictDecisionModel]]
     ] = None,
+    records: Optional[list[MemoryRecord]] = None,
 ) -> tuple[str, str]:
     """Resolve one candidate against active same-category memories and persist it."""
-    records = await list_v2_records(store, user_id, config)
+    records = records if records is not None else await list_v2_records(store, user_id, config)
     existing = [
         record for record in records
         if record.kind == MemoryKind.OBSERVATION
@@ -260,7 +336,9 @@ async def write_observation(
     normalized = " ".join(candidate.content.casefold().split())
     duplicate = next(
         (
-            record for record in existing
+            record for record in records
+            if record.kind == MemoryKind.OBSERVATION
+            and record.status == MemoryStatus.ACTIVE
             if " ".join(record.content.casefold().split()) == normalized
         ),
         None,
@@ -274,21 +352,61 @@ async def write_observation(
     now = utc_now_iso()
     conflict_group: Optional[str] = None
     supersedes: list[str] = []
+    existing_groups: list[str] = []
 
     if decision.action == "NOOP" and targets:
         return "NOOP", targets[0].memory_id
+    resolved_group: Optional[str] = None
     if decision.action in {"SUPERSEDE", "TEMPORAL_CHANGE"}:
-        supersedes = [record.memory_id for record in targets]
-        for record in targets:
+        target_groups = {record.conflict_group for record in targets if record.conflict_group}
+        target_ids = {record.memory_id for record in targets}
+        resolved_targets = [
+            record for record in records
+            if record.memory_id in target_ids
+            or (
+                record.conflict_group in target_groups
+                and record.status == MemoryStatus.ACTIVE
+            )
+        ]
+        supersedes = list(dict.fromkeys(record.memory_id for record in resolved_targets))
+        resolved_group = sorted(target_groups)[0] if target_groups else None
+        for record in resolved_targets:
             record.status = MemoryStatus.SUPERSEDED
+            if record.conflict_group:
+                record.metadata["conflict_status"] = "resolved"
+                record.metadata["conflict_resolved_at"] = now
             if decision.action == "TEMPORAL_CHANGE":
                 record.valid_to = now
             await store.update(record.memory_id, metadata=record.mem0_metadata())
-    elif decision.action == "CONFLICT":
-        conflict_group = _conflict_group(candidate, decision.target_memory_ids)
-        for record in targets:
+    elif decision.action == "CONFLICT" and targets:
+        existing_groups = sorted({
+            record.conflict_group
+            for record in targets
+            if record.conflict_group
+            and record.metadata.get("conflict_status") == "open"
+        })
+        conflict_group = (
+            existing_groups[0]
+            if existing_groups
+            else _conflict_group(candidate, [record.memory_id for record in targets])
+        )
+        # A new contradiction joins and, when needed, merges the complete open
+        # groups of its targets. Never move one member out and leave an orphan
+        # that maintenance could mistake for an adjudicated singleton.
+        target_ids = {record.memory_id for record in targets}
+        conflict_members = [
+            record for record in records
+            if record.status == MemoryStatus.ACTIVE
+            and (
+                record.memory_id in target_ids
+                or record.conflict_group in existing_groups
+            )
+        ]
+        for record in conflict_members:
             record.conflict_group = conflict_group
             record.metadata["conflict_status"] = "open"
+            if len(existing_groups) > 1:
+                record.metadata["conflict_merged_from"] = existing_groups
             await store.update(record.memory_id, metadata=record.mem0_metadata())
 
     try:
@@ -303,7 +421,7 @@ async def write_observation(
         source_kind=source_kind,
         source_refs=list(dict.fromkeys([*candidate.source_refs, f"run:{run_id}"])),
         valid_from=now,
-        conflict_group=conflict_group,
+        conflict_group=conflict_group or resolved_group,
         supersedes_ids=supersedes,
         app_id=advanced_app_id(config),
         project_id=config.memory_project_id,
@@ -312,10 +430,29 @@ async def write_observation(
         metadata={
             "conflict_decision": decision.action,
             "conflict_reason": decision.reason,
-            "conflict_status": "open" if conflict_group else None,
+            "conflict_status": "open" if conflict_group else ("resolved" if resolved_group else None),
+            "conflict_resolved_at": now if resolved_group else None,
+            "conflict_merged_from": existing_groups if conflict_group and len(existing_groups) > 1 else None,
         },
     )
-    return decision.action, await _persist_record(store, record)
+    memory_id = await _persist_record(store, record)
+    records.append(record)
+    for profile in records:
+        if profile.kind != MemoryKind.PROFILE or profile.status != MemoryStatus.ACTIVE:
+            continue
+        previous_metadata = dict(profile.metadata)
+        profile.status = MemoryStatus.ARCHIVED
+        profile.metadata["canonical"] = False
+        profile.metadata["invalidated_at"] = now
+        try:
+            await store.update(profile.memory_id, metadata=profile.mem0_metadata())
+        except Exception:
+            # The observation is authoritative; profile refresh is advisory and
+            # daily maintenance will clean up any stale canonical profile.
+            profile.status = MemoryStatus.ACTIVE
+            profile.metadata = previous_metadata
+            continue
+    return decision.action, memory_id
 
 
 def _source_fingerprint(records: list[MemoryRecord]) -> str:
@@ -327,7 +464,7 @@ def _source_fingerprint(records: list[MemoryRecord]) -> str:
     return hashlib.sha256("\n".join(values).encode()).hexdigest()
 
 
-async def maintain_user_memories(
+async def _maintain_user_memories_unlocked(
     store: MemoryStore,
     *,
     user_id: str,
@@ -354,11 +491,9 @@ async def maintain_user_memories(
         record for record in records
         if record.kind == MemoryKind.OBSERVATION
         and record.status == MemoryStatus.ACTIVE
+        and record.metadata.get("conflict_status") != "open"
         and record.memory_id not in reflected_ids
-        and not (
-            daily
-            and record.metadata.get("reflection_attempt_window") == current.date().isoformat()
-        )
+        and not record.metadata.get("reflection_processed_at")
     ]
     if len(unreflected) >= config.memory_reflection_observation_threshold:
         result.trigger_reasons.append("observation_count")
@@ -391,6 +526,7 @@ async def maintain_user_memories(
                 if (
                     record.kind == MemoryKind.OBSERVATION
                     and record.status == MemoryStatus.ACTIVE
+                    and record.metadata.get("conflict_status") != "open"
                     and record.app_id == advanced_app_id(config)
                     and record.project_id == config.memory_project_id
                     and record.user_id == user_id
@@ -405,10 +541,12 @@ async def maintain_user_memories(
             model_max_tokens=model_max_tokens,
             config=runnable_config,
             retrieve=retrieve_reflection_observations,
+            max_input_chars=config.memory_maintenance_max_input_chars,
         )
-        if daily and not dry_run:
+        if not dry_run:
             for record in unreflected:
                 record.metadata["reflection_attempt_window"] = current.date().isoformat()
+                record.metadata["reflection_processed_at"] = current.isoformat()
                 await store.update(record.memory_id, metadata=record.mem0_metadata())
         existing_fingerprints = {
             str(record.metadata.get("reflection_fingerprint", ""))
@@ -418,7 +556,7 @@ async def maintain_user_memories(
         for reflection in reflections:
             source_ids = sorted(set(reflection.source_memory_ids))
             fingerprint = hashlib.sha256(
-                f"{reflection.question}|{'|'.join(source_ids)}".encode()
+                f"{reflection.scope.casefold()}|{'|'.join(source_ids)}".encode()
             ).hexdigest()
             if fingerprint in existing_fingerprints:
                 continue
@@ -448,12 +586,25 @@ async def maintain_user_memories(
                 result.reflections_generated += 1
 
     if config.memory_profile_enabled:
-        source_records = [record for record in records if record.status == MemoryStatus.ACTIVE]
+        source_records = [
+            record for record in records
+            if record.status == MemoryStatus.ACTIVE
+            and record.kind != MemoryKind.PROFILE
+            and record.metadata.get("conflict_status") != "open"
+        ]
         fingerprint = _source_fingerprint(source_records)
         profiles = [
             record for record in records
             if record.kind == MemoryKind.PROFILE and record.status == MemoryStatus.ACTIVE
         ]
+        profiles.sort(
+            key=lambda record: (
+                int(record.metadata.get("profile_version", 0) or 0),
+                _parse_datetime(record.observed_at, current),
+                record.memory_id,
+            ),
+            reverse=True,
+        )
         canonical = profiles[0] if profiles else None
         current_fingerprint = str(canonical.metadata.get("profile_source_fingerprint", "")) if canonical else ""
         if source_records and fingerprint != current_fingerprint:
@@ -463,6 +614,7 @@ async def maintain_user_memories(
                 model_name=model_name,
                 model_max_tokens=model_max_tokens,
                 config=runnable_config,
+                max_input_chars=config.memory_maintenance_max_input_chars,
             )
             content = profile.render()[: config.memory_profile_max_chars]
             result.would_write += 1
@@ -506,6 +658,7 @@ async def maintain_user_memories(
             result.would_write += 1
             if not dry_run:
                 duplicate_profile.status = MemoryStatus.ARCHIVED
+                duplicate_profile.metadata["canonical"] = False
                 await store.update(
                     duplicate_profile.memory_id,
                     metadata=duplicate_profile.mem0_metadata(),
@@ -515,7 +668,7 @@ async def maintain_user_memories(
         for record in records:
             if record.status != MemoryStatus.ACTIVE or record.kind == MemoryKind.PROFILE:
                 continue
-            if record.conflict_group or record.importance > 3 or record.access_count > 1:
+            if record.importance > 3 or record.access_count > 1:
                 continue
             last_touch = _parse_datetime(record.last_accessed_at or record.observed_at, current)
             if current - last_touch <= timedelta(days=4 * memory_half_life_days(record, config)):
@@ -535,3 +688,34 @@ async def maintain_user_memories(
                 int(record.metadata.get("profile_version", 0) or 0),
             )
     return result
+
+
+async def maintain_user_memories(
+    store: MemoryStore,
+    *,
+    user_id: str,
+    config: Any,
+    model: Any,
+    model_name: str,
+    model_max_tokens: int,
+    runnable_config: Any,
+    daily: bool = False,
+    dry_run: bool = False,
+    now: Optional[datetime] = None,
+) -> MaintenanceResult:
+    """Run one user's maintenance under the cross-process mutation lock."""
+    async with memory_user_lock(config, user_id) as acquired:
+        if not acquired:
+            return MaintenanceResult(skipped_busy=True)
+        return await _maintain_user_memories_unlocked(
+            store,
+            user_id=user_id,
+            config=config,
+            model=model,
+            model_name=model_name,
+            model_max_tokens=model_max_tokens,
+            runnable_config=runnable_config,
+            daily=daily,
+            dry_run=dry_run,
+            now=now,
+        )

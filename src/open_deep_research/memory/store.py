@@ -15,6 +15,11 @@ from typing import Any, Optional, Protocol, runtime_checkable
 from pydantic import BaseModel, Field, model_validator
 
 MEMORY_SCHEMA_VERSION = 2
+OSS_LIST_HARD_LIMIT = 10001
+
+
+class MemoryListLimitExceeded(RuntimeError):
+    """Raised when OSS Mem0 cannot prove that a full listing was returned."""
 
 
 class MemoryCategory(str, Enum):
@@ -185,6 +190,7 @@ class MemoryRecord(BaseModel):
             app_id=str(metadata.get("app_id", "")),
             project_id=str(metadata.get("project_id", "")),
             agent_id=str(metadata.get("agent_id", "")),
+            user_id=str(metadata.get("user_id", "")),
             schema_version=int(metadata.get("schema_version", 1) or 1),
             metadata=metadata,
         )
@@ -241,6 +247,8 @@ class MemoryStore(Protocol):
 class NoopMemoryStore:
     """No-op store used when durable memory is unavailable."""
 
+    metadata_updates_reembed = False
+
     async def search(self, query: str, user_id: str, top_k: int = 8, filters: Optional[dict[str, Any]] = None, **_: Any) -> list[dict[str, Any]]:
         return []
 
@@ -265,6 +273,8 @@ class NoopMemoryStore:
 
 class PlatformMem0Store:
     """Mem0 Platform v3 adapter using the mem0ai 2.x typed client surface."""
+
+    metadata_updates_reembed = False
 
     def __init__(self, api_key: str, org_id: str = "default", project_id: str = "default") -> None:
         from mem0 import AsyncMemoryClient
@@ -362,6 +372,8 @@ class PlatformMem0Store:
 class OSSMem0Store:
     """Self-hosted Mem0 adapter with explicit Platform capability degradation."""
 
+    metadata_updates_reembed = True
+
     def __init__(self, config: dict[str, Any]) -> None:
         from mem0 import Memory
 
@@ -369,6 +381,7 @@ class OSSMem0Store:
 
     async def search(self, query: str, user_id: str, top_k: int = 8, filters: Optional[dict[str, Any]] = None, *, threshold: float = 0.1, rerank: bool = False, reference_date: Optional[str] = None) -> list[dict[str, Any]]:
         merged_filters = {**(filters or {}), "user_id": user_id}
+        kwargs = {"reference_date": reference_date} if reference_date else {}
         result = await asyncio.to_thread(
             self._memory.search,
             query=query,
@@ -376,6 +389,7 @@ class OSSMem0Store:
             filters=merged_filters,
             threshold=threshold,
             rerank=rerank,
+            **kwargs,
         )
         return result.get("results", []) if isinstance(result, dict) else list(result or [])
 
@@ -417,9 +431,14 @@ class OSSMem0Store:
         result = await asyncio.to_thread(
             self._memory.get_all,
             filters={**(filters or {}), "user_id": user_id},
-            top_k=1000,
+            top_k=OSS_LIST_HARD_LIMIT,
         )
-        return result.get("results", []) if isinstance(result, dict) else list(result or [])
+        memories = result.get("results", []) if isinstance(result, dict) else list(result or [])
+        if len(memories) >= OSS_LIST_HARD_LIMIT:
+            raise MemoryListLimitExceeded(
+                "OSSMem0Store listing reached its hard limit; refusing to use a truncated lifecycle view"
+            )
+        return memories
 
     async def list_users(self) -> builtins.list[str]:
         return []

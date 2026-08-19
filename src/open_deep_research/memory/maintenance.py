@@ -17,7 +17,7 @@ from open_deep_research.memory.lifecycle import (
     configure_advanced_store,
     maintain_user_memories,
 )
-from open_deep_research.memory.store import create_memory_store
+from open_deep_research.memory.store import NoopMemoryStore, create_memory_store
 from open_deep_research.model_resolution import get_configurable_model_template
 
 # Backward-compatible patch point for tests and integrations.  The implementation
@@ -31,6 +31,24 @@ def _parser() -> argparse.ArgumentParser:
     daily = subparsers.add_parser("daily", help="Run reflection, profile, and forgetting maintenance")
     daily.add_argument("--user-id", help="Limit maintenance to one trusted user ID")
     daily.add_argument("--dry-run", action="store_true", help="Evaluate without writing to Mem0")
+    daily.add_argument(
+        "--loop",
+        action="store_true",
+        help="Keep the lock and repeat daily maintenance until terminated",
+    )
+    daily.add_argument(
+        "--interval-hours",
+        type=float,
+        default=24,
+        help="Hours between loop iterations (default: 24)",
+    )
+    decay = subparsers.add_parser(
+        "configure-decay",
+        help="Explicitly apply the project-wide Mem0 Platform decay setting",
+    )
+    decay_group = decay.add_mutually_exclusive_group(required=True)
+    decay_group.add_argument("--enabled", dest="decay", action="store_true")
+    decay_group.add_argument("--disabled", dest="decay", action="store_false")
     return parser
 
 
@@ -41,7 +59,8 @@ async def _run_daily(args: argparse.Namespace, config: Configuration) -> dict[st
         raise RuntimeError("MEMORY_PROJECT_ID and MEMORY_APP_ID are required tenant boundaries")
 
     store = create_memory_store(config)
-    await configure_advanced_store(store, config)
+    if isinstance(store, NoopMemoryStore):
+        raise RuntimeError("Configured memory backend is unavailable")
     user_ids = [args.user_id] if args.user_id else await store.list_users()
     if not user_ids:
         raise RuntimeError("No users returned by Mem0; OSS maintenance requires --user-id")
@@ -68,22 +87,72 @@ async def _run_daily(args: argparse.Namespace, config: Configuration) -> dict[st
     return {"dry_run": args.dry_run, "users": summaries}
 
 
+async def _run_configure_decay(args: argparse.Namespace, config: Configuration) -> dict[str, Any]:
+    """Apply one explicit deployment-level project setting change."""
+    if config.memory_provider != "platform":
+        raise RuntimeError("configure-decay is only available for the Mem0 Platform provider")
+    store = create_memory_store(config)
+    if isinstance(store, NoopMemoryStore):
+        raise RuntimeError("Configured memory backend is unavailable")
+    await configure_advanced_store(store, config, decay=bool(args.decay))
+    return {"provider": "platform", "decay": bool(args.decay)}
+
+
+async def _run_daily_loop(
+    args: argparse.Namespace,
+    config: Configuration,
+    *,
+    sleep: Any = asyncio.sleep,
+    max_iterations: int | None = None,
+) -> list[dict[str, Any]]:
+    """Run daily maintenance repeatedly while the caller holds the file lock."""
+    if args.interval_hours <= 0:
+        raise ValueError("--interval-hours must be greater than zero")
+    results: list[dict[str, Any]] = []
+    while max_iterations is None or len(results) < max_iterations:
+        result = await _run_daily(args, config)
+        results.append(result)
+        sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+        if max_iterations is not None and len(results) >= max_iterations:
+            break
+        await sleep(args.interval_hours * 3600)
+    return results
+
+
+def _command_lock_path(config: Configuration, command: str) -> Path:
+    """Return a lock scoped to the side effect performed by one CLI command."""
+    filename = (
+        "memory-configure-decay.lock"
+        if command == "configure-decay"
+        else "memory-maintenance.lock"
+    )
+    return Path(config.runs_dir) / filename
+
+
 def main() -> None:
-    """Run the maintenance command under a process-wide file lock."""
+    """Run each maintenance command under its own process-wide file lock."""
     load_dotenv()
     args = _parser().parse_args()
     config = Configuration.from_runnable_config()
-    lock_path = Path(config.runs_dir) / "memory-maintenance.lock"
+    lock_path = _command_lock_path(config, args.command)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         with portalocker.Lock(str(lock_path), mode="a+b", timeout=0):
             if args.command == "daily":
-                result = asyncio.run(_run_daily(args, config))
+                if args.loop:
+                    asyncio.run(_run_daily_loop(args, config))
+                    result = None
+                else:
+                    result = asyncio.run(_run_daily(args, config))
+            elif args.command == "configure-decay":
+                result = asyncio.run(_run_configure_decay(args, config))
             else:  # pragma: no cover - argparse enforces known subcommands
                 raise RuntimeError(f"Unknown command: {args.command}")
     except portalocker.exceptions.LockException as exc:
         raise SystemExit("Another memory maintenance process is already running") from exc
-    sys.stdout.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+    if result is not None:
+        sys.stdout.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
 
 
 if __name__ == "__main__":

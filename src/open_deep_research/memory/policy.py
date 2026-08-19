@@ -163,6 +163,18 @@ FORBIDDEN_PATTERNS = [
 ]
 
 
+def _contains_forbidden_keyword(content: str) -> bool:
+    """Match credential words as tokens without rejecting benign compounds."""
+    lower = content.casefold()
+    for keyword in FORBIDDEN_KEYWORDS:
+        if keyword in {"password", "secret", "token", "credentials"}:
+            if re.search(rf"\b{re.escape(keyword)}\b", lower):
+                return True
+        elif keyword in lower:
+            return True
+    return False
+
+
 def filter_candidates(
     raw_candidates: list[MemoryCandidateModel],
     min_confidence: float,
@@ -194,8 +206,7 @@ def filter_candidates(
             continue
 
         # 3. Forbidden keyword check
-        lower = content.lower()
-        if any(kw in lower for kw in FORBIDDEN_KEYWORDS):
+        if _contains_forbidden_keyword(content):
             continue
 
         # 4. Forbidden pattern check
@@ -477,6 +488,39 @@ class MemoryConflictDecisionModel(BaseModel):
     reason: str = ""
 
 
+def _bounded_memory_payload(
+    records: list[MemoryRecord],
+    *,
+    max_chars: int,
+    include_category: bool = False,
+) -> tuple[str, list[MemoryRecord]]:
+    """Render a deterministic, importance-first prompt payload within budget."""
+    selected: list[MemoryRecord] = []
+    lines: list[str] = []
+    used = 0
+    ordered = sorted(
+        records,
+        key=lambda record: (record.importance, record.observed_at, record.memory_id),
+        reverse=True,
+    )
+    for record in ordered:
+        category = f"; category={record.category.value}" if include_category else ""
+        line = (
+            f"- id={record.memory_id}{category}; importance={record.importance}; "
+            f"observed_at={record.observed_at}; content={record.content}"
+        )
+        cost = len(line) + (1 if lines else 0)
+        if lines and used + cost > max_chars:
+            continue
+        if not lines and cost > max_chars:
+            line = line[:max_chars]
+            cost = len(line)
+        lines.append(line)
+        selected.append(record)
+        used += cost
+    return "\n".join(lines), selected
+
+
 async def decide_memory_conflict(
     candidate: MemoryCandidate,
     existing: list[MemoryRecord],
@@ -485,6 +529,7 @@ async def decide_memory_conflict(
     model_name: str,
     model_max_tokens: int,
     config: Any,
+    max_input_chars: int = 30000,
 ) -> MemoryConflictDecisionModel:
     """Classify duplicate, correction, temporal change, or unresolved conflict."""
     if not existing:
@@ -498,9 +543,9 @@ async def decide_memory_conflict(
                 reason="Exact normalized duplicate",
             )
 
-    payload = "\n".join(
-        f"- id={record.memory_id}; observed_at={record.observed_at}; content={record.content}"
-        for record in existing
+    payload, compared = _bounded_memory_payload(
+        existing,
+        max_chars=max_input_chars,
     )
     prompt = (
         "Compare a trusted new observation with existing memories of the same category. "
@@ -531,7 +576,7 @@ async def decide_memory_conflict(
         agent_role="lead",
         model_name=model_name,
     )
-    allowed_ids = {record.memory_id for record in existing if record.memory_id}
+    allowed_ids = {record.memory_id for record in compared if record.memory_id}
     response.target_memory_ids = [
         memory_id for memory_id in response.target_memory_ids if memory_id in allowed_ids
     ]
@@ -548,14 +593,15 @@ async def generate_reflections(
     model_max_tokens: int,
     config: Any,
     retrieve: Callable[[str], Awaitable[list[MemoryRecord]]] | None = None,
+    max_input_chars: int = 30000,
 ) -> list[ReflectionItemModel]:
     """Generate grounded reflections without allowing recursive reflection input."""
     observations = [record for record in records if record.kind.value == "observation"]
     if not observations:
         return []
-    recent_payload = "\n".join(
-        f"- id={record.memory_id}; importance={record.importance}; content={record.content}"
-        for record in observations
+    recent_payload, observations = _bounded_memory_payload(
+        observations,
+        max_chars=max_input_chars,
     )
     question_prompt = (
         "Generate at most three significant research-assistant memory questions raised by the recent observations. "
@@ -596,9 +642,9 @@ async def generate_reflections(
         relevant = [record for record in relevant if record.kind == MemoryKind.OBSERVATION]
         if not relevant:
             continue
-        payload = "\n".join(
-            f"- id={record.memory_id}; importance={record.importance}; content={record.content}"
-            for record in relevant
+        payload, relevant = _bounded_memory_payload(
+            relevant,
+            max_chars=max_input_chars,
         )
         reflection_prompt = (
             "Answer the supplied question with at most one durable higher-level insight. Every insight must cite only "
@@ -647,12 +693,17 @@ async def generate_research_profile(
     model_name: str,
     model_max_tokens: int,
     config: Any,
+    max_input_chars: int = 30000,
 ) -> ResearchProfileModel:
     """Generate the canonical non-sensitive research profile."""
-    payload = "\n".join(
-        f"- id={record.memory_id}; category={record.category.value}; content={record.content}"
-        for record in records
+    eligible_records = [
+        record for record in records
         if record.kind.value != "profile" and record.status.value == "active"
+    ]
+    payload, eligible_records = _bounded_memory_payload(
+        eligible_records,
+        max_chars=max_input_chars,
+        include_category=True,
     )
     prompt = (
         "Build a research-assistant profile using only the supplied memories. Include communication/report "
@@ -685,6 +736,6 @@ async def generate_research_profile(
         agent_role="lead",
         model_name=model_name,
     )
-    allowed = {record.memory_id for record in records}
+    allowed = {record.memory_id for record in eligible_records}
     response.source_memory_ids = [value for value in response.source_memory_ids if value in allowed]
     return sanitize_research_profile(response)

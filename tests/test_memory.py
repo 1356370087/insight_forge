@@ -225,6 +225,31 @@ class TestFilterCandidates:
         result = filter_candidates(raw, min_confidence=0.5)
         assert len(result) == 0
 
+    def test_credential_word_matching_does_not_reject_benign_compounds(self):
+        from open_deep_research.memory.policy import (
+            MemoryCandidateModel,
+            filter_candidates,
+        )
+
+        raw = [
+            MemoryCandidateModel(
+                category="user_research_preference",
+                content="Prefers tokenizer statistics in reports",
+                confidence=0.9,
+                reason="Benign technical preference",
+            ),
+            MemoryCandidateModel(
+                category="project_memory",
+                content="The deployment token is abc123",
+                confidence=0.9,
+                reason="Credential",
+            ),
+        ]
+        result = filter_candidates(raw, min_confidence=0.5)
+        assert [candidate.content for candidate in result] == [
+            "Prefers tokenizer statistics in reports",
+        ]
+
     def test_filters_markdown_link_pattern(self):
         from open_deep_research.memory.policy import (
             MemoryCandidateModel,
