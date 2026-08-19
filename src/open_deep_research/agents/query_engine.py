@@ -120,6 +120,23 @@ def _message_text(messages: list[Any]) -> str:
     return get_buffer_string(normalized)
 
 
+def _latest_handoff_assessments(
+    assessments: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Return the most recent assessment record per task id.
+
+    A task accumulates records across waves and artifact re-reads; terminal
+    verdicts (gate status, refs) must reflect each task's latest outcome
+    instead of duplicating or resurrecting superseded ones.
+    """
+    latest: dict[str, dict[str, Any]] = {}
+    for item in assessments:
+        task_id = str(item.get("tool_call_id", ""))
+        if task_id:
+            latest[task_id] = item
+    return latest
+
+
 def _evidence_limited_coverage_map(
     *,
     authoritative_ledger: dict[str, Any],
@@ -1577,9 +1594,17 @@ class QueryEngine:
                                 update=self._quality_recovery_state_update(state),
                             )
                         if recovery["mode"] == "accepted":
+                            caveat_task_ids = set(
+                                recovery.get("caveat_task_ids", [])
+                            )
                             for task_id in recovery.get(
                                 "accepted_task_ids", []
                             ):
+                                admission_status = (
+                                    AdmissionStatus.ACCEPTED_WITH_CAVEATS.value
+                                    if task_id in caveat_task_ids
+                                    else AdmissionStatus.ACCEPTED.value
+                                )
                                 await self._publish_public(
                                     "research.task.completed",
                                     stage="researching",
@@ -1589,7 +1614,7 @@ class QueryEngine:
                                         "mode": "sync",
                                         "status": "completed",
                                         "phase": "completed",
-                                        "admission_status": "accepted",
+                                        "admission_status": admission_status,
                                         "reason_code": "quality_gate_reassessed",
                                         "source_count": len(
                                             eligible_evidence_records(
@@ -1605,7 +1630,8 @@ class QueryEngine:
                                         ),
                                     },
                                     dedupe_key=(
-                                        f"task:{task_id}:admission:accepted"
+                                        f"task:{task_id}:admission:"
+                                        f"{admission_status}"
                                     ),
                                 )
                             completion_action = CompletionDecision.COMPLETE.value
@@ -2676,15 +2702,17 @@ class QueryEngine:
                 for item in state.get("handoff_assessments", [])
                 if isinstance(item, dict)
             ]
+            latest_by_task = _latest_handoff_assessments(assessments)
+            latest_records = list(latest_by_task.values())
             reason_codes: list[str] = []
-            if any(item.get("evaluator_error") for item in assessments):
+            if any(item.get("evaluator_error") for item in latest_records):
                 reason_codes.append("quality_evaluator_error")
-            if any(item.get("accepted") is False for item in assessments):
+            if any(item.get("accepted") is False for item in latest_records):
                 reason_codes.append("handoff_rejected")
             has_caveat_admission = any(
                 item.get("admission_status")
                 == AdmissionStatus.ACCEPTED_WITH_CAVEATS.value
-                for item in assessments
+                for item in latest_records
             )
             quality_status = "degraded" if reason_codes else "passed"
             if has_caveat_admission and not reason_codes:
@@ -2695,7 +2723,7 @@ class QueryEngine:
                 reason_codes=reason_codes,
                 assessment_refs=[
                     {
-                        "task_id": str(item.get("tool_call_id", "")),
+                        "task_id": task_id,
                         "evaluator_model": str(
                             item.get("evaluator_model", "")
                         ),
@@ -2703,8 +2731,7 @@ class QueryEngine:
                             item.get("evaluation_epoch", "")
                         ),
                     }
-                    for item in assessments
-                    if item.get("tool_call_id")
+                    for task_id, item in latest_by_task.items()
                 ],
             )
         result = {

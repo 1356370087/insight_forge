@@ -2071,7 +2071,7 @@ async def _execute_supervisor_tools(
 
     reassessment_updates: list[dict[str, Any]] = []
     readmitted_artifacts: list[
-        tuple[str, dict[str, Any], dict[str, Any], str]
+        tuple[str, dict[str, Any], dict[str, Any], str, str]
     ] = []
     for call in ordinary_calls:
         if call["name"] != "ReadResearchArtifact":
@@ -2089,6 +2089,11 @@ async def _execute_supervisor_tools(
                 "tool_call_id": task_id,
                 "trigger_tool_call_id": str(call["id"]),
                 "trigger": "artifact_read_reassessment",
+                "artifact_sha256": str(
+                    (output.get("artifact_ref") or {}).get("sha256", "")
+                )
+                if isinstance(output.get("artifact_ref"), dict)
+                else "",
                 **reassessment,
             })
         if output.get("admission_status") not in {
@@ -2113,7 +2118,13 @@ async def _execute_supervisor_tools(
         except (FileNotFoundError, ValueError, json.JSONDecodeError):
             continue
         readmitted_artifacts.append(
-            (task_id, artifact, dict(artifact_ref), str(call["id"]))
+            (
+                task_id,
+                artifact,
+                dict(artifact_ref),
+                str(call["id"]),
+                str(output.get("admission_status")),
+            )
         )
 
     completed_sync = 0
@@ -2229,7 +2240,7 @@ async def _execute_supervisor_tools(
                 dedupe_key=f"task:{call['id']}:findings",
             )
 
-    for task_id, artifact, _artifact_ref, trigger_call_id in readmitted_artifacts:
+    for task_id, artifact, _artifact_ref, trigger_call_id, admission_status in readmitted_artifacts:
         sources = extract_public_sources(
             artifact,
             limit=configurable.public_event_source_limit,
@@ -2243,7 +2254,7 @@ async def _execute_supervisor_tools(
                 "mode": "sync",
                 "status": "completed",
                 "phase": "completed",
-                "admission_status": "accepted",
+                "admission_status": admission_status,
                 "reason_code": "quality_gate_reassessed",
                 "trigger_tool_call_id": trigger_call_id,
                 "source_count": len(sources),
@@ -2253,7 +2264,7 @@ async def _execute_supervisor_tools(
                     "artifact reassessment."
                 ),
             },
-            dedupe_key=f"task:{task_id}:admission:accepted",
+            dedupe_key=f"task:{task_id}:admission:{admission_status}",
         )
 
     for overflow in overflow_conduct:
@@ -2430,7 +2441,7 @@ async def _execute_supervisor_tools(
         evidence_registry.extend(observation.get("evidence_registry", []))
         research_iterations.extend(observation.get("web_research_iterations", []))
 
-    for task_id, observation, artifact_ref, _trigger_call_id in readmitted_artifacts:
+    for task_id, observation, artifact_ref, _trigger_call_id, _admission in readmitted_artifacts:
         research_artifact_refs[task_id] = artifact_ref
         notes = observation.get("raw_notes", [])
         if notes:

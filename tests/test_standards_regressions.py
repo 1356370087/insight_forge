@@ -1332,3 +1332,221 @@ def test_query_engine_clears_run_scoped_web_resources(monkeypatch) -> None:
     engine._clear_run_resources()
 
     assert cleared == ["cleanup-run"]
+
+
+def test_handoff_assessment_history_appends_across_supervisor_turns() -> None:
+    # Regression: the QueryEngine state applier used to replace this list
+    # with each turn's records, wiping earlier waves' assessments (lost
+    # accepted handoffs, unexplainable rejections).
+    from open_deep_research.runtime import apply_update_to_state
+
+    state: dict = {"handoff_assessments": [
+        {"tool_call_id": "task-a", "accepted": True},
+    ]}
+    apply_update_to_state(state, {"handoff_assessments": [
+        {"tool_call_id": "task-b", "accepted": False},
+    ]})
+    apply_update_to_state(state, {"handoff_assessments": [
+        {"tool_call_id": "task-b", "accepted": True},
+    ]})
+
+    assert [item["tool_call_id"] for item in state["handoff_assessments"]] == [
+        "task-a", "task-b", "task-b",
+    ]
+
+
+def test_latest_handoff_assessments_keep_newest_record_per_task() -> None:
+    from open_deep_research.agents.query_engine import (
+        _latest_handoff_assessments,
+    )
+
+    history = [
+        {"tool_call_id": "task-a", "accepted": False},
+        {"tool_call_id": "task-b", "accepted": True},
+        {
+            "tool_call_id": "task-a",
+            "accepted": True,
+            "admission_status": "accepted_with_caveats",
+        },
+    ]
+
+    latest = _latest_handoff_assessments(history)
+
+    assert set(latest) == {"task-a", "task-b"}
+    assert latest["task-a"]["admission_status"] == "accepted_with_caveats"
+    assert latest["task-b"]["accepted"] is True
+
+
+@pytest.mark.asyncio
+async def test_read_artifact_reassessment_caps_repeated_same_sha_rejections(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    # Judge variance on an unchanged artifact must not burn unbounded
+    # re-evaluations: after the per-digest cap the latest rejection stands
+    # and no fresh judge call is made.
+    async def fake_ainvoke(_state, _config):
+        return {
+            "research_topic": "topic",
+            "researcher_messages": [],
+            "compressed_research": "summary",
+            "raw_notes": ["note"],
+            "metrics": {"sources_read": 1},
+        }
+
+    monkeypatch.setattr(deep_researcher.researcher_runtime, "ainvoke", fake_ainvoke)
+    tools = deep_researcher.build_supervisor_tools({"enable_async_research": False})
+    conduct = next(tool for tool in tools if tool.name == "ConductResearch")
+    context = ToolContext(
+        config={
+            "configurable": {
+                "runs_dir": str(tmp_path),
+                "quality_evaluation_enabled": True,
+            },
+            "metadata": {"run_id": "reassess-cap"},
+        },
+        role="supervisor",
+        tool_call_id="conduct-cap",
+    )
+    handoff = (await conduct.call(
+        ConductResearch(research_topic="topic"), context
+    )).output
+    task_id = handoff["task_id"]
+    sha = handoff["artifact_ref"]["sha256"]
+
+    evaluate_calls: list[int] = []
+
+    async def fake_evaluate(*_args, **_kwargs):
+        evaluate_calls.append(1)
+        return HandoffAssessment(
+            accepted=True,
+            admission_status="accepted_with_caveats",
+            relevance=5,
+            source_quality=5,
+            evidence_coverage=5,
+            groundedness=5,
+            requirement_coverage=[],
+            reason="re-evaluated",
+        )
+
+    monkeypatch.setattr(
+        deep_researcher, "evaluate_subagent_handoff", fake_evaluate
+    )
+    capped_tools = deep_researcher.build_supervisor_tools({
+        "enable_async_research": False,
+        "handoff_assessments": [
+            {
+                "tool_call_id": task_id,
+                "trigger": "artifact_read_reassessment",
+                "artifact_sha256": sha,
+                "accepted": False,
+                "admission_status": "rejected",
+            },
+            {
+                "tool_call_id": task_id,
+                "trigger": "artifact_read_reassessment",
+                "artifact_sha256": sha,
+                "accepted": False,
+                "admission_status": "rejected",
+            },
+        ],
+    })
+    read_tool = next(
+        tool for tool in capped_tools if tool.name == "ReadResearchArtifact"
+    )
+    result = await read_tool.call(
+        read_tool.input_schema(
+            task_id=task_id,
+            artifact_sha256=sha,
+            section="raw_notes",
+        ),
+        ToolContext(config=context.config, role="supervisor", tool_call_id="read-cap"),
+    )
+
+    assert result.output["status"] == "reassessment_capped"
+    assert result.output["admission_status"] == "rejected"
+    assert evaluate_calls == []
+
+
+@pytest.mark.asyncio
+async def test_read_artifact_still_reassesses_before_cap(monkeypatch, tmp_path) -> None:
+    async def fake_ainvoke(_state, _config):
+        return {
+            "research_topic": "topic",
+            "researcher_messages": [],
+            "compressed_research": "summary",
+            "raw_notes": ["note"],
+            "metrics": {"sources_read": 1},
+        }
+
+    monkeypatch.setattr(deep_researcher.researcher_runtime, "ainvoke", fake_ainvoke)
+    tools = deep_researcher.build_supervisor_tools({"enable_async_research": False})
+    conduct = next(tool for tool in tools if tool.name == "ConductResearch")
+    context = ToolContext(
+        config={
+            "configurable": {
+                "runs_dir": str(tmp_path),
+                "quality_evaluation_enabled": True,
+            },
+            "metadata": {"run_id": "reassess-once"},
+        },
+        role="supervisor",
+        tool_call_id="conduct-once",
+    )
+    handoff = (await conduct.call(
+        ConductResearch(research_topic="topic"), context
+    )).output
+    task_id = handoff["task_id"]
+    sha = handoff["artifact_ref"]["sha256"]
+
+    evaluate_calls: list[int] = []
+
+    async def fake_evaluate(*_args, **_kwargs):
+        evaluate_calls.append(1)
+        return HandoffAssessment(
+            accepted=True,
+            admission_status="accepted_with_caveats",
+            relevance=5,
+            source_quality=5,
+            evidence_coverage=5,
+            groundedness=5,
+            requirement_coverage=[],
+            reason="re-evaluated",
+        )
+
+    monkeypatch.setattr(
+        deep_researcher, "evaluate_subagent_handoff", fake_evaluate
+    )
+    tools_with_history = deep_researcher.build_supervisor_tools({
+        "enable_async_research": False,
+        "handoff_assessments": [
+            {
+                "tool_call_id": task_id,
+                "trigger": "wave_evaluation",
+                "accepted": False,
+                "admission_status": "rejected",
+            },
+            {
+                "tool_call_id": task_id,
+                "trigger": "artifact_read_reassessment",
+                "artifact_sha256": sha,
+                "accepted": False,
+                "admission_status": "rejected",
+            },
+        ],
+    })
+    read_tool = next(
+        tool for tool in tools_with_history if tool.name == "ReadResearchArtifact"
+    )
+    result = await read_tool.call(
+        read_tool.input_schema(
+            task_id=task_id,
+            artifact_sha256=sha,
+            section="raw_notes",
+        ),
+        ToolContext(config=context.config, role="supervisor", tool_call_id="read-once"),
+    )
+
+    assert result.output["status"] == "accepted_after_artifact_reassessment"
+    assert result.output["admission_status"] == "accepted_with_caveats"
+    assert len(evaluate_calls) == 1

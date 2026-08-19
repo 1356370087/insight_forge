@@ -58,6 +58,13 @@ class ReadResearchArtifact(BaseModel):
     )
 
 
+#: Same-digest artifact re-evaluations allowed per task before the latest
+#: rejection stands. Each re-read re-runs the full judge; without a cap,
+#: judge variance on an unchanged artifact can burn the supervisor's turn
+#: budget on re-reads that cannot produce new information.
+_MAX_SAME_SHA_REASSESSMENTS = 2
+
+
 async def _call(
     deps: SupervisorToolDeps,
     input: ReadResearchArtifact,
@@ -114,6 +121,30 @@ async def _call(
         and latest_assessment is not None
         and latest_assessment.get("accepted") is False
     ):
+        rejected_same_sha = [
+            item
+            for item in assessment_history
+            if item.get("trigger") == "artifact_read_reassessment"
+            and str(item.get("artifact_sha256", ""))
+            == input.artifact_sha256
+            and item.get("accepted") is False
+        ]
+        if len(rejected_same_sha) >= _MAX_SAME_SHA_REASSESSMENTS:
+            output.update(
+                {
+                    "status": "reassessment_capped",
+                    "admission_status": str(
+                        latest_assessment.get("admission_status")
+                        or "rejected"
+                    ),
+                    "message": (
+                        "Artifact reassessment budget exhausted for this "
+                        "digest; the latest rejection stands. Delegate a "
+                        "fresh research task instead of re-reading."
+                    ),
+                }
+            )
+            return ToolResult(output=output)
         quality_handoff = dict(artifact)
         selected_excerpt = json.dumps(
             {

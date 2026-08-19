@@ -7,6 +7,7 @@ from enum import Enum
 from typing import Any
 
 from open_deep_research.evidence import eligible_evidence_records
+from open_deep_research.quality.contract import is_delegable_requirement
 
 
 def accepted_evidence(state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -46,14 +47,27 @@ def completion_policy_context(
         for item in state.get("requirement_ids", [])
         if str(item)
     ]
+    # Process directives are satisfied by orchestration and deliverable
+    # formats belong to the final report; neither can enter the research
+    # coverage ledger, so counting them here would permanently force
+    # complete_partial outcomes.
     contract_requirement_ids = [
         str(item.get("requirement_id"))
         for item in raw_requirements
-        if isinstance(item, dict) and item.get("requirement_id")
+        if isinstance(item, dict)
+        and item.get("requirement_id")
+        and is_delegable_requirement(item)
+    ]
+    factual_contract_ids = set(contract_requirement_ids)
+    delegable_owned_ids = [
+        requirement_id
+        for requirement_id in owned_requirement_ids
+        if not factual_contract_ids
+        or requirement_id in factual_contract_ids
     ]
     required_ids = (
-        owned_requirement_ids
-        if owned_requirement_ids
+        delegable_owned_ids
+        if delegable_owned_ids
         else contract_requirement_ids
     )
     coverage_ledger = state.get("coverage_ledger", {})

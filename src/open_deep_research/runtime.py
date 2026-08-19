@@ -93,6 +93,7 @@ REDUCER_KEYS = {
     "completed_task_outputs",
     "memory_candidates",
     "human_feedback",
+    "handoff_assessments",
     "candidate_registry",
     "document_registry",
     "evidence_registry",

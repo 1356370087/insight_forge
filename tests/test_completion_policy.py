@@ -120,3 +120,85 @@ def test_completion_policy_does_not_count_quarantined_evidence():
     assert context.independent_source_count == 0
     assert decision.action == CompletionDecision.CONTINUE_WITH_GAPS
     assert "accepted_evidence" in decision.gaps
+
+
+def test_completion_context_ignores_non_factual_requirements_for_gaps():
+    # Deliverable-format and process requirements are owned by the final
+    # report / orchestration and never enter the research coverage ledger;
+    # counting them would permanently force complete_partial outcomes.
+    state = {
+        "coverage_contract": {
+            "requirements": [
+                {
+                    "requirement_id": "COV-01-aaa",
+                    "text": "调查 Python 3.13 自由线程的生产可用性",
+                    "kind": "factual",
+                },
+                {
+                    "requirement_id": "COV-02-bbb",
+                    "text": "调查 NumPy 2.1 的支持状态",
+                    "kind": "factual",
+                },
+                {
+                    "requirement_id": "COV-03-ccc",
+                    "text": "风险矩阵",
+                    "kind": "deliverable",
+                },
+                {
+                    "requirement_id": "COV-04-ddd",
+                    "text": "不需要澄清",
+                    "kind": "process",
+                },
+            ]
+        },
+        "coverage_ledger": {
+            "COV-01-aaa": {"status": "supported"},
+            "COV-02-bbb": {"status": "supported"},
+        },
+        "evidence_registry": [
+            {"evidence_id": "ev-1", "source_url": "https://example.org/1"}
+        ],
+    }
+
+    context = completion_policy_context(state)
+    assert context.uncovered_requirements == ()
+
+    decision = ResearchCompletionPolicy().evaluate(
+        CompletionPolicyContext(
+            explicit_completion_succeeded=True,
+            evidence_count=context.evidence_count,
+            independent_source_count=context.independent_source_count,
+            has_remaining_budget=False,
+            exhausted_reason="max_turns",
+        )
+    )
+    assert "coverage_gaps" not in decision.gaps
+
+
+def test_completion_context_still_reports_uncovered_factual_requirements():
+    state = {
+        "coverage_contract": {
+            "requirements": [
+                {
+                    "requirement_id": "COV-01-aaa",
+                    "text": "调查 Python 3.13 自由线程的生产可用性",
+                    "kind": "factual",
+                },
+                {
+                    "requirement_id": "COV-02-bbb",
+                    "text": "风险矩阵",
+                    "kind": "deliverable",
+                },
+            ]
+        },
+        "coverage_ledger": {
+            "COV-01-aaa": {"status": "supported"},
+        },
+    }
+
+    context = completion_policy_context(state)
+    assert context.uncovered_requirements == ()
+    # A factual requirement missing from the ledger is still a real gap.
+    state["coverage_ledger"] = {}
+    context = completion_policy_context(state)
+    assert list(context.uncovered_requirements) == ["COV-01-aaa"]
