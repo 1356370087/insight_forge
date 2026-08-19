@@ -76,6 +76,9 @@ uv.lock
 # .claude
 .claude/
 
+# .zcode
+.zcode/
+
 # Test scratch dirs and local evaluation output
 .codex-test-tmp/
 .pytest-public-events*/

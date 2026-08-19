@@ -1,0 +1,64 @@
+groups:
+  - name: insightforge-operational
+    interval: 30s
+    rules:
+      - alert: InsightForgeHighRunFailureRate
+        expr: |
+          sum(rate(open_deep_research_runs_total{status="failed"}[5m]))
+          /
+          clamp_min(sum(rate(open_deep_research_runs_total[5m])), 0.000001)
+          > 0.20
+        for: 5m
+        labels:
+          severity: warning
+          service: insightforge
+        annotations:
+          summary: InsightForge run failure rate exceeds 20%
+          description: More than 20% of completed runs have failed for 5 minutes.
+
+      - alert: InsightForgeTerminalRateLimits
+        expr: sum(increase(open_deep_research_terminal_rate_limits_total[5m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+          service: insightforge
+        annotations:
+          summary: InsightForge requests are exhausting rate-limit retries
+          description: At least one LLM or tool call terminated due to rate limiting in the last 5 minutes.
+
+      - alert: InsightForgeObservabilityExportErrors
+        expr: sum(increase(open_deep_research_observability_export_errors_total[5m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+          service: insightforge
+        annotations:
+          summary: InsightForge observability exports are failing
+          description: A fail-open observability backend write failed in the last 5 minutes.
+
+      - alert: InsightForgeResearchQueueWaitHigh
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(open_deep_research_research_task_queue_wait_seconds_bucket[5m]))
+          ) > 120
+        for: 5m
+        labels:
+          severity: warning
+          service: insightforge
+        annotations:
+          summary: InsightForge research task queue p95 wait exceeds 120 seconds
+          description: Research tasks have waited over two minutes at the 95th percentile for 5 minutes.
+
+      - alert: InsightForgeRunsDirQuotaHigh
+        expr: |
+          open_deep_research_runs_dir_quota_bytes > 0
+          and
+          open_deep_research_runs_dir_quota_ratio > 0.80
+        for: 10m
+        labels:
+          severity: warning
+          service: insightforge
+        annotations:
+          summary: InsightForge durable run storage exceeds 80% of its advisory quota
+          description: The runs directory is approaching its configured RUNS_DIR_MAX_BYTES capacity.
