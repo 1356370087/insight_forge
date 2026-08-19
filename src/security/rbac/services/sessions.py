@@ -43,6 +43,10 @@ logger = logging.getLogger(__name__)
 
 REFRESH_PURPOSE = "refresh"
 
+# Users in these statuses may keep refreshing; every other lifecycle state
+# (disabled, pending-email, forced password reset) revokes the session family.
+_REFRESH_ALLOWED_STATUSES = frozenset({UserStatus.ACTIVE, UserStatus.PENDING_APPROVAL})
+
 
 class RefreshError(Exception):
     """Base error for refresh-token failures."""
@@ -184,8 +188,15 @@ async def rotate(
     await db.flush()
 
     user = await db.get(User, str(claims["sub"]))
-    if user is None or str(session.user_id) != str(claims["sub"]) or user.status == UserStatus.DISABLED:
-        await _revoke_family(db, session, reason=SessionRevocationReason.DISABLED, actor_id=actor_id)
+    if user is None or str(session.user_id) != str(claims["sub"]) or user.status not in _REFRESH_ALLOWED_STATUSES:
+        # Only active / pending-approval users may hold sessions: a disabled or
+        # forced-password-reset user must not keep rotating tokens.
+        reason = (
+            SessionRevocationReason.DISABLED
+            if user is not None and user.status == UserStatus.DISABLED
+            else SessionRevocationReason.REVOKED
+        )
+        await _revoke_family(db, session, reason=reason, actor_id=actor_id)
         raise InvalidRefreshToken("user_unavailable")
 
     pair = await _issue_pair(

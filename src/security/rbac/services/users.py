@@ -229,6 +229,11 @@ async def admin_send_password_reset(
         db, user_id=str(user.id), purpose="password_reset", settings=settings,
     )
     user.status = UserStatus.PASSWORD_RESET_REQUIRED
+    # A forced reset is a containment action: outstanding sessions must die
+    # immediately and refresh rotation must stop, not just new logins.
+    await bump_authz_version(
+        db, str(user.id), reason="forced_password_reset",
+    )
     await db.flush()
     await audit.record(
         db, action="user.password_reset_sent", actor_id=actor_id, target_user_id=str(user.id),

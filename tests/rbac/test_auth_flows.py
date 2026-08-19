@@ -111,6 +111,66 @@ class TestLogin:
         assert exc.value.status == 403
         assert "verification" in exc.value.detail
 
+    async def test_wrong_password_on_pending_account_is_uniform_401(self, mail_recorder, settings):
+        """A wrong password never reveals lifecycle status — 401 like any account."""
+        async with iam_db.session_scope() as db:
+            await auth_service.register(
+                db, email="pe2@example.com", password=PASSWORD, display_name=None,
+                settings=settings, identity_for_rate_limit="ip-pe2",
+            )
+            await db.commit()
+        async with iam_db.session_scope() as db:
+            with pytest.raises(AuthError) as exc:
+                await auth_service.login(
+                    db, email="pe2@example.com", password="definitely-not-it",
+                    settings=settings, ip_address="ip-pe2",
+                )
+        assert exc.value.status == 401
+        assert exc.value.detail == "invalid_credentials"
+
+    async def test_lockout_scoped_to_failing_source_ip(self, mail_recorder, settings):
+        """Five failures lock that (account, ip) pair — not the rightful owner elsewhere."""
+        await _register_and_verify(mail_recorder, settings)
+        for _ in range(auth_service.LOGIN_MAX_FAILURES):
+            async with iam_db.session_scope() as db:
+                with pytest.raises(AuthError) as exc:
+                    await auth_service.login(
+                        db, email=EMAIL, password="wrong-password-here",
+                        settings=settings, ip_address="ip-attacker",
+                    )
+                await db.commit()
+            assert exc.value.detail == "invalid_credentials"
+        async with iam_db.session_scope() as db:
+            with pytest.raises(AuthError) as exc:
+                await auth_service.login(
+                    db, email=EMAIL, password=PASSWORD,
+                    settings=settings, ip_address="ip-attacker",
+                )
+        assert exc.value.status == 429
+        assert exc.value.detail == "account_locked"
+        # The same attacker cannot probe a locked unknown email cheaply either.
+        async with iam_db.session_scope() as db:
+            for _ in range(auth_service.LOGIN_MAX_FAILURES):
+                with pytest.raises(AuthError):
+                    await auth_service.login(
+                        db, email="ghost@example.com", password="whatever-password",
+                        settings=settings, ip_address="ip-attacker2",
+                    )
+                await db.commit()
+            with pytest.raises(AuthError) as exc:
+                await auth_service.login(
+                    db, email="ghost@example.com", password="whatever-password",
+                    settings=settings, ip_address="ip-attacker2",
+                )
+        assert exc.value.status == 429
+        # The rightful owner from another source IP is unaffected.
+        async with iam_db.session_scope() as db:
+            pair = await auth_service.login(
+                db, email=EMAIL, password=PASSWORD, settings=settings, ip_address="ip-victim",
+            )
+            await db.commit()
+        assert pair.access_token
+
     async def test_unknown_user_returns_invalid_credentials(self, settings):
         """An unknown user maps to invalid_credentials (401), not 404."""
         async with iam_db.session_scope() as db:
@@ -234,3 +294,62 @@ class TestRateLimiting:
                     settings=settings, identity_for_rate_limit="ip-rl",
                 )
         assert exc.value.status == 429
+
+
+class TestConcurrentRegistration:
+    """A same-email registration race must not surface a 500."""
+
+    async def test_concurrent_register_has_single_winner(self, settings):
+        """Two parallel registrations of one email yield exactly one outcome."""
+        import asyncio
+
+        async def _register():
+            async with iam_db.session_scope() as db:
+                outcome = await auth_service.register(
+                    db, email="race@example.com", password=PASSWORD, display_name=None,
+                    settings=settings, identity_for_rate_limit="ip-race",
+                )
+                await db.commit()
+                return outcome.issued_verification
+
+        results = await asyncio.gather(_register(), _register())
+        assert results.count(True) == 1
+
+
+class TestForcedPasswordReset:
+    """Admin-triggered resets must contain existing sessions."""
+
+    async def test_forced_reset_revokes_sessions_and_blocks_refresh(self, mail_recorder, settings):
+        """After an admin reset, refresh rotation dies and the session is revoked."""
+        from security.rbac.models import Session as IamSession
+        from security.rbac.services import users as users_service
+
+        await _register_and_verify(mail_recorder, settings)
+        async with iam_db.session_scope() as db:
+            pair = await auth_service.login(
+                db, email=EMAIL, password=PASSWORD, settings=settings, ip_address="ip-fr",
+            )
+            await db.commit()
+        async with iam_db.session_scope() as db:
+            user = await _get_user_by_email(db, EMAIL)
+            await users_service.admin_send_password_reset(
+                db, str(user.id), settings=settings,
+                actor_id="00000000-0000-0000-0000-000000000001", send_email=False,
+            )
+            await db.commit()
+        async with iam_db.session_scope() as db:
+            session = await db.get(IamSession, pair.session_id)
+            assert session is not None and session.is_revoked
+        async with iam_db.session_scope() as db:
+            with pytest.raises(AuthError) as exc:
+                await auth_service.refresh(
+                    db, refresh_token=pair.refresh_token, settings=settings,
+                    ip_address="ip-fr",
+                )
+        assert exc.value.status == 401
+
+
+async def _get_user_by_email(db, email: str):
+    from security.rbac.repositories import get_user_by_email_normalized
+
+    return await get_user_by_email_normalized(db, email)

@@ -27,9 +27,18 @@ def _request(*, forwarded_for: str | None, peer: str = "10.0.0.9") -> Request:
     )
 
 
-def test_default_trusted_proxy_uses_rightmost_forwarded_address(monkeypatch) -> None:
-    """A caller-controlled first hop cannot change the default bucket identity."""
+def test_default_ignores_forwarded_header(monkeypatch) -> None:
+    """Without an explicit topology, only the socket peer is trusted."""
     monkeypatch.delenv("IAM_TRUSTED_PROXY_COUNT", raising=False)
+
+    assert auth_router._client_ip(
+        _request(forwarded_for="fake-a, 198.51.100.7")
+    ) == "10.0.0.9"
+
+
+def test_single_trusted_proxy_uses_rightmost_forwarded_address(monkeypatch) -> None:
+    """With one configured hop, the proxy-appended rightmost entry wins."""
+    monkeypatch.setenv("IAM_TRUSTED_PROXY_COUNT", "1")
 
     first = auth_router._client_ip(
         _request(forwarded_for="fake-a, 198.51.100.7")

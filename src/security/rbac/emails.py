@@ -24,14 +24,19 @@ def normalize_email(email: str) -> str:
 
 
 def validate_and_normalize(email: str) -> str:
-    """Validate ``email`` with ``email_validator`` and return its normalized form."""
+    """Validate ``email`` with ``email_validator`` and return its normalized form.
+
+    Fails closed when the validator is unavailable: without it we cannot reject
+    addresses (e.g. containing newlines) that would corrupt downstream MIME
+    headers, so no address is accepted at all.
+    """
     raw = (email or "").strip()
     if not raw:
         raise InvalidEmail("email_required")
-    if _email_validator is not None:
-        try:
-            info = _email_validator.validate_email(raw, check_deliverability=False)
-        except _email_validator.EmailNotValidError as exc:
-            raise InvalidEmail(f"invalid_email:{exc}") from exc
-        raw = info.normalized
-    return normalize_email(raw)
+    if _email_validator is None:
+        raise InvalidEmail("email_validator_unavailable")
+    try:
+        info = _email_validator.validate_email(raw, check_deliverability=False)
+    except _email_validator.EmailNotValidError as exc:
+        raise InvalidEmail(f"invalid_email:{exc}") from exc
+    return normalize_email(info.normalized)

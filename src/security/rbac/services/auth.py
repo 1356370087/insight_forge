@@ -8,9 +8,12 @@ session per request and commits on success).
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass
+from datetime import timedelta
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..emails import InvalidEmail, validate_and_normalize
@@ -38,6 +41,10 @@ logger = logging.getLogger(__name__)
 
 LOGIN_MAX_FAILURES = 5
 LOGIN_LOCK_MINUTES = 15
+# Lockout window == lock duration: five failures within the window lock that
+# (account, source-IP) pair for the window's remainder.
+_LOGIN_LOCK_WINDOW = LOGIN_LOCK_MINUTES * 60
+_LOGIN_LOCK_BUCKET = "login-lock"
 
 
 class AuthError(Exception):
@@ -110,8 +117,15 @@ async def register(
         display_name=(display_name or "").strip() or None,
         status=UserStatus.PENDING_EMAIL,
     )
-    db.add(user)
-    await db.flush()
+    try:
+        # Savepoint so a concurrent registration of the same email (unique
+        # constraint) only rolls back the insert — the consumed rate-limit
+        # slot stays counted, and the caller still sees the 202-shaped outcome.
+        async with db.begin_nested():
+            db.add(user)
+            await db.flush()
+    except IntegrityError:
+        return RegisterOutcome(issued_verification=False, email=normalized)
     raw_token = await email_tokens.issue(
         db, user_id=str(user.id), purpose=email_tokens.EmailTokenPurpose.EMAIL_VERIFICATION, settings=settings,
     )
@@ -161,6 +175,36 @@ async def resend_verification(
     await send_verification_email(to=user.email, token=raw_token, settings=settings)
 
 
+def _lock_identity(subject: str, ip_address: str | None) -> str:
+    """Return the hashed (subject, ip) lockout key (fits the identity column)."""
+    raw = f"{subject}|{ip_address or 'unknown'}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+async def _login_lock_count(db: AsyncSession, subject: str, ip_address: str | None) -> int:
+    """Return in-window failures recorded against (subject, ip)."""
+    return await rate_limit.current_count(
+        db,
+        bucket=_LOGIN_LOCK_BUCKET,
+        identity=_lock_identity(subject, ip_address),
+        window_seconds=_LOGIN_LOCK_WINDOW,
+    )
+
+
+async def _record_login_failure(db: AsyncSession, subject: str, ip_address: str | None) -> None:
+    """Count a failed attempt against (subject, ip); a locked pair stays put."""
+    try:
+        await rate_limit.check_and_consume(
+            db,
+            bucket=_LOGIN_LOCK_BUCKET,
+            identity=_lock_identity(subject, ip_address),
+            limit=LOGIN_MAX_FAILURES,
+            window_seconds=_LOGIN_LOCK_WINDOW,
+        )
+    except RateLimited:
+        pass
+
+
 async def login(
     db: AsyncSession,
     *,
@@ -172,8 +216,11 @@ async def login(
 ) -> TokenPairRecord:
     """Authenticate and start a session; returns a fresh token pair.
 
-    Missing users incur a dummy Argon2 verify so response timing does not leak
-    account existence; all credential failures map to ``invalid_credentials``.
+    Account-existence protection: every wrong-password path answers a uniform
+    ``invalid_credentials``, and lifecycle-status errors are only reported
+    *after* the password verifies. Lockout is scoped to the failing
+    ``(account, source IP)`` pair, so an attacker cannot lock the account for
+    its rightful owner (who signs in from elsewhere).
     """
     identity_for_rate_limit = (ip_address or (email or "").lower() or "anon")
     try:
@@ -184,6 +231,7 @@ async def login(
     except RateLimited as exc:
         raise AuthError("rate_limited", status=429) from exc
 
+    normalized: str | None = None
     user = None
     try:
         normalized = validate_and_normalize(email)
@@ -191,14 +239,37 @@ async def login(
     except InvalidEmail:
         user = None
 
+    # Lockout subject: the user id when known, else the attempted email — both
+    # record and lock identically so the responses stay indistinguishable.
+    lock_subject = (
+        str(user.id)
+        if user is not None
+        else f"email:{normalized or (email or '').strip().lower() or 'unknown'}"
+    )
+    if await _login_lock_count(db, lock_subject, ip_address) >= LOGIN_MAX_FAILURES:
+        # Uniform timing: still pay the Argon2 cost before rejecting.
+        verify_password(password or "", dummy_hash())
+        raise AuthError("account_locked", status=429)
+
     if user is None:
         # Uniform timing for unknown emails.
         verify_password(password or "", dummy_hash())
+        await _record_login_failure(db, lock_subject, ip_address)
         raise AuthError("invalid_credentials", status=401)
 
-    if user.locked_until is not None and user.locked_until > utcnow():
-        raise AuthError("account_locked", status=429)
+    stored_hash = user.password_hash or dummy_hash()
+    if not verify_password(password or "", stored_hash):
+        await _record_login_failure(db, lock_subject, ip_address)
+        user.failed_login_count = int(user.failed_login_count) + 1
+        if user.failed_login_count >= LOGIN_MAX_FAILURES:
+            user.locked_until = utcnow() + timedelta(minutes=LOGIN_LOCK_MINUTES)
+            user.failed_login_count = 0
+            await audit.record(db, action="login.locked", actor_id=str(user.id), ip_address=ip_address)
+        await db.flush()
+        raise AuthError("invalid_credentials", status=401)
 
+    # Credentials verified — status errors from here on cannot leak account
+    # existence to an attacker without the password.
     if user.status == UserStatus.PENDING_EMAIL:
         raise AuthError("email_verification_required", status=403)
     if user.status == UserStatus.DISABLED:
@@ -206,24 +277,15 @@ async def login(
     if user.status == UserStatus.PASSWORD_RESET_REQUIRED:
         raise AuthError("password_reset_required", status=403)
 
-    stored_hash = user.password_hash or dummy_hash()
-    if not verify_password(password or "", stored_hash):
-        user.failed_login_count = int(user.failed_login_count) + 1
-        if user.failed_login_count >= LOGIN_MAX_FAILURES:
-            from datetime import timedelta
-
-            user.locked_until = utcnow() + timedelta(minutes=LOGIN_LOCK_MINUTES)
-            user.failed_login_count = 0
-            await audit.record(db, action="login.locked", actor_id=str(user.id), ip_address=ip_address)
-        await db.flush()
-        raise AuthError("invalid_credentials", status=401)
-
     # Successful authentication: clear failure counters, upgrade hash if needed.
     user.failed_login_count = 0
     user.locked_until = None
     if needs_rehash(stored_hash):
         user.password_hash = hash_password(password)
     await db.flush()
+    await rate_limit.reset(
+        db, bucket=_LOGIN_LOCK_BUCKET, identity=_lock_identity(lock_subject, ip_address),
+    )
 
     pair = await sessions.create_session(
         db, user, settings=settings, user_agent=user_agent, ip_address=ip_address,

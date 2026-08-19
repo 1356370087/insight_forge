@@ -183,3 +183,22 @@ class TestCacheControlAndShape:
             session = await db.get(Session, tokens["session_id"])
             assert session is not None
             assert session.is_revoked
+
+    async def test_concurrent_password_reset_single_winner(self, app, mail_recorder):
+        """Two parallel presentations of one reset token consume it exactly once."""
+        await _register_verified(mail_recorder)
+        settings = get_settings()
+        async with iam_db.session_scope() as db:
+            await auth_service.forgot_password(
+                db, email="zoe@example.com", settings=settings, identity_for_rate_limit="ip-rst",
+            )
+            await db.commit()
+        body = [m["text_body"] for m in mail_recorder if "reset" in m["subject"].lower()][-1]
+        token = re.search(r"token=([^\s]+)", body).group(1)
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            first, second = await asyncio.gather(
+                ac.post("/auth/password/reset", json={"token": token, "password": "first-new-passphrase"}),
+                ac.post("/auth/password/reset", json={"token": token, "password": "second-new-passphrase"}),
+            )
+        assert sorted((first.status_code, second.status_code)) == [200, 400]

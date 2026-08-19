@@ -33,6 +33,20 @@ export function csrfValid(request: NextRequest): boolean {
   return Boolean(cookie && header && cookie.length >= 16 && cookie === header);
 }
 
+// Login-CSRF guard for cookie-less auth actions: a browser form/fetch from
+// another site carries a foreign Origin header, while non-browser clients
+// send none. Compares host (name + port); the scheme may legitimately differ
+// behind a TLS-terminating proxy.
+export function sameOriginValid(request: NextRequest): boolean {
+  const origin = request.headers.get("origin");
+  if (!origin) return true;
+  try {
+    return new URL(origin).host === request.nextUrl.host;
+  } catch {
+    return false;
+  }
+}
+
 export function clearSession(response: NextResponse): void {
   for (const name of [ACCESS_COOKIE, REFRESH_COOKIE, CSRF_COOKIE]) {
     response.cookies.set(name, "", { path: "/", maxAge: 0, httpOnly: name !== CSRF_COOKIE, secure, sameSite: "lax" });

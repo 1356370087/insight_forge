@@ -84,11 +84,16 @@ async def consume(
     """
     digest = digest_token(raw_token, purpose=purpose)
     now = utcnow()
+    # Lock the row so two concurrent presentations of the same one-time token
+    # serialize: the loser sees used_at set and fails (same idiom as refresh
+    # rotation).
     result = await db.execute(
-        select(EmailToken).where(
+        select(EmailToken)
+        .where(
             EmailToken.digest == digest,
             EmailToken.purpose == purpose,
         )
+        .with_for_update()
     )
     record = result.scalar_one_or_none()
     if record is None:

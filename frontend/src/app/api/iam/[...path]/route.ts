@@ -6,6 +6,11 @@ const allowed = /^(auth\/(me|sessions(?:\/[^/]+)?|logout-all|password\/change)|a
 
 async function proxy(request: NextRequest, context: { params: Promise<{ path: string[] }> }) {
   const { path } = await context.params;
+  // Dot segments would survive encodeURIComponent and let new URL() rewrite
+  // the path below the allowlist after the regex has already matched.
+  if (path.some((segment) => segment === "." || segment === "..")) {
+    return NextResponse.json({ detail: "proxy_path_not_allowed" }, { status: 404 });
+  }
   const joined = path.join("/");
   if (!allowed.test(joined)) return NextResponse.json({ detail: "proxy_path_not_allowed" }, { status: 404 });
   return authenticatedProxy(request, `/${path.map(encodeURIComponent).join("/")}`);

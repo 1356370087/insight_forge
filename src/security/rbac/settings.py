@@ -95,8 +95,11 @@ class IAMSettings:
     open_registration: bool = field(default_factory=lambda: _flag("IAM_OPEN_REGISTRATION", "false"))
 
     # Distributed rate-limit bucket sizes (requests per window per identity).
+    # Defaults to 0 (trust only the socket peer): a non-zero value must be set
+    # deliberately to match the real proxy topology, otherwise clients could
+    # spoof X-Forwarded-For and rotate their rate-limit identity at will.
     trusted_proxy_count: int = field(
-        default_factory=lambda: max(0, _int("IAM_TRUSTED_PROXY_COUNT", 1))
+        default_factory=lambda: max(0, _int("IAM_TRUSTED_PROXY_COUNT", 0))
     )
     login_rate_limit: int = field(default_factory=lambda: _int("IAM_LOGIN_RATE_LIMIT", 10))
     register_rate_limit: int = field(default_factory=lambda: _int("IAM_REGISTER_RATE_LIMIT", 5))

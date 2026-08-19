@@ -81,6 +81,7 @@ class SessionRevocationReason:
     LOGOUT = "logout"
     LOGOUT_ALL = "logout_all"
     PASSWORD_CHANGE = "password_change"
+    FORCED_PASSWORD_RESET = "forced_password_reset"
     DISABLED = "account_disabled"
     REPLAY = "refresh_token_reuse"
     REVOKED = "revoked"

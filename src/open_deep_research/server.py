@@ -86,6 +86,7 @@ from security.rbac.permissions import (
     RESEARCH_TASK_ACTIVITY_READ_OWN,
 )
 from security.rbac.settings import get_settings as get_iam_settings
+from security.rbac.settings import local_dev_bypass_enabled
 
 load_dotenv()
 configure_logging()
@@ -1483,10 +1484,7 @@ def _require_run_owner(run_id: str, user: Principal) -> tuple[RunRecord | None, 
 
 def _task_activity_preview_allowed(user: Principal) -> bool:
     """Authorize bounded diagnostic previews without trusting the browser."""
-    local_bypass = os.environ.get("LOCAL_DEV_AUTH_BYPASS", "false").lower() in {
-        "1", "true", "yes", "on",
-    }
-    if local_bypass:
+    if local_dev_bypass_enabled():
         return True
     enabled = os.environ.get("TASK_ACTIVITY_PREVIEW_ENABLED", "false").lower() in {
         "1", "true", "yes", "on",
