@@ -13,7 +13,6 @@ from typing import Any, Literal, get_args, get_origin
 from langchain_core.messages import AIMessage
 from pydantic import BaseModel, Field
 
-from open_deep_research import quality as quality_evaluation
 from open_deep_research.evaluation import (
     JUDGE_SECURITY_PROTOCOL,
     JudgeConfig,
@@ -26,6 +25,7 @@ from open_deep_research.evaluation.execution import (
     evaluate_execution_compliance,
 )
 from open_deep_research.evidence import eligible_evidence_records
+from open_deep_research.quality import gate as quality_evaluation
 from open_deep_research.report.coverage import derive_coverage_checklist
 from tests.prompts import (
     CITATION_ACCURACY_PROMPT,

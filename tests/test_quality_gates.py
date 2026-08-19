@@ -8,7 +8,8 @@ from langchain_core.messages import ToolMessage
 
 from open_deep_research.agents import deep_researcher
 from open_deep_research.configuration import Configuration
-from open_deep_research.quality import (
+from open_deep_research.quality.contract import ResearchCoverageContract
+from open_deep_research.quality.gate import (
     TOOL_RESULT_EVALUATION_PROMPT,
     ToolResultAssessment,
     _bounded_evidence_records,
@@ -23,7 +24,6 @@ from open_deep_research.quality import (
     evaluate_subagent_handoff,
     evaluate_tool_results,
 )
-from open_deep_research.quality_contract import ResearchCoverageContract
 from open_deep_research.tools.utils import get_notes_from_tool_calls
 
 
@@ -39,7 +39,7 @@ def test_quality_model_uses_json_mode_and_disables_thinking(monkeypatch) -> None
         captured["init"] = kwargs
         return FakeModel()
 
-    monkeypatch.setattr("open_deep_research.quality.init_chat_model", fake_init_chat_model)
+    monkeypatch.setattr("open_deep_research.quality.gate.init_chat_model", fake_init_chat_model)
     configurable = Configuration(
         quality_evaluation_model="openai:qwen3.7-plus",
         quality_evaluation_base_url="https://example.test/v1",
@@ -64,7 +64,7 @@ def test_quality_model_enables_thinking_for_qwen_max_series(monkeypatch) -> None
         captured["init"] = kwargs
         return FakeModel()
 
-    monkeypatch.setattr("open_deep_research.quality.init_chat_model", fake_init_chat_model)
+    monkeypatch.setattr("open_deep_research.quality.gate.init_chat_model", fake_init_chat_model)
     configurable = Configuration(
         quality_evaluation_model="openai:qwen3.7-max-2026-05-17",
         quality_evaluation_base_url=(
@@ -646,11 +646,11 @@ async def test_runtime_judge_repairs_strict_single_key_schema_wrapper(
         return SimpleNamespace(content=json.dumps(wrapped))
 
     monkeypatch.setattr(
-        "open_deep_research.quality._build_quality_model",
+        "open_deep_research.quality.gate._build_quality_model",
         lambda *_args, **_kwargs: object(),
     )
     monkeypatch.setattr(
-        "open_deep_research.quality.invoke_model_with_retry_observability",
+        "open_deep_research.quality.gate.invoke_model_with_retry_observability",
         fake_invoke,
     )
 
@@ -924,11 +924,11 @@ async def test_contradictory_retry_is_repaired_once(monkeypatch) -> None:
         return SimpleNamespace(content=json.dumps(responses.pop(0)))
 
     monkeypatch.setattr(
-        "open_deep_research.quality._build_quality_model",
+        "open_deep_research.quality.gate._build_quality_model",
         lambda *_args, **_kwargs: object(),
     )
     monkeypatch.setattr(
-        "open_deep_research.quality.invoke_model_with_retry_observability",
+        "open_deep_research.quality.gate.invoke_model_with_retry_observability",
         fake_invoke,
     )
 
@@ -958,11 +958,11 @@ async def test_tool_gate_malformed_contract_follows_fail_open_boundary(
         return None
 
     monkeypatch.setattr(
-        "open_deep_research.quality._evaluate_json",
+        "open_deep_research.quality.gate._evaluate_json",
         fail_if_called,
     )
     monkeypatch.setattr(
-        "open_deep_research.quality.publish_task_activity",
+        "open_deep_research.quality.gate.publish_task_activity",
         ignore_activity,
     )
 
@@ -1004,11 +1004,11 @@ async def test_tool_gate_payload_closes_total_input_budget(monkeypatch) -> None:
         return None
 
     monkeypatch.setattr(
-        "open_deep_research.quality._evaluate_json",
+        "open_deep_research.quality.gate._evaluate_json",
         capture_evaluation,
     )
     monkeypatch.setattr(
-        "open_deep_research.quality.publish_task_activity",
+        "open_deep_research.quality.gate.publish_task_activity",
         ignore_activity,
     )
     contract = ResearchCoverageContract.model_validate({
@@ -1057,7 +1057,7 @@ async def test_handoff_payload_marks_text_truncation(monkeypatch) -> None:
         }
 
     monkeypatch.setattr(
-        "open_deep_research.quality._evaluate_json",
+        "open_deep_research.quality.gate._evaluate_json",
         capture_evaluation,
     )
 
@@ -1099,11 +1099,11 @@ async def test_tool_quality_activity_dedupe_key_is_stable(monkeypatch) -> None:
         dedupe_keys.append(kwargs["dedupe_key"])
 
     monkeypatch.setattr(
-        "open_deep_research.quality._evaluate_json",
+        "open_deep_research.quality.gate._evaluate_json",
         fake_evaluation,
     )
     monkeypatch.setattr(
-        "open_deep_research.quality.publish_task_activity",
+        "open_deep_research.quality.gate.publish_task_activity",
         capture_activity,
     )
     args = (
@@ -1125,11 +1125,11 @@ async def test_second_protocol_contradiction_uses_fail_open(monkeypatch) -> None
         return SimpleNamespace(content=json.dumps(_contradictory_retry()))
 
     monkeypatch.setattr(
-        "open_deep_research.quality._build_quality_model",
+        "open_deep_research.quality.gate._build_quality_model",
         lambda *_args, **_kwargs: object(),
     )
     monkeypatch.setattr(
-        "open_deep_research.quality.invoke_model_with_retry_observability",
+        "open_deep_research.quality.gate.invoke_model_with_retry_observability",
         fake_invoke,
     )
 
@@ -1154,11 +1154,11 @@ async def test_second_protocol_contradiction_fail_closed_stops_spending(
         return SimpleNamespace(content=json.dumps(_contradictory_retry()))
 
     monkeypatch.setattr(
-        "open_deep_research.quality._build_quality_model",
+        "open_deep_research.quality.gate._build_quality_model",
         lambda *_args, **_kwargs: object(),
     )
     monkeypatch.setattr(
-        "open_deep_research.quality.invoke_model_with_retry_observability",
+        "open_deep_research.quality.gate.invoke_model_with_retry_observability",
         fake_invoke,
     )
 
@@ -1181,11 +1181,11 @@ async def test_handoff_timeout_fail_closed_returns_structured_rejection(
         raise TimeoutError("judge timed out")
 
     monkeypatch.setattr(
-        "open_deep_research.quality._build_quality_model",
+        "open_deep_research.quality.gate._build_quality_model",
         lambda *_args, **_kwargs: object(),
     )
     monkeypatch.setattr(
-        "open_deep_research.quality.invoke_model_with_retry_observability",
+        "open_deep_research.quality.gate.invoke_model_with_retry_observability",
         fake_invoke,
     )
     handoff = {

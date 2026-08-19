@@ -8,8 +8,8 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel
 
-from open_deep_research import quality
 from open_deep_research.agents import deep_researcher
+from open_deep_research.quality import gate as quality
 from open_deep_research.report import assembly
 from open_deep_research.report.profiles import get_profile
 from open_deep_research.tools.web_research import pipeline as tool_pipeline

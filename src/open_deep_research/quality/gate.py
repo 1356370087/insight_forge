@@ -35,7 +35,7 @@ from open_deep_research.observability import (
     invoke_model_with_retry_observability,
 )
 from open_deep_research.public_task_activity import publish_task_activity
-from open_deep_research.quality_contract import (
+from open_deep_research.quality.contract import (
     AdmissionStatus,
     HandoffPolicyInput,
     RequirementCoverage,
@@ -43,7 +43,7 @@ from open_deep_research.quality_contract import (
     ResearchRiskProfile,
     resolve_handoff_admission,
 )
-from open_deep_research.quality_policy import (
+from open_deep_research.quality.policy import (
     QualityRigorPolicy,
     get_run_quality_rigor_policy,
     scores_meet_runtime_policy,

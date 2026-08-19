@@ -28,8 +28,8 @@ from open_deep_research.models.resolution import (
 from open_deep_research.observability import (
     invoke_model_with_retry_observability,
 )
-from open_deep_research.quality import _evaluate_json
-from open_deep_research.quality_contract import ResearchCoverageContract
+from open_deep_research.quality.contract import ResearchCoverageContract
+from open_deep_research.quality.gate import _evaluate_json
 from open_deep_research.report.recovery import (
     build_evidence_recovery_report,
 )

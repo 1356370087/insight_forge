@@ -9,7 +9,17 @@ import pytest
 from langchain_core.messages import HumanMessage
 
 from open_deep_research.agents import deep_researcher
-from open_deep_research.quality import (
+from open_deep_research.quality.contract import (
+    AdmissionStatus,
+    CoverageStatus,
+    HandoffPolicyInput,
+    RequirementCoverage,
+    build_research_coverage_contract,
+    classify_research_risk,
+    merge_coverage_ledger,
+    resolve_handoff_admission,
+)
+from open_deep_research.quality.gate import (
     HANDOFF_EVALUATION_PROMPT_V4,
     TOOL_RESULT_EVALUATION_PROMPT,
     HandoffAssessment,
@@ -19,16 +29,6 @@ from open_deep_research.quality import (
     deterministic_tool_checks,
     evaluate_subagent_handoff,
     evaluate_tool_results,
-)
-from open_deep_research.quality_contract import (
-    AdmissionStatus,
-    CoverageStatus,
-    HandoffPolicyInput,
-    RequirementCoverage,
-    build_research_coverage_contract,
-    classify_research_risk,
-    merge_coverage_ledger,
-    resolve_handoff_admission,
 )
 from open_deep_research.state import ResearchQuestion
 from open_deep_research.tools.base import ToolContext
@@ -221,11 +221,11 @@ async def test_official_only_tool_gate_projects_out_third_party_candidates(
         return None
 
     monkeypatch.setattr(
-        "open_deep_research.quality._evaluate_json",
+        "open_deep_research.quality.gate._evaluate_json",
         capture_evaluation,
     )
     monkeypatch.setattr(
-        "open_deep_research.quality.publish_task_activity",
+        "open_deep_research.quality.gate.publish_task_activity",
         ignore_activity,
     )
     records = [
@@ -788,11 +788,11 @@ async def test_v4_fail_open_evaluator_error_does_not_admit_empty_coverage(
         raise TimeoutError("quality judge unavailable")
 
     monkeypatch.setattr(
-        "open_deep_research.quality._build_quality_model",
+        "open_deep_research.quality.gate._build_quality_model",
         lambda *_args, **_kwargs: object(),
     )
     monkeypatch.setattr(
-        "open_deep_research.quality.invoke_model_with_retry_observability",
+        "open_deep_research.quality.gate.invoke_model_with_retry_observability",
         fail_judge,
     )
     handoff = {
@@ -862,11 +862,11 @@ async def test_v4_fail_open_does_not_bypass_required_coverage(
         raise TimeoutError("quality judge unavailable")
 
     monkeypatch.setattr(
-        "open_deep_research.quality._build_quality_model",
+        "open_deep_research.quality.gate._build_quality_model",
         lambda *_args, **_kwargs: object(),
     )
     monkeypatch.setattr(
-        "open_deep_research.quality.invoke_model_with_retry_observability",
+        "open_deep_research.quality.gate.invoke_model_with_retry_observability",
         fail_judge,
     )
     handoff = {
@@ -940,7 +940,7 @@ async def test_v4_policy_without_contract_fails_closed_on_judge_outage(
         raise TimeoutError("quality judge unavailable")
 
     monkeypatch.setattr(
-        "open_deep_research.quality._evaluate_json",
+        "open_deep_research.quality.gate._evaluate_json",
         fail_judge,
     )
     result = await evaluate_subagent_handoff(
@@ -972,7 +972,7 @@ async def test_v4_malformed_handoff_contract_is_rejected_not_raised(
         raise AssertionError("invalid contracts must not reach the Judge")
 
     monkeypatch.setattr(
-        "open_deep_research.quality._evaluate_json",
+        "open_deep_research.quality.gate._evaluate_json",
         fail_if_called,
     )
     result = await evaluate_subagent_handoff(
@@ -1027,7 +1027,7 @@ async def test_v4_successful_handoff_judge_does_not_add_unavailable_caveat(
         )
 
     monkeypatch.setattr(
-        "open_deep_research.quality._evaluate_json",
+        "open_deep_research.quality.gate._evaluate_json",
         pass_judge,
     )
     handoff = {
@@ -1136,7 +1136,7 @@ async def test_v4_structural_requirements_do_not_need_external_evidence_ids(
         )
 
     monkeypatch.setattr(
-        "open_deep_research.quality._evaluate_json",
+        "open_deep_research.quality.gate._evaluate_json",
         pass_judge,
     )
     handoff = {
@@ -1235,7 +1235,7 @@ async def test_v4_parallel_delegation_and_final_table_are_run_level(
         )
 
     monkeypatch.setattr(
-        "open_deep_research.quality._evaluate_json",
+        "open_deep_research.quality.gate._evaluate_json",
         pass_judge,
     )
     result = await evaluate_subagent_handoff(
@@ -1349,7 +1349,7 @@ async def test_v4_official_only_handoff_cannot_map_to_out_of_scope_evidence(
         )
 
     monkeypatch.setattr(
-        "open_deep_research.quality._evaluate_json",
+        "open_deep_research.quality.gate._evaluate_json",
         fake_evaluate,
     )
     handoff = {
@@ -1473,7 +1473,7 @@ async def test_v4_official_only_judge_can_evaluate_candidate_structure(
         )
 
     monkeypatch.setattr(
-        "open_deep_research.quality._evaluate_json",
+        "open_deep_research.quality.gate._evaluate_json",
         fake_evaluate,
     )
     official_url = (

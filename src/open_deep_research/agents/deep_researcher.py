@@ -90,19 +90,19 @@ from open_deep_research.public_events import (
     summarize_public_findings,
 )
 from open_deep_research.public_task_activity import publish_task_activity
-from open_deep_research.quality import (
-    _bounded_evidence_records,
-    evaluate_subagent_handoff,
-    evaluate_tool_results,
-    tool_result_content_has_error,
-)
-from open_deep_research.quality_contract import (
+from open_deep_research.quality.contract import (
     AdmissionStatus,
     ResearchCoverageContract,
     ResearchRiskProfile,
     build_research_coverage_contract,
     classify_research_risk,
     merge_coverage_ledger,
+)
+from open_deep_research.quality.gate import (
+    _bounded_evidence_records,
+    evaluate_subagent_handoff,
+    evaluate_tool_results,
+    tool_result_content_has_error,
 )
 from open_deep_research.run_context import RunContextStore
 from open_deep_research.runtime import (

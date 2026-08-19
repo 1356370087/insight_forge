@@ -8,7 +8,7 @@ from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field, create_model
 
 from open_deep_research.configuration import Configuration
-from open_deep_research.quality_contract import ResearchCoverageContract
+from open_deep_research.quality.contract import ResearchCoverageContract
 from open_deep_research.run_context import RunContextStore
 from open_deep_research.tasks.events import JSONLEventWriter
 from open_deep_research.tools.base import ToolContext

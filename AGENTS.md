@@ -146,7 +146,7 @@ START → researcher → researcher_tools → researcher (循环) 或 → assess
 - **模型回退与熔断**：`models/fallback.py` 统一负责候选链、错误分类、跨 provider 消息清洗和 `query.model_fallback` 公共事件；`models/circuit.py` 提供进程级 CLOSED/OPEN/HALF_OPEN 熔断与流式首包探测（off/shadow/enforced，默认 shadow）
 - **MODEL_TOKEN_LIMITS**：位于 `models/limits.py`，用于计算截断阈值；查找采用精确键优先、再按键长度降序的最长子串匹配。注意：此表需要手动维护
 
-### 7. 质量与证据（quality.py / evidence.py / quality_contract.py）
+### 7. 质量与证据（quality/ 子包：gate/contract/policy / evidence.py）
 
 - **覆盖契约**：从用户消息编译需求清单，每条需求有稳定 ID（`COV-NN-<hash>`）；门禁只对任务归属需求做硬覆盖检查
 - **来源契约**：用户消息中的显式 URL 白/黑名单、"仅官方来源"约束会被编译为来源准入范围（`SourceScope`）；受限契约下证据准入 fail-closed

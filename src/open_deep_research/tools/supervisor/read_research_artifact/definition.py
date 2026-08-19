@@ -9,7 +9,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from open_deep_research.configuration import Configuration
-from open_deep_research.quality_contract import ResearchRiskProfile
+from open_deep_research.quality.contract import ResearchRiskProfile
 from open_deep_research.run_context import RunContextStore
 from open_deep_research.tools.base import (
     ProgressCallback,

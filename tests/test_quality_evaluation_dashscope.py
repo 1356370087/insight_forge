@@ -17,7 +17,7 @@ from pydantic import BaseModel
 from open_deep_research.configuration import Configuration
 from open_deep_research.evaluation import JudgeConfig, build_judge_model
 from open_deep_research.models.capabilities import dashscope_qwen_enable_thinking
-from open_deep_research.quality import (
+from open_deep_research.quality.gate import (
     _build_quality_model,
     _content_text,
     evaluate_subagent_handoff,
@@ -135,7 +135,7 @@ class TestDashScopeQualityEvaluationConfiguration:
             monkeypatch.setenv(key, value)
         monkeypatch.delenv("QUALITY_EVALUATION_API_KEY", raising=False)
         monkeypatch.setattr(
-            "open_deep_research.quality.init_chat_model",
+            "open_deep_research.quality.gate.init_chat_model",
             fake_init_chat_model,
         )
 
@@ -279,7 +279,7 @@ class TestQualityEvaluationProviderIsolation:
         monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-key")
         monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
         monkeypatch.setattr(
-            "open_deep_research.quality.init_chat_model",
+            "open_deep_research.quality.gate.init_chat_model",
             fake_init_chat_model,
         )
         configurable = Configuration(
@@ -310,7 +310,7 @@ class TestQualityEvaluationProviderIsolation:
         monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-key")
         monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-key")
         monkeypatch.setattr(
-            "open_deep_research.quality.init_chat_model",
+            "open_deep_research.quality.gate.init_chat_model",
             fake_init_chat_model,
         )
         configurable = Configuration(
@@ -338,7 +338,7 @@ class TestQualityEvaluationProviderIsolation:
         monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-key")
         monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
         monkeypatch.setattr(
-            "open_deep_research.quality.init_chat_model",
+            "open_deep_research.quality.gate.init_chat_model",
             lambda **kwargs: captured.update(kwargs) or FakeModel(),
         )
         configurable = Configuration(
@@ -389,7 +389,7 @@ class TestQualityEvaluationProviderIsolation:
             }
 
         monkeypatch.setattr(
-            "open_deep_research.quality._evaluate_json",
+            "open_deep_research.quality.gate._evaluate_json",
             fake_evaluate_json,
         )
         handoff = {
@@ -440,7 +440,7 @@ class TestQualityEvaluationProviderIsolation:
             }
 
         monkeypatch.setattr(
-            "open_deep_research.quality._evaluate_json",
+            "open_deep_research.quality.gate._evaluate_json",
             fake_evaluate_json,
         )
         evidence_registry = [

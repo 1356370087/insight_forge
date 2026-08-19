@@ -10,7 +10,7 @@ from open_deep_research.agents import deep_researcher
 from open_deep_research.agents.query_engine import QueryEngine
 from open_deep_research.completion import accepted_evidence
 from open_deep_research.configuration import Configuration
-from open_deep_research.quality import HandoffAssessment
+from open_deep_research.quality.gate import HandoffAssessment
 from open_deep_research.run_context import RunContextStore
 from open_deep_research.runtime import apply_update_to_state
 from open_deep_research.runtime_control import RunCancelled

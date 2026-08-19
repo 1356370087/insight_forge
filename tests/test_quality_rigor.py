@@ -12,11 +12,11 @@ from open_deep_research.configuration import (
     freeze_run_config,
     run_config_fingerprint,
 )
-from open_deep_research.quality import (
+from open_deep_research.quality.gate import (
     evaluate_subagent_handoff,
     evaluate_tool_results,
 )
-from open_deep_research.quality_policy import (
+from open_deep_research.quality.policy import (
     QualityEvaluationRigor,
     get_quality_rigor_policy,
 )
@@ -71,11 +71,11 @@ async def test_strict_tool_gate_preserves_fail_open_on_judge_timeout(
         raise TimeoutError("judge timed out")
 
     monkeypatch.setattr(
-        "open_deep_research.quality._build_quality_model",
+        "open_deep_research.quality.gate._build_quality_model",
         lambda *_args, **_kwargs: object(),
     )
     monkeypatch.setattr(
-        "open_deep_research.quality.invoke_model_with_retry_observability",
+        "open_deep_research.quality.gate.invoke_model_with_retry_observability",
         fake_invoke,
     )
 
@@ -102,11 +102,11 @@ async def test_strict_handoff_gate_preserves_fail_open_on_judge_timeout(
         raise TimeoutError("judge timed out")
 
     monkeypatch.setattr(
-        "open_deep_research.quality._build_quality_model",
+        "open_deep_research.quality.gate._build_quality_model",
         lambda *_args, **_kwargs: object(),
     )
     monkeypatch.setattr(
-        "open_deep_research.quality.invoke_model_with_retry_observability",
+        "open_deep_research.quality.gate.invoke_model_with_retry_observability",
         fake_invoke,
     )
     handoff = {
@@ -218,11 +218,11 @@ async def test_runtime_judge_applies_frozen_rigor_and_records_thresholds(
         return SimpleNamespace(content=json.dumps(responses.pop(0)))
 
     monkeypatch.setattr(
-        "open_deep_research.quality._build_quality_model",
+        "open_deep_research.quality.gate._build_quality_model",
         lambda *_args, **_kwargs: object(),
     )
     monkeypatch.setattr(
-        "open_deep_research.quality.invoke_model_with_retry_observability",
+        "open_deep_research.quality.gate.invoke_model_with_retry_observability",
         fake_invoke,
     )
     tool_results = [

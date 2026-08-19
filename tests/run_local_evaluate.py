@@ -24,7 +24,7 @@ from open_deep_research.evaluation import (
     MetricStatus,
     normalize_evaluator_metric,
 )
-from open_deep_research.quality_policy import (
+from open_deep_research.quality.policy import (
     QualityEvaluationRigor,
     get_quality_rigor_policy,
     rigor_from_legacy_min_score,

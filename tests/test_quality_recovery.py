@@ -8,7 +8,7 @@ import pytest
 
 from open_deep_research.agents.query_engine import QueryEngine
 from open_deep_research.completion import CompletionDecision
-from open_deep_research.quality import HandoffAssessment
+from open_deep_research.quality.gate import HandoffAssessment
 from open_deep_research.report import recovery
 from open_deep_research.report.recovery import build_evidence_recovery_report
 

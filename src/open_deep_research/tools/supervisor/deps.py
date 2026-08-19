@@ -8,7 +8,7 @@ from typing import Any
 
 from langchain_core.runnables import RunnableConfig
 
-from open_deep_research.quality_contract import (
+from open_deep_research.quality.contract import (
     ResearchCoverageContract,
     ResearchRiskProfile,
 )

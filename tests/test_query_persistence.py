@@ -17,7 +17,7 @@ from open_deep_research.configuration import (
     freeze_run_config,
     run_config_fingerprint,
 )
-from open_deep_research.quality import HandoffAssessment
+from open_deep_research.quality.gate import HandoffAssessment
 from open_deep_research.run_context import (
     ResearchBriefPersistenceError,
     RunConfigurationError,

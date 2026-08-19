@@ -11,7 +11,7 @@ import pymupdf
 import pytest
 
 from open_deep_research.configuration import Configuration
-from open_deep_research.quality import deterministic_tool_checks
+from open_deep_research.quality.gate import deterministic_tool_checks
 from open_deep_research.security.network import validate_connected_peer
 from open_deep_research.tools.registry import get_all_tools
 from open_deep_research.tools.web_research import pipeline as utils

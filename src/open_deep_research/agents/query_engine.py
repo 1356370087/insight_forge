@@ -67,14 +67,14 @@ from open_deep_research.public_events import (
     extract_public_sources,
 )
 from open_deep_research.public_task_activity import publish_task_activity
-from open_deep_research.quality import (
-    HandoffAssessment,
-    evaluate_subagent_handoff,
-)
-from open_deep_research.quality_contract import (
+from open_deep_research.quality.contract import (
     AdmissionStatus,
     ResearchRiskProfile,
     merge_coverage_ledger,
+)
+from open_deep_research.quality.gate import (
+    HandoffAssessment,
+    evaluate_subagent_handoff,
 )
 from open_deep_research.report.coverage import derive_state_coverage_checklist
 from open_deep_research.report.evidence_synthesis import (

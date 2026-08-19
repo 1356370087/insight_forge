@@ -13,7 +13,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 from open_deep_research.agents import deep_researcher
 from open_deep_research.agents.query_engine import QueryEngine
 from open_deep_research.configuration import Configuration
-from open_deep_research.quality import HandoffAssessment
+from open_deep_research.quality.gate import HandoffAssessment
 from open_deep_research.run_context import RunContextStore
 from open_deep_research.tools import utils
 from open_deep_research.tools.base import (

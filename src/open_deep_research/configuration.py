@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Literal, Optional
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from open_deep_research.quality_policy import (
+from open_deep_research.quality.policy import (
     QualityEvaluationRigor,
     get_quality_rigor_policy,
     rigor_from_legacy_min_score,
