@@ -9,12 +9,16 @@ from typing import Any
 import aiohttp
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import StructuredTool, ToolException
-from mcp import McpError
+from mcp import MCPError
+from mcp.types import URL_ELICITATION_REQUIRED
 
 from open_deep_research.security.redaction import redact_text
 from open_deep_research.tools.token_store import get_token_store
 
 logger = logging.getLogger(__name__)
+
+_LEGACY_INTERACTION_REQUIRED = -32003
+"""Pre-v2 server convention for "visit this URL to interact"; kept for older servers."""
 
 
 async def exchange_mcp_subject_token(
@@ -98,12 +102,36 @@ async def fetch_tokens(config: RunnableConfig) -> dict[str, Any] | None:
     return tokens
 
 
-def _find_mcp_error(exc: BaseException) -> McpError | None:
-    if isinstance(exc, McpError):
+def _find_mcp_error(exc: BaseException) -> MCPError | None:
+    if isinstance(exc, MCPError):
         return exc
     for nested in getattr(exc, "exceptions", ()):
         if found := _find_mcp_error(nested):
             return found
+    return None
+
+
+def _interaction_required_message(code: int, error_data: Any) -> str | None:
+    """Build the HITL message for an interaction-required error, if it is one."""
+    data = error_data if isinstance(error_data, dict) else {}
+    if code == URL_ELICITATION_REQUIRED:
+        parts: list[str] = []
+        for item in data.get("elicitations") or []:
+            if not isinstance(item, dict):
+                continue
+            message = str(item.get("message") or "Required interaction")
+            if url := item.get("url"):
+                message = f"{message} {url}"
+            parts.append(message)
+        return "\n".join(parts) if parts else "Required interaction"
+    if code == _LEGACY_INTERACTION_REQUIRED:
+        message_payload = data.get("message", {})
+        error_message = "Required interaction"
+        if isinstance(message_payload, dict):
+            error_message = message_payload.get("text") or error_message
+        if url := data.get("url"):
+            error_message = f"{error_message} {url}"
+        return error_message
     return None
 
 
@@ -120,13 +148,10 @@ def wrap_mcp_authenticate_tool(tool: StructuredTool) -> StructuredTool:
                 raise
             error_details = mcp_error.error
             error_data = getattr(error_details, "data", None) or {}
-            if getattr(error_details, "code", None) == -32003:
-                message_payload = error_data.get("message", {})
-                error_message = "Required interaction"
-                if isinstance(message_payload, dict):
-                    error_message = message_payload.get("text") or error_message
-                if url := error_data.get("url"):
-                    error_message = f"{error_message} {url}"
+            error_message = _interaction_required_message(
+                getattr(error_details, "code", None), error_data
+            )
+            if error_message is not None:
                 raise ToolException(error_message) from original_error
             raise
 

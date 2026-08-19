@@ -10,7 +10,7 @@ from open_deep_research.configuration import BrowserMCPConfig
 def build_browser_mcp_connection(
     browser_config: BrowserMCPConfig,
 ) -> dict[str, Any] | None:
-    """Build a langchain-mcp-adapters connection from validated configuration."""
+    """Build an MCP client connection dict from validated configuration."""
     if browser_config.transport == "stdio":
         if not browser_config.command:
             return None

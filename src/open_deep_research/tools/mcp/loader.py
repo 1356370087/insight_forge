@@ -9,13 +9,13 @@ from typing import Any, cast
 
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import StructuredTool
-from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from open_deep_research.configuration import BrowserMCPConfig, Configuration
 from open_deep_research.security.content import inspect_untrusted_content
 from open_deep_research.tools.adapters import adapt_langchain_tool
 from open_deep_research.tools.base import Tool, ToolEffect, ToolOrigin
 from open_deep_research.tools.mcp.browser import build_browser_mcp_connection
+from open_deep_research.tools.mcp.client import MultiServerMCPClient
 from open_deep_research.tools.mcp.oauth import (
     fetch_tokens,
     wrap_mcp_authenticate_tool,

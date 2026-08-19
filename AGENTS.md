@@ -136,7 +136,7 @@ START → researcher → researcher_tools → researcher (循环) 或 → assess
 - **统一协议**：`base.py` 的 Tool 协议覆盖 `name`、`input_schema`、`origin`、`retryable`、`description`、`prompt`、`is_enabled`、`egress_urls`、`max_output_chars`、`effect`、`concurrency_safe` 与 `call`；`adapters.py` 负责 LangChain/结构化工具适配
 - **统一装配**：`registry.py` 是 Researcher、Supervisor、MCP 与内置浏览器工具的唯一装配入口，统一执行启用条件、名称唯一性、权限过滤、描述预算投影和动态工具提示词生成
 - **搜索与 Web 工具**：`tavily_search/`、`openai_web_search/`、`anthropic_web_search/`、`web_research/`、`fetch_url/`、`fetch_webpage/` 等目录分别声明工具；`get_search_tool()` 由 registry 按 `SearchAPI` 和 `web_pipeline_mode` 选择
-- **MCP 子包**：`mcp/loader.py` 负责 `MultiServerMCPClient` 装载，`mcp/oauth.py` 负责 OAuth Token Exchange（RFC 8693），`mcp/browser.py` 负责内置浏览器工具；外部网络目标通过工具的 `egress_urls` 声明进入治理管线
+- **MCP 子包**：`mcp/client.py` 提供基于 mcp 2.x SDK 的进程内 `MultiServerMCPClient`（替代已不兼容的 langchain-mcp-adapters，stdio/streamable_http/sse 传输，每次工具调用新建会话），`mcp/loader.py` 负责装载与信任校验，`mcp/oauth.py` 负责 OAuth Token Exchange（RFC 8693，同时翻译 v2 `URL_ELICITATION_REQUIRED` 与旧版 `-32003` 交互错误码），`mcp/browser.py` 负责内置浏览器工具；外部网络目标通过工具的 `egress_urls` 声明进入治理管线
 - **Supervisor 工具**：`supervisor/` 下按工具分目录；`SupervisorToolDeps` 是冻结依赖对象，`deep_researcher.py` 只负责注入当前状态并请求装配，不再内嵌工具调用闭包
 - **动态提示词**：Researcher 与 Supervisor 的系统提示词从最终可用工具集动态渲染 `<Available Tools>`，因此禁用、权限裁剪或配置切换后的工具不会残留在提示词中
 - **tavily_search**：包含并行搜索、去重、LLM 摘要三个步骤。摘要预算 120 秒（含重试），失败时隔离外部内容
