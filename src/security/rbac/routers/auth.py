@@ -48,12 +48,26 @@ def _raise_auth_error(exc: AuthError) -> None:
     raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
 
 
+def _client_ip(request: Request) -> str:
+    """Resolve the client IP using only the configured trusted proxy suffix."""
+    peer_ip = request.client.host if request.client else "unknown"
+    trusted_proxy_count = get_settings().trusted_proxy_count
+    if trusted_proxy_count == 0:
+        return peer_ip
+
+    forwarded = [
+        item.strip()
+        for item in request.headers.get("x-forwarded-for", "").split(",")
+        if item.strip()
+    ]
+    if len(forwarded) < trusted_proxy_count:
+        return peer_ip
+    return forwarded[-trusted_proxy_count]
+
+
 def _client_identity(request: Request) -> str:
-    """Return a stable identity for rate limiting (IP, falling back to UA)."""
-    forwarded = request.headers.get("x-forwarded-for", "")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+    """Return the stable, trusted client IP used by rate-limit buckets."""
+    return _client_ip(request)
 
 
 def _request_meta(request: Request) -> tuple[str, str | None]:

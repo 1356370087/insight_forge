@@ -95,6 +95,9 @@ class IAMSettings:
     open_registration: bool = field(default_factory=lambda: _flag("IAM_OPEN_REGISTRATION", "false"))
 
     # Distributed rate-limit bucket sizes (requests per window per identity).
+    trusted_proxy_count: int = field(
+        default_factory=lambda: max(0, _int("IAM_TRUSTED_PROXY_COUNT", 1))
+    )
     login_rate_limit: int = field(default_factory=lambda: _int("IAM_LOGIN_RATE_LIMIT", 10))
     register_rate_limit: int = field(default_factory=lambda: _int("IAM_REGISTER_RATE_LIMIT", 5))
     resend_rate_limit: int = field(default_factory=lambda: _int("IAM_RESEND_RATE_LIMIT", 3))

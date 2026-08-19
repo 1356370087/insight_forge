@@ -11,7 +11,10 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import StructuredTool, ToolException
 from mcp import McpError
 
+from open_deep_research.security.redaction import redact_text
 from open_deep_research.tools.token_store import get_token_store
+
+logger = logging.getLogger(__name__)
 
 
 async def exchange_mcp_subject_token(
@@ -36,9 +39,17 @@ async def exchange_mcp_subject_token(
             ) as response:
                 if response.status == 200:
                     return await response.json()
-                logging.error("Token exchange failed: %s", await response.text())
+                response_body = redact_text(await response.text())[:512]
+                logger.warning(
+                    "MCP token exchange failed status=%s response=%s",
+                    response.status,
+                    response_body,
+                )
     except Exception as exc:
-        logging.error("Error during token exchange: %s", exc)
+        logger.warning(
+            "MCP token exchange error: %s",
+            redact_text(str(exc))[:512],
+        )
     return None
 
 

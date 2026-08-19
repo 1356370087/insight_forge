@@ -93,6 +93,18 @@ async def assert_schema_current(expected_revision: str | None = None) -> None:
         raise StartupError(f"schema_revision_mismatch:got={revision}:expected={expected_revision}")
 
 
+async def check_database_connection(settings: IAMSettings | None = None) -> None:
+    """Execute the lightweight IAM database probe used by readiness checks."""
+    import sqlalchemy as sa
+
+    settings = settings or get_settings()
+    if not settings.database_url:
+        return
+    engine = get_engine()
+    async with engine.connect() as conn:
+        await conn.execute(sa.text("SELECT 1"))
+
+
 async def shutdown_rbac() -> None:
     """Dispose the IAM engine on application shutdown."""
     await dispose_engine()

@@ -7,7 +7,13 @@ here to keep the namespace focused.
 
 from __future__ import annotations
 
-from .app_extension import StartupError, mount_rbac, shutdown_rbac, startup_checks
+from .app_extension import (
+    StartupError,
+    check_database_connection,
+    mount_rbac,
+    shutdown_rbac,
+    startup_checks,
+)
 from .dependencies import (
     apply_principal_to_config,
     build_principal,
@@ -28,6 +34,7 @@ __all__ = [
     "StartupError",
     "apply_principal_to_config",
     "build_principal",
+    "check_database_connection",
     "get_current_principal",
     "get_settings",
     "local_dev_bypass_enabled",
