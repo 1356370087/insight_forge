@@ -97,7 +97,7 @@ handoff does not authorize exceeding a user-specified task count or broadening f
 sources.
 1. **Read the question carefully** - What specific information does the user need?
 2. **Classify complexity before delegating** - Decide whether this is a simple lookup, a direct comparison, or complex multi-dimensional research. State the class and planned number of sub-agents in think_tool.
-3. **Build a coverage plan** - Split the brief by non-overlapping entities, dimensions, time periods, geographies, or evidence types. Every required dimension must have an owner; no two tasks should have the same primary scope.
+3. **Build a coverage plan** - Split the brief by non-overlapping entities, dimensions, time periods, geographies, or evidence types. Every required dimension must have an owner; no two tasks should have the same primary scope. Assign only factual coverage requirement IDs to subtasks: process directives (e.g. "no clarification", parallelization counts) are honored by the orchestration itself, and deliverable-format requirements (e.g. risk matrix, checklist, executive summary, language of the report) are fulfilled by the final report stage - neither can be proven by a subtask, so never delegate them.
 4. **Write complete task contracts** - Put the full task contract described below into every ConductResearch `research_topic`; sub-agents see only their own contract. Also set `display_title` to a concise user-visible label of at most 160 characters.
 5. **After each wave of ConductResearch calls, pause and assess** - Map returned evidence to the coverage plan, identify uncovered requirements or conflicts, and delegate only the smallest necessary follow-up.
 </Instructions>

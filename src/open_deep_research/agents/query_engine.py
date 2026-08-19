@@ -70,6 +70,7 @@ from open_deep_research.observability import get_trace_recorder
 from open_deep_research.quality.contract import (
     AdmissionStatus,
     ResearchRiskProfile,
+    is_delegable_requirement,
     merge_coverage_ledger,
 )
 from open_deep_research.quality.gate import (
@@ -2461,10 +2462,15 @@ class QueryEngine:
                 else []
             )
             coverage_ledger = dict(state.get("coverage_ledger", {}))
+            # Process directives are satisfied by orchestration and deliverable
+            # formats belong to the final report; only factual requirements
+            # count as research coverage gaps here.
             uncovered_requirement_ids = [
                 str(requirement.get("requirement_id", ""))
                 for requirement in contract_requirements
-                if requirement.get("requirement_id")
+                if isinstance(requirement, dict)
+                and requirement.get("requirement_id")
+                and is_delegable_requirement(requirement)
                 and coverage_ledger.get(
                     str(requirement.get("requirement_id")),
                     {},
@@ -2557,6 +2563,7 @@ class QueryEngine:
                 for requirement in contract_requirements
                 if isinstance(requirement, dict)
                 and requirement.get("requirement_id")
+                and is_delegable_requirement(requirement)
                 and coverage_ledger.get(
                     str(requirement.get("requirement_id")),
                     {},

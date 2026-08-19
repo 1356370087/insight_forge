@@ -6,7 +6,7 @@ import hashlib
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Literal, Mapping, Sequence, cast
 
 from langchain_core.messages import BaseMessage
 from pydantic import BaseModel, ConfigDict, Field
@@ -15,6 +15,90 @@ from open_deep_research.report.coverage import derive_coverage_checklist
 
 COVERAGE_CONTRACT_SCHEMA_VERSION = 1
 QUALITY_RISK_POLICY_VERSION = "quality-risk-v1"
+
+RequirementKind = Literal["factual", "process", "deliverable"]
+
+# Orchestration/interaction directives the engine itself satisfies; a research
+# subtask can never prove them with web evidence ("至少并行两个研究员",
+# "不需要澄清", citation-scope rules).
+_PROCESS_REQUIREMENT_RE = re.compile(
+    r"(?:不可拆分|单一研究任务)|"
+    r"(?:至少.{0,48}(?:并行.{0,16})?(?:Subagent|子智能体|研究员))|"
+    r"(?:并行.{0,24}(?:委派|开展|执行|运行)?.{0,16}(?:两个|多个|多名|两名)?.{0,16}(?:Subagent|子智能体|研究员))|"
+    r"(?:每个.{0,24}(?:Subagent|子智能体|研究员).{0,80}(?:读取|引用|来源))|"
+    r"(?:(?:只|仅|严格).{0,480}(?:URL|网址|链接).{0,80}(?:证据|来源))|"
+    r"(?:不得.{0,32}(?:引用|使用).{0,32}(?:其他|额外|未指定).{0,16}(?:URL|网址|链接|来源))|"
+    r"(?:每项.{0,48}(?:引用|来源))|"
+    r"(?:(?:必须|需要).{0,48}标(?:为|注为).{0,24}未证实)|"
+    r"(?:不得.{0,80}(?:引用第三方|搜索候选摘要|当作证据))|"
+    r"(?:不?需要澄清|无需澄清|不?需要确认|无需确认)|"
+    r"(?:直接(?:执行|开始|研究|运行)|立即(?:执行|开始)|不必等待)|"
+    r"(?:single\s+(?:indivisible\s+)?research\s+task)|"
+    r"(?:must\s+(?:cite|label).{0,80})|"
+    r"(?:do\s+not\s+(?:cite|use).{0,80})|"
+    r"(?:no\s+clarification.{0,40})|"
+    r"(?:proceed\s+directly.{0,40})",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+
+# Output-format obligations owned by the final report stage ("风险矩阵",
+# "检查清单", "用中文输出"); evidence cannot prove a deliverable's existence.
+_DELIVERABLE_REQUIREMENT_RE = re.compile(
+    r"(?:最终.{0,32}(?:中文.{0,16})?(?:对照表|比较表|表格|报告|输出|呈现))|"
+    r"(?:(?:用|使用|以).{0,12}(?:中文|英文).{0,24}(?:输出|撰写|呈现|回答|报告))|"
+    r"(?:执行摘要|executive\s+summary)|"
+    r"(?:风险矩阵|risk\s+matrix)|"
+    r"(?:(?:检查|核对|排查)清单|(?:pre-?)?(?:launch|production|go-?live).{0,24}checklist)|"
+    r"(?:(?:对照|比较)表|对比表格)|"
+    r"(?:可点击.{0,8}(?:引用|链接)|clickable\s+(?:citation|link))|"
+    r"(?:输出.{0,16}(?:表格|清单|矩阵|摘要))|"
+    r"(?:报告(?:末尾|结尾|中).{0,24}(?:附|包含|提供))",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+
+
+def classify_requirement_kind(text: str) -> RequirementKind:
+    """Classify one requirement text as factual, process, or deliverable.
+
+    Factual requirements need external evidence; process requirements are
+    orchestration directives the engine satisfies itself; deliverable
+    requirements are output-format obligations owned by the final report.
+    """
+    value = str(text or "")
+    if _PROCESS_REQUIREMENT_RE.search(value):
+        return "process"
+    if _DELIVERABLE_REQUIREMENT_RE.search(value):
+        return "deliverable"
+    return "factual"
+
+
+def is_delegable_requirement(
+    requirement: CoverageRequirement | Mapping[str, Any],
+) -> bool:
+    """Return whether a research subtask can own this requirement.
+
+    Only factual requirements are delegable. An explicit ``process`` /
+    ``deliverable`` kind is authoritative; an explicit ``factual`` kind (or a
+    payload compiled before kinds existed) still gets the pattern fallback so
+    hand-built and legacy requirements classify the same way the compiler
+    would have classified them.
+    """
+    if isinstance(requirement, CoverageRequirement):
+        kind: RequirementKind | None = requirement.kind
+        text = requirement.text
+    else:
+        raw_kind = requirement.get("kind")
+        kind = None
+        if isinstance(raw_kind, str) and raw_kind in (
+            "factual",
+            "process",
+            "deliverable",
+        ):
+            kind = cast(RequirementKind, raw_kind)
+        text = str(requirement.get("text", ""))
+    if kind is not None and kind != "factual":
+        return False
+    return classify_requirement_kind(text) == "factual"
 
 
 class AdmissionStatus(str, Enum):
@@ -40,6 +124,7 @@ class CoverageRequirement(BaseModel):
 
     requirement_id: str
     text: str
+    kind: RequirementKind = "factual"
     source_message_index: int = Field(ge=0)
     source_start: int = Field(ge=0)
     source_end: int = Field(ge=0)
@@ -59,6 +144,14 @@ class ResearchCoverageContract(BaseModel):
     def requirement_ids(self) -> tuple[str, ...]:
         """Return stable requirement identifiers in source order."""
         return tuple(item.requirement_id for item in self.requirements)
+
+    def delegable_requirement_ids(self) -> tuple[str, ...]:
+        """Return IDs of factual requirements a research subtask may own."""
+        return tuple(
+            item.requirement_id
+            for item in self.requirements
+            if item.kind == "factual"
+        )
 
 
 class RequirementCoverage(BaseModel):
@@ -262,6 +355,7 @@ def build_research_coverage_contract(
                         ordinal,
                     ),
                     text=item,
+                    kind=classify_requirement_kind(item),
                     source_message_index=message_index,
                     source_start=start,
                     source_end=end,
@@ -289,6 +383,7 @@ def build_research_coverage_contract(
                         ordinal,
                     ),
                     text=source_item,
+                    kind=classify_requirement_kind(source_item),
                     source_message_index=message_index,
                     source_start=start,
                     source_end=end,
@@ -306,6 +401,7 @@ def build_research_coverage_contract(
             CoverageRequirement(
                 requirement_id=_stable_requirement_id(0, fallback, 1),
                 text=fallback,
+                kind=classify_requirement_kind(fallback),
                 source_message_index=human_payloads[0][0],
                 source_start=0,
                 source_end=len(fallback),

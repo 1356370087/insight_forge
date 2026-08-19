@@ -1597,3 +1597,264 @@ def test_research_tool_schemas_enumerate_contract_requirement_ids() -> None:
             "requirement_ids"
         ]
         assert requirement_schema["items"]["enum"] == expected_ids
+
+
+_E2E_DELIVERABLE_QUERY = (
+    "调查 Python 3.13 自由线程模式的官方定位与生产可用性。"
+    "最终用中文输出执行摘要、风险矩阵、生产上线前检查清单，"
+    "并为关键事实提供可点击引用。不需要澄清，直接执行。"
+)
+
+
+def _kinds_by_text(contract) -> dict[str, str]:
+    return {
+        requirement.text: requirement.kind
+        for requirement in contract.requirements
+    }
+
+
+def test_requirement_kinds_classified_at_compilation() -> None:
+    contract = build_research_coverage_contract(
+        [HumanMessage(content=_E2E_DELIVERABLE_QUERY)]
+    )
+    kinds = _kinds_by_text(contract)
+
+    deliverable_texts = [
+        text for text, kind in kinds.items() if kind == "deliverable"
+    ]
+    assert any("执行摘要" in text for text in deliverable_texts)
+    assert any("风险矩阵" in text for text in deliverable_texts)
+    assert any("检查清单" in text for text in deliverable_texts)
+    assert any("可点击" in text for text in deliverable_texts)
+
+    process_texts = [text for text, kind in kinds.items() if kind == "process"]
+    assert any("澄清" in text for text in process_texts)
+    assert any("直接执行" in text for text in process_texts)
+
+    # The researchable question itself stays factual and delegable.
+    factual_texts = [text for text, kind in kinds.items() if kind == "factual"]
+    assert any("Python 3.13" in text for text in factual_texts)
+
+
+def test_legacy_payloads_without_kind_classify_via_patterns() -> None:
+    from open_deep_research.quality.contract import is_delegable_requirement
+
+    assert is_delegable_requirement({"text": "风险矩阵"}) is False
+    assert is_delegable_requirement({"text": "生产上线前检查清单"}) is False
+    assert is_delegable_requirement({"text": "不需要澄清"}) is False
+    assert is_delegable_requirement({"text": "直接执行"}) is False
+    assert is_delegable_requirement({"text": "调查 NumPy 2.1 的支持状态"}) is True
+    # Explicit non-factual kinds stay authoritative even for odd text.
+    assert is_delegable_requirement({"kind": "deliverable", "text": "杂项"}) is False
+    assert is_delegable_requirement({"kind": "process", "text": "杂项"}) is False
+
+
+def test_deliverable_and_process_requirements_are_evidence_optional() -> None:
+    from open_deep_research.quality.gate import (
+        _evidence_optional_requirement_ids,
+    )
+
+    contract = build_research_coverage_contract(
+        [HumanMessage(content=_E2E_DELIVERABLE_QUERY)]
+    )
+    expected = {
+        requirement.requirement_id
+        for requirement in contract.requirements
+        if requirement.kind != "factual"
+    }
+    assert expected  # the query must actually produce non-factual requirements
+    assert set(_evidence_optional_requirement_ids(contract)) == expected
+
+
+def test_non_factual_requirements_are_not_delegable() -> None:
+    from open_deep_research.tools.supervisor.common import (
+        coverage_bound_input_schema,
+        validate_requirement_ids,
+    )
+    from open_deep_research.tools.supervisor.conduct_research import (
+        ConductResearch,
+    )
+
+    contract = build_research_coverage_contract(
+        [HumanMessage(content=_E2E_DELIVERABLE_QUERY)]
+    )
+    factual_ids = list(contract.delegable_requirement_ids())
+    non_factual_ids = [
+        requirement.requirement_id
+        for requirement in contract.requirements
+        if requirement.kind != "factual"
+    ]
+    assert factual_ids and non_factual_ids
+
+    schema = coverage_bound_input_schema(ConductResearch, contract)
+    enum = schema.model_fields["requirement_ids"].json_schema_extra["items"][
+        "enum"
+    ]
+    assert set(enum) == set(factual_ids)
+
+    mixed = validate_requirement_ids(
+        factual_ids[:1] + non_factual_ids, contract, required=True
+    )
+    assert mixed == factual_ids[:1]
+
+    with pytest.raises(ValueError, match="non_delegable_requirement_ids_only"):
+        validate_requirement_ids(non_factual_ids, contract, required=True)
+
+
+def test_contract_without_delegable_requirements_allows_empty_assignment() -> None:
+    from open_deep_research.tools.supervisor.common import (
+        validate_requirement_ids,
+    )
+
+    contract = build_research_coverage_contract(
+        [HumanMessage(content="不需要澄清，直接执行。")]
+    )
+    assert not contract.delegable_requirement_ids()
+    assert (
+        validate_requirement_ids([], contract, required=True) == []
+    )
+
+
+@pytest.mark.asyncio
+async def test_v4_handoff_ignores_deliverable_and_process_requirements(
+    monkeypatch,
+) -> None:
+    # Regression for the 2026-08-20 E2E: deliverable-format and process
+    # requirements used to be owned by subtasks and could never cite
+    # evidence, so every handoff was structurally rejected.
+    contract = build_research_coverage_contract(
+        [HumanMessage(content=_E2E_DELIVERABLE_QUERY)]
+    )
+    factual_requirement = next(
+        requirement
+        for requirement in contract.requirements
+        if requirement.kind == "factual"
+    )
+    non_factual_ids = [
+        requirement.requirement_id
+        for requirement in contract.requirements
+        if requirement.kind != "factual"
+    ]
+    captured: dict = {}
+
+    async def pass_judge(_schema, _prompt, payload, _config, **_kwargs):
+        captured.update(payload)
+        return HandoffAssessment(
+            accepted=True,
+            admission_status="accepted",
+            relevance=5,
+            source_quality=5,
+            evidence_coverage=5,
+            groundedness=5,
+            requirement_coverage=[
+                {
+                    "requirement_id": factual_requirement.requirement_id,
+                    "status": "supported",
+                    "evidence_ids": ["ev-a"],
+                    "explanation": "Grounded in official Python docs.",
+                },
+            ],
+            reason="The factual requirement is supported.",
+        )
+
+    monkeypatch.setattr(
+        "open_deep_research.quality.gate._evaluate_json",
+        pass_judge,
+    )
+    handoff = {
+        "compressed_research": "Python 3.13 free-threading evidence. " * 20
+        + "\n## 风险矩阵\n- 实验性：高\n## 生产上线前检查清单\n- 验证 C 扩展",
+        "evidence_registry": [
+            {
+                "evidence_id": "ev-a",
+                "claim": "Free-threaded builds are experimental in 3.13.",
+                "supporting_excerpt": "The free-threaded build is experimental.",
+                "source_url": "https://docs.python.org/3.13/howto/free-threading-python.html",
+                "security_status": "accepted",
+            }
+        ],
+        "metrics": {"sources_read": 1},
+    }
+    result = await evaluate_subagent_handoff(
+        "Advisory task.",
+        handoff,
+        {
+            "configurable": {
+                "quality_evaluation_fail_open": False,
+                "quality_evaluation_min_sources": 1,
+            },
+            "metadata": {
+                "quality_policy_version": "quality-gate-v4",
+                "runtime_config_frozen": True,
+            },
+        },
+        coverage_contract=contract,
+        # The supervisor delegates every requirement ID it can see; non-factual
+        # IDs must be filtered out of the owned set, not reject the handoff.
+        requirement_ids=list(contract.requirement_ids()),
+    )
+
+    assert result.accepted is True
+    assert result.admission_status is AdmissionStatus.ACCEPTED
+    assert result.hard_rejection_reasons == []
+    assert captured["owned_requirement_ids"] == [factual_requirement.requirement_id]
+    assert set(captured["evidence_optional_requirement_ids"]) == set(
+        non_factual_ids
+    )
+
+
+def test_bound_compressed_research_keeps_head_and_tail() -> None:
+    from open_deep_research.quality.gate import (
+        _COMPRESSED_TRUNCATION_MARKER,
+        _bound_compressed_research,
+    )
+
+    full = (
+        "FINDINGS free-threaded build is experimental. " * 1200
+        + "\n## 风险矩阵\n实验性:高;生态:中\n"
+        + "\n## 生产上线前检查清单\n- 项 1\n- 项 2\n"
+    )
+    bounded = _bound_compressed_research(full, 12_000)
+
+    assert len(bounded) <= 12_000
+    assert bounded.startswith("FINDINGS")  # head (findings) preserved
+    assert "风险矩阵" in bounded  # tail (deliverables) preserved
+    assert "生产上线前检查清单" in bounded
+    assert "项 2" in bounded  # the very end survives
+    assert _COMPRESSED_TRUNCATION_MARKER.strip() in bounded
+
+    assert _bound_compressed_research(full, len(full) + 5) == full
+
+
+def test_bound_compressed_research_prioritizes_deliverable_sections() -> None:
+    # Structured handoff (findings first, deliverables late): the section-aware
+    # bound must keep the deliverable sections even when a positional cut would
+    # place them in the omitted middle.
+    from open_deep_research.quality.gate import _bound_compressed_research
+
+    findings = "\n\n".join(
+        f"**{n}. Findings Section {n}**\n\n" + ("Grounded official evidence. " * 120)
+        for n in range(1, 9)
+    )
+    full = (
+        findings
+        + "\n\n**9. Executive Summary (draft for final report)**\n\n"
+        + "实验性定位与生产建议摘要。"
+        + "\n\n**10. Risk Matrix**\n\n"
+        + "| R1 | C-extension 生态 | 高 | 中 |\n| R2 | 单线程回退 | 中 | 高 |"
+        + "\n\n**11. Pre-Production Checklist**\n\n"
+        + "- [ ] 验证 C 扩展\n- [ ] 基准测试"
+        + "\n\n**Coverage Checklist**\n\n"
+        + "| COV-07 (风险矩阵) | supported | Section 10 |"
+    )
+    bounded = _bound_compressed_research(full, 12_000)
+
+    assert len(bounded) <= 12_000
+    assert len(bounded) < len(full)  # truncation actually happened
+    # Deliverable sections survive with their content, not just headings.
+    assert "10. Risk Matrix" in bounded and "| R1 |" in bounded
+    assert "11. Pre-Production Checklist" in bounded and "验证 C 扩展" in bounded
+    assert "Executive Summary" in bounded
+    assert "COV-07" in bounded
+    # Leading findings fill the remaining budget in document order.
+    assert "1. Findings Section 1" in bounded

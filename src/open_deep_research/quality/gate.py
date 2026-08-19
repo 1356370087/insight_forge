@@ -41,6 +41,7 @@ from open_deep_research.quality.contract import (
     RequirementCoverage,
     ResearchCoverageContract,
     ResearchRiskProfile,
+    is_delegable_requirement,
     resolve_handoff_admission,
 )
 from open_deep_research.quality.policy import (
@@ -74,25 +75,6 @@ _QUALITY_EVIDENCE_FIELD_LIMITS = {
     "conflict_group": 160,
     "security_status": 40,
 }
-_EVIDENCE_OPTIONAL_REQUIREMENT_RE = re.compile(
-    r"(?:不可拆分|单一研究任务)|"
-    r"(?:至少.{0,48}(?:并行.{0,16})?(?:Subagent|子智能体|研究员))|"
-    r"(?:并行.{0,24}(?:委派|开展|执行|运行)?.{0,16}(?:两个|多个|多名|两名)?.{0,16}(?:Subagent|子智能体|研究员))|"
-    r"(?:最终.{0,32}(?:中文.{0,16})?(?:对照表|比较表|表格|报告|输出|呈现))|"
-    r"(?:(?:用|使用|以).{0,12}(?:中文|英文).{0,24}(?:输出|撰写|呈现|回答|报告))|"
-    r"(?:每个.{0,24}(?:Subagent|子智能体|研究员).{0,80}(?:读取|引用|来源))|"
-    r"(?:(?:只|仅|严格).{0,480}(?:URL|网址|链接).{0,80}(?:证据|来源))|"
-    r"(?:不得.{0,32}(?:引用|使用).{0,32}(?:其他|额外|未指定).{0,16}(?:URL|网址|链接|来源))|"
-    r"(?:每项.{0,48}(?:引用|来源))|"
-    r"(?:(?:必须|需要).{0,48}标(?:为|注为).{0,24}未证实)|"
-    r"(?:不得.{0,80}(?:引用第三方|搜索候选摘要|当作证据))|"
-    r"(?:single\s+(?:indivisible\s+)?research\s+task)|"
-    r"(?:must\s+(?:cite|label).{0,80})|"
-    r"(?:do\s+not\s+(?:cite|use).{0,80})",
-    flags=re.IGNORECASE | re.DOTALL,
-)
-
-
 class ToolResultAssessment(BaseModel):
     """JSON decision produced after a researcher tool batch."""
 
@@ -289,7 +271,7 @@ Return exactly one JSON object with:
 - caveats, missing_information, unsupported_claims, follow_up_tasks: arrays of strings
 - reason: string
 
-Use only owned_requirement_ids in requirement_coverage. Every supported factual requirement must cite at least one evidence_id present in evidence_registry. Requirements listed in evidence_optional_requirement_ids are process or deliverable-format checks; they may use an empty evidence_ids array when their explanation points to compressed_research structure or deterministic_checks. Do not invent IDs.
+Use only owned_requirement_ids in requirement_coverage. Every supported factual requirement must cite at least one evidence_id present in evidence_registry. Requirements listed in evidence_optional_requirement_ids are process or deliverable-format checks; they are satisfied by the orchestration or the final report stage and excluded from owned_requirement_ids, so do not emit coverage rows for them, and never treat their absence from a subtask handoff as a gap. Do not invent IDs.
 The candidate compressed_research is available only to evaluate its deliverable structure, explicit guarantee/inference labels, limitations, and requested checklist. Treat every factual statement in it as unsupported unless it is grounded by an evidence_id in the source-scoped evidence_registry. A URL in compressed_research that violates the user's source constraint is a deterministic rejection; do not use it as support.
 evidence_registry is a size-bounded, citation-prioritized projection. evidence_registry_stats.truncated=true means unrelated eligible records were omitted and is not, by itself, a gap. explicit_citation_count and explicit_citation_included_count report whether IDs explicitly cited by the handoff fit; priority_matched_count and priority_included_count report broader claim/excerpt matches. Continue to require an included evidence_id for every factual claim you mark supported.
 input_truncated, compressed_research_truncated, or raw_notes_truncated=true means oversized prose was shortened for the evaluator budget. Machine-readable failure codes, requirement/evidence IDs, and source URLs remain authoritative; truncation alone is not a coverage gap.
@@ -1146,14 +1128,119 @@ def _evidence_text_match_score(
     return best
 
 
+_COMPRESSED_TRUNCATION_MARKER = "[…evaluator budget: content omitted…]"
+
+# Deliverable-format structures the judge must be able to verify in a handoff;
+# they concentrate late in compressed research (findings first, deliverables
+# and the coverage map last).
+_DELIVERABLE_SECTION_RE = re.compile(
+    r"风险矩阵|检查清单|核对清单|执行摘要|对照表|比较表|交付|"
+    r"上线前|发布前|go-?live|checklist|risk\s+matrix|executive\s+summary",
+    re.IGNORECASE,
+)
+
+# Heading-like block openers: markdown headings, bold headings, numbered heads.
+_COMPRESSED_HEADING_LINE_RE = re.compile(
+    r"^\s*(?:#{1,6}\s+\S|\*\*[^*]+\*\*|\d+\.\s+\S)"
+)
+
+
+def _compressed_block_plan(full_text: str) -> list[tuple[str, bool]]:
+    """Split into blank-line blocks flagged as deliverable-section content.
+
+    A heading block that mentions a deliverable flips the flag for the whole
+    section (heading, tables, lists) until the next heading block.
+    """
+    plan: list[tuple[str, bool]] = []
+    deliverable_section = False
+    for block in re.split(r"\n\s*\n", full_text):
+        matched = bool(_DELIVERABLE_SECTION_RE.search(block))
+        if _COMPRESSED_HEADING_LINE_RE.match(block):
+            deliverable_section = matched
+        plan.append((block, matched or deliverable_section))
+    return plan
+
+
+def _positional_head_tail(full_text: str, budget: int) -> str:
+    """Fit ``full_text`` into ``budget`` chars keeping a head majority plus tail."""
+    if budget >= len(full_text):
+        return full_text
+    marker = _COMPRESSED_TRUNCATION_MARKER
+    if budget <= len(marker) + 4:
+        return full_text[:budget]
+    head_budget = max(0, (budget - len(marker) - 4) * 2 // 3)
+    tail_budget = max(0, budget - len(marker) - 4 - head_budget)
+    return "\n\n".join(
+        (
+            full_text[:head_budget],
+            marker,
+            full_text[len(full_text) - tail_budget:],
+        )
+    )
+
+
+def _bound_compressed_research(full_text: str, budget: int) -> str:
+    """Fit compressed research into ``budget`` chars, preserving deliverables.
+
+    A plain prefix cut hides exactly the deliverable-format sections (risk
+    matrix, checklist, coverage map) the judge must verify, which made judges
+    truthfully report deliverables as absent. Keep deliverable-flagged
+    sections unconditionally, fill the remaining budget with leading findings
+    in document order, and mark each omission; structure-less payloads fall
+    back to a positional head+tail cut. ``compressed_research_truncated``
+    stays the authoritative protocol flag for the truncation itself.
+    """
+    if budget >= len(full_text):
+        return full_text
+    plan = _compressed_block_plan(full_text)
+    must_keep = [block for block, keep in plan if keep]
+    must_chars = sum(len(block) for block in must_keep) + 2 * max(
+        0, len(must_keep) + 1
+    )
+    if not must_keep or must_chars > budget or len(plan) <= 2:
+        return _positional_head_tail(full_text, budget)
+    remaining = budget - must_chars - len(_COMPRESSED_TRUNCATION_MARKER)
+    kept: list[tuple[int, str]] = []
+    fill_exhausted = False
+    for index, (block, keep) in enumerate(plan):
+        if keep:
+            kept.append((index, block))
+            continue
+        # Leading content stays contiguous: once the head budget runs out,
+        # stop filling but keep collecting later must-keep sections.
+        if fill_exhausted or remaining < len(block) + 2:
+            fill_exhausted = True
+            continue
+        remaining -= len(block) + 2
+        kept.append((index, block))
+    parts: list[str] = []
+    previous_index = -1
+    for index, block in kept:
+        if previous_index != -1 and index > previous_index + 1:
+            parts.append(_COMPRESSED_TRUNCATION_MARKER)
+        parts.append(block)
+        previous_index = index
+    if kept and kept[-1][0] < len(plan) - 1:
+        parts.append(_COMPRESSED_TRUNCATION_MARKER)
+    result = "\n\n".join(parts)
+    if len(result) > budget:
+        return _positional_head_tail(full_text, budget)
+    return result
+
+
 def _evidence_optional_requirement_ids(
     coverage_contract: ResearchCoverageContract,
 ) -> tuple[str, ...]:
-    """Return process/output requirements that do not need external proof."""
+    """Return process/deliverable requirements that do not need external proof.
+
+    Kind classification happens at contract compilation; the pattern fallback
+    inside :func:`is_delegable_requirement` covers legacy payloads that were
+    serialized before requirement kinds existed.
+    """
     return tuple(
         requirement.requirement_id
         for requirement in coverage_contract.requirements
-        if _EVIDENCE_OPTIONAL_REQUIREMENT_RE.search(requirement.text)
+        if not is_delegable_requirement(requirement)
     )
 
 
@@ -1885,7 +1972,9 @@ async def evaluate_subagent_handoff(
     )
     remaining = max(0, limit - evidence_chars)
     compressed_budget = max(0, remaining - raw_notes_reserve)
-    compressed_research = full_compressed_research[:compressed_budget]
+    compressed_research = _bound_compressed_research(
+        full_compressed_research, compressed_budget
+    )
     remaining = max(0, remaining - len(compressed_research))
     raw_notes = raw_notes_text[:remaining]
     payload: dict[str, Any] = {
