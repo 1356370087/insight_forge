@@ -257,6 +257,7 @@ class ReportContext:
                     span_name=span_name,
                     agent_role="lead",
                     model_name=candidate_model,
+                    stage="writing",
                 )
 
             return await invoke_with_output_recovery(
@@ -311,6 +312,7 @@ class ReportContext:
                 span_name=span_name,
                 agent_role="lead",
                 model_name=candidate_model,
+                stage="writing",
             )
 
         return await invoke_with_model_fallback(

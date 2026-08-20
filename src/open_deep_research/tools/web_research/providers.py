@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import random
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from anthropic import AsyncAnthropic
+from langchain_core.messages import HumanMessage
+from langchain_core.messages.utils import count_tokens_approximately
 from langchain_core.runnables import RunnableConfig
 from openai import AsyncOpenAI
 
+from open_deep_research.budgets import BudgetGate
 from open_deep_research.configuration import Configuration
+from open_deep_research.events.public import event_publisher_from_config
 from open_deep_research.observability import TokenUsage, get_trace_recorder
 from open_deep_research.tools.governance import classify_llm_retryable_error
 from open_deep_research.tools.legacy_shims import get_api_key_for_model
@@ -47,6 +52,37 @@ def _safe_exception_message(exc: BaseException) -> str:
     except Exception:  # noqa: BLE001 - observability must never mask the SDK error
         text = ""
     return text or type(exc).__name__
+
+
+def _is_uncertain_failure(exc: BaseException) -> bool:
+    if isinstance(exc, TimeoutError | ConnectionError | asyncio.CancelledError):
+        return True
+    text = f"{type(exc).__name__} {_safe_exception_message(exc)}".lower()
+    return any(
+        marker in text
+        for marker in (
+            "timeout",
+            "connection",
+            "disconnect",
+            "network",
+            "transport",
+            "brokenpipe",
+            "incomplete read",
+        )
+    )
+
+
+def _approximate_text_tokens(value: Any) -> int:
+    text = str(value or "")
+    if not text:
+        return 0
+    try:
+        return max(
+            1,
+            int(count_tokens_approximately([HumanMessage(content=text)])),
+        )
+    except Exception:  # noqa: BLE001 - estimation remains fail-open
+        return max(1, len(text) // 4)
 
 
 def sdk_usage(response: Any) -> TokenUsage:
@@ -140,11 +176,61 @@ async def sdk_call_with_observability(
         provider=provider,
         model=str(model),
     ) as span:
+        metadata = config.get("metadata") or {}
+        budget_gate = BudgetGate.from_config(
+            configurable,
+            str(metadata.get("run_id") or "default"),
+            started_at=(
+                float(stored["started_at"])
+                if recorder.store is not None
+                and (stored := recorder._safe(
+                    recorder.store.get_run,
+                    str(metadata.get("run_id") or "default"),
+                ))
+                and stored.get("started_at")
+                else None
+            ),
+        )
         attempt = 0
         while True:
+            budget_operation_key = f"usage:{span.span_id}:{attempt + 1}:native"
+            budget_gate.reserve_model_call(
+                budget_operation_key,
+                estimated_input_tokens=max(1, _approximate_text_tokens(input_preview)),
+                estimated_output_tokens=max(1, configurable.research_model_max_tokens),
+                model_name=f"{provider}:{model}",
+            )
             try:
                 response = await call()
             except Exception as exc:  # noqa: BLE001 - classified before retry
+                uncertain = _is_uncertain_failure(exc)
+                budget_gate.fail_model_call(
+                    budget_operation_key,
+                    uncertain=uncertain,
+                )
+                failed_revision = span.add_usage(
+                    TokenUsage(
+                        usage_source="missing",
+                        response_status=(
+                            "unknown_failed" if uncertain else "rejected"
+                        ),
+                    ),
+                    provider,
+                    str(model),
+                    event_key=f"{span.span_id}:{attempt + 1}:failed",
+                    attempt_index=attempt + 1,
+                    stage="researching",
+                    task_id=str(config.get("metadata", {}).get("task_id") or "") or None,
+                    operation=span_name,
+                    response_status="unknown_failed" if uncertain else "rejected",
+                )
+                if failed_revision:
+                    with contextlib.suppress(Exception):
+                        await event_publisher_from_config(config).publish(
+                            "run.usage.updated",
+                            payload={"revision": failed_revision, "accounting_status": "partial"},
+                            dedupe_key=f"run-usage:{failed_revision}",
+                        )
                 error_type, retryable = classify_llm_retryable_error(exc)
                 attempts_made = attempt + 1
                 if (
@@ -172,9 +258,54 @@ async def sdk_call_with_observability(
                 attempt += 1
                 continue
             usage = sdk_usage(response)
-            if hasattr(span, "add_usage") and usage.total_tokens > 0:
-                span.add_usage(usage, provider, str(model))
-            if configurable.trace_payload_mode != "none":
+            if usage.has_reported_tokens:
+                usage.usage_source = (
+                    "provider_reported"
+                    if usage.input_tokens > 0 and usage.output_tokens > 0
+                    else "provider_partial"
+                )
+            elif configurable.token_usage_estimation_enabled:
+                input_text = str(input_preview or "")
+                output_text = _response_text(response)
+                estimated_input = _approximate_text_tokens(input_text)
+                estimated_output = _approximate_text_tokens(output_text)
+                usage = TokenUsage(
+                    estimated_input_tokens=estimated_input,
+                    estimated_output_tokens=estimated_output,
+                    estimated_total_tokens=estimated_input + estimated_output,
+                    usage_source="tokenizer_estimated",
+                )
+            else:
+                usage = TokenUsage(usage_source="missing")
+            revision = span.add_usage(
+                usage,
+                provider,
+                str(model),
+                event_key=f"{span.span_id}:{attempt + 1}:1",
+                attempt_index=attempt + 1,
+                stage="researching",
+                task_id=str(config.get("metadata", {}).get("task_id") or "") or None,
+                operation=span_name,
+            )
+            budget_gate.settle_model_call(
+                budget_operation_key,
+                input_tokens=usage.input_tokens or usage.estimated_input_tokens,
+                output_tokens=usage.output_tokens or usage.estimated_output_tokens,
+                model_name=f"{provider}:{model}",
+            )
+            if revision:
+                with contextlib.suppress(Exception):
+                    await event_publisher_from_config(config).publish(
+                        "run.usage.updated",
+                        payload={
+                            "revision": revision,
+                            "accounting_status": (
+                                "complete" if usage.usage_source == "provider_reported" else "partial"
+                            ),
+                        },
+                        dedupe_key=f"run-usage:{revision}",
+                    )
+            if configurable.observability_enabled and configurable.trace_payload_mode != "none":
                 span.set_output(_response_text(response))
             return response
 

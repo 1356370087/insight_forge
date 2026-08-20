@@ -302,6 +302,7 @@ async def _invoke_draft(
             span_name="lead.evidence_limited_writer",
             agent_role="lead",
             model_name=candidate_model,
+            stage="writing",
         )
 
     response = await invoke_with_model_fallback(

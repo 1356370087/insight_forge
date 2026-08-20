@@ -58,7 +58,6 @@ from open_deep_research.models.circuit import (
     model_circuit_policy_from_configuration,
 )
 from open_deep_research.observability import (
-    TokenUsage,
     apply_helicone_config,
     get_trace_recorder,
     invoke_model_with_retry_observability,
@@ -369,7 +368,13 @@ async def _default_call_model(
         span_name=params.model_span_name,
         agent_role=params.role.value,
         model_name=model_config.get("model"),
+        stage=(
+            "planning"
+            if params.role is AgentRole.SUPERVISOR
+            else "researching"
+        ),
         attributes={"tool_count": len(params.tools)},
+        budget_gate=params.budget_gate,
     )
 
 
@@ -823,7 +828,6 @@ async def query(params: QueryParams) -> AsyncIterator[QueryEvent]:
     )
     acknowledged_event_ids = frozenset(params.acknowledged_event_ids)
     execution_namespace = params.execution_namespace or state_key
-    budget_gate = params.budget_gate
     recorder = get_trace_recorder(params.config)
     resumed_tool_batch = (
         params.initial_state is not None
@@ -1062,46 +1066,10 @@ async def query(params: QueryParams) -> AsyncIterator[QueryEvent]:
                     params.cancellation_scope.checkpoint(model_stage)
                 response: BaseMessage | None = None
                 model_error: BaseException | None = None
-                successful_model_op_key = ""
                 max_model_attempts = max(
                     1, params.model_transport_max_attempts
                 )
                 for model_attempt in range(1, max_model_attempts + 1):
-                    base_model_op_key = (
-                        f"model:{execution_namespace}:{params.role.value}:"
-                        f"{state.turn}:r{state.revision}:m{candidate_index}"
-                    )
-                    model_op_key = (
-                        base_model_op_key
-                        if model_attempt == 1
-                        else f"{base_model_op_key}:retry:{model_attempt}"
-                    )
-                    if budget_gate is not None and budget_gate.enabled:
-                        try:
-                            budget_gate.reserve_model_call(
-                                model_op_key,
-                                estimated_input_tokens=(
-                                    compilation.estimated_input_tokens
-                                ),
-                                estimated_output_tokens=requested_output,
-                                model_name=model_name,
-                            )
-                        except DeadlineExceeded:
-                            state = _terminal_state(
-                                state,
-                                reason=TerminalReason.DEADLINE_EXCEEDED,
-                            )
-                            await _persist_query_state(params, state)
-                            yield _state_changed_event(state)
-                            break
-                        except BudgetExhausted:
-                            state = _terminal_state(
-                                state,
-                                reason=TerminalReason.BUDGET_EXHAUSTED,
-                            )
-                            await _persist_query_state(params, state)
-                            yield _state_changed_event(state)
-                            break
                     if state.phase is QueryPhase.TERMINAL:
                         break
                     if params.call_model is not None:
@@ -1155,6 +1123,22 @@ async def query(params: QueryParams) -> AsyncIterator[QueryEvent]:
                         )
                         await _persist_query_state(params, state)
                         raise
+                    except DeadlineExceeded:
+                        state = _terminal_state(
+                            state,
+                            reason=TerminalReason.DEADLINE_EXCEEDED,
+                        )
+                        await _persist_query_state(params, state)
+                        yield _state_changed_event(state)
+                        break
+                    except BudgetExhausted:
+                        state = _terminal_state(
+                            state,
+                            reason=TerminalReason.BUDGET_EXHAUSTED,
+                        )
+                        await _persist_query_state(params, state)
+                        yield _state_changed_event(state)
+                        break
                     except TimeoutError as exc:
                         model_error = exc
                         if model_attempt < max_model_attempts:
@@ -1174,7 +1158,6 @@ async def query(params: QueryParams) -> AsyncIterator[QueryEvent]:
                     except Exception as exc:  # noqa: BLE001
                         model_error = exc
                     else:
-                        successful_model_op_key = model_op_key
                         model_error = None
                     break
 
@@ -1357,21 +1340,6 @@ async def query(params: QueryParams) -> AsyncIterator[QueryEvent]:
                     break
 
                 assert response is not None
-                if (
-                    budget_gate is not None
-                    and budget_gate.ledger is not None
-                ):
-                    usage = TokenUsage.from_response(response)
-                    try:
-                        budget_gate.settle_model_call(
-                            successful_model_op_key,
-                            input_tokens=usage.input_tokens,
-                            output_tokens=usage.output_tokens,
-                            model_name=model_name,
-                        )
-                    except (BudgetExhausted, DeadlineExceeded):
-                        pass
-
                 response_status = classify_model_response(response)
                 raw_tool_calls = list(
                     getattr(response, "tool_calls", []) or []

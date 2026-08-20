@@ -16,7 +16,7 @@ from open_deep_research.quality.policy import (
     rigor_from_legacy_min_score,
 )
 
-RUN_CONFIG_SCHEMA_VERSION = 5
+RUN_CONFIG_SCHEMA_VERSION = 6
 QUALITY_POLICY_VERSION = "quality-gate-v4"
 RUN_CONFIG_FROZEN_FIELDS = (
     "max_structured_output_retries",
@@ -81,6 +81,9 @@ RUN_CONFIG_FROZEN_FIELDS = (
     "sandbox_network_mode",
     "task_timeout_seconds",
     "sandbox_timeout_seconds",
+    "token_usage_accounting_enabled",
+    "token_usage_estimation_enabled",
+    "model_costs_per_million",
 )
 _MODEL_CIRCUIT_FROZEN_FIELDS = {
     "model_circuit_breaker_enabled",
@@ -94,9 +97,19 @@ _MODEL_CIRCUIT_FROZEN_FIELDS = {
     "model_first_packet_timeout_seconds",
     "model_slow_first_packet_threshold_seconds",
 }
-RUN_CONFIG_FROZEN_FIELDS_V4 = tuple(
+_TOKEN_USAGE_V6_FROZEN_FIELDS = {
+    "token_usage_accounting_enabled",
+    "token_usage_estimation_enabled",
+    "model_costs_per_million",
+}
+RUN_CONFIG_FROZEN_FIELDS_V5 = tuple(
     field_name
     for field_name in RUN_CONFIG_FROZEN_FIELDS
+    if field_name not in _TOKEN_USAGE_V6_FROZEN_FIELDS
+)
+RUN_CONFIG_FROZEN_FIELDS_V4 = tuple(
+    field_name
+    for field_name in RUN_CONFIG_FROZEN_FIELDS_V5
     if field_name not in _MODEL_CIRCUIT_FROZEN_FIELDS
 )
 _QUALITY_V4_FROZEN_FIELDS = {
@@ -377,6 +390,20 @@ class Configuration(BaseModel):
         }
     )
     # Observability / Operations
+    token_usage_accounting_enabled: bool = Field(
+        default=True,
+        description=(
+            "Persist content-free token accounting records independently of the "
+            "observability master switch."
+        ),
+    )
+    token_usage_estimation_enabled: bool = Field(
+        default=True,
+        description=(
+            "Estimate input/output tokens only when a successful provider response "
+            "does not include usage metadata."
+        ),
+    )
     observability_enabled: bool = Field(
         default=True,
         metadata={
@@ -1940,6 +1967,8 @@ def frozen_run_config_values(config: RunnableConfig) -> dict[str, Any]:
         if schema_version == 3
         else RUN_CONFIG_FROZEN_FIELDS_V4
         if schema_version == 4
+        else RUN_CONFIG_FROZEN_FIELDS_V5
+        if schema_version == 5
         else RUN_CONFIG_FROZEN_FIELDS
     )
     return {
@@ -1999,6 +2028,8 @@ def freeze_run_config(
             if schema_version == 3
             else RUN_CONFIG_FROZEN_FIELDS_V4
             if schema_version == 4
+            else RUN_CONFIG_FROZEN_FIELDS_V5
+            if schema_version == 5
             else RUN_CONFIG_FROZEN_FIELDS
         )
         missing = [

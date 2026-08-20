@@ -22,15 +22,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import (
     AIMessageChunk,
     BaseMessage,
     get_buffer_string,
     message_chunk_to_message,
 )
+from langchain_core.messages.utils import count_tokens_approximately
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel
 
+from open_deep_research.budgets import BudgetGate
 from open_deep_research.configuration import Configuration
 from open_deep_research.events.public import event_publisher_from_config
 from open_deep_research.events.task_activity import publish_task_activity
@@ -103,6 +106,24 @@ def _safe_http_status(exc: BaseException) -> int | None:
         if isinstance(status, int):
             return status
     return None
+
+
+def _is_uncertain_model_failure(exc: BaseException) -> bool:
+    """Return whether the provider may have executed an indeterminate request."""
+    if isinstance(exc, TimeoutError | ConnectionError | asyncio.CancelledError):
+        return True
+    name = type(exc).__name__.lower()
+    message = _exc_message(exc).lower()
+    uncertain_markers = (
+        "timeout",
+        "connection",
+        "disconnect",
+        "network",
+        "transport",
+        "brokenpipe",
+        "incomplete read",
+    )
+    return any(marker in name or marker in message for marker in uncertain_markers)
 
 
 def _exc_message(exc: BaseException) -> str:
@@ -262,6 +283,12 @@ class TokenUsage:
     reasoning_tokens: int = 0
     estimated_cost_usd: float = 0.0
     raw_usage: dict[str, Any] = field(default_factory=dict)
+    estimated_input_tokens: int = 0
+    estimated_output_tokens: int = 0
+    estimated_total_tokens: int = 0
+    usage_source: str = "provider_reported"
+    cost_source: str = "unavailable"
+    response_status: str = "success"
 
     @classmethod
     def from_response(cls, response: Any) -> "TokenUsage":
@@ -279,6 +306,12 @@ class TokenUsage:
             usage = response_metadata.get("usage")
             if isinstance(usage, dict):
                 candidates.append(usage)
+        llm_output = getattr(response, "llm_output", None)
+        if isinstance(llm_output, dict):
+            for key in ("token_usage", "usage"):
+                usage = llm_output.get(key)
+                if isinstance(usage, dict):
+                    candidates.append(usage)
 
         for usage in candidates:
             input_tokens = _safe_int(
@@ -345,6 +378,294 @@ class TokenUsage:
             "reasoning_tokens": self.reasoning_tokens,
             "estimated_cost_usd": self.estimated_cost_usd,
         }
+
+    @property
+    def has_reported_tokens(self) -> bool:
+        """Return whether this record contains any provider-reported token value."""
+        return any((self.input_tokens, self.output_tokens, self.total_tokens))
+
+    @property
+    def has_estimated_tokens(self) -> bool:
+        """Return whether this record contains a local fallback estimate."""
+        return any(
+            (
+                self.estimated_input_tokens,
+                self.estimated_output_tokens,
+                self.estimated_total_tokens,
+            )
+        )
+
+
+class UsageCaptureCallback(BaseCallbackHandler):
+    """Capture raw provider usage before structured-output parsers discard it."""
+
+    def __init__(
+        self,
+        *,
+        recorder: "TraceRecorder | None" = None,
+        config: RunnableConfig | None = None,
+        messages: list[BaseMessage] | None = None,
+        model: Any = None,
+        model_name: str | None = None,
+        span_id: str | None = None,
+        attempt_index: int = 1,
+        agent_role: str | None = None,
+        budget_gate: BudgetGate | None = None,
+    ) -> None:
+        self.raise_error = True
+        self._seen_run_ids: set[str] = set()
+        self._terminal_run_ids: set[str] = set()
+        self.records: list[TokenUsage] = []
+        self._budget_keys: dict[str, str] = {}
+        self._settled_budget_keys: set[str] = set()
+        self._pending_physical_ids: list[str] = []
+        self._physical_counter = 0
+        self._model_name = model_name or "unknown"
+        self._model = model
+        self._messages = list(messages or [])
+        self._estimation_enabled = bool(
+            recorder is not None
+            and recorder.configuration.token_usage_estimation_enabled
+        )
+        self._estimated_input = 0
+        self._estimated_output = 1
+        self._budget_gate: BudgetGate | None = budget_gate
+        if recorder is not None:
+            metadata = (config or {}).get("metadata") or {}
+            run_id = str(metadata.get("run_id") or "")
+            if run_id and self._budget_gate is None:
+                started_at = None
+                if recorder.store is not None:
+                    stored = recorder._safe(recorder.store.get_run, run_id) or {}
+                    started_at = stored.get("started_at")
+                self._budget_gate = BudgetGate.from_config(
+                    recorder.configuration,
+                    run_id,
+                    started_at=float(started_at) if started_at else None,
+                )
+            try:
+                self._estimated_input = max(
+                    1, int(count_tokens_approximately(messages or []))
+                )
+            except Exception:  # noqa: BLE001
+                self._estimated_input = max(
+                    1, len(get_buffer_string(messages or [])) // 4
+                )
+            output_fields = {
+                "researcher": "research_model_max_tokens",
+                "supervisor": "research_model_max_tokens",
+                "summarization": "summarization_model_max_tokens",
+                "message_summary": "message_summary_model_max_tokens",
+                "compression": "compression_model_max_tokens",
+                "final_report": "final_report_model_max_tokens",
+                "quality_evaluator": "quality_evaluation_model_max_tokens",
+            }
+            self._estimated_output = max(
+                1,
+                int(
+                    getattr(
+                        recorder.configuration,
+                        output_fields.get(agent_role or "", "research_model_max_tokens"),
+                        1,
+                    )
+                    or 1
+                ),
+            )
+        self._budget_key_prefix = f"usage:{span_id or 'unknown'}:{attempt_index}"
+
+    def begin_physical_attempt(self) -> None:
+        """Pre-reserve a physical request before adapter callbacks can run."""
+        self._physical_counter += 1
+        placeholder = f"outer-{self._physical_counter}"
+        operation_key = f"{self._budget_key_prefix}:{placeholder}"
+        if self._budget_gate is not None:
+            self._budget_gate.reserve_model_call(
+                operation_key,
+                estimated_input_tokens=self._estimated_input,
+                estimated_output_tokens=self._estimated_output,
+                model_name=self._model_name,
+            )
+        self._budget_keys[placeholder] = operation_key
+        self._pending_physical_ids.append(placeholder)
+
+    def _reserve_budget(self, run_id: Any) -> None:
+        callback_run_id = str(run_id)
+        if callback_run_id in self._budget_keys:
+            return
+        if self._pending_physical_ids:
+            placeholder = self._pending_physical_ids.pop(0)
+            self._budget_keys[callback_run_id] = self._budget_keys.pop(placeholder)
+            return
+        if self._budget_gate is None:
+            return
+        operation_key = f"{self._budget_key_prefix}:{callback_run_id}"
+        self._budget_gate.reserve_model_call(
+            operation_key,
+            estimated_input_tokens=self._estimated_input,
+            estimated_output_tokens=self._estimated_output,
+            model_name=self._model_name,
+        )
+        self._budget_keys[callback_run_id] = operation_key
+
+    def on_chat_model_start(
+        self, _serialized: dict[str, Any], _messages: list[list[BaseMessage]], *, run_id: Any, **_kwargs: Any
+    ) -> None:
+        self._reserve_budget(run_id)
+
+    def on_llm_start(
+        self, _serialized: dict[str, Any], _prompts: list[str], *, run_id: Any, **_kwargs: Any
+    ) -> None:
+        self._reserve_budget(run_id)
+
+    def on_llm_end(self, response: Any, *, run_id: Any, **_kwargs: Any) -> None:
+        callback_run_id = str(run_id)
+        if callback_run_id in self._pending_physical_ids:
+            self._pending_physical_ids.remove(callback_run_id)
+        if callback_run_id in self._seen_run_ids:
+            return
+        self._seen_run_ids.add(callback_run_id)
+        self._terminal_run_ids.add(callback_run_id)
+        candidates: list[Any] = []
+        for generation_group in getattr(response, "generations", None) or []:
+            for generation in generation_group or []:
+                candidates.append(getattr(generation, "message", generation))
+        candidates.append(response)
+        for candidate in candidates:
+            usage = TokenUsage.from_response(candidate)
+            if usage.has_reported_tokens:
+                usage.usage_source = (
+                    "provider_reported"
+                    if usage.input_tokens > 0 and usage.output_tokens > 0
+                    else "provider_partial"
+                )
+                self.records.append(usage)
+                operation_key = self._budget_keys.get(callback_run_id)
+                if operation_key and self._budget_gate is not None:
+                    self._budget_gate.settle_model_call(
+                        operation_key,
+                        input_tokens=usage.input_tokens,
+                        output_tokens=usage.output_tokens,
+                        model_name=self._model_name,
+                    )
+                    self._settled_budget_keys.add(operation_key)
+                return
+        usage = (
+            _estimated_usage(
+                self._model,
+                self._messages,
+                candidates[0] if candidates else response,
+            )
+            if self._estimation_enabled
+            else TokenUsage(usage_source="missing")
+        )
+        self.records.append(usage)
+        operation_key = self._budget_keys.get(callback_run_id)
+        if operation_key and self._budget_gate is not None:
+            self._budget_gate.settle_model_call(
+                operation_key,
+                input_tokens=usage.estimated_input_tokens,
+                output_tokens=usage.estimated_output_tokens,
+                model_name=self._model_name,
+            )
+            self._settled_budget_keys.add(operation_key)
+
+    def on_llm_error(self, error: BaseException, *, run_id: Any, **_kwargs: Any) -> None:
+        """Record a physical provider attempt even when a wrapper falls back."""
+        self._record_failed_run(str(run_id), error)
+
+    def _record_failed_run(self, callback_run_id: str, error: BaseException) -> None:
+        if callback_run_id in self._terminal_run_ids:
+            return
+        if callback_run_id in self._pending_physical_ids:
+            self._pending_physical_ids.remove(callback_run_id)
+        self._terminal_run_ids.add(callback_run_id)
+        self._seen_run_ids.add(callback_run_id)
+        uncertain = _is_uncertain_model_failure(error)
+        self.records.append(
+            TokenUsage(
+                usage_source="missing",
+                response_status="unknown_failed" if uncertain else "rejected",
+            )
+        )
+        operation_key = self._budget_keys.get(callback_run_id)
+        if operation_key and self._budget_gate is not None:
+            self._budget_gate.fail_model_call(operation_key, uncertain=uncertain)
+            self._settled_budget_keys.add(operation_key)
+
+    def settle_outer_failure(self, error: BaseException) -> None:
+        """Finalize callback reservations when cancellation bypasses callbacks."""
+        unresolved = [
+            callback_run_id
+            for callback_run_id in self._budget_keys
+            if callback_run_id not in self._terminal_run_ids
+        ]
+        for callback_run_id in unresolved:
+            self._record_failed_run(callback_run_id, error)
+        if not self._budget_keys and not self.records:
+            uncertain = _is_uncertain_model_failure(error)
+            self.records.append(
+                TokenUsage(
+                    usage_source="missing",
+                    response_status="unknown_failed" if uncertain else "rejected",
+                )
+            )
+
+    def settle_outer_success(self, response: Any) -> None:
+        """Capture adapters that return without dispatching LangChain callbacks."""
+        unresolved = [
+            callback_run_id
+            for callback_run_id in self._budget_keys
+            if callback_run_id not in self._terminal_run_ids
+        ]
+        for callback_run_id in unresolved:
+            self.on_llm_end(response, run_id=callback_run_id)
+
+    def settle_estimated_success(self, usage: TokenUsage) -> None:
+        """Settle successful no-usage calls with the local fallback estimate."""
+        if self._budget_gate is None:
+            return
+        for operation_key in self._budget_keys.values():
+            if operation_key in self._settled_budget_keys:
+                continue
+            self._budget_gate.settle_model_call(
+                operation_key,
+                input_tokens=usage.estimated_input_tokens or usage.input_tokens,
+                output_tokens=usage.estimated_output_tokens or usage.output_tokens,
+                model_name=self._model_name,
+            )
+            self._settled_budget_keys.add(operation_key)
+
+
+def _estimated_usage(model: Any, messages: list[BaseMessage], response: Any) -> TokenUsage:
+    """Build a content-free fallback estimate for a successful model response."""
+    input_tokens = 0
+    output_tokens = 0
+    counter = getattr(model, "get_num_tokens_from_messages", None)
+    if callable(counter):
+        try:
+            input_tokens = max(0, int(counter(messages)))
+        except Exception:  # noqa: BLE001 - tokenizer support varies by adapter
+            input_tokens = 0
+    if not input_tokens:
+        try:
+            input_tokens = max(0, int(count_tokens_approximately(messages)))
+        except Exception:  # noqa: BLE001
+            input_tokens = max(1, len(get_buffer_string(messages)) // 4)
+    output_text = _message_preview(response, None, redact=False) or ""
+    token_counter = getattr(model, "get_num_tokens", None)
+    if callable(token_counter):
+        try:
+            output_tokens = max(0, int(token_counter(output_text)))
+        except Exception:  # noqa: BLE001
+            output_tokens = 0
+    if not output_tokens and output_text:
+        output_tokens = max(1, len(output_text) // 4)
+    return TokenUsage(
+        estimated_input_tokens=input_tokens,
+        estimated_output_tokens=output_tokens,
+        estimated_total_tokens=input_tokens + output_tokens,
+        usage_source="tokenizer_estimated",
+    )
 
 
 class SQLiteTraceStore:
@@ -467,6 +788,19 @@ class SQLiteTraceStore:
                     cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
                     reasoning_tokens INTEGER NOT NULL DEFAULT 0,
                     estimated_cost_usd REAL NOT NULL DEFAULT 0,
+                    estimated_input_tokens INTEGER NOT NULL DEFAULT 0,
+                    estimated_output_tokens INTEGER NOT NULL DEFAULT 0,
+                    estimated_total_tokens INTEGER NOT NULL DEFAULT 0,
+                    usage_source TEXT NOT NULL DEFAULT 'legacy_unclassified',
+                    cost_source TEXT NOT NULL DEFAULT 'unavailable',
+                    event_key TEXT,
+                    attempt_index INTEGER NOT NULL DEFAULT 1,
+                    stage TEXT NOT NULL DEFAULT 'unknown',
+                    agent_role TEXT,
+                    task_id TEXT,
+                    operation TEXT,
+                    duration_ms INTEGER,
+                    response_status TEXT NOT NULL DEFAULT 'success',
                     raw_usage_json TEXT NOT NULL DEFAULT '{}',
                     created_at REAL NOT NULL
                 );
@@ -477,6 +811,10 @@ class SQLiteTraceStore:
                     ON spans(parent_span_id);
                 CREATE INDEX IF NOT EXISTS idx_usage_run
                     ON usage_events(run_id);
+                CREATE INDEX IF NOT EXISTS idx_runs_user_started
+                    ON runs(user_id, started_at);
+                CREATE INDEX IF NOT EXISTS idx_usage_run_created
+                    ON usage_events(run_id, created_at);
 
                 CREATE TABLE IF NOT EXISTS retry_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -505,6 +843,10 @@ class SQLiteTraceStore:
         tables are created via ``CREATE TABLE IF NOT EXISTS`` in ``_ensure_schema``.
         """
         with self._lock, self._connect() as conn:
+            usage_columns_before = {
+                row["name"] for row in conn.execute("PRAGMA table_info(usage_events)")
+            }
+            legacy_usage_schema = "usage_source" not in usage_columns_before
             additions = {
                 "runs": (
                     ("attempt_count", "INTEGER NOT NULL DEFAULT 1"),
@@ -526,6 +868,19 @@ class SQLiteTraceStore:
                     ("cache_creation_input_tokens", "INTEGER NOT NULL DEFAULT 0"),
                     ("reasoning_tokens", "INTEGER NOT NULL DEFAULT 0"),
                     ("estimated_cost_usd", "REAL NOT NULL DEFAULT 0"),
+                    ("estimated_input_tokens", "INTEGER NOT NULL DEFAULT 0"),
+                    ("estimated_output_tokens", "INTEGER NOT NULL DEFAULT 0"),
+                    ("estimated_total_tokens", "INTEGER NOT NULL DEFAULT 0"),
+                    ("usage_source", "TEXT NOT NULL DEFAULT 'legacy_unclassified'"),
+                    ("cost_source", "TEXT NOT NULL DEFAULT 'unavailable'"),
+                    ("event_key", "TEXT"),
+                    ("attempt_index", "INTEGER NOT NULL DEFAULT 1"),
+                    ("stage", "TEXT NOT NULL DEFAULT 'unknown'"),
+                    ("agent_role", "TEXT"),
+                    ("task_id", "TEXT"),
+                    ("operation", "TEXT"),
+                    ("duration_ms", "INTEGER"),
+                    ("response_status", "TEXT NOT NULL DEFAULT 'success'"),
                 ),
             }
             for table, columns in additions.items():
@@ -533,6 +888,46 @@ class SQLiteTraceStore:
                 for column, ddl in columns:
                     if column not in existing:
                         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_runs_user_started ON runs(user_id, started_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_usage_run_created "
+                "ON usage_events(run_id, created_at)"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_event_key "
+                "ON usage_events(run_id, event_key) WHERE event_key IS NOT NULL"
+            )
+            if legacy_usage_schema:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO usage_events (
+                        run_id, span_id, provider, model,
+                        input_tokens, output_tokens, total_tokens,
+                        cached_input_tokens, cache_creation_input_tokens,
+                        reasoning_tokens, estimated_cost_usd,
+                        estimated_input_tokens, estimated_output_tokens,
+                        estimated_total_tokens, usage_source, cost_source,
+                        event_key, attempt_index, stage, agent_role, task_id,
+                        operation, duration_ms, response_status,
+                        raw_usage_json, created_at
+                    )
+                    SELECT
+                        spans.run_id, spans.span_id, spans.provider, spans.model,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        'legacy_unclassified', 'unavailable',
+                        'legacy-missing:' || spans.span_id, 1, 'unknown',
+                        spans.agent_role, NULL, spans.name, spans.duration_ms,
+                        'success', '{}', COALESCE(spans.ended_at, spans.started_at)
+                    FROM spans
+                    WHERE spans.kind = 'llm'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM usage_events
+                          WHERE usage_events.span_id = spans.span_id
+                      )
+                    """
+                )
 
     def start_run(self, run_id: str, user_id: str | None, metadata: dict[str, Any]) -> None:
         with self._lock, self._connect() as conn:
@@ -883,20 +1278,37 @@ class SQLiteTraceStore:
         provider: str | None,
         model: str | None,
         usage: TokenUsage,
-    ) -> None:
-        if usage.total_tokens <= 0 and usage.input_tokens <= 0 and usage.output_tokens <= 0:
-            return
+        *,
+        event_key: str | None = None,
+        attempt_index: int = 1,
+        stage: str = "unknown",
+        agent_role: str | None = None,
+        task_id: str | None = None,
+        operation: str | None = None,
+        duration_ms: int | None = None,
+        response_status: str = "success",
+    ) -> int | None:
+        if (
+            not usage.has_reported_tokens
+            and not usage.has_estimated_tokens
+            and usage.usage_source not in {"missing", "legacy_unclassified"}
+        ):
+            return None
         with self._lock, self._connect() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """
-                INSERT INTO usage_events (
+                INSERT OR IGNORE INTO usage_events (
                     run_id, span_id, provider, model,
                     input_tokens, output_tokens, total_tokens,
                     cached_input_tokens, cache_creation_input_tokens,
                     reasoning_tokens, estimated_cost_usd,
+                    estimated_input_tokens, estimated_output_tokens,
+                    estimated_total_tokens, usage_source, cost_source,
+                    event_key, attempt_index, stage, agent_role, task_id,
+                    operation, duration_ms, response_status,
                     raw_usage_json, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -910,10 +1322,24 @@ class SQLiteTraceStore:
                     usage.cache_creation_input_tokens,
                     usage.reasoning_tokens,
                     usage.estimated_cost_usd,
+                    usage.estimated_input_tokens,
+                    usage.estimated_output_tokens,
+                    usage.estimated_total_tokens,
+                    usage.usage_source,
+                    usage.cost_source,
+                    event_key,
+                    max(1, attempt_index),
+                    stage or "unknown",
+                    agent_role,
+                    task_id,
+                    operation,
+                    duration_ms,
+                    response_status,
                     _json(usage.raw_usage),
                     _now(),
                 ),
             )
+            return int(cursor.lastrowid) if cursor.rowcount else None
 
     def get_usage(self, run_id: str) -> dict[str, Any]:
         with self._lock, self._connect() as conn:
@@ -942,6 +1368,597 @@ class SQLiteTraceStore:
             "estimated_cost_usd": float(row["estimated_cost_usd"] if row else 0.0),
         }
 
+    @staticmethod
+    def _token_vector(rows: list[dict[str, Any]], *, estimated: bool = False) -> dict[str, int]:
+        prefix = "estimated_" if estimated else ""
+        return {
+            "input_tokens": sum(int(row.get(f"{prefix}input_tokens") or 0) for row in rows),
+            "output_tokens": sum(int(row.get(f"{prefix}output_tokens") or 0) for row in rows),
+            "total_tokens": sum(int(row.get(f"{prefix}total_tokens") or 0) for row in rows),
+            "cached_input_tokens": 0 if estimated else sum(
+                int(row.get("cached_input_tokens") or 0) for row in rows
+            ),
+            "cache_creation_input_tokens": 0 if estimated else sum(
+                int(row.get("cache_creation_input_tokens") or 0) for row in rows
+            ),
+            "reasoning_tokens": 0 if estimated else sum(
+                int(row.get("reasoning_tokens") or 0) for row in rows
+            ),
+        }
+
+    def _usage_rows(
+        self,
+        run_id: str,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["run_id = ?"]
+        parameters: list[Any] = [run_id]
+        if provider:
+            clauses.append("provider = ?")
+            parameters.append(provider)
+        if model:
+            clauses.append("model = ?")
+            parameters.append(model)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM usage_events WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY created_at, id",
+                tuple(parameters),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_usage_accounting(
+        self,
+        run_id: str,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+        reserved_budget: dict[str, int] | None = None,
+    ) -> dict[str, Any]:
+        """Return the business-facing reported/estimated usage projection."""
+        rows = self._usage_rows(run_id, provider=provider, model=model)
+        run = self.get_run(run_id) or {}
+        retry_rows = self._retry_rows(run_id, provider=provider, model=model)
+        operations = self._accounting_operations(
+            run_id,
+            rows=rows,
+            provider=provider,
+            model=model,
+            retry_rows=retry_rows,
+        )
+        return self._project_usage_accounting(
+            run_id,
+            rows=rows,
+            run=run,
+            reserved_budget=reserved_budget,
+            operations=operations,
+            retry_timestamps=[float(row.get("created_at") or 0) for row in retry_rows],
+        )
+
+    def get_usage_accounting_many(
+        self,
+        run_ids: list[str],
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Project many runs from one consistent, bounded-query SQLite snapshot."""
+        selected = list(dict.fromkeys(str(run_id) for run_id in run_ids if run_id))
+        if not selected:
+            return {}
+
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "CREATE TEMP TABLE selected_usage_runs (run_id TEXT PRIMARY KEY)"
+            )
+            conn.executemany(
+                "INSERT INTO selected_usage_runs (run_id) VALUES (?)",
+                ((run_id,) for run_id in selected),
+            )
+            run_rows = conn.execute(
+                "SELECT runs.* FROM runs "
+                "JOIN selected_usage_runs selected ON selected.run_id = runs.run_id"
+            ).fetchall()
+            usage_clauses: list[str] = []
+            usage_parameters: list[Any] = []
+            if provider:
+                usage_clauses.append("usage_events.provider = ?")
+                usage_parameters.append(provider)
+            if model:
+                usage_clauses.append("usage_events.model = ?")
+                usage_parameters.append(model)
+            usage_where = (
+                " WHERE " + " AND ".join(usage_clauses) if usage_clauses else ""
+            )
+            usage_rows = conn.execute(
+                "SELECT usage_events.* FROM usage_events "
+                "JOIN selected_usage_runs selected "
+                "ON selected.run_id = usage_events.run_id"
+                + usage_where
+                + " ORDER BY usage_events.run_id, usage_events.created_at, usage_events.id",
+                tuple(usage_parameters),
+            ).fetchall()
+            span_rows = conn.execute(
+                "SELECT spans.* FROM spans "
+                "JOIN selected_usage_runs selected ON selected.run_id = spans.run_id "
+                "WHERE spans.kind IN ('llm', 'tool')"
+            ).fetchall()
+            retry_rows = conn.execute(
+                "SELECT retry_events.* FROM retry_events "
+                "JOIN selected_usage_runs selected "
+                "ON selected.run_id = retry_events.run_id"
+            ).fetchall()
+
+        runs_by_id = {str(row["run_id"]): dict(row) for row in run_rows}
+        usage_by_run: dict[str, list[dict[str, Any]]] = {
+            run_id: [] for run_id in selected
+        }
+        spans_by_run: dict[str, list[dict[str, Any]]] = {
+            run_id: [] for run_id in selected
+        }
+        retries_by_run: dict[str, list[dict[str, Any]]] = {
+            run_id: [] for run_id in selected
+        }
+        for row in usage_rows:
+            usage_by_run.setdefault(str(row["run_id"]), []).append(dict(row))
+        for row in span_rows:
+            spans_by_run.setdefault(str(row["run_id"]), []).append(dict(row))
+        for row in retry_rows:
+            retries_by_run.setdefault(str(row["run_id"]), []).append(dict(row))
+
+        result: dict[str, dict[str, Any]] = {}
+        for run_id in selected:
+            usage = usage_by_run.get(run_id, [])
+            spans = spans_by_run.get(run_id, [])
+            span_by_id = {str(row.get("span_id") or ""): row for row in spans}
+            retries = [
+                row
+                for row in retries_by_run.get(run_id, [])
+                if self._span_matches_usage_filter(
+                    span_by_id.get(str(row.get("span_id") or "")),
+                    provider=provider,
+                    model=model,
+                )
+            ]
+            operations = (
+                self._filtered_accounting_operations(usage, retries)
+                if provider or model
+                else self._operations_from_loaded(spans, retries, usage)
+            )
+            result[run_id] = self._project_usage_accounting(
+                run_id,
+                rows=usage,
+                run=runs_by_id.get(run_id, {}),
+                reserved_budget=None,
+                operations=operations,
+                retry_timestamps=[
+                    float(row.get("created_at") or 0) for row in retries
+                ],
+            )
+        return result
+
+    def _project_usage_accounting(
+        self,
+        run_id: str,
+        *,
+        rows: list[dict[str, Any]],
+        run: dict[str, Any],
+        reserved_budget: dict[str, int] | None,
+        operations: dict[str, Any],
+        retry_timestamps: list[float],
+    ) -> dict[str, Any]:
+        """Build the public projection from already-loaded content-free rows."""
+        if not rows:
+            totals = self._empty_accounting_totals()
+            budget_limits = self._budget_limits(run)
+            for key in ("input_tokens", "output_tokens", "model_calls", "cost_micro_usd"):
+                totals["budgets"][key]["limit"] = budget_limits[key]
+                totals["budgets"][key]["reserved"] = int(
+                    (reserved_budget or {}).get(key, 0)
+                )
+            return {
+                "schema_version": 1,
+                "run_id": run_id,
+                "status": run.get("status", "unknown"),
+                "duration_ms": run.get("duration_ms"),
+                "revision": 0,
+                "updated_at": run.get("started_at"),
+                "accounting_status": "unavailable",
+                "unavailable_reason": (
+                    "no_usage_events" if run else "run_not_observed"
+                ),
+                "totals": totals,
+                "breakdowns": {"by_stage": [], "by_agent_role": [], "by_model": [], "by_task": []},
+                "timeline": [],
+                "operations": operations,
+            }
+
+        source_counts = {
+            source: sum(1 for row in rows if row.get("usage_source") == source)
+            for source in (
+                "provider_reported",
+                "provider_partial",
+                "tokenizer_estimated",
+                "missing",
+                "legacy_unclassified",
+            )
+        }
+        successful = sum(1 for row in rows if row.get("response_status") == "success")
+        complete_reported = source_counts["provider_reported"]
+        unknown_failed = sum(
+            1 for row in rows if row.get("response_status") == "unknown_failed"
+        )
+        coverage = complete_reported / successful if successful else 0.0
+        accounting_status = (
+            "complete"
+            if successful > 0
+            and complete_reported == successful
+            and unknown_failed == 0
+            else "partial"
+        )
+        costs = [float(row.get("estimated_cost_usd") or 0) for row in rows]
+        configured_cost = any(row.get("cost_source") == "configured_estimate" for row in rows)
+        provider_cost = any(row.get("cost_source") == "provider_reported" for row in rows)
+        cost_source = (
+            "provider_reported" if provider_cost else "configured_estimate" if configured_cost else "unavailable"
+        )
+        budget_limits = self._budget_limits(run)
+        totals = {
+            "reported": self._token_vector(rows),
+            "estimated": self._token_vector(rows, estimated=True),
+            "calls": {
+                "attempts": len(rows),
+                "successful_responses": successful,
+                "provider_reported": source_counts["provider_reported"],
+                "provider_partial": source_counts["provider_partial"],
+                "estimated": source_counts["tokenizer_estimated"],
+                "missing": source_counts["missing"],
+                "unknown_failed_attempts": unknown_failed,
+                "legacy_unclassified": source_counts["legacy_unclassified"],
+                "coverage_ratio": coverage,
+            },
+            "cost": {
+                "estimated_cost_micro_usd": int(round(sum(costs) * 1_000_000))
+                if cost_source != "unavailable"
+                else None,
+                "cost_source": cost_source,
+                "price_table_hash": self._price_table_hash(run),
+            },
+            "budgets": {
+                "input_tokens": {"settled": self._token_vector(rows)["input_tokens"], "estimated": self._token_vector(rows, estimated=True)["input_tokens"], "reserved": int((reserved_budget or {}).get("input_tokens", 0)), "limit": budget_limits["input_tokens"]},
+                "output_tokens": {"settled": self._token_vector(rows)["output_tokens"], "estimated": self._token_vector(rows, estimated=True)["output_tokens"], "reserved": int((reserved_budget or {}).get("output_tokens", 0)), "limit": budget_limits["output_tokens"]},
+                "model_calls": {"settled": len(rows), "estimated": 0, "reserved": int((reserved_budget or {}).get("model_calls", 0)), "limit": budget_limits["model_calls"]},
+                "cost_micro_usd": {"settled": int(round(sum(costs) * 1_000_000)) if cost_source != "unavailable" else None, "estimated": 0, "reserved": int((reserved_budget or {}).get("cost_micro_usd", 0)), "limit": budget_limits["cost_micro_usd"]},
+            },
+        }
+        breakdowns = {
+            "by_stage": self._breakdown(rows, "stage"),
+            "by_agent_role": self._breakdown(rows, "agent_role"),
+            "by_model": self._breakdown(rows, "model", include_provider=True),
+            "by_task": self._breakdown(rows, "task_id"),
+        }
+        return {
+            "schema_version": 1,
+            "run_id": run_id,
+            "status": run.get("status", "unknown"),
+            "duration_ms": run.get("duration_ms"),
+            "revision": max(int(row.get("id") or 0) for row in rows),
+            "updated_at": max(float(row.get("created_at") or 0) for row in rows),
+            "accounting_status": accounting_status,
+            "totals": totals,
+            "breakdowns": breakdowns,
+            "timeline": self._timeline(rows, retry_timestamps=retry_timestamps),
+            "operations": operations,
+        }
+
+    @staticmethod
+    def _price_table_hash(run: dict[str, Any]) -> str | None:
+        try:
+            metadata = json.loads(run.get("metadata_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            return None
+        value = metadata.get("model_costs_price_table_hash")
+        return str(value) if value else None
+
+    @staticmethod
+    def _budget_limits(run: dict[str, Any]) -> dict[str, int | None]:
+        try:
+            metadata = json.loads(run.get("metadata_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            metadata = {}
+        limits = metadata.get("budget_limits") or {}
+        return {
+            key: int(value) if value is not None else None
+            for key, value in {
+                "input_tokens": limits.get("input_tokens"),
+                "output_tokens": limits.get("output_tokens"),
+                "model_calls": limits.get("model_calls"),
+                "cost_micro_usd": limits.get("cost_micro_usd"),
+            }.items()
+        }
+
+    @staticmethod
+    def _empty_accounting_totals() -> dict[str, Any]:
+        vector = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "reasoning_tokens": 0,
+        }
+        return {
+            "reported": dict(vector),
+            "estimated": dict(vector),
+            "calls": {
+                "attempts": 0, "successful_responses": 0, "provider_reported": 0,
+                "provider_partial": 0, "estimated": 0, "missing": 0,
+                "unknown_failed_attempts": 0, "legacy_unclassified": 0,
+                "coverage_ratio": 0.0,
+            },
+            "cost": {"estimated_cost_micro_usd": None, "cost_source": "unavailable", "price_table_hash": None},
+            "budgets": {
+                key: {"settled": None if key == "cost_micro_usd" else 0, "estimated": 0, "reserved": 0, "limit": None}
+                for key in ("input_tokens", "output_tokens", "model_calls", "cost_micro_usd")
+            },
+        }
+
+    def _breakdown(
+        self, rows: list[dict[str, Any]], key: str, *, include_provider: bool = False
+    ) -> list[dict[str, Any]]:
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            value = str(row.get(key) or "unknown")
+            if include_provider and row.get("provider"):
+                value = f"{row['provider']}:{value}"
+            grouped.setdefault(value, []).append(row)
+        result = []
+        for value, bucket in sorted(
+            grouped.items(), key=lambda item: self._token_vector(item[1])["total_tokens"] + self._token_vector(item[1], estimated=True)["total_tokens"], reverse=True
+        ):
+            sources = {str(row.get("usage_source") or "legacy_unclassified") for row in bucket}
+            cost_available = any(row.get("cost_source") != "unavailable" for row in bucket)
+            result.append({
+                "key": value,
+                "label": value.replace("_", " ").title(),
+                "reported": self._token_vector(bucket),
+                "estimated": self._token_vector(bucket, estimated=True),
+                "call_count": len(bucket),
+                "estimated_cost_micro_usd": int(round(sum(float(row.get("estimated_cost_usd") or 0) for row in bucket) * 1_000_000)) if cost_available else None,
+                "cost_source": "configured_estimate" if cost_available else "unavailable",
+                "average_latency_ms": int(sum(int(row.get("duration_ms") or 0) for row in bucket) / len(bucket)) if bucket else 0,
+                "completeness": "complete" if sources == {"provider_reported"} else "partial",
+            })
+        return result
+
+    def _timeline(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        retry_timestamps: list[float],
+    ) -> list[dict[str, Any]]:
+        all_timestamps = [
+            *(float(row.get("created_at") or 0) for row in rows),
+            *retry_timestamps,
+        ]
+        start = min(all_timestamps)
+        end = max(all_timestamps)
+        width = max(1.0, (end - start) / 119) if end > start else 1.0
+        buckets: dict[int, list[dict[str, Any]]] = {}
+        for row in rows:
+            index = min(119, int((float(row.get("created_at") or start) - start) / width))
+            buckets.setdefault(index, []).append(row)
+        retry_buckets: dict[int, int] = {}
+        for created_at in retry_timestamps:
+            index = min(119, int((created_at - start) / width))
+            retry_buckets[index] = retry_buckets.get(index, 0) + 1
+        reported_cumulative = 0
+        estimated_cumulative = 0
+        result = []
+        for index in sorted(set(buckets) | set(retry_buckets)):
+            bucket = buckets.get(index, [])
+            reported = self._token_vector(bucket)["total_tokens"]
+            estimated = self._token_vector(bucket, estimated=True)["total_tokens"]
+            reported_cumulative += reported
+            estimated_cumulative += estimated
+            result.append({
+                "timestamp": start + index * width,
+                "reported_tokens": reported,
+                "estimated_tokens": estimated,
+                "reported_cumulative": reported_cumulative,
+                "estimated_cumulative": estimated_cumulative,
+                "call_count": len(bucket),
+                "retry_count": retry_buckets.get(index, 0),
+            })
+        return result
+
+    def _retry_rows(
+        self,
+        run_id: str,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["retry_events.run_id = ?"]
+        parameters: list[Any] = [run_id]
+        if provider:
+            clauses.append("spans.provider = ?")
+            parameters.append(provider)
+        if model:
+            clauses.append("spans.model = ?")
+            parameters.append(model)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT retry_events.* FROM retry_events "
+                "JOIN spans ON spans.span_id = retry_events.span_id WHERE "
+                + " AND ".join(clauses),
+                tuple(parameters),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    @staticmethod
+    def _span_matches_usage_filter(
+        span: dict[str, Any] | None,
+        *,
+        provider: str | None,
+        model: str | None,
+    ) -> bool:
+        if provider is None and model is None:
+            return True
+        if span is None:
+            return False
+        return (provider is None or span.get("provider") == provider) and (
+            model is None or span.get("model") == model
+        )
+
+    @staticmethod
+    def _filtered_accounting_operations(
+        usage_rows: list[dict[str, Any]],
+        retry_rows: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        successful = [
+            row for row in usage_rows if row.get("response_status") == "success"
+        ]
+        input_tokens = sum(int(row.get("input_tokens") or 0) for row in successful)
+        cached_tokens = sum(
+            int(row.get("cached_input_tokens") or 0) for row in successful
+        )
+        cache_hits = sum(
+            1
+            for row in successful
+            if int(row.get("input_tokens") or 0) > 0
+            and int(row.get("cached_input_tokens") or 0) > 0
+        )
+        cache_eligible = sum(
+            1 for row in successful if int(row.get("input_tokens") or 0) > 0
+        )
+        output_tokens = sum(
+            int(row.get("output_tokens") or 0) for row in successful
+        )
+        reasoning_tokens = sum(
+            int(row.get("reasoning_tokens") or 0) for row in successful
+        )
+        duration_seconds = (
+            sum(int(row.get("duration_ms") or 0) for row in successful) / 1000
+        )
+        rate_limited_calls = {
+            str(row.get("span_id") or "")
+            for row in retry_rows
+            if row.get("error_type") == "rate_limited"
+        }
+        rate_limited_count = len(rate_limited_calls - {""})
+        return {
+            "llm_call_count": len(usage_rows),
+            "retry_count": len(retry_rows),
+            "rate_limited_count": rate_limited_count,
+            "rate_429": (
+                rate_limited_count / len(usage_rows) if usage_rows else 0.0
+            ),
+            "cache_hit_rate": cache_hits / cache_eligible if cache_eligible else 0.0,
+            "cache_input_ratio": cached_tokens / input_tokens if input_tokens else 0.0,
+            "reasoning_output_ratio": (
+                reasoning_tokens / output_tokens if output_tokens else 0.0
+            ),
+            "output_tokens_per_second": (
+                output_tokens / duration_seconds if duration_seconds else 0.0
+            ),
+            "tool_call_count": 0,
+            "tool_success_rate": 0.0,
+            "empty_tool_result_count": 0,
+            "zero_source_search_count": 0,
+        }
+
+    @classmethod
+    def _operations_from_loaded(
+        cls,
+        spans: list[dict[str, Any]],
+        retries: list[dict[str, Any]],
+        usage_rows: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        operations = cls._filtered_accounting_operations(usage_rows, retries)
+        llm_rows = [row for row in spans if row.get("kind") == "llm"]
+        tool_rows = [row for row in spans if row.get("kind") == "tool"]
+        rate_limited_calls = {
+            str(row.get("span_id") or "")
+            for row in retries
+            if row.get("error_type") == "rate_limited"
+        }
+        rate_limited_calls.update(
+            str(row.get("span_id") or "")
+            for row in spans
+            if row.get("error_type") == "rate_limited"
+        )
+        rate_limited_count = len(rate_limited_calls - {""})
+        total_calls = len(usage_rows) + len(tool_rows)
+        successful_tools = sum(
+            1 for row in tool_rows if row.get("status") == "success"
+        )
+        empty_tool_result_count = 0
+        zero_source_search_count = 0
+        for row in tool_rows:
+            if row.get("status") != "success":
+                continue
+            try:
+                attributes = json.loads(row.get("attributes_json") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                attributes = {}
+            if not attributes.get("result_chars", 0):
+                empty_tool_result_count += 1
+            if "search" in str(row.get("name") or "").lower() and not attributes.get(
+                "source_count", 0
+            ):
+                zero_source_search_count += 1
+        operations.update(
+            {
+                "llm_call_count": len(usage_rows) if usage_rows else len(llm_rows),
+                "retry_count": len(retries),
+                "rate_limited_count": rate_limited_count,
+                "rate_429": rate_limited_count / total_calls if total_calls else 0.0,
+                "tool_call_count": len(tool_rows),
+                "tool_success_rate": (
+                    successful_tools / len(tool_rows) if tool_rows else 0.0
+                ),
+                "empty_tool_result_count": empty_tool_result_count,
+                "zero_source_search_count": zero_source_search_count,
+            }
+        )
+        return operations
+
+    def _accounting_operations(
+        self,
+        run_id: str,
+        *,
+        rows: list[dict[str, Any]] | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        retry_rows: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        usage_rows = rows or []
+        retries = retry_rows or []
+        if provider or model:
+            return self._filtered_accounting_operations(usage_rows, retries)
+        metrics = self.get_metrics(run_id)
+        token_operations = self._filtered_accounting_operations(usage_rows, retries)
+        return {
+            "llm_call_count": token_operations["llm_call_count"],
+            "retry_count": metrics.get("retry_count", 0),
+            "rate_limited_count": metrics.get("rate_limited_count", 0),
+            "rate_429": metrics.get("rate_429", 0.0),
+            "cache_hit_rate": token_operations["cache_hit_rate"],
+            "cache_input_ratio": token_operations["cache_input_ratio"],
+            "reasoning_output_ratio": token_operations["reasoning_output_ratio"],
+            "output_tokens_per_second": token_operations[
+                "output_tokens_per_second"
+            ],
+            "tool_call_count": metrics.get("tool_call_count", 0),
+            "tool_success_rate": metrics.get("tool_success_rate", 0.0),
+            "empty_tool_result_count": metrics.get("empty_tool_result_count", 0),
+            "zero_source_search_count": metrics.get("zero_source_search_count", 0),
+        }
+
     def list_runs(self, limit: int = 100, user_id: str | None = None) -> list[dict[str, Any]]:
         with self._lock, self._connect() as conn:
             if user_id is None:
@@ -953,6 +1970,31 @@ class SQLiteTraceStore:
                     "SELECT * FROM runs WHERE user_id = ? ORDER BY started_at DESC LIMIT ?",
                     (user_id, limit),
                 ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_runs_for_usage(
+        self,
+        *,
+        user_id: str,
+        cutoff: float | None = None,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List all retained usage runs after applying owner filtering in SQL."""
+        clauses = ["user_id = ?"]
+        parameters: list[Any] = [user_id]
+        if cutoff is not None:
+            clauses.append("started_at >= ?")
+            parameters.append(cutoff)
+        if status:
+            clauses.append("status = ?")
+            parameters.append(status)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM runs WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY started_at DESC",
+                tuple(parameters),
+            ).fetchall()
         return [dict(row) for row in rows]
 
     def get_run(self, run_id: str, user_id: str | None = None) -> dict[str, Any] | None:
@@ -1091,23 +2133,59 @@ class SpanContext:
         if self._run_token is not None:
             _current_run_id.reset(self._run_token)
 
-    def add_usage(self, usage: TokenUsage, provider: str | None, model: str | None) -> None:
+    def add_usage(
+        self,
+        usage: TokenUsage,
+        provider: str | None,
+        model: str | None,
+        *,
+        event_key: str | None = None,
+        attempt_index: int = 1,
+        stage: str = "unknown",
+        task_id: str | None = None,
+        operation: str | None = None,
+        duration_ms: int | None = None,
+        response_status: str = "success",
+    ) -> int | None:
         """Attach usage to this span and persist a usage event."""
         self.recorder.estimate_usage_cost(usage, provider, model)
-        self.usage = usage
+        self.usage = TokenUsage(
+            input_tokens=self.usage.input_tokens + usage.input_tokens,
+            output_tokens=self.usage.output_tokens + usage.output_tokens,
+            total_tokens=self.usage.total_tokens + usage.total_tokens,
+            cached_input_tokens=self.usage.cached_input_tokens + usage.cached_input_tokens,
+            cache_creation_input_tokens=(
+                self.usage.cache_creation_input_tokens
+                + usage.cache_creation_input_tokens
+            ),
+            reasoning_tokens=self.usage.reasoning_tokens + usage.reasoning_tokens,
+            estimated_cost_usd=self.usage.estimated_cost_usd + usage.estimated_cost_usd,
+        )
         if self.recorder.store is not None:
-            self.recorder._safe(
+            return self.recorder._safe(
                 self.recorder.store.add_usage,
                 self.run_id,
                 self.span_id,
                 provider,
                 model,
                 usage,
+                event_key=event_key,
+                attempt_index=attempt_index,
+                stage=stage,
+                agent_role=self.agent_role,
+                task_id=task_id,
+                operation=operation or self.name,
+                duration_ms=duration_ms,
+                response_status=response_status,
             )
+        return None
 
     def set_output(self, payload: Any) -> None:
         """Attach a redacted output preview using the recorder payload policy."""
-        if self.recorder.configuration.trace_payload_mode == "none":
+        if (
+            not self.recorder.configuration.observability_enabled
+            or self.recorder.configuration.trace_payload_mode == "none"
+        ):
             return
         limit = (
             None
@@ -1199,6 +2277,7 @@ class NoopSpanContext:
     run_id: str | None = None
 
     def __init__(self):
+        self.started_monotonic = monotonic_time()
         self.attributes: dict[str, Any] = {}
         self.output_preview: str | None = None
         self.usage = TokenUsage()
@@ -1236,12 +2315,16 @@ class TraceRecorder:
         self.configuration = Configuration.from_runnable_config(self.config)
         self.store = (
             _get_store(self.configuration.trace_store_path)
-            if self.configuration.observability_enabled and self.configuration.sqlite_observability_enabled
+            if self.configuration.token_usage_accounting_enabled
+            or (
+                self.configuration.observability_enabled
+                and self.configuration.sqlite_observability_enabled
+            )
             else None
         )
         self.langfuse = create_langfuse_sink(self.configuration, self.config)
         self.prometheus = get_prometheus_metrics(self.configuration)
-        self.enabled = self.configuration.observability_enabled and any(
+        self.enabled = any(
             (self.store is not None, self.langfuse is not None, self.prometheus is not None)
         )
 
@@ -1267,16 +2350,20 @@ class TraceRecorder:
     ) -> float:
         """Populate a local cost estimate from configured per-million-token rates."""
         if usage.estimated_cost_usd > 0:
+            usage.cost_source = "provider_reported"
             return usage.estimated_cost_usd
         prices = self.configuration.model_costs_per_million
         candidates = [model, f"{provider}:{model}" if provider and model else None]
         rates = next((prices[key] for key in candidates if key and key in prices), None)
         if not rates:
+            usage.cost_source = "unavailable"
             return 0.0
-        cached = min(usage.cached_input_tokens, usage.input_tokens)
-        uncached = max(0, usage.input_tokens - cached)
+        priced_input = usage.input_tokens or usage.estimated_input_tokens
+        priced_output = usage.output_tokens or usage.estimated_output_tokens
+        cached = min(usage.cached_input_tokens, priced_input)
+        uncached = max(0, priced_input - cached)
         reasoning = min(usage.reasoning_tokens, usage.output_tokens)
-        normal_output = max(0, usage.output_tokens - reasoning)
+        normal_output = max(0, priced_output - reasoning)
         cost = (
             uncached * float(rates.get("input", 0))
             + cached * float(rates.get("cached_input", rates.get("input", 0)))
@@ -1286,6 +2373,7 @@ class TraceRecorder:
             + reasoning * float(rates.get("reasoning", rates.get("output", 0)))
         ) / 1_000_000
         usage.estimated_cost_usd = cost
+        usage.cost_source = "configured_estimate"
         return cost
 
     def active_span(self) -> SpanContext | NoopSpanContext:
@@ -1308,8 +2396,19 @@ class TraceRecorder:
         if not self.enabled:
             return NoopSpanContext()
         run_attributes = dict(metadata or {})
+        price_table = self.configuration.model_costs_per_million
+        if price_table:
+            run_attributes["model_costs_price_table_hash"] = hashlib.sha256(
+                json.dumps(price_table, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+        run_attributes["budget_limits"] = {
+            "input_tokens": self.configuration.max_run_input_tokens,
+            "output_tokens": self.configuration.max_run_output_tokens,
+            "model_calls": self.configuration.max_run_model_calls,
+            "cost_micro_usd": self.configuration.max_run_cost_micro_usd,
+        }
         if self.store is not None:
-            self._safe(self.store.start_run, run_id, user_id, metadata or {})
+            self._safe(self.store.start_run, run_id, user_id, run_attributes)
             stored_run = self._safe(self.store.get_run, run_id) or {}
             run_attributes["attempt_count"] = int(stored_run.get("attempt_count") or 1)
         return self.start_span(
@@ -1370,6 +2469,15 @@ class TraceRecorder:
         if self.store is not None:
             usage = self._safe(self.store.finish_run, run_id, status, safe_error) or usage
             metrics = self._safe(self.store.get_metrics, run_id) or {}
+        stored_run = self._safe(self.store.get_run, run_id) if self.store is not None else None
+        reserved_budget: dict[str, int] = {}
+        if stored_run:
+            gate = BudgetGate.from_config(
+                self.configuration,
+                run_id,
+                started_at=float(stored_run.get("started_at") or time.time()),
+            )
+            reserved_budget = self._safe(gate.outstanding_reservations) or {}
         active = self.active_span()
         if isinstance(active, SpanContext) and active.kind == "run":
             if error:
@@ -1414,6 +2522,15 @@ class TraceRecorder:
             "tool_success_rate": metrics.get("tool_success_rate", 0.0),
             "empty_tool_result_count": metrics.get("empty_tool_result_count", 0),
             "zero_source_search_count": metrics.get("zero_source_search_count", 0),
+            "usage_accounting": (
+                self._safe(
+                    self.store.get_usage_accounting,
+                    run_id,
+                    reserved_budget=reserved_budget,
+                )
+                if self.store is not None
+                else None
+            ),
         }
 
     def start_span(
@@ -1439,7 +2556,10 @@ class TraceRecorder:
         resolved_parent = parent_span_id if parent_span_id is not None else _current_span_id.get()
         resolved_langfuse_parent = _current_langfuse_span_id.get()
         preview = None
-        if self.configuration.trace_payload_mode != "none":
+        if (
+            self.configuration.observability_enabled
+            and self.configuration.trace_payload_mode != "none"
+        ):
             limit = None if self.configuration.trace_payload_mode == "full" else self.configuration.trace_preview_chars
             preview = _message_preview(
                 input_payload,
@@ -1476,19 +2596,22 @@ def get_trace_recorder(config: RunnableConfig | None) -> TraceRecorder:
     return TraceRecorder(config)
 
 
-def _langchain_invoke_config(recorder: TraceRecorder, config: RunnableConfig | None) -> RunnableConfig | None:
-    """Attach the optional Langfuse LangChain callback without mutating caller config."""
-    if (
-        recorder.langfuse is None
-        or not recorder.configuration.langfuse_langchain_callback_enabled
-    ):
-        return None
-    handler = recorder._safe(recorder.langfuse.callback_handler)
-    if handler is None:
-        return None
+def _langchain_invoke_config(
+    recorder: TraceRecorder,
+    config: RunnableConfig | None,
+    capture: UsageCaptureCallback,
+) -> RunnableConfig:
+    """Attach usage and optional Langfuse callbacks without mutating caller config."""
     invoke_config: dict[str, Any] = dict(config or {})
     callbacks = list(invoke_config.get("callbacks") or [])
-    callbacks.append(handler)
+    callbacks.append(capture)
+    if (
+        recorder.langfuse is not None
+        and recorder.configuration.langfuse_langchain_callback_enabled
+    ):
+        handler = recorder._safe(recorder.langfuse.callback_handler)
+        if handler is not None:
+            callbacks.append(handler)
     invoke_config["callbacks"] = callbacks
     return cast(RunnableConfig, invoke_config)
 
@@ -1500,6 +2623,8 @@ class _ModelInvocationResult:
     response: Any
     ttft_seconds: float | None = None
     probe_status: str = "off"
+    usage_records: tuple[TokenUsage, ...] = ()
+    usage_capture: UsageCaptureCallback | None = None
 
 
 def _observe_first_packet_metrics(
@@ -1544,7 +2669,15 @@ async def _call_model_ainvoke(
     invoke_config: RunnableConfig | None,
 ) -> Any:
     """Invoke a model while preserving the optional callback config."""
-    if invoke_config is None:
+    try:
+        signature = inspect.signature(model.ainvoke)
+        accepts_config = "config" in signature.parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+    except (TypeError, ValueError):
+        accepts_config = True
+    if invoke_config is None or not accepts_config:
         return await model.ainvoke(messages)
     return await model.ainvoke(messages, config=invoke_config)
 
@@ -1580,9 +2713,37 @@ async def _ainvoke_model(
     messages: list[BaseMessage],
     recorder: TraceRecorder,
     config: RunnableConfig | None,
+    *,
+    span_id: str | None = None,
+    attempt_index: int = 1,
+    model_name: str | None = None,
+    agent_role: str | None = None,
+    usage_capture: UsageCaptureCallback | None = None,
 ) -> _ModelInvocationResult:
     """Invoke with optional TTFT streaming and conservative fallback."""
-    invoke_config = _langchain_invoke_config(recorder, config)
+    capture = usage_capture or UsageCaptureCallback(
+        recorder=recorder,
+        config=config,
+        messages=messages,
+        model=model,
+        model_name=model_name,
+        span_id=span_id,
+        attempt_index=attempt_index,
+        agent_role=agent_role,
+    )
+    invoke_config = _langchain_invoke_config(recorder, config, capture)
+
+    async def call_model() -> Any:
+        capture.begin_physical_attempt()
+        try:
+            response = await _call_model_ainvoke(model, messages, invoke_config)
+            capture.settle_outer_success(response)
+            return response
+        except BaseException as exc:
+            capture.settle_outer_failure(exc)
+            setattr(exc, "usage_capture_records", tuple(capture.records))
+            raise
+
     configuration = recorder.configuration
     probe_mode = (
         configuration.model_first_packet_probe
@@ -1591,23 +2752,36 @@ async def _ainvoke_model(
     )
     if probe_mode == "off":
         return _ModelInvocationResult(
-            await _call_model_ainvoke(model, messages, invoke_config)
+            await call_model(),
+            usage_records=tuple(capture.records),
+            usage_capture=capture,
         )
 
     stream_method = getattr(model, "astream", None)
     if not callable(stream_method):
         return _ModelInvocationResult(
-            await _call_model_ainvoke(model, messages, invoke_config),
+            await call_model(),
             probe_status="fallback",
+            usage_records=tuple(capture.records),
+            usage_capture=capture,
         )
 
     iterator: Any = None
     received_first = False
     started = monotonic_time()
+    capture.begin_physical_attempt()
     try:
+        try:
+            stream_signature = inspect.signature(stream_method)
+            stream_accepts_config = "config" in stream_signature.parameters or any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in stream_signature.parameters.values()
+            )
+        except (TypeError, ValueError):
+            stream_accepts_config = True
         iterator = (
             stream_method(messages)
-            if invoke_config is None
+            if invoke_config is None or not stream_accepts_config
             else stream_method(messages, config=invoke_config)
         )
         if inspect.isawaitable(iterator):
@@ -1635,17 +2809,24 @@ async def _ainvoke_model(
                     break
                 merged = merged + chunk
             if shape_ok:
+                response = message_chunk_to_message(merged)
+                capture.settle_outer_success(response)
                 return _ModelInvocationResult(
-                    message_chunk_to_message(merged),
+                    response,
                     ttft_seconds=max(0.0, first_elapsed),
                     probe_status="streamed",
+                    usage_records=tuple(capture.records),
+                    usage_capture=capture,
                 )
         else:
             trailing = [item async for item in iterator]
             if not trailing:
+                capture.settle_outer_success(first)
                 return _ModelInvocationResult(
                     first,
                     probe_status="non_streaming_wrapper",
+                    usage_records=tuple(capture.records),
+                    usage_capture=capture,
                 )
             # Structured-output runnables stream incremental parser partials
             # of one result; every item is the same pydantic type and the
@@ -1654,31 +2835,231 @@ async def _ainvoke_model(
             if isinstance(first, BaseModel) and all(
                 isinstance(item, type(first)) for item in trailing
             ):
+                response = trailing[-1]
+                capture.settle_outer_success(response)
                 return _ModelInvocationResult(
-                    trailing[-1],
+                    response,
                     ttft_seconds=max(0.0, first_elapsed),
                     probe_status="non_streaming_wrapper",
+                    usage_records=tuple(capture.records),
+                    usage_capture=capture,
                 )
         # The stream shape cannot be merged faithfully (mixed chunk types or
         # fragment-style non-message items). The probe must never change call
         # semantics, so degrade to the plain non-streaming invoke instead of
         # raising — this also keeps shadow mode observation-only.
+        if iterator is not None:
+            await _close_async_iterator(iterator)
+            iterator = None
+        capture.settle_outer_failure(
+            RuntimeError("stream disconnected before final usage metadata")
+        )
         return _ModelInvocationResult(
-            await _call_model_ainvoke(model, messages, invoke_config),
+            await call_model(),
             probe_status="fallback",
+            usage_records=tuple(capture.records),
+            usage_capture=capture,
         )
     except Exception as exc:
         if not received_first and (
             probe_mode == "shadow" or _streaming_unsupported(exc)
         ):
+            capture.settle_outer_failure(exc)
             return _ModelInvocationResult(
-                await _call_model_ainvoke(model, messages, invoke_config),
+                await call_model(),
                 probe_status="fallback",
+                usage_records=tuple(capture.records),
+                usage_capture=capture,
             )
+        capture.settle_outer_failure(exc)
+        setattr(exc, "usage_capture_records", tuple(capture.records))
         raise
     finally:
         if iterator is not None:
             await _close_async_iterator(iterator)
+
+
+def _usage_stage(agent_role: str | None, attributes: dict[str, Any]) -> str:
+    stage = str(attributes.get("stage") or "")
+    if stage in {"preparing", "planning", "researching", "synthesizing", "writing", "finalizing"}:
+        return stage
+    return _CIRCUIT_ROLE_STAGE.get(agent_role or "", "preparing")
+
+
+def _usage_attributes(
+    attributes: dict[str, Any] | None,
+    stage: str | None,
+) -> dict[str, Any]:
+    result = dict(attributes or {})
+    if stage is not None:
+        if stage not in {
+            "preparing",
+            "planning",
+            "researching",
+            "synthesizing",
+            "writing",
+            "finalizing",
+        }:
+            raise ValueError(f"Unsupported token accounting stage: {stage}")
+        result["stage"] = stage
+    return result
+
+
+def _sum_usage(records: list[TokenUsage]) -> TokenUsage:
+    return TokenUsage(
+        input_tokens=sum(item.input_tokens for item in records),
+        output_tokens=sum(item.output_tokens for item in records),
+        total_tokens=sum(item.total_tokens for item in records),
+        cached_input_tokens=sum(item.cached_input_tokens for item in records),
+        cache_creation_input_tokens=sum(
+            item.cache_creation_input_tokens for item in records
+        ),
+        reasoning_tokens=sum(item.reasoning_tokens for item in records),
+        estimated_input_tokens=sum(item.estimated_input_tokens for item in records),
+        estimated_output_tokens=sum(item.estimated_output_tokens for item in records),
+        estimated_total_tokens=sum(item.estimated_total_tokens for item in records),
+        estimated_cost_usd=sum(item.estimated_cost_usd for item in records),
+        usage_source=(records[0].usage_source if len(records) == 1 else "provider_reported"),
+    )
+
+
+async def _publish_usage_revision(
+    config: RunnableConfig | None, revision: int | None, accounting_status: str
+) -> None:
+    metadata = (config or {}).get("metadata") or {}
+    if not revision or not metadata.get("run_id"):
+        return
+    try:
+        await event_publisher_from_config(config or {}).publish(
+            "run.usage.updated",
+            stage=None,
+            payload={"revision": revision, "accounting_status": accounting_status},
+            dedupe_key=f"run-usage:{revision}",
+        )
+    except Exception as exc:  # noqa: BLE001 - accounting is fail-open
+        logger.debug("Usage update event failed open: %s", exc)
+
+
+def _run_accounting_status(
+    recorder: TraceRecorder,
+    run_id: str,
+    fallback: str = "partial",
+) -> str:
+    if recorder.store is None:
+        return fallback
+    projection = recorder._safe(recorder.store.get_usage_accounting, run_id) or {}
+    return str(projection.get("accounting_status") or fallback)
+
+
+async def _record_successful_invocation(
+    *,
+    recorder: TraceRecorder,
+    span: Any,
+    invocation_result: _ModelInvocationResult,
+    response: Any,
+    model: Any,
+    messages: list[BaseMessage],
+    config: RunnableConfig | None,
+    provider: str | None,
+    model_id: str | None,
+    agent_role: str | None,
+    operation: str,
+    attributes: dict[str, Any],
+    attempt_index: int,
+    duration_ms: int | None,
+) -> TokenUsage:
+    records = list(invocation_result.usage_records)
+    if not records:
+        fallback = TokenUsage.from_response(response)
+        if fallback.has_reported_tokens:
+            fallback.usage_source = (
+                "provider_reported"
+                if fallback.input_tokens > 0 and fallback.output_tokens > 0
+                else "provider_partial"
+            )
+            records = [fallback]
+    if not records and recorder.configuration.token_usage_estimation_enabled:
+        records = [_estimated_usage(model, messages, response)]
+    if not records:
+        records = [TokenUsage(usage_source="missing")]
+    task_id = str((config or {}).get("metadata", {}).get("task_id") or "") or None
+    stage = _usage_stage(agent_role, attributes)
+    revisions: list[int] = []
+    for physical_index, usage in enumerate(records, start=1):
+        physical_attempt_index = attempt_index + physical_index - 1
+        revision = span.add_usage(
+            usage,
+            provider,
+            model_id,
+            event_key=f"{span.span_id}:{physical_attempt_index}:success",
+            attempt_index=physical_attempt_index,
+            stage=stage,
+            task_id=task_id,
+            operation=operation,
+            duration_ms=duration_ms,
+            response_status=usage.response_status,
+        )
+        if revision:
+            revisions.append(int(revision))
+    aggregate = _sum_usage(records)
+    if invocation_result.usage_capture is not None:
+        invocation_result.usage_capture.settle_estimated_success(aggregate)
+    status = _run_accounting_status(recorder, span.run_id)
+    await _publish_usage_revision(config, max(revisions, default=None), status)
+    return aggregate
+
+
+async def _record_failed_invocation(
+    *,
+    recorder: TraceRecorder,
+    span: Any,
+    exc: BaseException,
+    config: RunnableConfig | None,
+    provider: str | None,
+    model_id: str | None,
+    agent_role: str | None,
+    operation: str,
+    attributes: dict[str, Any],
+    attempt_index: int,
+    usage_capture: UsageCaptureCallback | None = None,
+) -> int:
+    if usage_capture is not None:
+        usage_capture.settle_outer_failure(exc)
+    captured = list(
+        usage_capture.records
+        if usage_capture is not None
+        else (getattr(exc, "usage_capture_records", ()) or ())
+    )
+    task_id = str((config or {}).get("metadata", {}).get("task_id") or "") or None
+    status = "unknown_failed" if _is_uncertain_model_failure(exc) else "rejected"
+    records = captured or [
+        TokenUsage(
+            usage_source="missing",
+            response_status=status,
+        )
+    ]
+    revisions: list[int] = []
+    for physical_index, usage in enumerate(records, start=1):
+        physical_attempt_index = attempt_index + physical_index - 1
+        revision = span.add_usage(
+            usage,
+            provider,
+            model_id,
+            event_key=f"{span.span_id}:{physical_attempt_index}:failed",
+            attempt_index=physical_attempt_index,
+            stage=_usage_stage(agent_role, attributes),
+            task_id=task_id,
+            operation=operation,
+            response_status=usage.response_status if captured else status,
+        )
+        if revision:
+            revisions.append(int(revision))
+    await _publish_usage_revision(
+        config,
+        max(revisions, default=None),
+        _run_accounting_status(recorder, span.run_id),
+    )
+    return len(records)
 
 
 def apply_helicone_config(
@@ -1730,12 +3111,14 @@ async def invoke_model_with_observability(
     span_name: str,
     agent_role: str | None = None,
     model_name: str | None = None,
+    stage: str | None = None,
     attributes: dict[str, Any] | None = None,
+    budget_gate: BudgetGate | None = None,
 ) -> Any:
     """Invoke a model while recording a local LLM span and token usage."""
     provider, model_id = _provider_model(model_name)
     recorder = get_trace_recorder(config)
-    span_attributes = dict(attributes or {})
+    span_attributes = _usage_attributes(attributes, stage)
     if recorder.langfuse is not None and recorder.configuration.langfuse_langchain_callback_enabled:
         span_attributes["langfuse_callback_managed"] = True
     with recorder.start_span(
@@ -1747,12 +3130,44 @@ async def invoke_model_with_observability(
         provider=provider,
         model=model_id or model_name,
     ) as span:
-        invocation_result = await _ainvoke_model(
-            model,
-            messages,
-            recorder,
-            config,
+        usage_capture = UsageCaptureCallback(
+            recorder=recorder,
+            config=config,
+            messages=messages,
+            model=model,
+            model_name=model_name,
+            span_id=span.span_id,
+            attempt_index=1,
+            agent_role=agent_role,
+            budget_gate=budget_gate,
         )
+        try:
+            invocation_result = await _ainvoke_model(
+                model,
+                messages,
+                recorder,
+                config,
+                span_id=span.span_id,
+                attempt_index=1,
+                model_name=model_name,
+                agent_role=agent_role,
+                usage_capture=usage_capture,
+            )
+        except Exception as exc:
+            await _record_failed_invocation(
+                recorder=recorder,
+                span=span,
+                exc=exc,
+                config=config,
+                provider=provider,
+                model_id=model_id or model_name,
+                agent_role=agent_role,
+                operation=span_name,
+                attributes=span_attributes,
+                attempt_index=1,
+                usage_capture=usage_capture,
+            )
+            raise
         response = invocation_result.response
         span.attributes["llm.first_token_probe_status"] = (
             invocation_result.probe_status
@@ -1769,10 +3184,26 @@ async def invoke_model_with_observability(
             agent_role=agent_role,
             operation=span_name,
         )
-        usage = TokenUsage.from_response(response)
-        if hasattr(span, "add_usage"):
-            span.add_usage(usage, provider, model_id or model_name)
-        if getattr(recorder.configuration, "trace_payload_mode", "preview") != "none":
+        await _record_successful_invocation(
+            recorder=recorder,
+            span=span,
+            invocation_result=invocation_result,
+            response=response,
+            model=model,
+            messages=messages,
+            config=config,
+            provider=provider,
+            model_id=model_id or model_name,
+            agent_role=agent_role,
+            operation=span_name,
+            attributes=span_attributes,
+            attempt_index=1,
+            duration_ms=int((monotonic_time() - span.started_monotonic) * 1000),
+        )
+        if (
+            recorder.configuration.observability_enabled
+            and getattr(recorder.configuration, "trace_payload_mode", "preview") != "none"
+        ):
             span.output_preview = _message_preview(
                 response,
                 None if recorder.configuration.trace_payload_mode == "full" else recorder.configuration.trace_preview_chars,
@@ -1789,7 +3220,9 @@ async def invoke_model_with_retry_observability(
     span_name: str,
     agent_role: str | None = None,
     model_name: str | None = None,
+    stage: str | None = None,
     attributes: dict[str, Any] | None = None,
+    budget_gate: BudgetGate | None = None,
     max_attempts: int | None = None,
     base_delay: float | None = None,
     max_delay: float | None = None,
@@ -1820,7 +3253,7 @@ async def invoke_model_with_retry_observability(
         max_delay = configurable.tool_retry_max_delay
     sleeper = sleeper or asyncio.sleep
 
-    span_attributes = dict(attributes or {})
+    span_attributes = _usage_attributes(attributes, stage)
     if recorder.langfuse is not None and recorder.configuration.langfuse_langchain_callback_enabled:
         span_attributes["langfuse_callback_managed"] = True
     task_id = str((config or {}).get("metadata", {}).get("task_id") or "")
@@ -1890,15 +3323,50 @@ async def invoke_model_with_retry_observability(
                 circuit_permit = None
                 logger.debug("Model circuit before_call failed open: %s", exc)
         attempt = 0  # attempts made so far (0 == first try in progress)
+        physical_attempts_recorded = 0
         while True:
+            usage_capture = UsageCaptureCallback(
+                recorder=recorder,
+                config=config,
+                messages=messages,
+                model=model,
+                model_name=model_name,
+                span_id=span.span_id,
+                attempt_index=attempt + 1,
+                agent_role=agent_role,
+                budget_gate=budget_gate,
+            )
             try:
-                invocation = _ainvoke_model(model, messages, recorder, config)
+                invocation = _ainvoke_model(
+                    model,
+                    messages,
+                    recorder,
+                    config,
+                    span_id=span.span_id,
+                    attempt_index=attempt + 1,
+                    model_name=model_name,
+                    agent_role=agent_role,
+                    usage_capture=usage_capture,
+                )
                 invocation_result = await asyncio.wait_for(
                     invocation,
                     timeout=configurable.model_call_timeout_seconds,
                 )
                 response = invocation_result.response
             except Exception as exc:  # noqa: BLE001 -- classify then decide
+                physical_attempts_recorded += await _record_failed_invocation(
+                    recorder=recorder,
+                    span=span,
+                    exc=exc,
+                    config=config,
+                    provider=provider,
+                    model_id=model_id or model_name,
+                    agent_role=agent_role,
+                    operation=span_name,
+                    attributes=span_attributes,
+                    attempt_index=physical_attempts_recorded + 1,
+                    usage_capture=usage_capture,
+                )
                 error_type, retryable = classify_llm_retryable_error(exc)
                 attempts_made = attempt + 1
                 if not retryable or attempts_made >= max_attempts:
@@ -2022,10 +3490,26 @@ async def invoke_model_with_retry_observability(
                 agent_role=agent_role,
                 operation=span_name,
             )
-            usage = TokenUsage.from_response(response)
-            if hasattr(span, "add_usage"):
-                span.add_usage(usage, provider, model_id or model_name)
-            if getattr(recorder.configuration, "trace_payload_mode", "preview") != "none":
+            usage = await _record_successful_invocation(
+                recorder=recorder,
+                span=span,
+                invocation_result=invocation_result,
+                response=response,
+                model=model,
+                messages=messages,
+                config=config,
+                provider=provider,
+                model_id=model_id or model_name,
+                agent_role=agent_role,
+                operation=span_name,
+                attributes=span_attributes,
+                attempt_index=physical_attempts_recorded + 1,
+                duration_ms=int((monotonic_time() - activity_started) * 1000),
+            )
+            if (
+                recorder.configuration.observability_enabled
+                and getattr(recorder.configuration, "trace_payload_mode", "preview") != "none"
+            ):
                 span.output_preview = _message_preview(
                     response,
                     None if recorder.configuration.trace_payload_mode == "full" else recorder.configuration.trace_preview_chars,

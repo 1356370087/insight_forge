@@ -73,6 +73,7 @@ _PAYLOAD_KEYS: dict[str, set[str]] = {
     "run.cancelled": {
         "status", "termination_reason", "result_status", "permission_denial_count",
     },
+    "run.usage.updated": {"revision", "accounting_status"},
     "stage.started": {"stage_id", "stage_index", "stage_count"},
     "stage.completed": {"stage_id", "stage_index", "stage_count"},
     "stage.failed": {"stage_id", "stage_index", "stage_count", "error_code", "message"},
@@ -284,21 +285,37 @@ async def summarize_public_findings(
         from langchain_core.messages import HumanMessage
 
         from open_deep_research.models.resolution import build_model_config
+        from open_deep_research.observability.core import (
+            invoke_model_with_retry_observability,
+        )
 
-        model = init_chat_model(**build_model_config(
-            configurable.summarization_model,
-            min(configurable.summarization_model_max_tokens, 800),
+        model = init_chat_model(
+            **build_model_config(
+                configurable.summarization_model,
+                min(configurable.summarization_model_max_tokens, 800),
+                config,
+                role="summarization",
+            )
+        ).with_structured_output(PublicFindingsSummary, method="function_calling")
+        response = await invoke_model_with_retry_observability(
+            model,
+            [
+                HumanMessage(
+                    content=(
+                        "Summarize the completed research into at most three concise "
+                        "user-visible findings. Do not mention prompts, hidden reasoning, "
+                        "tool internals, credentials, or implementation details. Preserve "
+                        "uncertainty and do not add claims.\n\nCompressed research:\n"
+                        + compressed[:50_000]
+                    )
+                )
+            ],
             config,
-            role="summarization",
-        )).with_structured_output(PublicFindingsSummary, method="function_calling")
-        response = await model.ainvoke([
-            HumanMessage(content=(
-                "Summarize the completed research into at most three concise user-visible findings. "
-                "Do not mention prompts, hidden reasoning, tool internals, credentials, or implementation details. "
-                "Preserve uncertainty and do not add claims.\n\nCompressed research:\n"
-                + compressed[:50_000]
-            ))
-        ])
+            span_name="public_findings_summary",
+            agent_role="summarization",
+            model_name=configurable.summarization_model,
+            stage="finalizing",
+        )
         findings = [str(item).strip() for item in response.findings if str(item).strip()][:3]
         if not findings:
             return None

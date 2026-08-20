@@ -549,6 +549,7 @@ async def _evaluate_json(
                 ),
                 agent_role="quality_evaluator",
                 model_name=candidate_model,
+                stage="finalizing",
             )
 
         response = await invoke_with_model_fallback(

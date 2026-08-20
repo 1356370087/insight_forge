@@ -336,6 +336,7 @@ async def extract_memory_candidates(
         span_name="lead.memory_extract",
         agent_role="lead",
         model_name=research_model,
+        stage="finalizing",
         max_attempts=max_structured_output_retries,
     )
 
@@ -575,6 +576,7 @@ async def decide_memory_conflict(
         span_name="lead.memory_conflict",
         agent_role="lead",
         model_name=model_name,
+        stage="finalizing",
     )
     allowed_ids = {record.memory_id for record in compared if record.memory_id}
     response.target_memory_ids = [
@@ -632,6 +634,7 @@ async def generate_reflections(
         span_name="lead.memory_reflect_questions",
         agent_role="lead",
         model_name=model_name,
+        stage="finalizing",
     )
 
     reflections: list[ReflectionItemModel] = []
@@ -673,6 +676,7 @@ async def generate_reflections(
             span_name="lead.memory_reflect_answer",
             agent_role="lead",
             model_name=model_name,
+            stage="finalizing",
         )
         allowed = {record.memory_id for record in relevant}
         for item in response.reflections[:1]:
@@ -735,6 +739,7 @@ async def generate_research_profile(
         span_name="lead.memory_profile",
         agent_role="lead",
         model_name=model_name,
+        stage="finalizing",
     )
     allowed = {record.memory_id for record in eligible_records}
     response.source_memory_ids = [value for value in response.source_memory_ids if value in allowed]

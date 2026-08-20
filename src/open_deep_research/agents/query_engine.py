@@ -1157,6 +1157,7 @@ class QueryEngine:
         result = {
             "status": "cancelled",
             "usage": self._usage_subset(self.total_usage),
+            "usage_accounting": self.total_usage.get("usage_accounting"),
             "metrics": self._metrics_subset(self.total_usage),
             "permission_denials": self.permission_denials,
         }
@@ -1537,6 +1538,9 @@ class QueryEngine:
                             {
                                 "run_id": self.run_id,
                                 "usage": self._usage_subset(self.total_usage),
+                                "usage_accounting": self.total_usage.get(
+                                    "usage_accounting"
+                                ),
                                 "metrics": self._metrics_subset(self.total_usage),
                             },
                         )
@@ -1806,6 +1810,9 @@ class QueryEngine:
                             {
                                 "run_id": self.run_id,
                                 "usage": self._usage_subset(self.total_usage),
+                                "usage_accounting": self.total_usage.get(
+                                    "usage_accounting"
+                                ),
                                 "metrics": self._metrics_subset(self.total_usage),
                             },
                         )
@@ -1907,6 +1914,9 @@ class QueryEngine:
                     {
                         "run_id": self.run_id,
                         "usage": self._usage_subset(self.total_usage),
+                        "usage_accounting": self.total_usage.get(
+                            "usage_accounting"
+                        ),
                         "metrics": self._metrics_subset(self.total_usage),
                     },
                 )
@@ -1932,6 +1942,9 @@ class QueryEngine:
                         {
                             "run_id": self.run_id,
                             "usage": self._usage_subset(self.total_usage),
+                            "usage_accounting": self.total_usage.get(
+                                "usage_accounting"
+                            ),
                             "metrics": self._metrics_subset(self.total_usage),
                         },
                     )
@@ -1988,6 +2001,9 @@ class QueryEngine:
                         "status": "error",
                         "error": str(exc),
                         "usage": self._usage_subset(self.total_usage),
+                        "usage_accounting": self.total_usage.get(
+                            "usage_accounting"
+                        ),
                         "metrics": self._metrics_subset(self.total_usage),
                         "permission_denials": self.permission_denials,
                         "persistence_degraded": self.persistence_degraded,
@@ -1999,6 +2015,9 @@ class QueryEngine:
                         "run_id": self.run_id,
                         "error": str(exc),
                         "usage": self._usage_subset(self.total_usage),
+                        "usage_accounting": self.total_usage.get(
+                            "usage_accounting"
+                        ),
                         "metrics": self._metrics_subset(self.total_usage),
                     },
                 )
@@ -2742,6 +2761,7 @@ class QueryEngine:
             ),
             "completion": state.get("completion_decision", {}),
             "usage": self._usage_subset(self.total_usage),
+            "usage_accounting": self.total_usage.get("usage_accounting"),
             "metrics": self._metrics_subset(self.total_usage),
             "permission_denials": self.permission_denials,
             "persistence_degraded": self.persistence_degraded,
@@ -2792,6 +2812,7 @@ class QueryEngine:
                 "status": result_status,
                 "result": result,
                 "usage": self._usage_subset(self.total_usage),
+                "usage_accounting": self.total_usage.get("usage_accounting"),
                 "metrics": self._metrics_subset(self.total_usage),
             },
         )

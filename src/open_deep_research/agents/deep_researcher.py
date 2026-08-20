@@ -360,6 +360,7 @@ async def compact_query_context(
                     span_name=f"{channel}.compact_query_context",
                     agent_role=channel,
                     model_name=candidate_model,
+                    stage="planning" if channel == "supervisor" else "researching",
                 )
 
             response = await invoke_with_model_fallback(
@@ -748,6 +749,7 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
         span_name="lead.clarify_with_user",
         agent_role="lead",
         model_name=configurable.research_model,
+        stage="preparing",
     )
     # Step 4: Route based on clarification analysis
     if response.need_clarification:
@@ -976,6 +978,7 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
         span_name="lead.write_research_brief",
         agent_role="lead",
         model_name=configurable.research_model,
+        stage="planning",
     )
     coverage_contract = build_research_coverage_contract(
         state.get("messages", []),
@@ -1099,6 +1102,7 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
         span_name="supervisor.model",
         agent_role="supervisor",
         model_name=configurable.research_model,
+        stage="planning",
     )
 
     # Step 3: Update state and proceed to tool execution
@@ -2630,6 +2634,7 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
         span_name="researcher.model",
         agent_role="researcher",
         model_name=configurable.research_model,
+        stage="researching",
     )
     
     # Step 4: Update state and proceed to tool execution
@@ -3487,6 +3492,7 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
                             span_name="researcher.compress",
                             agent_role="researcher",
                             model_name=candidate_model,
+                            stage="synthesizing",
                         ),
                         timeout=configurable.model_call_timeout_seconds,
                     )

@@ -70,6 +70,7 @@ async def summarize_webpage(
                     span_name="tool.tavily.summarize_webpage",
                     agent_role="researcher",
                     model_name=candidate_model,
+                    stage="researching",
                 )
 
             invocation = invoke_with_model_fallback(
@@ -88,6 +89,7 @@ async def summarize_webpage(
                 span_name="tool.tavily.summarize_webpage",
                 agent_role="researcher",
                 model_name=model_name,
+                stage="researching",
             )
         summary = await asyncio.wait_for(invocation, timeout=120.0)
         return (

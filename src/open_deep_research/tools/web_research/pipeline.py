@@ -294,6 +294,7 @@ async def _rerank_web_candidates(
             span_name="web.rerank",
             agent_role="researcher",
             model_name=candidate_model,
+            stage="researching",
         )
 
     result = await invoke_with_model_fallback(
@@ -371,6 +372,7 @@ async def _extract_web_evidence(
             span_name="web.extract_evidence",
             agent_role="researcher",
             model_name=candidate_model,
+            stage="researching",
         )
 
     result = await asyncio.wait_for(

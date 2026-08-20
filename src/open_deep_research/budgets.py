@@ -194,6 +194,57 @@ class RunBudgetLedger:
             self._write_unlocked(data)
             return reservation
 
+    def release(self, operation_key: str) -> BudgetReservation | None:
+        """Release a reservation when an operation is known not to consume it."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with portalocker.Lock(str(self.lock_path), mode="a+b", timeout=30):
+            data = self._load_unlocked()
+            raw = data["reservations"].get(operation_key)
+            if raw is None:
+                return None
+            reservation = BudgetReservation.model_validate(raw)
+            if reservation.status == "settled":
+                return reservation
+            reservation.actual = 0
+            reservation.status = "released"
+            data["reservations"][operation_key] = reservation.model_dump(mode="json")
+            self._write_unlocked(data)
+            return reservation
+
+    def mark_uncertain(self, operation_key: str) -> BudgetReservation | None:
+        """Keep a conservative reservation for an indeterminate remote attempt."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with portalocker.Lock(str(self.lock_path), mode="a+b", timeout=30):
+            data = self._load_unlocked()
+            raw = data["reservations"].get(operation_key)
+            if raw is None:
+                return None
+            reservation = BudgetReservation.model_validate(raw)
+            if reservation.status not in {"settled", "released"}:
+                reservation.status = "uncertain"
+                data["reservations"][operation_key] = reservation.model_dump(
+                    mode="json"
+                )
+                self._write_unlocked(data)
+            return reservation
+
+    def outstanding_by_dimension(self) -> dict[str, int]:
+        """Return unresolved conservative reservations grouped by dimension."""
+        if not self.path.exists():
+            return {dimension.value: 0 for dimension in BudgetDimension}
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with portalocker.Lock(str(self.lock_path), mode="a+b", timeout=30):
+            data = self._load_unlocked()
+        return {
+            dimension.value: sum(
+                int(item.get("actual") if item.get("actual") is not None else item["reserved"])
+                for item in data["reservations"].values()
+                if item["dimension"] == dimension.value
+                and item.get("status") in {"reserved", "uncertain"}
+            )
+            for dimension in BudgetDimension
+        }
+
     def snapshot(self) -> RunBudgetSnapshot:
         """Return current conservative usage across all dimensions."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -325,7 +376,7 @@ class BudgetGate:
             self.ledger.reserve(key, dimension, amount)
 
     def _settle(self, key: str, actual: int) -> None:
-        if self.ledger is not None and actual:
+        if self.ledger is not None:
             try:
                 self.ledger.settle(key, actual=actual)
             except KeyError:
@@ -342,33 +393,44 @@ class BudgetGate:
     ) -> None:
         """Pre-reserve one model call plus estimated token/cost usage."""
         self.check_deadline("model")
-        self._reserve(op_key, BudgetDimension.MODEL_CALLS, 1)
-        policy = self.ledger.policy if self.ledger is not None else None
-        if policy is not None and policy.max_input_tokens is not None:
-            self._reserve(
-                f"{op_key}:input",
-                BudgetDimension.INPUT_TOKENS,
-                max(1, estimated_input_tokens),
-            )
-        if policy is not None and policy.max_output_tokens is not None:
-            self._reserve(
-                f"{op_key}:output",
-                BudgetDimension.OUTPUT_TOKENS,
-                max(1, estimated_output_tokens),
-            )
-        if policy is not None and policy.max_cost_micro_usd is not None:
-            estimated_cost = estimate_cost_micro_usd(
-                model_name,
-                max(1, estimated_input_tokens),
-                max(1, estimated_output_tokens),
-                self.cost_pricing,
-            )
-            if estimated_cost > 0:
+        reserved_keys: list[str] = []
+        try:
+            self._reserve(op_key, BudgetDimension.MODEL_CALLS, 1)
+            reserved_keys.append(op_key)
+            policy = self.ledger.policy if self.ledger is not None else None
+            if policy is not None and policy.max_input_tokens is not None:
                 self._reserve(
-                    f"{op_key}:cost",
-                    BudgetDimension.COST_MICRO_USD,
-                    estimated_cost,
+                    f"{op_key}:input",
+                    BudgetDimension.INPUT_TOKENS,
+                    max(1, estimated_input_tokens),
                 )
+                reserved_keys.append(f"{op_key}:input")
+            if policy is not None and policy.max_output_tokens is not None:
+                self._reserve(
+                    f"{op_key}:output",
+                    BudgetDimension.OUTPUT_TOKENS,
+                    max(1, estimated_output_tokens),
+                )
+                reserved_keys.append(f"{op_key}:output")
+            if policy is not None and policy.max_cost_micro_usd is not None:
+                estimated_cost = estimate_cost_micro_usd(
+                    model_name,
+                    max(1, estimated_input_tokens),
+                    max(1, estimated_output_tokens),
+                    self.cost_pricing,
+                )
+                if estimated_cost > 0:
+                    self._reserve(
+                        f"{op_key}:cost",
+                        BudgetDimension.COST_MICRO_USD,
+                        estimated_cost,
+                    )
+                    reserved_keys.append(f"{op_key}:cost")
+        except Exception:
+            if self.ledger is not None:
+                for key in reserved_keys:
+                    self.ledger.release(key)
+            raise
 
     def settle_model_call(
         self,
@@ -380,6 +442,7 @@ class BudgetGate:
     ) -> None:
         """Settle provider-reported usage for one model call."""
         policy = self.ledger.policy if self.ledger is not None else None
+        self._settle(op_key, 1)
         if policy is not None and policy.max_input_tokens is not None:
             self._settle(f"{op_key}:input", input_tokens)
         if policy is not None and policy.max_output_tokens is not None:
@@ -392,6 +455,24 @@ class BudgetGate:
                 self.cost_pricing,
             )
             self._settle(f"{op_key}:cost", actual_cost)
+
+    def fail_model_call(self, op_key: str, *, uncertain: bool) -> None:
+        """Finalize reservations for a failed physical model attempt."""
+        if self.ledger is None:
+            return
+        self._settle(op_key, 1)
+        for suffix in ("input", "output", "cost"):
+            key = f"{op_key}:{suffix}"
+            if uncertain:
+                self.ledger.mark_uncertain(key)
+            else:
+                self.ledger.release(key)
+
+    def outstanding_reservations(self) -> dict[str, int]:
+        """Expose unresolved reservations for the business usage projection."""
+        if self.ledger is None:
+            return {dimension.value: 0 for dimension in BudgetDimension}
+        return self.ledger.outstanding_by_dimension()
 
     def reserve_tool_call(self, op_key: str) -> None:
         """Pre-reserve one tool execution."""
