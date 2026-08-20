@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Iterable, cast
 
@@ -23,10 +24,13 @@ from open_deep_research.tools.fetch_webpage import fetch_webpage
 from open_deep_research.tools.governance import AgentRole, filter_tools_by_permission
 from open_deep_research.tools.mcp import load_browser_mcp_tools, load_mcp_tools
 from open_deep_research.tools.openai_web_search import openai_web_search
+from open_deep_research.tools.read_file import read_file
 from open_deep_research.tools.research_complete import research_complete
+from open_deep_research.tools.shell_exec import shell_exec
 from open_deep_research.tools.tavily_search import tavily_search
 from open_deep_research.tools.think_tool import think_tool
 from open_deep_research.tools.web_research import web_research
+from open_deep_research.tools.write_file import write_file
 
 _RESEARCHER_BUILTINS: tuple[Tool, ...] = (
     research_complete,
@@ -37,6 +41,9 @@ _RESEARCHER_BUILTINS: tuple[Tool, ...] = (
     web_research,
     fetch_url,
     fetch_webpage,
+    shell_exec,
+    read_file,
+    write_file,
 )
 
 
@@ -83,59 +90,84 @@ async def assemble_toolset(
     else:
         tools = [tool for tool in _RESEARCHER_BUILTINS if tool.is_enabled(config)]
         existing_names = {tool.name for tool in tools}
-        loaded_mcp_tools = await load_mcp_tools(config, existing_names)
-        mcp_tools = [
-            tool
-            if isinstance(tool, Tool)
-            else adapt_langchain_tool(
-                tool,
-                origin=ToolOrigin.MCP,
-                effect=ToolEffect.DESTRUCTIVE,
-                retryable=True,
+        if os.getenv("SANDBOX_TASK_TOKEN"):
+            from open_deep_research.sandbox.gateway_catalog import (
+                load_gateway_catalog_tools,
             )
-            for tool in loaded_mcp_tools
-        ]
-        tools.extend(mcp_tools)
-        existing_names.update(tool.name for tool in mcp_tools)
 
-        loaded_browser_tools = await load_browser_mcp_tools(config, existing_names)
-        browser_effects = (
-            configurable.browser_mcp_config.tool_effects
-            if configurable.browser_mcp_config is not None
-            else {}
-        )
-        browser_tools = [
-            tool
-            if isinstance(tool, Tool)
-            else adapt_langchain_tool(
-                tool,
-                origin=ToolOrigin.BROWSER,
-                effect=ToolEffect(
-                    browser_effects.get(tool.name, ToolEffect.DESTRUCTIVE.value)
-                ),
-                retryable=True,
+            tools.extend(
+                await load_gateway_catalog_tools(
+                    role.value,
+                    config,
+                    existing_names,
+                )
             )
-            for tool in loaded_browser_tools
-        ]
-        if configurable.web_pipeline_mode == "enforced":
-            browser_tools = [
-                tool for tool in browser_tools if tool.effect is ToolEffect.READ_ONLY
+        else:
+            loaded_mcp_tools = await load_mcp_tools(config, existing_names)
+            mcp_tools = [
+                tool
+                if isinstance(tool, Tool)
+                else adapt_langchain_tool(
+                    tool,
+                    origin=ToolOrigin.MCP,
+                    effect=ToolEffect.DESTRUCTIVE,
+                    retryable=True,
+                )
+                for tool in loaded_mcp_tools
             ]
-        tools.extend(browser_tools)
-        existing_names.update(tool.name for tool in browser_tools)
+            tools.extend(mcp_tools)
+            existing_names.update(tool.name for tool in mcp_tools)
 
-        skill_tools = await load_skill_tools(config, existing_names)
-        tools.extend(
-            tool
-            if isinstance(tool, Tool)
-            else adapt_langchain_tool(
-                tool,
-                origin=ToolOrigin.SKILL,
-                retryable=True,
+            loaded_browser_tools = await load_browser_mcp_tools(
+                config,
+                existing_names,
             )
-            for tool in skill_tools
-        )
+            browser_effects = (
+                configurable.browser_mcp_config.tool_effects
+                if configurable.browser_mcp_config is not None
+                else {}
+            )
+            browser_tools = [
+                tool
+                if isinstance(tool, Tool)
+                else adapt_langchain_tool(
+                    tool,
+                    origin=ToolOrigin.BROWSER,
+                    effect=ToolEffect(
+                        browser_effects.get(
+                            tool.name,
+                            ToolEffect.DESTRUCTIVE.value,
+                        )
+                    ),
+                    retryable=True,
+                )
+                for tool in loaded_browser_tools
+            ]
+            if configurable.web_pipeline_mode == "enforced":
+                browser_tools = [
+                    tool
+                    for tool in browser_tools
+                    if tool.effect is ToolEffect.READ_ONLY
+                ]
+            tools.extend(browser_tools)
+            existing_names.update(tool.name for tool in browser_tools)
+
+            skill_tools = await load_skill_tools(config, existing_names)
+            tools.extend(
+                tool
+                if isinstance(tool, Tool)
+                else adapt_langchain_tool(
+                    tool,
+                    origin=ToolOrigin.SKILL,
+                    retryable=True,
+                )
+                for tool in skill_tools
+            )
     build_tool_registry(tools)
+    if os.getenv("SANDBOX_TASK_TOKEN"):
+        from open_deep_research.sandbox.gateway_tool import proxy_gateway_tools
+
+        tools = proxy_gateway_tools(tools)
     return tools
 
 

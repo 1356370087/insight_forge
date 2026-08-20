@@ -3,9 +3,6 @@
 from __future__ import annotations
 
 from open_deep_research.tools.base import Tool
-from open_deep_research.tools.supervisor.approve_research_domain.definition import (
-    build_approve_research_domain,
-)
 from open_deep_research.tools.supervisor.cancel_research_task.definition import (
     build_cancel_research_task,
 )
@@ -40,6 +37,8 @@ from open_deep_research.tools.think_tool import think_tool
 def build_supervisor_tools(deps: SupervisorToolDeps) -> list[Tool]:
     """Build Supervisor tools exclusively from module-level definitions."""
     completion = build_research_complete()
+    if deps.sandbox_enabled and not deps.enable_async_research:
+        raise ValueError("sandbox_requires_async_research")
     if not deps.enable_async_research:
         return [
             build_conduct_research(deps),
@@ -53,7 +52,6 @@ def build_supervisor_tools(deps: SupervisorToolDeps) -> list[Tool]:
         build_list_research_tasks(deps),
         build_update_research_task(deps),
         build_cancel_research_task(deps),
-        build_approve_research_domain(deps),
         build_wait_for_research_updates(deps),
         completion,
         think_tool,

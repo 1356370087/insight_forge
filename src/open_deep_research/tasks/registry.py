@@ -83,9 +83,8 @@ class TaskRecord:
     pending_update_instructions: list[str] = field(default_factory=list)
     error_message: Optional[str] = None
 
-    # Pending domain-confirmation (set while WAITING_FOR_CONFIRMATION).
-    # The live asyncio.Future lives in DomainApprovalRegistry, not here — these
-    # scalars are for snapshot display only.
+    # Pending security approval projection (durable decisions live in
+    # SecurityApprovalStore; these scalars are for snapshot display only).
     pending_domain: Optional[str] = None
     pending_domain_tool: Optional[str] = None
 

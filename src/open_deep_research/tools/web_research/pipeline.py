@@ -32,9 +32,8 @@ from open_deep_research.observability import (
     get_trace_recorder,
     invoke_model_with_retry_observability,
 )
-from open_deep_research.sandbox.policy import allowed_domains
+from open_deep_research.sandbox.policy import allowed_domains, network_policy_mode
 from open_deep_research.security.content import inspect_untrusted_content
-from open_deep_research.tasks.domain_approvals import get_domain_approval_registry
 from open_deep_research.tools.base import (
     ToolContext,
 )
@@ -426,13 +425,17 @@ async def _approve_candidate_batch(
     run_id = str(config.get("metadata", {}).get("run_id", "default"))
     domains = sorted({candidate.domain for candidate in candidates})
     urls = [candidate.canonical_url for candidate in candidates]
-    network_mode = configurable.sandbox_network_mode
-    if network_mode in {"open-network", "allow-search-only"}:
-        # These URLs are fetched only inside the governed, read-only SEARCH
-        # pipeline. ``allow-search-only`` must not deadlock a synchronous
-        # Researcher that has no supervisor approval channel.
+    network_mode = network_policy_mode(configurable)
+    if config.get("metadata", {}).get("sandbox_gateway_physical") is True:
+        return DomainApprovalBatch(
+            run_id=run_id,
+            iteration=iteration,
+            domains=domains,
+            urls=urls,
+        )
+    if network_mode == "disabled":
         return DomainApprovalBatch(run_id=run_id, iteration=iteration, domains=domains, urls=urls)
-    if network_mode == "no-network":
+    if network_mode in {"offline", "gateway-only"}:
         return DomainApprovalBatch(
             run_id=run_id,
             iteration=iteration,
@@ -441,24 +444,17 @@ async def _approve_candidate_batch(
             denied_domains=domains,
         )
     statically_allowed = set(allowed_domains(configurable))
-    registry = get_domain_approval_registry()
-    pending: list[str] = []
     denied: list[str] = []
     for domain in domains:
         if domain in statically_allowed:
             continue
-        decision = registry.is_allowed(run_id, domain)
-        if decision is False:
-            denied.append(domain)
-        elif decision is None:
-            registry.request_decision(run_id, domain, "web_research")
-            pending.append(domain)
+        denied.append(domain)
     return DomainApprovalBatch(
         run_id=run_id,
         iteration=iteration,
         domains=domains,
         urls=urls,
-        pending_domains=pending,
+        pending_domains=[],
         denied_domains=denied,
     )
 

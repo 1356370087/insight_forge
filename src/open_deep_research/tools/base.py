@@ -48,6 +48,14 @@ class ToolEffect(str, Enum):
     DESTRUCTIVE = "destructive"
 
 
+class ToolExecutionZone(str, Enum):
+    """Physical trust boundary in which a tool implementation executes."""
+
+    SANDBOX_LOCAL = "sandbox_local"
+    GATEWAY = "gateway"
+    HOST_CONTROL = "host_control"
+
+
 @dataclass(frozen=True, slots=True)
 class ToolContext:
     """Runtime facts shared with every tool invocation."""
@@ -103,6 +111,11 @@ class Tool(Protocol, Generic[InputT, OutputT, ProgressT_co]):
         ...
 
     @property
+    def execution_zone(self) -> ToolExecutionZone:
+        """Return the authoritative physical execution zone."""
+        ...
+
+    @property
     def concurrency_safe(self) -> bool:
         """Return whether independent calls may execute concurrently."""
         ...
@@ -146,6 +159,7 @@ class BuiltTool(Generic[InputT, OutputT, ProgressT]):
     input_schema: type[InputT]
     origin: ToolOrigin
     effect: ToolEffect
+    execution_zone: ToolExecutionZone
     retryable: bool
     concurrency_safe: bool
     supports_idempotency: bool
@@ -211,6 +225,7 @@ def build_tool(
     ],
     origin: ToolOrigin,
     effect: ToolEffect = ToolEffect.READ_ONLY,
+    execution_zone: Optional[ToolExecutionZone] = None,
     retryable: bool = False,
     concurrency_safe: bool = False,
     supports_idempotency: bool = False,
@@ -268,6 +283,14 @@ def build_tool(
         input_schema=input_schema,
         origin=origin,
         effect=effect,
+        execution_zone=(
+            execution_zone
+            or (
+                ToolExecutionZone.SANDBOX_LOCAL
+                if origin is ToolOrigin.SYSTEM
+                else ToolExecutionZone.GATEWAY
+            )
+        ),
         retryable=bool(retryable),
         concurrency_safe=bool(concurrency_safe),
         supports_idempotency=bool(supports_idempotency),
@@ -305,6 +328,13 @@ async def tool_to_model_definition(
     max_description_chars: int = 2_000,
 ) -> dict[str, Any]:
     """Project a Tool into the schema-only shape accepted by bind_tools()."""
+    remote_definition = getattr(tool, "model_definition", None)
+    if isinstance(remote_definition, dict):
+        projected = dict(remote_definition)
+        projected["description"] = str(
+            projected.get("description") or ""
+        )[:max_description_chars]
+        return projected
     description = (await tool.description(None)).strip()
     description = description[:max_description_chars]
     return {

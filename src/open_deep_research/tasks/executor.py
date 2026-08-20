@@ -24,7 +24,6 @@ from open_deep_research.observability.telemetry import get_prometheus_metrics
 from open_deep_research.run_context import RunContextStore
 from open_deep_research.sandbox.manager import DockerSandboxManager
 from open_deep_research.tasks.coordination import publish_task_update
-from open_deep_research.tasks.domain_approvals import get_domain_approval_registry
 from open_deep_research.tasks.events import EventType, JSONLEventWriter, ResearchEvent
 from open_deep_research.tasks.recovery import CheckpointManager, ResearcherCheckpoint
 from open_deep_research.tasks.registry import (
@@ -405,9 +404,8 @@ def _config_with_task_id(config: RunnableConfig, task_id: str) -> RunnableConfig
 
 
 def _clear_run_approvals_if_idle(registry: TaskRegistry, run_id: str) -> None:
-    """Release run-scoped approval state only after its last active task ends."""
-    if registry.count_active(run_id=run_id) == 0:
-        get_domain_approval_registry().clear_run(run_id)
+    """Retain durable run approvals until the run itself reaches terminal state."""
+    del registry, run_id
 
 
 # ---------------------------------------------------------------------------
@@ -478,7 +476,7 @@ async def run_task(
             ),
         }
 
-        if configurable.enable_docker_sandbox:
+        if configurable.sandbox_enabled:
             sandbox_result = await DockerSandboxManager().run_researcher_task(
                 task_record,
                 config,
@@ -851,7 +849,7 @@ async def run_task_with_control(
                 )
 
             async def invoke_researcher() -> dict[str, Any]:
-                if configurable.enable_docker_sandbox:
+                if configurable.sandbox_enabled:
                     sandbox_result = await DockerSandboxManager().run_researcher_task(
                         task_record,
                         config,

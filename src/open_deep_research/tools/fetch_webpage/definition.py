@@ -14,7 +14,6 @@ from open_deep_research.security.network import (
     validate_public_http_url,
     validate_response_peer,
 )
-from open_deep_research.tasks.domain_approvals import get_domain_approval_registry
 from open_deep_research.tools.adapters import adapt_langchain_tool
 from open_deep_research.tools.availability import legacy_fetch_enabled
 from open_deep_research.tools.base import ToolOrigin
@@ -57,15 +56,14 @@ async def _fetch_webpage_call(
                     current_host = urlsplit(current_url).hostname
                     next_host = urlsplit(next_url).hostname
                     if next_host != current_host and is_enforced_mode(configurable):
-                        run_id = str(
-                            (config or {}).get("metadata", {}).get("run_id", "default")
-                        )
-                        approved = (
-                            next_host in set(allowed_domains(configurable))
-                            or get_domain_approval_registry().is_allowed(
-                                run_id, str(next_host)
-                            )
-                            is True
+                        approved = next_host in (
+                            set(allowed_domains(configurable))
+                            | {
+                                str(value).lower()
+                                for value in (config or {}).get("metadata", {}).get(
+                                    "sandbox_gateway_authorized_hosts", []
+                                )
+                            }
                         )
                         if not approved:
                             raise ToolException(

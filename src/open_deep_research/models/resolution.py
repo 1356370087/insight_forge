@@ -9,6 +9,7 @@ all of those layers without creating import cycles.
 from __future__ import annotations
 
 import os
+from collections import ChainMap
 from collections.abc import Mapping
 from functools import lru_cache
 from typing import Any
@@ -94,9 +95,21 @@ def is_dashscope_qwen(
 
 
 def _key_source(config: Mapping[str, Any] | None) -> Mapping[str, Any]:
+    metadata = (config or {}).get("metadata", {})
+    configurable = (config or {}).get("configurable", {})
+    if (
+        isinstance(metadata, Mapping)
+        and metadata.get("sandbox_gateway_physical") is True
+        and isinstance(configurable, Mapping)
+    ):
+        api_keys = configurable.get("apiKeys", {})
+        return (
+            ChainMap(api_keys, os.environ)
+            if isinstance(api_keys, Mapping)
+            else os.environ
+        )
     if os.getenv("GET_API_KEYS_FROM_CONFIG", "false").lower() != "true":
         return os.environ
-    configurable = (config or {}).get("configurable", {})
     if not isinstance(configurable, Mapping):
         return {}
     api_keys = configurable.get("apiKeys", {})
@@ -227,6 +240,7 @@ def build_model_config(
         "max_tokens": max_tokens,
         "max_retries": 0,
         "api_key": api_key,
+        "metadata": {"sandbox_model_role": role},
     }
     if base_url := resolve_base_url(
         model_spec,
@@ -250,4 +264,19 @@ def build_model_config(
 @lru_cache(maxsize=1)
 def get_configurable_model_template() -> Any:
     """Return the process-wide lazily initialized configurable chat template."""
+    sandbox_api_process = os.getenv("SANDBOX_ENABLED", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    } and os.getenv("SANDBOX_GATEWAY_PHYSICAL_PROCESS", "").lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if os.getenv("SANDBOX_TASK_TOKEN") or sandbox_api_process:
+        from open_deep_research.sandbox.gateway_model import GatewayChatModel
+
+        return GatewayChatModel()
     return init_chat_model(configurable_fields=_CONFIGURABLE_MODEL_FIELDS)

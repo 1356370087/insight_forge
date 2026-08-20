@@ -69,6 +69,8 @@ class AgentState(AgentInputState, total=False):
     # Async SubAgent: collected outputs from completed background tasks.
     completed_task_outputs: Annotated[list[dict], override_reducer]
     processed_mailbox_message_ids: Annotated[list[str], override_reducer]
+    enable_async_research: bool
+    sandbox_enabled: bool
     # Mem0 long-term memory
     memory_context: Optional[str]
     memory_candidates: Annotated[list[dict], override_reducer]
@@ -115,6 +117,7 @@ class SupervisorState(TypedDict, total=False):
     research_iterations: int
     raw_notes: Annotated[list[str], override_reducer]
     enable_async_research: bool
+    sandbox_enabled: bool
     memory_context: Optional[str]
     approved_research_plan: Optional[str]
     human_feedback: Annotated[list[dict], override_reducer]

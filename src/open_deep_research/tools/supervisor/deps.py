@@ -35,6 +35,7 @@ class SupervisorToolDeps:
     """
 
     enable_async_research: bool = False
+    sandbox_enabled: bool = False
     coverage_contract: ResearchCoverageContract | None = None
     risk_profile: ResearchRiskProfile = field(
         default_factory=lambda: ResearchRiskProfile(level="standard")

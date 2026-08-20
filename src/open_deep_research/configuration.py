@@ -16,7 +16,7 @@ from open_deep_research.quality.policy import (
     rigor_from_legacy_min_score,
 )
 
-RUN_CONFIG_SCHEMA_VERSION = 6
+RUN_CONFIG_SCHEMA_VERSION = 7
 QUALITY_POLICY_VERSION = "quality-gate-v4"
 RUN_CONFIG_FROZEN_FIELDS = (
     "max_structured_output_retries",
@@ -78,9 +78,13 @@ RUN_CONFIG_FROZEN_FIELDS = (
     "quality_risk_mode",
     "quality_caveat_admission_enabled",
     "quality_gap_recovery_max_attempts",
-    "sandbox_network_mode",
+    "sandbox_enabled",
+    "enable_async_research",
+    "sandbox_profile_id",
+    "sandbox_policy_digest",
+    "sandbox_runtime_digest",
+    "gateway_protocol_version",
     "task_timeout_seconds",
-    "sandbox_timeout_seconds",
     "token_usage_accounting_enabled",
     "token_usage_estimation_enabled",
     "model_costs_per_million",
@@ -102,9 +106,22 @@ _TOKEN_USAGE_V6_FROZEN_FIELDS = {
     "token_usage_estimation_enabled",
     "model_costs_per_million",
 }
-RUN_CONFIG_FROZEN_FIELDS_V5 = tuple(
+RUN_CONFIG_FROZEN_FIELDS_V6 = tuple(
     field_name
     for field_name in RUN_CONFIG_FROZEN_FIELDS
+    if field_name
+    not in {
+        "sandbox_profile_id",
+        "sandbox_enabled",
+        "enable_async_research",
+        "sandbox_policy_digest",
+        "sandbox_runtime_digest",
+        "gateway_protocol_version",
+    }
+) + ("sandbox_network_mode", "sandbox_timeout_seconds")
+RUN_CONFIG_FROZEN_FIELDS_V5 = tuple(
+    field_name
+    for field_name in RUN_CONFIG_FROZEN_FIELDS_V6
     if field_name not in _TOKEN_USAGE_V6_FROZEN_FIELDS
 )
 RUN_CONFIG_FROZEN_FIELDS_V4 = tuple(
@@ -1410,153 +1427,49 @@ class Configuration(BaseModel):
     max_mcp_output_chars: int = Field(default=30_000, ge=256)
     allowed_mcp_servers: list[str] = Field(default_factory=list)
     allowed_model_endpoints: list[str] = Field(default_factory=list)
-    # Docker Sandbox Configuration
-    enable_docker_sandbox: bool = Field(
+    # Sandbox Policy V7. These fields are administrator owned on HTTP surfaces.
+    sandbox_enabled: bool = Field(
         default=False,
         metadata={
             "x_oap_ui_config": {
                 "type": "boolean",
                 "default": False,
-                "description": "Run async Researcher SubAgents in isolated Docker containers."
+                "description": "Enable fail-closed sandbox execution for async Researcher tasks."
             }
         }
     )
-    sandbox_provider: Literal["docker"] = Field(
-        default="docker",
-        metadata={
-            "x_oap_ui_config": {
-                "type": "select",
-                "default": "docker",
-                "description": "Sandbox provider for async Researcher isolation.",
-                "options": [{"label": "Docker", "value": "docker"}],
-            }
-        }
+    sandbox_policy_path: str = Field(
+        default="config/sandbox-policy.toml",
+        description="Administrator-owned SandboxPolicyBundle TOML path.",
     )
-    sandbox_image: str = Field(
-        default="open-deep-research-sandbox:latest",
-        metadata={
-            "x_oap_ui_config": {
-                "type": "text",
-                "default": "open-deep-research-sandbox:latest",
-                "description": "Docker image used to run isolated Researcher workers."
-            }
-        }
+    sandbox_controller_socket: str = Field(
+        default="/run/insightforge/sandbox-controller.sock",
+        description="Unix socket exposed by the trusted sandbox controller.",
     )
-    sandbox_workspace_root: Optional[str] = Field(
+    sandbox_gateway_url: str = Field(
+        default="http://sandbox-gateway:8081",
+        description="Internal data-plane URL for the sandbox gateway.",
+    )
+    sandbox_root_signing_key: Optional[str] = Field(
         default=None,
-        metadata={
-            "x_oap_ui_config": {
-                "type": "text",
-                "default": "",
-                "description": "Optional root directory for sandbox workspaces. Defaults to runs_dir/<run_id>/workspaces."
-            }
-        }
+        description="Base64 root key used to derive sandbox capability keys.",
     )
-    sandbox_network_mode: Literal[
-        "no-network",
-        "allow-search-only",
-        "allowlist-domain",
-        "open-network",
-    ] = Field(
-        default="allow-search-only",
-        metadata={
-            "x_oap_ui_config": {
-                "type": "select",
-                "default": "allow-search-only",
-                "description": "Network isolation policy for sandbox containers.",
-                "options": [
-                    {"label": "No network", "value": "no-network"},
-                    {"label": "Allow search only", "value": "allow-search-only"},
-                    {"label": "Allowlist domain", "value": "allowlist-domain"},
-                    {"label": "Open network", "value": "open-network"},
-                ],
-            }
-        }
+    sandbox_profile_id: str = Field(
+        default="research-gateway-only",
+        description="Resolved administrator profile pinned into a V7 run.",
     )
-    sandbox_allowed_domains: list[str] = Field(
-        default_factory=list,
-        metadata={
-            "x_oap_ui_config": {
-                "type": "text",
-                "default": "",
-                "description": "Additional allowed domains for proxy-backed sandbox network policies."
-            }
-        }
+    sandbox_policy_digest: str = Field(
+        default="disabled",
+        description="Canonical policy digest frozen for one run.",
     )
-    sandbox_cleanup_policy: Literal["always", "on_success", "never"] = Field(
-        default="always",
-        metadata={
-            "x_oap_ui_config": {
-                "type": "select",
-                "default": "always",
-                "description": "When to remove sandbox containers and temporary files.",
-                "options": [
-                    {"label": "Always", "value": "always"},
-                    {"label": "On success", "value": "on_success"},
-                    {"label": "Never", "value": "never"},
-                ],
-            }
-        }
+    sandbox_runtime_digest: str = Field(
+        default="disabled",
+        description="Immutable runtime/profile digest frozen for one run.",
     )
-    sandbox_timeout_seconds: Optional[int] = Field(
-        default=None,
-        metadata={
-            "x_oap_ui_config": {
-                "type": "number",
-                "default": "",
-                "description": "Optional sandbox-specific task timeout. Defaults to task_timeout_seconds."
-            }
-        }
-    )
-    sandbox_memory: str = Field(
-        default="1g",
-        metadata={
-            "x_oap_ui_config": {
-                "type": "text",
-                "default": "1g",
-                "description": "Memory limit for each sandbox container."
-            }
-        }
-    )
-    sandbox_cpus: float = Field(
-        default=1.0,
-        metadata={
-            "x_oap_ui_config": {
-                "type": "number",
-                "default": 1.0,
-                "description": "CPU quota for each sandbox container."
-            }
-        }
-    )
-    sandbox_pids_limit: int = Field(
-        default=256,
-        metadata={
-            "x_oap_ui_config": {
-                "type": "number",
-                "default": 256,
-                "description": "Maximum process count for each sandbox container."
-            }
-        }
-    )
-    sandbox_read_only_rootfs: bool = Field(
-        default=True,
-        metadata={
-            "x_oap_ui_config": {
-                "type": "boolean",
-                "default": True,
-                "description": "Mount the sandbox container root filesystem read-only."
-            }
-        }
-    )
-    sandbox_user: str = Field(
-        default="1000:1000",
-        metadata={
-            "x_oap_ui_config": {
-                "type": "text",
-                "default": "1000:1000",
-                "description": "User id and group id used inside sandbox containers."
-            }
-        }
+    gateway_protocol_version: int = Field(
+        default=1,
+        ge=1,
+        description="Worker/Gateway wire protocol version.",
     )
     # Mem0 Long-Term Memory Configuration
     enable_memory: bool = Field(
@@ -1801,16 +1714,6 @@ class Configuration(BaseModel):
             raise ValueError("model token overrides must be positive")
         return normalized
 
-    @field_validator("sandbox_allowed_domains", mode="before")
-    @classmethod
-    def parse_sandbox_allowed_domains(cls, value: Any) -> list[str]:
-        """Accept comma-separated env values for sandbox domain allowlists."""
-        if value is None or value == "":
-            return []
-        if isinstance(value, str):
-            return [item.strip() for item in value.split(",") if item.strip()]
-        return value
-
     @field_validator(
         "supervisor_tool_whitelist",
         "researcher_tool_whitelist",
@@ -1897,6 +1800,36 @@ class Configuration(BaseModel):
             )
         return self
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_legacy_sandbox_fields(cls, value: Any) -> Any:
+        """Reject removed V6 sandbox fields instead of silently ignoring them."""
+        if not isinstance(value, dict):
+            return value
+        legacy_fields = {
+            "enable_docker_sandbox",
+            "sandbox_provider",
+            "sandbox_image",
+            "sandbox_workspace_root",
+            "sandbox_network_mode",
+            "sandbox_allowed_domains",
+            "sandbox_cleanup_policy",
+            "sandbox_timeout_seconds",
+            "sandbox_memory",
+            "sandbox_cpus",
+            "sandbox_pids_limit",
+            "sandbox_read_only_rootfs",
+            "sandbox_user",
+        }
+        found = sorted(legacy_fields.intersection(value))
+        if found:
+            raise ValueError(
+                "legacy_sandbox_config_removed:"
+                + ",".join(found)
+                + ";see=docs/07-Docker沙箱隔离修复SPEC.md"
+            )
+        return value
+
     @model_validator(mode="after")
     def validate_leader_lease_timing(self) -> "Configuration":
         """Ensure a live leader renews well before its lease can expire."""
@@ -1914,12 +1847,55 @@ class Configuration(BaseModel):
             raise ValueError("advanced memory retrieval weights must sum to 1.0")
         return self
 
+    @model_validator(mode="after")
+    def validate_sandbox_v7(self) -> "Configuration":
+        """Fail closed when V7 sandbox execution lacks hard prerequisites."""
+        if not self.sandbox_enabled:
+            return self
+        if not self.enable_async_research:
+            raise ValueError("sandbox_requires_async_research")
+        if not self.sandbox_root_signing_key:
+            raise ValueError("sandbox_unavailable:root_signing_key")
+        from open_deep_research.sandbox.crypto import decode_root_key
+        from open_deep_research.sandbox.schema import load_policy_bundle
+
+        decode_root_key(self.sandbox_root_signing_key)
+        load_policy_bundle(self.sandbox_policy_path)
+        return self
+
     @classmethod
     def from_runnable_config(
         cls, config: Optional[RunnableConfig] = None
     ) -> "Configuration":
         """Create a Configuration instance from a RunnableConfig."""
         configurable = config.get("configurable", {}) if config else {}
+        legacy_fields = {
+            "enable_docker_sandbox",
+            "sandbox_provider",
+            "sandbox_image",
+            "sandbox_workspace_root",
+            "sandbox_network_mode",
+            "sandbox_allowed_domains",
+            "sandbox_cleanup_policy",
+            "sandbox_timeout_seconds",
+            "sandbox_memory",
+            "sandbox_cpus",
+            "sandbox_pids_limit",
+            "sandbox_read_only_rootfs",
+            "sandbox_user",
+        }
+        legacy = sorted(legacy_fields.intersection(configurable))
+        legacy_env = sorted(
+            field.upper() for field in legacy_fields if field.upper() in os.environ
+        )
+        if "SANDBOX_SECRET_ENV_KEYS" in os.environ:
+            legacy_env.append("SANDBOX_SECRET_ENV_KEYS")
+        if legacy or legacy_env:
+            raise ValueError(
+                "legacy_sandbox_config_removed:"
+                + ",".join(legacy + legacy_env)
+                + ";see=docs/07-Docker沙箱隔离修复SPEC.md"
+            )
         metadata = config.get("metadata", {}) if config else {}
         frozen = metadata.get("runtime_config_frozen") is True
         field_names = list(cls.model_fields.keys())
@@ -1969,6 +1945,8 @@ def frozen_run_config_values(config: RunnableConfig) -> dict[str, Any]:
         if schema_version == 4
         else RUN_CONFIG_FROZEN_FIELDS_V5
         if schema_version == 5
+        else RUN_CONFIG_FROZEN_FIELDS_V6
+        if schema_version == 6
         else RUN_CONFIG_FROZEN_FIELDS
     )
     return {
@@ -2019,19 +1997,11 @@ def freeze_run_config(
         schema_version = int(
             metadata.get("run_config_schema_version", 1)
         )
-        frozen_fields = (
-            RUN_CONFIG_FROZEN_FIELDS_V1
-            if schema_version == 1
-            else RUN_CONFIG_FROZEN_FIELDS_V2
-            if schema_version == 2
-            else RUN_CONFIG_FROZEN_FIELDS_V3
-            if schema_version == 3
-            else RUN_CONFIG_FROZEN_FIELDS_V4
-            if schema_version == 4
-            else RUN_CONFIG_FROZEN_FIELDS_V5
-            if schema_version == 5
-            else RUN_CONFIG_FROZEN_FIELDS
-        )
+        if schema_version < RUN_CONFIG_SCHEMA_VERSION:
+            raise ValueError(
+                "run_schema_not_resumable:sandbox_policy_v7_required"
+            )
+        frozen_fields = RUN_CONFIG_FROZEN_FIELDS
         missing = [
             field_name
             for field_name in frozen_fields
@@ -2059,6 +2029,26 @@ def freeze_run_config(
         resolved_config = Configuration(**configured_values)
     else:
         resolved_config = Configuration.from_runnable_config(frozen)
+    if resolved_config.sandbox_enabled:
+        from open_deep_research.sandbox.schema import (
+            load_policy_bundle,
+            policy_digest,
+            runtime_digest,
+        )
+
+        bundle = load_policy_bundle(resolved_config.sandbox_policy_path)
+        auth_user = frozen["configurable"].get("langgraph_auth_user") or {}
+        roles = set(auth_user.get("roles") or []) if isinstance(auth_user, dict) else set()
+        profile_id, profile = bundle.select_profile(roles)
+        resolved_config = resolved_config.model_copy(
+            update={
+                "sandbox_profile_id": profile_id,
+                "sandbox_policy_digest": policy_digest(bundle),
+                "sandbox_runtime_digest": runtime_digest(profile),
+            }
+        )
+        metadata["sandbox_deployment_id"] = bundle.deployment_id
+        metadata["sandbox_profile"] = profile.model_dump(mode="json")
     resolved = resolved_config.model_dump(mode="json")
     for field_name in RUN_CONFIG_FROZEN_FIELDS:
         frozen["configurable"][field_name] = resolved[field_name]

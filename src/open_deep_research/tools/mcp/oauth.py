@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
 from langchain_core.runnables import RunnableConfig
@@ -19,6 +22,15 @@ logger = logging.getLogger(__name__)
 
 _LEGACY_INTERACTION_REQUIRED = -32003
 """Pre-v2 server convention for "visit this URL to interact"; kept for older servers."""
+
+
+class MCPInteractionRequired(ToolException):
+    """Structured MCP interaction request forwarded to the approval layer."""
+
+    def __init__(self, message: str, interaction_url: str | None = None) -> None:
+        """Store a bounded message and validated interaction URL."""
+        super().__init__(message)
+        self.interaction_url = interaction_url
 
 
 async def exchange_mcp_subject_token(
@@ -59,6 +71,21 @@ async def exchange_mcp_subject_token(
 
 async def get_tokens(config: RunnableConfig) -> dict[str, Any] | None:
     """Retrieve a user's cached MCP tokens when they have not expired."""
+    metadata = config.get("metadata", {})
+    if metadata.get("sandbox_gateway_physical"):
+        vault = config.get("configurable", {}).get("_sandbox_credential_vault")
+        if not isinstance(vault, dict):
+            return None
+        tokens = vault.get("mcp_tokens")
+        if not isinstance(tokens, dict):
+            return None
+        expires_at = tokens.get("_expires_at")
+        if expires_at is not None and float(expires_at) <= datetime.now(
+            timezone.utc
+        ).timestamp():
+            vault.pop("mcp_tokens", None)
+            return None
+        return {key: value for key, value in tokens.items() if key != "_expires_at"}
     if not config.get("configurable", {}).get("thread_id"):
         return None
     user_id = config.get("metadata", {}).get("owner")
@@ -80,6 +107,19 @@ async def get_tokens(config: RunnableConfig) -> dict[str, Any] | None:
 
 async def set_tokens(config: RunnableConfig, tokens: dict[str, Any]) -> None:
     """Store MCP tokens in the configured per-user token store."""
+    metadata = config.get("metadata", {})
+    if metadata.get("sandbox_gateway_physical"):
+        configurable = config.setdefault("configurable", {})
+        vault = configurable.setdefault("_sandbox_credential_vault", {})
+        if not isinstance(vault, dict):
+            raise RuntimeError("sandbox_gateway_credential_vault_invalid")
+        value = dict(tokens)
+        if tokens.get("expires_in"):
+            value["_expires_at"] = datetime.now(timezone.utc).timestamp() + float(
+                tokens["expires_in"]
+            )
+        vault["mcp_tokens"] = value
+        return
     if not config.get("configurable", {}).get("thread_id"):
         return
     user_id = config.get("metadata", {}).get("owner")
@@ -135,6 +175,42 @@ def _interaction_required_message(code: int, error_data: Any) -> str | None:
     return None
 
 
+def _validated_interaction_url(value: str | None) -> str | None:
+    """Accept a bounded HTTPS OAuth URL without user-info or private IP literals."""
+    if not value or len(value) > 4096:
+        return None
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname
+        if (
+            parsed.scheme.lower() not in {"http", "https"}
+            or not host
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            return None
+        if parsed.scheme.lower() == "http" and host.lower() not in {
+            "localhost",
+            "127.0.0.1",
+            "::1",
+        }:
+            return None
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            address = None
+        if address is not None and not address.is_global and not address.is_loopback:
+            return None
+        netloc = host.lower()
+        if parsed.port:
+            netloc += f":{parsed.port}"
+        return urlunsplit(
+            (parsed.scheme.lower(), netloc, parsed.path or "/", parsed.query, "")
+        )
+    except (TypeError, ValueError):
+        return None
+
+
 def wrap_mcp_authenticate_tool(tool: StructuredTool) -> StructuredTool:
     """Translate MCP interaction-required failures into ToolException."""
     original_coroutine = tool.coroutine
@@ -152,7 +228,14 @@ def wrap_mcp_authenticate_tool(tool: StructuredTool) -> StructuredTool:
                 getattr(error_details, "code", None), error_data
             )
             if error_message is not None:
-                raise ToolException(error_message) from original_error
+                match = re.search(r"https?://[^\s]+", error_message)
+                interaction_url = _validated_interaction_url(
+                    match.group(0).rstrip(".,)") if match else None
+                )
+                raise MCPInteractionRequired(
+                    error_message,
+                    interaction_url,
+                ) from original_error
             raise
 
     tool.coroutine = authentication_wrapper
@@ -163,5 +246,6 @@ __all__ = [
     "fetch_tokens",
     "get_tokens",
     "set_tokens",
+    "MCPInteractionRequired",
     "wrap_mcp_authenticate_tool",
 ]

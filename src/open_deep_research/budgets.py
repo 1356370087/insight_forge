@@ -479,6 +479,10 @@ class BudgetGate:
         self.check_deadline("tool")
         self._reserve(op_key, BudgetDimension.TOOL_CALLS, 1)
 
+    def settle_tool_call(self, op_key: str) -> None:
+        """Count one authorized tool attempt exactly once."""
+        self._settle(op_key, 1)
+
     def reserve_fetch_call(self, op_key: str) -> None:
         """Pre-reserve one webpage fetch against the run fetch budget."""
         self._reserve(op_key, BudgetDimension.FETCH_CALLS, 1)

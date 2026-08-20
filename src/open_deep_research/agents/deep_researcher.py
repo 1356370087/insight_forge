@@ -8,7 +8,6 @@ import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from typing import Any, Literal, cast
 
-from langchain.chat_models import init_chat_model
 from langchain_core.messages import (
     AIMessage,
     BaseMessage,
@@ -728,10 +727,9 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
     
     # Configure model with structured output (retry is handled by the
     # observability retry wrapper at the call site).
-    clarification_model = (
-        init_chat_model(**model_config)
-        .with_structured_output(ClarifyWithUser, method="function_calling")
-    )
+    clarification_model = configurable_model.with_config(
+        model_config
+    ).with_structured_output(ClarifyWithUser, method="function_calling")
     
     # Step 3: Analyze whether clarification is needed
     summary_context = _format_conversation_summary(state.get("conversation_summary"))
@@ -955,10 +953,9 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
     
     # Configure model for structured research question generation (retry is
     # handled by the observability retry wrapper at the call site).
-    research_model = (
-        init_chat_model(**research_model_config)
-        .with_structured_output(ResearchQuestion, method="function_calling")
-    )
+    research_model = configurable_model.with_config(
+        research_model_config
+    ).with_structured_output(ResearchQuestion, method="function_calling")
     
     # Step 2: Generate structured research brief from user messages
     memory_context = state.get("memory_context") or ""
@@ -993,6 +990,7 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
     # Step 3: Initialize supervisor with research brief and instructions
     supervisor_prompt_state: SupervisorState = {
         "enable_async_research": configurable.enable_async_research,
+        "sandbox_enabled": configurable.sandbox_enabled,
         "coverage_contract": coverage_contract.model_dump(mode="json"),
         "research_risk_profile": risk_profile.model_dump(mode="json"),
     }
@@ -1040,6 +1038,7 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
                 ]
             },
             "enable_async_research": configurable.enable_async_research,
+            "sandbox_enabled": configurable.sandbox_enabled,
             "memory_context": state.get("memory_context"),
         }
     )
@@ -1267,6 +1266,7 @@ def build_supervisor_tools(state: SupervisorState) -> list[Tool]:
     )
     deps = SupervisorToolDeps(
         enable_async_research=bool(state.get("enable_async_research", False)),
+        sandbox_enabled=bool(state.get("sandbox_enabled", False)),
         coverage_contract=coverage_contract,
         risk_profile=risk_profile,
         memory_context=state.get("memory_context"),
@@ -1640,6 +1640,11 @@ async def _execute_supervisor_tools(
         most_recent_message.tool_calls,
         coverage_contract,
     )
+    if configurable.sandbox_enabled:
+        if not state.get("enable_async_research", False):
+            raise RuntimeError("sandbox_requires_async_research")
+        if any(call.get("name") == "ConductResearch" for call in tool_calls):
+            raise RuntimeError("sandbox_sync_research_forbidden")
 
     if (
         state.get("research_iterations", 0)

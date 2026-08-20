@@ -335,6 +335,58 @@ class QueryEngine:
         self._lease_heartbeat_task = asyncio.create_task(self._lease_heartbeat())
         return lease.fence_token
 
+    async def _register_sandbox_gateway(self) -> None:
+        """Register the frozen run and ephemeral credentials before any model call."""
+        configurable = Configuration.from_runnable_config(self.config)
+        if not configurable.sandbox_enabled:
+            return
+        if self.run_fence_token is None:
+            raise RuntimeError("sandbox_gateway_registration_requires_fence")
+        from open_deep_research.sandbox.gateway_client import (
+            SandboxGatewayControlClient,
+            split_gateway_registration,
+        )
+
+        frozen, credentials = split_gateway_registration(dict(self.config))
+        await SandboxGatewayControlClient(configurable).register_run(
+            run_id=self.run_id,
+            fence_token=self.run_fence_token,
+            frozen_config=frozen,
+            api_keys=credentials,
+        )
+
+    async def _unregister_sandbox_gateway(self) -> None:
+        """Best-effort erasure of the run's in-memory Gateway credential vault."""
+        configurable = Configuration.from_runnable_config(self.config)
+        if not configurable.sandbox_enabled or self.run_fence_token is None:
+            return
+        try:
+            from open_deep_research.sandbox.gateway_client import (
+                SandboxGatewayControlClient,
+            )
+
+            await SandboxGatewayControlClient(configurable).unregister_run(
+                run_id=self.run_id,
+                fence_token=self.run_fence_token,
+            )
+        except Exception:
+            # Capability expiry and Controller termination remain authoritative
+            # if Gateway is unavailable during terminal cleanup.
+            return
+
+    async def _shutdown_teammates_before_gateway_release(self) -> None:
+        """Stop every task container before erasing its Gateway run context."""
+        from open_deep_research.tasks.teammate_pool import shutdown_teammate_pool
+
+        cleanup = asyncio.create_task(shutdown_teammate_pool(self.config))
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            # A caller cancellation must not strand a Docker thread/container
+            # or erase the Gateway context while that Worker is still alive.
+            await cleanup
+            raise
+
     async def _lease_heartbeat(self) -> None:
         configurable = Configuration.from_runnable_config(self.config)
         while self.run_fence_token is not None:
@@ -456,17 +508,7 @@ class QueryEngine:
             raise RuntimeError("run_not_recoverable")
 
     def _clear_run_resources(self) -> None:
-        """Best-effort cleanup of process-local resources owned by this run."""
-        try:
-            from open_deep_research.tasks.domain_approvals import (
-                get_domain_approval_registry,
-            )
-
-            get_domain_approval_registry().clear_run(self.run_id)
-        except Exception:
-            # Cleanup must never replace the terminal result of a completed or
-            # already-failed research run.
-            pass
+        """Durable V7 approvals require no process-local cleanup."""
 
     @classmethod
     def load(
@@ -481,7 +523,9 @@ class QueryEngine:
         bootstrap_store = RunContextStore(run_id, runs_dir=runs_dir)
         manifest = bootstrap_store.load_manifest()
         if int(manifest.schema_version) < 2:
-            raise RunConfigurationError("run_schema_not_resumable")
+            raise RunConfigurationError(
+                "run_schema_not_resumable:sandbox_policy_v7_required"
+            )
         if manifest.coordination_backend != "file_mailbox":
             raise JournalCorruptedError("legacy_coordination_backend_not_resumable")
         persisted = manifest.config
@@ -499,33 +543,9 @@ class QueryEngine:
         supplied_metadata = dict((config or {}).get("metadata", {}))
         frozen = persisted_metadata.get("runtime_config_frozen") is True
         if not frozen:
-            if not legacy_migration:
-                raise RunConfigurationError("legacy_run_config_not_frozen")
-            missing = sorted(
-                set(RUN_CONFIG_FROZEN_FIELDS) - set(supplied_configurable)
-            )
-            if missing:
-                raise RunConfigurationError(
-                    "legacy_migration_requires_full_config:"
-                    + ",".join(missing)
-                )
-            migration_config: RunnableConfig = {
-                "configurable": {
-                    **supplied_configurable,
-                    "thread_id": run_id,
-                    "runs_dir": runs_dir,
-                },
-                "metadata": {
-                    **supplied_metadata,
-                    "run_id": run_id,
-                    "legacy_config_migration": True,
-                },
-            }
-            return cls(
-                freeze_run_config(
-                    migration_config,
-                    prefer_configurable=True,
-                )
+            del legacy_migration
+            raise RunConfigurationError(
+                "run_schema_not_resumable:sandbox_policy_v7_required"
             )
 
         persisted_run_config: RunnableConfig = {
@@ -535,6 +555,8 @@ class QueryEngine:
         try:
             persisted_run_config = freeze_run_config(persisted_run_config)
         except ValueError as exc:
+            if str(exc).startswith("run_schema_not_resumable:"):
+                raise RunConfigurationError(str(exc)) from exc
             raise JournalCorruptedError(str(exc)) from exc
         if (
             manifest.config_fingerprint
@@ -1229,10 +1251,17 @@ class QueryEngine:
         self.messages = state["messages"]
         try:
             await self.acquire_run_lease()
+            await self._register_sandbox_gateway()
             async for event in self._stream_new_message(state):
                 yield event
         finally:
-            await self.release_run_lease()
+            try:
+                await self._shutdown_teammates_before_gateway_release()
+            finally:
+                try:
+                    await self._unregister_sandbox_gateway()
+                finally:
+                    await self.release_run_lease()
 
     async def _stream_new_message(
         self,
@@ -1275,6 +1304,7 @@ class QueryEngine:
         self._validate_resume_manifest(self.context_store.load_manifest())
         try:
             await self.acquire_run_lease()
+            await self._register_sandbox_gateway()
             replay = self.context_store.replay()
             self._validate_resume_manifest(replay.manifest)
             self.persistence_degraded = replay.manifest.persistence_degraded
@@ -1367,7 +1397,13 @@ class QueryEngine:
             ):
                 yield event
         finally:
-            await self.release_run_lease()
+            try:
+                await self._shutdown_teammates_before_gateway_release()
+            finally:
+                try:
+                    await self._unregister_sandbox_gateway()
+                finally:
+                    await self.release_run_lease()
 
     async def _stream_execution(
         self,
@@ -2868,6 +2904,7 @@ class QueryEngine:
     ) -> dict[str, Any]:
         from open_deep_research.agents import deep_researcher as graph
 
+        runtime_configuration = Configuration.from_runnable_config(self.config)
         base_state: dict[str, Any] = {
             "supervisor_messages": list(main_state.get("supervisor_messages", [])),
             "research_brief": main_state.get("research_brief", ""),
@@ -2887,7 +2924,8 @@ class QueryEngine:
             "document_registry": list(main_state.get("document_registry", [])),
             "evidence_registry": list(main_state.get("evidence_registry", [])),
             "web_research_iterations": list(main_state.get("web_research_iterations", [])),
-            "enable_async_research": main_state.get("enable_async_research", False),
+            "enable_async_research": runtime_configuration.enable_async_research,
+            "sandbox_enabled": runtime_configuration.sandbox_enabled,
             "memory_context": main_state.get("memory_context"),
             "approved_research_plan": main_state.get("approved_research_plan"),
             "human_feedback": list(self.human_feedback),
@@ -2903,6 +2941,10 @@ class QueryEngine:
             ),
         }
         supervisor_state = {**base_state, **(restored_state or {})}
+        supervisor_state["enable_async_research"] = (
+            runtime_configuration.enable_async_research
+        )
+        supervisor_state["sandbox_enabled"] = runtime_configuration.sandbox_enabled
         # The authoritative brief always wins over journal/state caches.
         if self.context_store is not None and self.context_store.brief_path.exists():
             supervisor_state["research_brief"] = self.context_store.load_research_brief()
@@ -2931,6 +2973,7 @@ class QueryEngine:
                     ),
                     "research_iterations": 0,
                     "enable_async_research": supervisor_state["enable_async_research"],
+                    "sandbox_enabled": supervisor_state["sandbox_enabled"],
                     "memory_context": supervisor_state.get("memory_context"),
                     "approved_research_plan": supervisor_state.get("approved_research_plan"),
                     "applied_query_event_ids": {

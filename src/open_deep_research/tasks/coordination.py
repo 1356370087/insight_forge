@@ -2,13 +2,9 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
-import time
 from pathlib import Path
-from typing import Any
 
-import portalocker
 from langchain_core.runnables import RunnableConfig
 
 from open_deep_research.configuration import Configuration
@@ -17,8 +13,6 @@ from open_deep_research.tasks.mailbox import (
     CoordinationError,
     FileMailbox,
     MailboxMessage,
-    atomic_write_json,
-    read_json_file,
     validate_component,
 )
 from open_deep_research.tasks.state import TaskSnapshot, get_task_state_store
@@ -166,44 +160,3 @@ async def ack_lead_updates(
             consumer_id=consumer_id,
             message_ids=message_ids,
         )
-
-
-class FileDomainDecisionStore:
-    """Locked persistent cache for per-run domain approvals."""
-
-    def __init__(self, configurable: Configuration, run_id: str) -> None:
-        """Initialize the run-scoped decision document."""
-        safe_run_id = validate_component(run_id, "run_id")
-        self.root = Path(configurable.runs_dir).resolve() / safe_run_id / "coordination"
-        self.path = self.root / "domain_decisions.json"
-        self.lock_path = self.root / "domain_decisions.lock"
-        self.timeout = configurable.mailbox_lock_timeout_seconds
-
-    def _update(self, domain: str, allowed: bool) -> None:
-        self.root.mkdir(parents=True, exist_ok=True)
-        with portalocker.Lock(str(self.lock_path), mode="a+b", timeout=self.timeout):
-            payload: dict[str, Any] = {"schema_version": 1, "decisions": {}}
-            if self.path.exists():
-                payload = read_json_file(self.path)
-            payload.setdefault("decisions", {})[domain.lower()] = {
-                "allowed": allowed,
-                "updated_at": time.time(),
-            }
-            atomic_write_json(self.path, payload)
-
-    async def record(self, domain: str, allowed: bool) -> None:
-        """Persist one allow/deny decision."""
-        await asyncio.to_thread(self._update, domain, allowed)
-
-    async def get(self, domain: str) -> bool | None:
-        """Return a persisted decision when available."""
-        def read_locked() -> bool | None:
-            self.root.mkdir(parents=True, exist_ok=True)
-            with portalocker.Lock(str(self.lock_path), mode="a+b", timeout=self.timeout):
-                if not self.path.exists():
-                    return None
-                payload = read_json_file(self.path)
-                decision = payload.get("decisions", {}).get(domain.lower())
-                return None if decision is None else bool(decision["allowed"])
-
-        return await asyncio.to_thread(read_locked)

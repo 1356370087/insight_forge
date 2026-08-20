@@ -5,6 +5,7 @@ from __future__ import annotations
 from langchain_core.runnables import RunnableConfig
 
 from open_deep_research.configuration import Configuration, SearchAPI
+from open_deep_research.sandbox.policy import network_policy_mode
 
 
 def _configuration(config: RunnableConfig) -> Configuration:
@@ -15,7 +16,7 @@ def provider_search_enabled(config: RunnableConfig, provider: SearchAPI) -> bool
     """Return whether a legacy/shadow provider search tool is enabled."""
     configurable = _configuration(config)
     return (
-        configurable.sandbox_network_mode != "no-network"
+        network_policy_mode(configurable) != "offline"
         and configurable.web_pipeline_mode in {"legacy", "shadow"}
         and SearchAPI(configurable.search_api) is provider
     )

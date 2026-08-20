@@ -12,7 +12,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Protocol, cast
 
-from langchain.chat_models import init_chat_model
 from langchain_core.messages import BaseMessage, HumanMessage, get_buffer_string
 from langchain_core.runnables import RunnableConfig
 
@@ -219,16 +218,17 @@ class ReportContext:
     def build_structured_model(self, schema, *, model_name: str | None = None):
         """Construct a writer model bound to a Pydantic schema for structured output.
 
-        Mirrors the webpage-summarization pattern in ``tools/utils.py``: build a
-        chat model via ``init_chat_model`` then bind ``.with_structured_output``.
+        Reuse the process model template, then bind structured output.
         """
         resolved_model = model_name or self.configurable.final_report_model
-        model = init_chat_model(**build_model_config(
-            resolved_model,
-            self.configurable.final_report_model_max_tokens,
-            self.config,
-            role="final_report",
-        ))
+        model = _writer_model_template.with_config(
+            build_model_config(
+                resolved_model,
+                self.configurable.final_report_model_max_tokens,
+                self.config,
+                role="final_report",
+            )
+        )
         return model.with_structured_output(schema, method="function_calling")
 
     async def invoke_writer_with_output_recovery(

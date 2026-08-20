@@ -14,12 +14,7 @@ from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
 from open_deep_research.configuration import Configuration
-from open_deep_research.tasks.coordination import (
-    FileDomainDecisionStore,
-    get_mailbox,
-    publish_task_update,
-)
-from open_deep_research.tasks.domain_approvals import get_domain_approval_registry
+from open_deep_research.tasks.coordination import get_mailbox, publish_task_update
 from open_deep_research.tasks.events import EventType
 from open_deep_research.tasks.lease import LeaderLeaseManager
 from open_deep_research.tasks.mailbox import (
@@ -61,6 +56,7 @@ class TeamFile(BaseModel):
 class _RuntimeTeammate:
     descriptor: TeammateDescriptor
     loop_task: asyncio.Task[None]
+    active_task: asyncio.Task[None] | None = None
 
 
 class TeammatePool:
@@ -102,6 +98,8 @@ class TeammatePool:
         self.fence_token: int | None = (
             int(inherited_token) if inherited_token is not None else None
         )
+        if self.fence_token is not None:
+            self.lease.fence_token = self.fence_token
         self._started = False
         self._stopping = False
 
@@ -194,6 +192,29 @@ class TeammatePool:
                             )
                         except Exception:
                             pass
+                        if (
+                            self.configurable.sandbox_enabled
+                            and record.container_id
+                        ):
+                            try:
+                                from open_deep_research.sandbox.controller_client import (
+                                    SandboxControllerClient,
+                                )
+                                from open_deep_research.sandbox.schema import (
+                                    load_policy_bundle,
+                                )
+
+                                bundle = load_policy_bundle(
+                                    self.configurable.sandbox_policy_path
+                                )
+                                await SandboxControllerClient(
+                                    self.configurable,
+                                    bundle,
+                                ).stop_task(record.container_id)
+                            except Exception as stop_exc:
+                                record.error_message = (
+                                    f"Lead lease lost; sandbox stop failed: {stop_exc}"
+                                )[:1000]
                 for runtime in self._runtimes.values():
                     runtime.loop_task.cancel()
                 self._started = False
@@ -253,6 +274,14 @@ class TeammatePool:
                     pending_update_instructions=list(snapshot.pending_update_instructions),
                     trace_parent_span_id=snapshot.trace_parent_span_id,
                     langfuse_parent_span_id=snapshot.langfuse_parent_span_id,
+                    sandbox_enabled=bool(snapshot.sandbox.get("enabled")),
+                    workspace_path=snapshot.sandbox.get("workspace_path"),
+                    container_id=snapshot.sandbox.get("container_id"),
+                    sandbox_network_mode=snapshot.sandbox.get("network_mode"),
+                    output_archive_path=snapshot.sandbox.get(
+                        "output_archive_path"
+                    ),
+                    last_sandbox_event=snapshot.sandbox.get("last_event"),
                 ))
         await self._dispatch_pending()
 
@@ -334,15 +363,6 @@ class TeammatePool:
             await record.control_queue.put({"type": "update", "instruction": instruction})
         elif message.type == "cancel_request" and record is not None:
             record.cancelled.set()
-        elif message.type == "domain_decision" and record is not None:
-            domain = str(message.payload["domain"])
-            allowed = bool(message.payload["allow"])
-            await FileDomainDecisionStore(self.configurable, self.run_id).record(domain, allowed)
-            from open_deep_research.tasks.domain_approvals import (
-                get_domain_approval_registry,
-            )
-
-            get_domain_approval_registry().record_decision(self.run_id, domain, allowed)
         elif message.type == "shutdown_request":
             if record is not None:
                 record.cancelled.set()
@@ -377,6 +397,9 @@ class TeammatePool:
                         descriptor.updated_at = time.time()
                         await self._write_descriptor(descriptor)
                         active = asyncio.create_task(self._execute_task(record))
+                        runtime = self._runtimes.get(descriptor.teammate_id)
+                        if runtime is not None:
+                            runtime.active_task = active
                 elif await self._handle_control(descriptor, message):
                     ack_ids.append(message.message_id)
                     await self.mailbox.ack(
@@ -403,6 +426,9 @@ class TeammatePool:
                 except Exception:
                     pass
                 active = None
+                runtime = self._runtimes.get(descriptor.teammate_id)
+                if runtime is not None:
+                    runtime.active_task = None
                 descriptor.status = "idle"
                 descriptor.current_task_id = None
                 descriptor.tasks_completed += 1
@@ -443,6 +469,17 @@ class TeammatePool:
 
     async def shutdown(self, timeout_seconds: float = 10) -> None:
         """Request graceful teammate shutdown, then cancel stragglers."""
+        active_tasks: list[asyncio.Task[None]] = []
+        for runtime in self._runtimes.values():
+            if runtime.descriptor.current_task_id:
+                record = self.registry.get(runtime.descriptor.current_task_id)
+                if record is not None:
+                    record.cancelled.set()
+            if runtime.active_task is not None and not runtime.active_task.done():
+                runtime.active_task.cancel()
+                active_tasks.append(runtime.active_task)
+        if active_tasks:
+            await asyncio.gather(*active_tasks, return_exceptions=True)
         for teammate_id in self._runtimes:
             await self.mailbox.send(
                 recipient=teammate_id,
@@ -468,7 +505,6 @@ class TeammatePool:
         if self._owns_lease_lifecycle and self.fence_token is not None:
             await self.lease.release(expected_fence_token=self.fence_token)
         self.fence_token = None
-        get_domain_approval_registry().clear_run(self.run_id)
 
 
 _POOLS: dict[tuple[str, str], TeammatePool] = {}

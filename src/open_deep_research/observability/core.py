@@ -396,6 +396,40 @@ class TokenUsage:
         )
 
 
+def _is_sandbox_gateway_proxy(model: Any) -> bool:
+    """Recognize a Gateway proxy through LangChain binding wrappers."""
+    pending = [model]
+    seen: set[int] = set()
+    while pending:
+        candidate = pending.pop()
+        if candidate is None or id(candidate) in seen:
+            continue
+        seen.add(id(candidate))
+        if getattr(candidate, "is_sandbox_gateway_model", False):
+            return True
+        if isinstance(candidate, dict):
+            pending.extend(candidate.values())
+            continue
+        if isinstance(candidate, list | tuple | set | frozenset):
+            pending.extend(candidate)
+            continue
+        for attribute in (
+            "bound",
+            "model",
+            "runnable",
+            "first",
+            "middle",
+            "last",
+            "steps",
+            "steps__",
+            "mapper",
+        ):
+            nested = getattr(candidate, attribute, None)
+            if nested is not None and nested is not candidate:
+                pending.append(nested)
+    return False
+
+
 class UsageCaptureCallback(BaseCallbackHandler):
     """Capture raw provider usage before structured-output parsers discard it."""
 
@@ -429,11 +463,14 @@ class UsageCaptureCallback(BaseCallbackHandler):
         )
         self._estimated_input = 0
         self._estimated_output = 1
-        self._budget_gate: BudgetGate | None = budget_gate
+        remote_budget_authority = _is_sandbox_gateway_proxy(model)
+        self._budget_gate: BudgetGate | None = (
+            None if remote_budget_authority else budget_gate
+        )
         if recorder is not None:
             metadata = (config or {}).get("metadata") or {}
             run_id = str(metadata.get("run_id") or "")
-            if run_id and self._budget_gate is None:
+            if run_id and self._budget_gate is None and not remote_budget_authority:
                 started_at = None
                 if recorder.store is not None:
                     stored = recorder._safe(recorder.store.get_run, run_id) or {}
@@ -634,6 +671,15 @@ class UsageCaptureCallback(BaseCallbackHandler):
                 model_name=self._model_name,
             )
             self._settled_budget_keys.add(operation_key)
+
+    async def flush_budget(self) -> None:
+        """Flush an optional async remote authority at physical boundaries."""
+        flush = getattr(self._budget_gate, "flush_pending", None)
+        if not callable(flush):
+            return
+        result = flush()
+        if inspect.isawaitable(result):
+            await result
 
 
 def _estimated_usage(model: Any, messages: list[BaseMessage], response: Any) -> TokenUsage:
@@ -2733,14 +2779,26 @@ async def _ainvoke_model(
     )
     invoke_config = _langchain_invoke_config(recorder, config, capture)
 
-    async def call_model() -> Any:
+    async def begin_attempt() -> None:
         capture.begin_physical_attempt()
+        await capture.flush_budget()
+
+    async def settle_success(response: Any) -> None:
+        capture.settle_outer_success(response)
+        await capture.flush_budget()
+
+    async def settle_failure(exc: BaseException) -> None:
+        capture.settle_outer_failure(exc)
+        await capture.flush_budget()
+
+    async def call_model() -> Any:
+        await begin_attempt()
         try:
             response = await _call_model_ainvoke(model, messages, invoke_config)
-            capture.settle_outer_success(response)
+            await settle_success(response)
             return response
         except BaseException as exc:
-            capture.settle_outer_failure(exc)
+            await settle_failure(exc)
             setattr(exc, "usage_capture_records", tuple(capture.records))
             raise
 
@@ -2769,7 +2827,7 @@ async def _ainvoke_model(
     iterator: Any = None
     received_first = False
     started = monotonic_time()
-    capture.begin_physical_attempt()
+    await begin_attempt()
     try:
         try:
             stream_signature = inspect.signature(stream_method)
@@ -2810,7 +2868,7 @@ async def _ainvoke_model(
                 merged = merged + chunk
             if shape_ok:
                 response = message_chunk_to_message(merged)
-                capture.settle_outer_success(response)
+                await settle_success(response)
                 return _ModelInvocationResult(
                     response,
                     ttft_seconds=max(0.0, first_elapsed),
@@ -2821,7 +2879,7 @@ async def _ainvoke_model(
         else:
             trailing = [item async for item in iterator]
             if not trailing:
-                capture.settle_outer_success(first)
+                await settle_success(first)
                 return _ModelInvocationResult(
                     first,
                     probe_status="non_streaming_wrapper",
@@ -2836,7 +2894,7 @@ async def _ainvoke_model(
                 isinstance(item, type(first)) for item in trailing
             ):
                 response = trailing[-1]
-                capture.settle_outer_success(response)
+                await settle_success(response)
                 return _ModelInvocationResult(
                     response,
                     ttft_seconds=max(0.0, first_elapsed),
@@ -2851,7 +2909,7 @@ async def _ainvoke_model(
         if iterator is not None:
             await _close_async_iterator(iterator)
             iterator = None
-        capture.settle_outer_failure(
+        await settle_failure(
             RuntimeError("stream disconnected before final usage metadata")
         )
         return _ModelInvocationResult(
@@ -2864,14 +2922,14 @@ async def _ainvoke_model(
         if not received_first and (
             probe_mode == "shadow" or _streaming_unsupported(exc)
         ):
-            capture.settle_outer_failure(exc)
+            await settle_failure(exc)
             return _ModelInvocationResult(
                 await call_model(),
                 probe_status="fallback",
                 usage_records=tuple(capture.records),
                 usage_capture=capture,
             )
-        capture.settle_outer_failure(exc)
+        await settle_failure(exc)
         setattr(exc, "usage_capture_records", tuple(capture.records))
         raise
     finally:
@@ -3542,6 +3600,14 @@ async def invoke_model_with_retry_observability(
                     dedupe_key=f"activity:model:{activity_call_id}:completed",
                     update_run_summary=True,
                 )
+            if (
+                invocation_result.ttft_seconds is not None
+                and isinstance(response, BaseMessage)
+            ):
+                response.response_metadata = {
+                    **response.response_metadata,
+                    "provider_ttft_ms": invocation_result.ttft_seconds * 1000,
+                }
             return response
 
 

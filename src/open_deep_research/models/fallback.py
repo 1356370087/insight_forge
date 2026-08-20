@@ -95,6 +95,14 @@ def build_model_candidate_chain(
     model: Any,
 ) -> list[ModelCandidate]:
     """Build a stable, de-duplicated candidate chain for one model role."""
+    if getattr(model, "is_sandbox_gateway_model", False):
+        return [
+            ModelCandidate(
+                model_id=primary_model,
+                model=model.for_role(role),
+                model_config={"model": primary_model, "max_tokens": max_tokens},
+            )
+        ]
     candidates: list[ModelCandidate] = []
     seen: set[str] = set()
     for model_id in (primary_model, *fallback_models):

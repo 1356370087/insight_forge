@@ -11,7 +11,6 @@ from datetime import date
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from langchain.chat_models import init_chat_model
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field, model_validator
@@ -312,7 +311,11 @@ def _build_quality_model(configurable: Configuration, config: RunnableConfig):
     )
     if kwargs.get("api_key") is None:
         kwargs.pop("api_key")
-    model = init_chat_model(**kwargs)
+    from open_deep_research.models.resolution import (
+        get_configurable_model_template,
+    )
+
+    model = get_configurable_model_template().with_config(kwargs)
     if is_dashscope:
         return model.bind(response_format={"type": "json_object"})
     return model

@@ -7,7 +7,6 @@ with handlers backed by the persistent teammate pool and file Mailbox.
 
 from __future__ import annotations
 
-import asyncio
 import time
 from typing import Any, Callable, Coroutine, Optional
 
@@ -21,11 +20,9 @@ from open_deep_research.events.public import (
 )
 from open_deep_research.observability import current_span_ids, get_trace_recorder
 from open_deep_research.observability.telemetry import get_prometheus_metrics
-from open_deep_research.sandbox.manager import stop_sandbox_container
-from open_deep_research.tasks.coordination import (
-    FileDomainDecisionStore,
-    publish_task_update,
-)
+from open_deep_research.sandbox.controller_client import SandboxControllerClient
+from open_deep_research.sandbox.schema import load_policy_bundle
+from open_deep_research.tasks.coordination import publish_task_update
 from open_deep_research.tasks.events import EventType, JSONLEventWriter, ResearchEvent
 from open_deep_research.tasks.registry import (
     TaskRecord,
@@ -196,9 +193,8 @@ def format_task_snapshot_for_context(snapshot: TaskSnapshot) -> str:
             f"Phase: {snapshot.phase.value}\n"
             f"Elapsed: {snapshot.elapsed_seconds:.1f}s\n"
             f"Domain awaiting approval: {domain}\n"
-            f"Use ApproveResearchDomain(task_id={snapshot.task_id}, "
-            f"domain='{domain}', allow=True/False) to allow or deny. "
-            f"The task is paused until you decide.\n"
+            "A durable human security approval is required; resolve it through "
+            "the run security-approvals API or workspace approval card.\n"
         )
     return (
         f"### {snapshot.task_id} - {snapshot.status.value.upper()}\n"
@@ -299,9 +295,12 @@ async def handle_start_research_task(
     )
     if memory_context:
         record.memory_context = memory_context
-    if configurable.enable_docker_sandbox:
+    if configurable.sandbox_enabled:
         record.sandbox_enabled = True
-        record.sandbox_network_mode = configurable.sandbox_network_mode
+        from open_deep_research.sandbox.schema import resolve_profile
+
+        _bundle, _profile_id, profile = resolve_profile(configurable)
+        record.sandbox_network_mode = profile.network.mode
 
     # Emit creation event
     if event_writer is not None:
@@ -606,7 +605,11 @@ async def handle_cancel_research_task(
         stop_error = None
         if record.container_id:
             try:
-                await asyncio.to_thread(stop_sandbox_container, record.container_id)
+                if effective_config.sandbox_enabled:
+                    bundle = load_policy_bundle(effective_config.sandbox_policy_path)
+                    await SandboxControllerClient(effective_config, bundle).stop_task(
+                        record.container_id
+                    )
             except Exception as exc:
                 stop_error = str(exc)
 
@@ -636,13 +639,6 @@ async def handle_cancel_research_task(
         await _publish_snapshot_update(
             effective_config, snapshot, EventType.TASK_CANCELLED, event_writer
         )
-        if record.run_id and registry.count_active(run_id=record.run_id) == 0:
-            from open_deep_research.tasks.domain_approvals import (
-                get_domain_approval_registry,
-            )
-
-            get_domain_approval_registry().clear_run(record.run_id)
-
         if stop_error:
             results.append(f"- {task_id}: cancelled; sandbox stop failed: {stop_error}")
         else:
@@ -651,103 +647,6 @@ async def handle_cancel_research_task(
     return ToolMessage(
         content="Cancellation results:\n" + "\n".join(results),
         name="CancelResearchTask",
-        tool_call_id=tool_call["id"],
-    )
-
-
-async def handle_approve_research_domain(
-    tool_call: dict[str, Any],
-    config: RunnableConfig,
-    registry: TaskRegistry,
-    event_writer: Optional[JSONLEventWriter] = None,
-    state_store: Optional[TaskStateStore] = None,
-) -> ToolMessage:
-    """Record the supervisor's allow/deny decision for a paused task's domain.
-
-    Resolves the pending ``asyncio.Future`` that the in-process governance layer
-    is awaiting, flips the task back to ``RUNNING``, and caches the decision for
-    the rest of the run. Also pushes a ``domain_decision`` marker onto the
-    control queue (informational; the future is the real resume signal).
-    """
-    task_id: str = tool_call["args"]["task_id"]
-    domain: str = tool_call["args"]["domain"]
-    allow: bool = tool_call["args"]["allow"]
-
-    current_run_id = str(config.get("metadata", {}).get("run_id", "default"))
-    record = registry.get(task_id)
-    if record is None or record.run_id not in {"", current_run_id}:
-        return ToolMessage(
-            content=f"Task {task_id} not found.",
-            name="ApproveResearchDomain",
-            tool_call_id=tool_call["id"],
-        )
-
-    if record.status not in (TaskStatus.WAITING_FOR_CONFIRMATION, TaskStatus.RUNNING):
-        return ToolMessage(
-            content=(
-                f"Task {task_id} is {record.status.value}; only waiting or running "
-                f"tasks accept domain decisions."
-            ),
-            name="ApproveResearchDomain",
-            tool_call_id=tool_call["id"],
-        )
-
-    configurable = Configuration.from_runnable_config(config)
-    if record.run_id:
-        await FileDomainDecisionStore(configurable, record.run_id).record(domain, allow)
-        from open_deep_research.tasks.teammate_pool import find_active_teammate_pool
-
-        pool = find_active_teammate_pool(record.run_id)
-        if pool is not None:
-            await pool.send_control(
-                task_id=task_id,
-                message_type="domain_decision",
-                payload={"domain": domain.lower(), "allow": allow},
-                priority=0,
-            )
-        else:
-            from open_deep_research.tasks.domain_approvals import (
-                get_domain_approval_registry,
-            )
-
-            get_domain_approval_registry().record_decision(record.run_id, domain, allow)
-    else:
-        from open_deep_research.tasks.domain_approvals import (
-            get_domain_approval_registry,
-        )
-
-        get_domain_approval_registry().record_decision(record.run_id, domain, allow)
-
-    if record.status == TaskStatus.WAITING_FOR_CONFIRMATION:
-        registry.update_status(task_id, TaskStatus.RUNNING)
-    record.pending_domain = None
-    record.pending_domain_tool = None
-
-    if event_writer is not None:
-        event_writer.write(ResearchEvent(
-            event_type=EventType.TASK_DOMAIN_DECISION,
-            task_id=task_id,
-            run_id=event_writer.run_id,
-            phase=record.phase.value,
-            data={"domain": domain.lower(), "allow": allow},
-        ))
-
-    store = state_store or get_task_state_store(configurable)
-    snapshot = await store.update_from_record(
-        record,
-        fence_token=_run_fence_token(config),
-    )
-    await _publish_snapshot_update(
-        configurable, snapshot, EventType.TASK_DOMAIN_DECISION, event_writer
-    )
-
-    return ToolMessage(
-        content=(
-            f"Domain '{domain}' {'approved' if allow else 'denied'} for task "
-            f"{task_id} (run {record.run_id}). The task will "
-            f"{'resume' if allow else 'skip that fetch'}."
-        ),
-        name="ApproveResearchDomain",
         tool_call_id=tool_call["id"],
     )
 

@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import random
 from dataclasses import dataclass
 from enum import Enum
@@ -40,15 +39,9 @@ from open_deep_research.sandbox.policy import (
     allowed_domains,
     egress_host_from_url,
     is_enforced_mode,
+    network_policy_mode,
 )
-from open_deep_research.tasks.domain_approvals import get_domain_approval_registry
 from open_deep_research.tasks.events import EventType, JSONLEventWriter, ResearchEvent
-from open_deep_research.tasks.executor import emit_task_state_change
-from open_deep_research.tasks.registry import (
-    TaskRecord,
-    TaskStatus,
-    get_task_registry,
-)
 from open_deep_research.tools.base import (
     Tool,
     ToolContext,
@@ -98,6 +91,7 @@ class ToolErrorType(str, Enum):
     egress_domain_denied = "egress_domain_denied"
     egress_domain_pending = "egress_domain_pending"
     sensitive_tool_approval_required = "sensitive_tool_approval_required"
+    interaction_required = "interaction_required"
     runtime_missing_result = "runtime_missing_result"
     runtime_duplicate_result = "runtime_duplicate_result"
     runtime_hook_error = "runtime_hook_error"
@@ -253,6 +247,8 @@ def classify_retryable_error(exc: BaseException) -> tuple[ToolErrorType, bool]:
 
     # 4. LangChain ToolException carrying HTTP hints in its message.
     if isinstance(exc, ToolException):
+        if getattr(exc, "interaction_url", None):
+            return ToolErrorType.interaction_required, False
         msg = str(exc).lower()
         if "429" in msg or "rate" in msg:
             return ToolErrorType.rate_limited, True
@@ -913,49 +909,13 @@ def _serialize_governed_output(
     return f"{content[:limit]}\n[truncated {omitted} chars]"
 
 
-def _find_task_for_run(
-    registry: Any, run_id: str, task_id: Optional[str] = None
-) -> Optional[TaskRecord]:
-    """Locate the active task for a run (used to pause it for a domain decision).
-
-    Prefers an explicit ``task_id`` threaded via config metadata; otherwise falls
-    back to any RUNNING/WAITING task for the run, preferring a WAITING one.
-    """
-    if task_id:
-        rec = registry.get(task_id)
-        if rec is not None and rec.run_id == run_id and rec.status in (
-            TaskStatus.RUNNING,
-            TaskStatus.WAITING_FOR_CONFIRMATION,
-        ):
-            return rec
-    candidates = [
-        r
-        for r in registry.list(run_id=run_id)
-        if r.status in (TaskStatus.RUNNING, TaskStatus.WAITING_FOR_CONFIRMATION)
-    ]
-    if not candidates:
-        return None
-    return next(
-        (r for r in candidates if r.status == TaskStatus.WAITING_FOR_CONFIRMATION),
-        candidates[0],
-    )
-
-
 async def check_egress_domain(
     tool_call: dict[str, Any],
     tool: Tool,
     args: dict[str, Any],
     config: RunnableConfig,
 ) -> Optional[ToolMessage]:
-    """Enforce the egress domain allowlist for URL-bearing tools.
-
-    Returns ``None`` to allow the call to proceed, or a ``ToolMessage`` carrying a
-    structured :class:`ToolError` to block it. In the in-process path an undecided
-    domain **blocks inline** on a per-run ``asyncio.Future`` (the researcher task
-    pauses as ``WAITING_FOR_CONFIRMATION`` until the supervisor decides); in the
-    Docker sandbox path the worker cannot share host asyncio state, so it returns
-    a pending ``ToolError`` telling the researcher to request approval and retry.
-    """
+    """Enforce the V7 egress allowlist, denying unknown hosts during M1."""
     tool_call_id = tool_call["id"]
     configurable = Configuration.from_runnable_config(config)
     if not is_enforced_mode(configurable):
@@ -964,133 +924,41 @@ async def check_egress_domain(
     host = _egress_host_for_tool(tool, args, configurable)
     if host is None:
         return None
-    if configurable.sandbox_network_mode == "no-network":
+    authorized_hosts = {
+        str(value).lower()
+        for value in config.get("metadata", {}).get(
+            "sandbox_gateway_authorized_hosts", []
+        )
+    }
+    if host in authorized_hosts:
+        return None
+    mode = network_policy_mode(configurable)
+    if mode == "offline":
         return ToolError(
             error_type=ToolErrorType.egress_domain_denied,
             tool_name=getattr(tool, "name", "unknown"),
             message="Network access is disabled for this run.",
-            detail={"domain": host, "network_mode": "no-network"},
+            detail={"domain": host, "network_mode": mode},
         ).to_tool_message(tool_call_id)
     if host in set(allowed_domains(configurable)):
         return None
 
-    run_id = config.get("metadata", {}).get("run_id", "default")
-    task_id = config.get("metadata", {}).get("task_id")
-    approvals = get_domain_approval_registry()
-    decision = approvals.is_allowed(run_id, host)
-    if decision is None:
-        from open_deep_research.tasks.coordination import FileDomainDecisionStore
-
-        decision = await FileDomainDecisionStore(configurable, run_id).get(host)
-        if decision is not None:
-            approvals.record_decision(run_id, host, decision)
-    if decision is True:
-        return None
-    if decision is False:
-        return ToolError(
-            error_type=ToolErrorType.egress_domain_denied,
-            tool_name=getattr(tool, "name", "unknown"),
-            message=(
-                f"Domain '{host}' is not on the egress allowlist and was denied "
-                f"for this run."
-            ),
-            detail={"domain": host, "run_id": run_id, "denied": True},
-        ).to_tool_message(tool_call_id)
-
-    # Undecided domain. The Docker sandbox worker sets SANDBOX_NETWORK_MODE; inside
-    # the container it cannot block on a host-side Future, so it returns a pending
-    # error and the researcher is told to ask the supervisor to approve and retry.
-    if os.getenv("SANDBOX_NETWORK_MODE") is not None:
-        return ToolError(
-            error_type=ToolErrorType.egress_domain_pending,
-            tool_name=getattr(tool, "name", "unknown"),
-            message=(
-                f"Domain '{host}' requires supervisor approval before it can be "
-                f"fetched. Ask the supervisor to approve it with "
-                f"ApproveResearchDomain(task_id, domain='{host}', allow=True), "
-                f"then retry this fetch."
-            ),
-            detail={"domain": host, "run_id": run_id, "pending": True},
-        ).to_tool_message(tool_call_id)
-
-    # In-process path: pause inline (Option 1) until the supervisor decides.
-    registry = get_task_registry()
-    record = _find_task_for_run(registry, run_id, task_id)
-    if record is None:
-        if configurable.sandbox_network_mode == "allow-search-only":
-            # In this mode direct fetches are unavailable by design (only the
-            # governed search pipeline may fetch), so say that instead of
-            # hinting at a missing approval channel.
-            message = (
-                f"Domain '{host}' is not on the egress allowlist. Direct URL "
-                f"fetches are disabled in 'allow-search-only' mode; only the "
-                f"governed web_research pipeline may fetch. Add the domain to "
-                f"sandbox_allowed_domains to permit direct fetches."
-            )
-        else:
-            message = (
-                f"Domain '{host}' is not on the egress allowlist and no active "
-                f"task context is available to request approval."
-            )
-        return ToolError(
-            error_type=ToolErrorType.egress_domain_denied,
-            tool_name=getattr(tool, "name", "unknown"),
-            message=message,
-            detail={
-                "domain": host,
-                "run_id": run_id,
-                "network_mode": configurable.sandbox_network_mode,
-            },
-        ).to_tool_message(tool_call_id)
-
-    req = approvals.request_decision(run_id, host, getattr(tool, "name", "unknown"))
-    record.pending_domain = host
-    record.pending_domain_tool = getattr(tool, "name", "unknown")
-    registry.update_status(record.task_id, TaskStatus.WAITING_FOR_CONFIRMATION)
-    await emit_task_state_change(
-        record,
-        config,
-        event_type=EventType.TASK_DOMAIN_CONFIRMATION_REQUESTED,
-        runs_dir=configurable.runs_dir,
-        run_id=run_id,
-        event_log_enabled=configurable.event_log_enabled,
-        data={"domain": host, "tool": getattr(tool, "name", "unknown")},
-    )
-    try:
-        allowed = await req.wait()  # blocks until ApproveResearchDomain resolves it
-    except asyncio.CancelledError:
-        record.pending_domain = None
-        record.pending_domain_tool = None
-        return ToolError(
-            error_type=ToolErrorType.egress_domain_denied,
-            tool_name=getattr(tool, "name", "unknown"),
-            message=f"Domain '{host}' request cancelled (task ended).",
-            detail={"domain": host, "run_id": run_id, "cancelled": True},
-        ).to_tool_message(tool_call_id)
-    finally:
-        record.pending_domain = None
-        record.pending_domain_tool = None
-
-    if not allowed:
-        return ToolError(
-            error_type=ToolErrorType.egress_domain_denied,
-            tool_name=getattr(tool, "name", "unknown"),
-            message=f"Domain '{host}' was denied by the supervisor for this run.",
-            detail={"domain": host, "run_id": run_id, "denied": True},
-        ).to_tool_message(tool_call_id)
-
-    # Allowed -> the domain is now cached for the rest of the run; proceed.
-    registry.update_status(record.task_id, TaskStatus.RUNNING)
-    await emit_task_state_change(
-        record,
-        config,
-        event_type=EventType.TASK_DOMAIN_DECISION,
-        runs_dir=configurable.runs_dir,
-        run_id=run_id,
-        event_log_enabled=configurable.event_log_enabled,
-        data={"domain": host, "allow": True},
-    )
-    return None
+    run_id = str(config.get("metadata", {}).get("run_id", "default"))
+    return ToolError(
+        error_type=ToolErrorType.egress_domain_denied,
+        tool_name=getattr(tool, "name", "unknown"),
+        message=(
+            f"Domain '{host}' is not allowed by sandbox profile "
+            f"'{configurable.sandbox_profile_id}'."
+        ),
+        detail={
+            "domain": host,
+            "run_id": run_id,
+            "network_mode": mode,
+            "profile_id": configurable.sandbox_profile_id,
+            "denied": True,
+        },
+    ).to_tool_message(tool_call_id)
 
 
 async def execute_governed_tool_call(
@@ -1286,7 +1154,10 @@ async def execute_governed_tool_call(
             message=f"Tool execution failed after {failure.attempts} attempt(s): {_safe_exc_str(failure.inner)}",
             attempts=failure.attempts,
             retryable=False,
-            detail={"status": _safe_status(failure.inner)},
+            detail={
+                "status": _safe_status(failure.inner),
+                "interaction_url": getattr(failure.inner, "interaction_url", None),
+            },
         ), tool_call_id)
     except Exception as exc:  # noqa: BLE001 -- non-retryable, surfaced directly
         error_type, _ = classify_retryable_error(exc)

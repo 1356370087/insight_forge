@@ -13,6 +13,7 @@ from open_deep_research.tools.base import (
     ProgressCallback,
     ToolContext,
     ToolEffect,
+    ToolExecutionZone,
     ToolOrigin,
     ToolResult,
 )
@@ -29,6 +30,7 @@ class LangChainToolAdapter:
     adapted: BaseTool
     origin: ToolOrigin
     effect: ToolEffect = ToolEffect.READ_ONLY
+    execution_zone: ToolExecutionZone = ToolExecutionZone.GATEWAY
     retryable: bool = False
     concurrency_safe: bool = False
     supports_idempotency: bool = False
@@ -89,6 +91,7 @@ def adapt_langchain_tool(
     *,
     origin: ToolOrigin,
     effect: ToolEffect = ToolEffect.READ_ONLY,
+    execution_zone: ToolExecutionZone = ToolExecutionZone.GATEWAY,
     retryable: bool = False,
     concurrency_safe: bool = False,
     supports_idempotency: bool = False,
@@ -132,6 +135,7 @@ def adapt_langchain_tool(
         adapted=tool,
         origin=origin,
         effect=effect,
+        execution_zone=execution_zone,
         retryable=retryable,
         concurrency_safe=concurrency_safe,
         supports_idempotency=supports_idempotency,
