@@ -1,6 +1,6 @@
 import { fetchEventSource } from "@microsoft/fetch-event-source";
 import { csrfHeaders, refreshBrowserSession } from "./auth";
-import type { PublicEvent, RunSnapshot, TaskActivityEvent, TaskActivityKind, TaskActivityPage } from "./types";
+import type { PublicEvent, RunSnapshot, RunUsageResponse, TaskActivityEvent, TaskActivityKind, TaskActivityPage, UsageAnalyticsResponse } from "./types";
 
 const API_BASE = process.env.NEXT_PUBLIC_RESEARCH_API_BASE ?? "/api/research";
 
@@ -26,6 +26,12 @@ export const researchApi = {
   capabilities: () => apiFetch<Record<string, unknown>>("/capabilities"),
   listRuns: (status?: string) => apiFetch<{ items: Array<Record<string, unknown>>; next_cursor?: string }>(`/runs?limit=50${status ? `&status=${encodeURIComponent(status)}` : ""}`),
   getRun: (id: string) => apiFetch<RunSnapshot>(`/runs/${encodeURIComponent(id)}`),
+  runUsage: (id: string) => apiFetch<RunUsageResponse>(`/runs/${encodeURIComponent(id)}/usage`),
+  usageAnalytics: (params: Record<string, string | number | undefined> = {}) => {
+    const query = new URLSearchParams();
+    Object.entries(params).forEach(([key, value]) => { if (value !== undefined && value !== "") query.set(key, String(value)); });
+    return apiFetch<UsageAnalyticsResponse>(`/usage/analytics${query.size ? `?${query}` : ""}`);
+  },
   createRun: (query: string, configurable: Record<string, unknown>, title?: string) => apiFetch<{ run_id: string }>("/runs", {
     method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
     body: JSON.stringify({ title, messages: [{ role: "user", content: query }], configurable }),

@@ -12,6 +12,7 @@ export function useRunStream(runId: string) {
     const controller = new AbortController();
     let stopped = false;
     let authRestarts = 0;
+    let usageRefreshTimer: ReturnType<typeof setTimeout> | undefined;
     const store = useResearchRunStore.getState();
     store.reset(runId);
     async function connect() {
@@ -26,10 +27,17 @@ export function useRunStream(runId: string) {
           onOpen: () => useResearchRunStore.getState().setConnection("connected"),
           onEvent: async (event) => {
             useResearchRunStore.getState().applyEvent(event);
+            if (event.type === "run.usage.updated") {
+              if (usageRefreshTimer) clearTimeout(usageRefreshTimer);
+              usageRefreshTimer = setTimeout(() => {
+                void queryClient.invalidateQueries({ queryKey: ["run-usage", runId] });
+              }, 300);
+            }
             if (["run.completed", "run.failed", "run.cancelled"].includes(event.type)) {
               const finalSnapshot = await researchApi.getRun(runId);
               useResearchRunStore.getState().hydrate(finalSnapshot);
               await queryClient.invalidateQueries({ queryKey: ["runs"] });
+              await queryClient.invalidateQueries({ queryKey: ["run-usage", runId] });
               controller.abort();
             }
           },
@@ -50,6 +58,6 @@ export function useRunStream(runId: string) {
       }
     }
     void connect();
-    return () => { stopped = true; controller.abort(); };
+    return () => { stopped = true; if (usageRefreshTimer) clearTimeout(usageRefreshTimer); controller.abort(); };
   }, [queryClient, runId]);
 }

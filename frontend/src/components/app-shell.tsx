@@ -1,7 +1,7 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import { ChevronRight, CircleDot, FlaskConical, Languages, LogOut, Menu, PanelRight, Plus, Settings, Shield, UserRound, X } from "lucide-react";
+import { BarChart3, ChevronRight, CircleDot, FlaskConical, Languages, LogOut, Menu, PanelRight, Plus, Settings, Shield, UserRound, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useState, type ReactNode } from "react";
@@ -30,7 +30,7 @@ export function AppShell({ children, inspector }: { children: ReactNode; inspect
       {!data?.items.length && <p className="empty-note">还没有研究记录。发起第一个问题，事件轨道会在这里留下可回放档案。</p>}
     </nav>
     <div className="sidebar-identity"><span>{identity?.display_name || identity?.email || (localAuthBypass ? "LOCAL RESEARCHER" : "正在验证身份")}</span><small>{identity?.roles.join(" · ") || (localAuthBypass ? "developer" : "IAM / CHECKING")}</small></div>
-    <div className="sidebar-footer"><Link href="/settings"><Settings size={16} /> 配置中心</Link><Link href="/account/security"><UserRound size={16} /> 账户与会话</Link>{isAdmin && <Link href="/admin"><Shield size={16} /> 身份管理</Link>}<button onClick={switchLocale}><Languages size={16} /> 中 / EN</button>{!localAuthBypass && <button onClick={logout}><LogOut size={16} /> 退出登录</button>}</div>
+    <div className="sidebar-footer"><Link className={pathname === "/usage" ? "active" : ""} href="/usage"><BarChart3 size={16} /> 用量分析</Link><Link href="/settings"><Settings size={16} /> 配置中心</Link><Link href="/account/security"><UserRound size={16} /> 账户与会话</Link>{isAdmin && <Link href="/admin"><Shield size={16} /> 身份管理</Link>}<button onClick={switchLocale}><Languages size={16} /> 中 / EN</button>{!localAuthBypass && <button onClick={logout}><LogOut size={16} /> 退出登录</button>}</div>
   </>;
   return <div className="command-shell">
     <aside className={`left-rail ${leftOpen ? "drawer-open" : ""}`}>{sidebar}<button className="drawer-close" onClick={() => setLeftOpen(false)} aria-label="关闭导航"><X /></button></aside>
