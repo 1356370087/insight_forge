@@ -1,8 +1,8 @@
 # Docker 沙箱隔离修复 SPEC
 
-状态：Approved for implementation  
-基线：`e43827f`  
-目标版本：Sandbox Policy / Run Config Schema V7  
+状态：Approved for implementation
+基线：`e43827f`
+目标版本：Sandbox Policy / Run Config Schema V7
 支持平台：Linux、WSL2；macOS 与原生 Windows 仅预留 Provider 接口
 
 ## 1. 背景与问题
