@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import shutil
+import stat
+import time
+import uuid
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,46 +16,137 @@ from typing import Any, Optional
 from langchain_core.messages import message_to_dict
 from langchain_core.runnables import RunnableConfig
 
-from open_deep_research.configuration import Configuration, SearchAPI
-from open_deep_research.sandbox.policy import allowed_domains
+from open_deep_research.configuration import Configuration
+from open_deep_research.sandbox.crypto import SandboxDerivedKeys, encode_task_token
+from open_deep_research.sandbox.safe_io import ArchiveLimits, extract_safe_tar
+from open_deep_research.sandbox.schema import (
+    SandboxProfile,
+    policy_digest,
+    resolve_profile,
+    runtime_digest,
+)
+from open_deep_research.sandbox.wire import (
+    SandboxTaskPayloadV1,
+    SandboxTaskResultV1,
+    TaskTokenClaimsV1,
+)
 from open_deep_research.tasks.events import EventType, JSONLEventWriter, ResearchEvent
 from open_deep_research.tasks.registry import TaskRecord
 
 CONTAINER_WORKSPACE = "/workspace"
 TASK_PAYLOAD_NAME = "task_payload.json"
 TASK_RESULT_NAME = "result.json"
-
-
-SANDBOX_SECRET_ENV_KEYS = (
-    "OPENAI_API_KEY",
-    "ANTHROPIC_API_KEY",
-    "GOOGLE_API_KEY",
-    "TAVILY_API_KEY",
-    "GROQ_API_KEY",
-    "DEEPSEEK_API_KEY",
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
-    "AWS_REGION",
-    "AWS_DEFAULT_REGION",
-    "BEDROCK_AWS_REGION",
-)
-
-
-def _sandbox_secret_env_keys() -> tuple[str, ...]:
-    """Return configured sandbox secret names; an explicit empty value disables injection."""
-    configured = os.environ.get("SANDBOX_SECRET_ENV_KEYS")
-    if configured is None:
-        return SANDBOX_SECRET_ENV_KEYS
-    return tuple(key.strip() for key in configured.split(",") if key.strip())
-
-PROXY_ENV_KEYS = (
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "NO_PROXY",
-    "http_proxy",
-    "https_proxy",
-    "no_proxy",
+_SANDBOX_RUNTIME_CONFIG_KEYS = frozenset(
+    {
+        "max_structured_output_retries",
+        "model_transport_max_attempts",
+        "model_circuit_breaker_enabled",
+        "model_first_packet_probe",
+        "context_recovery_max_attempts",
+        "output_token_escalation_enabled",
+        "output_continuation_max_attempts",
+        "model_fallbacks",
+        "model_context_window_overrides",
+        "model_max_output_tokens_overrides",
+        "unknown_model_context_window_tokens",
+        "max_concurrent_tool_calls",
+        "max_tool_batch_size",
+        "model_call_timeout_seconds",
+        "tool_call_timeout_seconds",
+        "research_tool_call_timeout_seconds",
+        "hook_timeout_seconds",
+        "max_concurrent_research_units",
+        "search_api",
+        "max_researcher_iterations",
+        "max_react_tool_calls",
+        "summarization_model",
+        "summarization_model_max_tokens",
+        "max_content_length",
+        "research_model",
+        "research_model_max_tokens",
+        "compression_model",
+        "compression_model_max_tokens",
+        "researcher_tool_whitelist",
+        "researcher_blocked_origins",
+        "max_tool_retries",
+        "tool_retry_base_delay",
+        "tool_retry_max_delay",
+        "tool_param_constraints",
+        "role_tool_blacklist",
+        "role_blocked_origins",
+        "task_timeout_seconds",
+        "web_pipeline_mode",
+        "web_pipeline_shadow_sample_rate",
+        "fetch_backend_order",
+        "external_extract_backends",
+        "fetch_top_k",
+        "web_min_source_authority",
+        "search_candidate_limit",
+        "max_fetches_per_researcher",
+        "max_fetches_per_run",
+        "fetch_global_concurrency",
+        "fetch_per_host_concurrency",
+        "web_rerank_model",
+        "web_evidence_model",
+        "html_max_bytes",
+        "pdf_max_bytes",
+        "pdf_max_pages",
+        "respect_robots_txt",
+        "browser_render_fallback_enabled",
+        "enable_message_summarization",
+        "message_summary_trigger_tokens",
+        "message_summary_keep_last",
+        "message_summary_model",
+        "message_summary_model_max_tokens",
+        "quality_evaluation_enabled",
+        "quality_evaluation_model",
+        "quality_evaluation_model_max_tokens",
+        "quality_evaluation_fail_open",
+        "quality_evaluation_rigor",
+        "quality_evaluation_min_sources",
+        "quality_evaluation_max_input_chars",
+        "quality_risk_mode",
+        "quality_caveat_admission_enabled",
+        "quality_gap_recovery_max_attempts",
+        "query_context_compaction_enabled",
+        "query_context_trigger_ratio",
+        "query_context_recent_window_ratio",
+        "query_context_summary_max_tokens",
+        "query_journal_inline_content_max_chars",
+        "prompt_injection_protection_enabled",
+        "external_content_fail_closed",
+        "max_external_content_bytes",
+        "max_mcp_description_chars",
+        "max_tool_description_chars",
+        "max_mcp_output_chars",
+        "sandbox_profile_id",
+        "gateway_protocol_version",
+        "sandbox_enabled",
+        "enable_async_research",
+        "enable_memory",
+        "memory_auto_write",
+        "observability_enabled",
+        "sqlite_observability_enabled",
+        "token_usage_accounting_enabled",
+        "token_usage_estimation_enabled",
+        "event_log_enabled",
+        "task_checkpoint_enabled",
+        "query_session_persistence_enabled",
+        "task_state_backend",
+        "runs_dir",
+        "trace_store_path",
+        "langfuse_enabled",
+        "prometheus_enabled",
+        "helicone_enabled",
+        "browser_mcp_enabled",
+        "mcp_config",
+        "run_deadline_seconds",
+        "max_run_model_calls",
+        "max_run_tool_calls",
+        "max_run_input_tokens",
+        "max_run_output_tokens",
+        "max_run_cost_micro_usd",
+    }
 )
 
 
@@ -82,6 +175,21 @@ def _short_container_id(container_id: Optional[str]) -> Optional[str]:
     if not container_id:
         return None
     return container_id[:12]
+
+
+def _write_regular_file(path: Path, data: bytes, *, max_bytes: int) -> None:
+    """Write a bounded host file without following a container-created link."""
+    bounded = data[:max_bytes]
+    if path.is_symlink():
+        raise RuntimeError(f"Refusing to follow sandbox symlink: {path}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        os.write(descriptor, bounded)
+    finally:
+        os.close(descriptor)
 
 
 @dataclass(frozen=True)
@@ -162,13 +270,19 @@ class SandboxSpec:
     environment: dict[str, str]
     network_mode: str
     allowed_domains: list[str]
-    memory: str
+    memory: int
     cpus: float
     pids_limit: int
     read_only_rootfs: bool
     user: str
     timeout_seconds: int
-    cleanup_policy: str
+    retention: str
+    output_bytes: int
+    log_bytes: int
+    artifact_bytes: int
+    max_files: int
+    stop_grace_seconds: int
+    labels: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -188,6 +302,44 @@ class DockerSandboxManager:
         """Create a manager, optionally with an injected Docker client."""
         self._client = docker_client
 
+    async def _create_controller_task(
+        self,
+        controller: Any,
+        *,
+        payload: Any,
+        task_token: str,
+        runtime_digest_value: str,
+        stop_grace_seconds: int,
+    ) -> Any:
+        """Finish an in-flight create and stop its container if caller cancels."""
+        create = asyncio.create_task(
+            controller.create_task(
+                payload=payload,
+                task_token=task_token,
+                runtime_digest_value=runtime_digest_value,
+            )
+        )
+        try:
+            return await asyncio.shield(create)
+        except asyncio.CancelledError:
+            created = None
+            try:
+                created = await asyncio.shield(create)
+            except Exception:
+                pass
+            if created is not None:
+                stop = asyncio.create_task(
+                    controller.stop_task(
+                        created.container_id,
+                        timeout_seconds=stop_grace_seconds,
+                    )
+                )
+                try:
+                    await asyncio.shield(stop)
+                except Exception:
+                    pass
+            raise
+
     async def run_researcher_task(
         self,
         task_record: TaskRecord,
@@ -200,6 +352,172 @@ class DockerSandboxManager:
     ) -> SandboxResult:
         """Run one researcher task in a Docker sandbox and collect its output."""
         configurable = Configuration.from_runnable_config(config)
+        bundle, profile_id, profile = resolve_profile(configurable)
+        if self._client is not None:
+            raise RuntimeError("sandbox_controller_required")
+        if self._client is None:
+            from open_deep_research.sandbox.controller_client import (
+                SandboxControllerClient,
+            )
+            from open_deep_research.sandbox.gateway_client import (
+                SandboxGatewayControlClient,
+                split_gateway_registration,
+            )
+
+            metadata = config.get("metadata", {}) if config else {}
+            fence_token = max(1, int(metadata.get("run_fence_token") or 1))
+            frozen_for_gateway, credentials = split_gateway_registration(
+                dict(config or {})
+            )
+            await SandboxGatewayControlClient(configurable).register_run(
+                run_id=task_record.run_id or str(metadata.get("run_id") or "default"),
+                fence_token=fence_token,
+                frozen_config=frozen_for_gateway,
+                api_keys=credentials,
+            )
+
+            payload = self.build_payload(
+                task_record=task_record,
+                config=config,
+                researcher_state=researcher_state,
+                profile_id=profile_id,
+                policy_digest_value=policy_digest(bundle),
+            )
+            now = time.time()
+            claims = TaskTokenClaimsV1(
+                run_id=payload.run_id,
+                task_id=payload.task_id,
+                fence_token=payload.fence_token,
+                profile_id=profile_id,
+                policy_digest=payload.policy_digest,
+                issued_at=now,
+                expires_at=now + profile.resources.timeout_seconds + 60,
+                jti=str(uuid.uuid4()),
+            )
+            keys = SandboxDerivedKeys.from_root(configurable.sandbox_root_signing_key or "")
+            controller = SandboxControllerClient(configurable, bundle)
+            created = await self._create_controller_task(
+                controller,
+                payload=payload,
+                task_token=encode_task_token(claims, keys.task_token),
+                runtime_digest_value=runtime_digest(profile),
+                stop_grace_seconds=profile.resources.stop_grace_seconds,
+            )
+            task_record.sandbox_enabled = True
+            task_record.workspace_path = f"controller://{payload.task_id}"
+            task_record.sandbox_network_mode = profile.network.mode
+            task_record.container_id = created.container_id
+            self._record_event(
+                task_record,
+                EventType.SANDBOX_CONTAINER_CREATED,
+                runs_dir,
+                run_id,
+                event_log_enabled,
+                data={"container_id": _short_container_id(created.container_id)},
+            )
+            # Persist the container identity before start so crash recovery and
+            # cancellation never depend on a terminal Controller response.
+            from open_deep_research.tasks.state import get_task_state_store
+
+            await get_task_state_store(configurable).update_from_record(
+                task_record,
+                fence_token=payload.fence_token,
+            )
+            try:
+                if created.status == "created":
+                    status = await controller.start_task(created.container_id)
+                else:
+                    status = await controller.task_status(created.container_id)
+                self._record_event(
+                    task_record,
+                    EventType.SANDBOX_CONTAINER_STARTED,
+                    runs_dir,
+                    run_id,
+                    event_log_enabled,
+                    data={"container_id": _short_container_id(created.container_id)},
+                )
+                deadline = time.monotonic() + profile.resources.timeout_seconds
+                while status.status not in {"result_ready", "exited", "dead"}:
+                    if task_record.cancelled.is_set():
+                        raise asyncio.CancelledError
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("sandbox task timed out")
+                    await asyncio.sleep(0.2)
+                    status = await controller.task_status(created.container_id)
+                response = await controller.collect_task(created.container_id)
+                canonical_archive = await controller.collect_archive(
+                    created.container_id
+                )
+                archive_path = self._archive_controller_output(
+                    canonical_archive,
+                    response.logs,
+                    runs_dir=runs_dir,
+                    run_id=run_id,
+                    task_id=task_record.task_id,
+                    profile=profile,
+                )
+                task_record.output_archive_path = archive_path
+                self._record_event(
+                    task_record,
+                    EventType.SANDBOX_OUTPUT_COLLECTED,
+                    runs_dir,
+                    run_id,
+                    event_log_enabled,
+                    data={
+                        "container_id": _short_container_id(created.container_id),
+                        "exit_code": response.exit_code,
+                        "output_archive_path": archive_path,
+                    },
+                )
+                if (
+                    status.timed_out
+                    or response.exit_code != 0
+                    or response.result.status == "failed"
+                ):
+                    raise RuntimeError(response.result.error or "Sandbox worker failed.")
+                return SandboxResult(
+                    container_id=response.container_id,
+                    exit_code=response.exit_code,
+                    result=response.result.model_dump(
+                        mode="json",
+                        exclude={"schema_version", "status", "task_id", "error"},
+                    ),
+                    output_archive_path=archive_path,
+                )
+            finally:
+                try:
+                    await controller.stop_task(
+                        created.container_id,
+                        timeout_seconds=profile.resources.stop_grace_seconds,
+                    )
+                    if profile.runtime.retention == "remove":
+                        self._record_event(
+                            task_record,
+                            EventType.SANDBOX_CONTAINER_REMOVED,
+                            runs_dir,
+                            run_id,
+                            event_log_enabled,
+                            data={
+                                "container_id": _short_container_id(
+                                    created.container_id
+                                )
+                            },
+                        )
+                except Exception as stop_exc:
+                    self._record_event(
+                        task_record,
+                        EventType.SANDBOX_FAILED,
+                        runs_dir,
+                        run_id,
+                        event_log_enabled,
+                        data={
+                            "container_id": _short_container_id(
+                                created.container_id
+                            ),
+                            "error": f"sandbox_termination_failed:{_safe_error(stop_exc)}",
+                        },
+                    )
+                    raise RuntimeError("sandbox_termination_failed") from stop_exc
         workspace = self.prepare_workspace(
             configurable=configurable,
             run_id=run_id,
@@ -208,13 +526,14 @@ class DockerSandboxManager:
 
         task_record.sandbox_enabled = True
         task_record.workspace_path = str(workspace.root)
-        task_record.sandbox_network_mode = configurable.sandbox_network_mode
+        task_record.sandbox_network_mode = profile.network.mode
 
         self.write_payload(
             workspace=workspace,
             task_record=task_record,
             config=config,
             researcher_state=researcher_state,
+            profile_id=profile_id,
         )
 
         self._record_event(
@@ -225,11 +544,11 @@ class DockerSandboxManager:
             event_log_enabled,
             data={
                 "workspace_path": str(workspace.root),
-                "network_mode": configurable.sandbox_network_mode,
+                "network_mode": profile.network.mode,
+                "profile_id": profile_id,
             },
         )
 
-        self._validate_network_policy(configurable)
         spec = self.build_spec(configurable, config)
         self._record_event(
             task_record,
@@ -238,10 +557,10 @@ class DockerSandboxManager:
             run_id,
             event_log_enabled,
             data={
-                "network_mode": configurable.sandbox_network_mode,
+                "network_mode": profile.network.mode,
                 "docker_network_mode": spec.network_mode,
                 "allowed_domains": spec.allowed_domains,
-                "proxy_enforced": self._proxy_configured(spec.environment),
+                "proxy_enforced": bool(configurable.sandbox_gateway_url),
             },
         )
 
@@ -265,10 +584,7 @@ class DockerSandboxManager:
         task_id: str,
     ) -> SandboxWorkspace:
         """Create a task workspace under the configured sandbox root."""
-        root_base = Path(
-            configurable.sandbox_workspace_root
-            or Path(configurable.runs_dir) / run_id / "workspaces"
-        ).resolve()
+        root_base = (Path(configurable.runs_dir) / run_id / "workspaces").resolve()
         workspace_root = (root_base / task_id).resolve()
         if root_base not in workspace_root.parents and workspace_root != root_base:
             raise ValueError("Sandbox workspace escaped configured workspace root.")
@@ -281,37 +597,96 @@ class DockerSandboxManager:
         task_record: TaskRecord,
         config: RunnableConfig,
         researcher_state: dict[str, Any],
+        profile_id: str | None = None,
     ) -> Path:
         """Write the JSON payload consumed by the container worker."""
-        safe_configurable = Configuration.from_runnable_config(config).model_dump(mode="json")
-        safe_configurable.pop("enable_memory", None)
-        safe_configurable.pop("memory_auto_write", None)
-        safe_configurable["enable_memory"] = False
-        safe_configurable["memory_auto_write"] = False
-
-        payload = {
-            "task_id": task_record.task_id,
-            "research_topic": task_record.research_topic,
-            "researcher_state": {
-                **researcher_state,
-                "researcher_messages": [
-                    message_to_dict(message)
-                    for message in researcher_state.get("researcher_messages", [])
-                ],
-            },
-            "configurable": safe_configurable,
-            "metadata": {
-                "run_id": task_record.run_id,
-                "user_id": task_record.user_id,
-                "task_id": task_record.task_id,
-                "trace_parent_span_id": task_record.trace_parent_span_id,
-                "langfuse_parent_span_id": task_record.langfuse_parent_span_id,
-            },
-        }
-
+        payload = self.build_payload(
+            task_record=task_record,
+            config=config,
+            researcher_state=researcher_state,
+            profile_id=profile_id,
+        )
         payload_path = workspace.input_dir / TASK_PAYLOAD_NAME
-        payload_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        payload_path.write_text(payload.model_dump_json(), encoding="utf-8")
         return payload_path
+
+    def build_payload(
+        self,
+        *,
+        task_record: TaskRecord,
+        config: RunnableConfig,
+        researcher_state: dict[str, Any],
+        profile_id: str | None = None,
+        policy_digest_value: str | None = None,
+    ) -> SandboxTaskPayloadV1:
+        """Build a strict, secret-free payload without touching host storage."""
+        configurable = Configuration.from_runnable_config(config)
+        _bundle, resolved_profile_id, _profile = resolve_profile(configurable)
+        safe_configurable = configurable.model_dump(
+            mode="json",
+            include=_SANDBOX_RUNTIME_CONFIG_KEYS,
+        )
+        safe_configurable.update(
+            {
+                "sandbox_enabled": False,
+                "enable_async_research": False,
+                "model_circuit_breaker_enabled": False,
+                "model_first_packet_probe": "off",
+                "model_fallbacks": {},
+                "enable_memory": False,
+                "memory_auto_write": False,
+                "observability_enabled": False,
+                "sqlite_observability_enabled": False,
+                "token_usage_accounting_enabled": False,
+                "event_log_enabled": False,
+                "task_checkpoint_enabled": False,
+                "query_session_persistence_enabled": False,
+                "task_state_backend": "memory",
+                "runs_dir": "/workspace/tmp/runs",
+                "trace_store_path": "/workspace/tmp/traces.sqlite3",
+                "langfuse_enabled": False,
+                "prometheus_enabled": False,
+                "helicone_enabled": False,
+                "browser_mcp_enabled": False,
+                "mcp_config": None,
+                "run_deadline_seconds": None,
+                "max_run_model_calls": None,
+                "max_run_tool_calls": None,
+                "max_run_input_tokens": None,
+                "max_run_output_tokens": None,
+                "max_run_cost_micro_usd": None,
+            }
+        )
+        auth_user = config.get("configurable", {}).get("langgraph_auth_user") if config else None
+        if isinstance(auth_user, dict):
+            safe_configurable["langgraph_auth_user"] = {
+                "identity": str(auth_user.get("identity") or ""),
+                "roles": [str(value) for value in auth_user.get("roles", [])],
+                "permissions": [
+                    str(value) for value in auth_user.get("permissions", [])
+                ],
+                "is_authenticated": bool(auth_user.get("is_authenticated", True)),
+            }
+        safe_state = {
+            key: value
+            for key, value in researcher_state.items()
+            if key != "_query_checkpoint_callback"
+        }
+        safe_state["researcher_messages"] = [
+            message_to_dict(message)
+            for message in researcher_state.get("researcher_messages", [])
+        ]
+        metadata = config.get("metadata", {}) if config else {}
+        return SandboxTaskPayloadV1(
+            task_id=task_record.task_id,
+            run_id=task_record.run_id or str(metadata.get("run_id") or "default"),
+            research_topic=task_record.research_topic,
+            researcher_state=safe_state,
+            runtime_config=safe_configurable,
+            profile_id=profile_id or resolved_profile_id,
+            policy_digest=policy_digest_value or configurable.sandbox_policy_digest,
+            fence_token=max(1, int(metadata.get("run_fence_token") or 1)),
+        )
 
     def build_spec(
         self,
@@ -319,22 +694,35 @@ class DockerSandboxManager:
         config: RunnableConfig,
     ) -> SandboxSpec:
         """Build the container spec from runtime configuration."""
-        env = self._build_environment(configurable, config)
-        network_mode = "none" if configurable.sandbox_network_mode == "no-network" else "bridge"
-        timeout = configurable.sandbox_timeout_seconds or configurable.task_timeout_seconds
+        bundle, _profile_id, profile = resolve_profile(configurable)
+        env = self._build_environment(configurable, config, profile)
+        metadata = config.get("metadata", {}) if config else {}
         return SandboxSpec(
-            image=configurable.sandbox_image,
+            image=profile.runtime.worker_image_digest,
             command=["python", "-m", "open_deep_research.sandbox.worker"],
             environment=env,
-            network_mode=network_mode,
-            allowed_domains=self._allowed_domains(configurable),
-            memory=configurable.sandbox_memory,
-            cpus=configurable.sandbox_cpus,
-            pids_limit=configurable.sandbox_pids_limit,
-            read_only_rootfs=configurable.sandbox_read_only_rootfs,
-            user=configurable.sandbox_user,
-            timeout_seconds=timeout,
-            cleanup_policy=configurable.sandbox_cleanup_policy,
+            network_mode="none",
+            allowed_domains=list(profile.network.allow_domains),
+            memory=profile.resources.memory_bytes,
+            cpus=profile.resources.cpu_cores,
+            pids_limit=profile.resources.pids,
+            read_only_rootfs=profile.runtime.read_only_rootfs,
+            user=f"{profile.runtime.uid}:{profile.runtime.gid}",
+            timeout_seconds=profile.resources.timeout_seconds,
+            retention=profile.runtime.retention,
+            output_bytes=profile.resources.output_bytes,
+            log_bytes=profile.resources.log_bytes,
+            artifact_bytes=profile.resources.artifact_bytes,
+            max_files=profile.resources.max_files,
+            stop_grace_seconds=profile.resources.stop_grace_seconds,
+            labels={
+                "com.insightforge.sandbox.deployment_id": bundle.deployment_id,
+                "com.insightforge.sandbox.run_id": str(metadata.get("run_id") or "default"),
+                "com.insightforge.sandbox.task_id": str(metadata.get("task_id") or "pending"),
+                "com.insightforge.sandbox.fence_token": str(metadata.get("run_fence_token") or 0),
+                "com.insightforge.sandbox.profile_id": configurable.sandbox_profile_id,
+                "com.insightforge.sandbox.policy_digest": configurable.sandbox_policy_digest,
+            },
         )
 
     def build_container_kwargs(
@@ -358,6 +746,7 @@ class DockerSandboxManager:
             "nano_cpus": int(spec.cpus * 1_000_000_000),
             "pids_limit": spec.pids_limit,
             "user": spec.user,
+            "labels": spec.labels,
         }
 
     def stop_container(self, container_id: str, *, timeout: int = 5) -> None:
@@ -416,8 +805,14 @@ class DockerSandboxManager:
 
             logs = container.logs(stdout=True, stderr=True)
             if isinstance(logs, bytes):
-                logs = logs.decode("utf-8", errors="replace")
-            (workspace.logs_dir / "container.log").write_text(str(logs), encoding="utf-8")
+                log_bytes = logs
+            else:
+                log_bytes = str(logs).encode("utf-8", errors="replace")
+            _write_regular_file(
+                workspace.logs_dir / "container.log",
+                log_bytes,
+                max_bytes=spec.log_bytes,
+            )
 
             if exit_code != 0:
                 raise RuntimeError(f"Sandbox container exited with code {exit_code}.")
@@ -458,64 +853,52 @@ class DockerSandboxManager:
             )
             raise
         finally:
-            cleanup = spec.cleanup_policy
-            should_cleanup = cleanup == "always" or (cleanup == "on_success" and exit_code == 0)
-            if should_cleanup:
-                self._cleanup_tmp(workspace, task_record, runs_dir, run_id, event_log_enabled)
-                if container is not None:
+            if container is not None:
+                stop = getattr(container, "stop", None)
+                if callable(stop):
                     try:
-                        container.remove(force=True)
-                        self._record_event(
-                            task_record,
-                            EventType.SANDBOX_CONTAINER_REMOVED,
-                            runs_dir,
-                            run_id,
-                            event_log_enabled,
-                            data={"container_id": _short_container_id(task_record.container_id)},
-                        )
+                        stop(timeout=spec.stop_grace_seconds)
                     except Exception:
                         pass
+            self._cleanup_tmp(workspace, task_record, runs_dir, run_id, event_log_enabled)
+            if container is not None and spec.retention == "remove":
+                try:
+                    container.remove(force=True)
+                    self._record_event(
+                        task_record,
+                        EventType.SANDBOX_CONTAINER_REMOVED,
+                        runs_dir,
+                        run_id,
+                        event_log_enabled,
+                        data={"container_id": _short_container_id(task_record.container_id)},
+                    )
+                except Exception:
+                    pass
 
     def _get_client(self) -> Any:
         if self._client is not None:
             return self._client
-        try:
-            import docker
-        except ImportError as exc:
-            raise RuntimeError(
-                "Docker sandbox is enabled but the Docker SDK is not installed. "
-                "Install dependencies with `uv sync` or add `docker>=7.1.0`."
-            ) from exc
-        self._client = docker.from_env()
-        return self._client
+        raise RuntimeError("sandbox_controller_required")
 
     def _coerce_mounts_for_docker(self, mount_specs: list[dict[str, Any]]) -> list[Any]:
-        try:
-            from docker.types import Mount
-        except ImportError:
-            return mount_specs
-        return [
-            Mount(
-                target=spec["target"],
-                source=spec["source"],
-                type=spec["type"],
-                read_only=spec["read_only"],
-            )
-            for spec in mount_specs
-        ]
+        """Return SDK-neutral mount data for the explicit test seam."""
+        return mount_specs
 
     def _read_worker_result(self, workspace: SandboxWorkspace) -> dict[str, Any]:
         result_path = workspace.output_dir / TASK_RESULT_NAME
         if not result_path.exists():
             raise RuntimeError("Sandbox worker did not produce output/result.json.")
-        result = json.loads(result_path.read_text(encoding="utf-8"))
-        if result.get("status") == "failed":
-            raise RuntimeError(result.get("error", "Sandbox worker failed."))
-        return {
-            "compressed_research": result.get("compressed_research", ""),
-            "raw_notes": result.get("raw_notes", []),
-            "metrics": result.get("metrics", {}),
-        }
+        info = result_path.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise RuntimeError("Sandbox result must be a regular file.")
+        if info.st_size > 64 * 1024 * 1024:
+            raise RuntimeError("Sandbox result exceeds the 64 MiB contract.")
+        result = SandboxTaskResultV1.model_validate_json(
+            result_path.read_text(encoding="utf-8")
+        )
+        if result.status == "failed":
+            raise RuntimeError(result.error or "Sandbox worker failed.")
+        return result.model_dump(mode="json", exclude={"schema_version", "status", "task_id", "error"})
 
     def _archive_output(
         self,
@@ -527,14 +910,94 @@ class DockerSandboxManager:
         artifacts_root = Path(runs_dir) / run_id / "artifacts"
         artifacts_root.mkdir(parents=True, exist_ok=True)
         archive_path = artifacts_root / f"{task_id}.zip"
+        if archive_path.is_symlink():
+            raise RuntimeError("Refusing to overwrite sandbox archive symlink.")
+        total_bytes = 0
+        total_files = 0
         with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             for base_dir in (workspace.output_dir, workspace.logs_dir, workspace.artifacts_dir):
                 if not base_dir.exists():
                     continue
                 for path in base_dir.rglob("*"):
-                    if path.is_file():
-                        zf.write(path, path.relative_to(workspace.root))
+                    info = path.lstat()
+                    if stat.S_ISLNK(info.st_mode):
+                        raise RuntimeError(f"Sandbox output contains symlink: {path}")
+                    if stat.S_ISDIR(info.st_mode):
+                        continue
+                    if not stat.S_ISREG(info.st_mode):
+                        raise RuntimeError(f"Sandbox output contains special file: {path}")
+                    total_files += 1
+                    total_bytes += info.st_size
+                    if total_files > 10_000 or total_bytes > 512 * 1024 * 1024:
+                        raise RuntimeError("Sandbox output archive exceeds collection limits.")
+                    zf.write(path, path.relative_to(workspace.root))
         return str(archive_path)
+
+    def _archive_controller_output(
+        self,
+        archive: bytes,
+        controller_logs: str,
+        *,
+        runs_dir: str,
+        run_id: str,
+        task_id: str,
+        profile: SandboxProfile,
+    ) -> str:
+        """Validate Controller output again and create the durable host ZIP."""
+        runs_root = Path(runs_dir).resolve()
+        collection_root = (
+            runs_root
+            / run_id
+            / "sandbox"
+            / "collections"
+            / f".{uuid.uuid4().hex}"
+        ).resolve()
+        if runs_root not in collection_root.parents:
+            raise RuntimeError("sandbox collection path escaped runs directory")
+        collection_root.mkdir(parents=True, exist_ok=False)
+        workspace = SandboxWorkspace(
+            root=collection_root,
+            input_dir=collection_root / "input",
+            output_dir=collection_root / "output",
+            tmp_dir=collection_root / "tmp",
+            logs_dir=collection_root / "logs",
+            artifacts_dir=collection_root / "artifacts",
+        )
+        try:
+            extract_safe_tar(
+                archive,
+                collection_root,
+                limits=ArchiveLimits(
+                    max_bytes=(
+                        profile.resources.output_bytes
+                        + profile.resources.log_bytes
+                        + profile.resources.artifact_bytes
+                    ),
+                    max_files=profile.resources.max_files,
+                ),
+            )
+            for path in (
+                workspace.input_dir,
+                workspace.output_dir,
+                workspace.tmp_dir,
+                workspace.logs_dir,
+                workspace.artifacts_dir,
+            ):
+                path.mkdir(parents=True, exist_ok=True)
+            if controller_logs:
+                _write_regular_file(
+                    workspace.logs_dir / "controller.log",
+                    controller_logs.encode("utf-8", errors="replace"),
+                    max_bytes=profile.resources.log_bytes,
+                )
+            return self._archive_output(
+                workspace,
+                runs_dir,
+                run_id,
+                task_id,
+            )
+        finally:
+            shutil.rmtree(collection_root, ignore_errors=True)
 
     def _cleanup_tmp(
         self,
@@ -584,61 +1047,23 @@ class DockerSandboxManager:
             enabled=event_log_enabled,
         )
 
-    def _validate_network_policy(self, configurable: Configuration) -> None:
-        if configurable.sandbox_network_mode != "no-network":
-            return
-        search_api = configurable.search_api
-        if isinstance(search_api, SearchAPI):
-            search_value = search_api.value
-        else:
-            search_value = str(search_api)
-        if search_value != SearchAPI.NONE.value:
-            raise ValueError(
-                "sandbox_network_mode='no-network' requires search_api='none'."
-            )
-        if configurable.mcp_config and configurable.mcp_config.url:
-            raise ValueError(
-                "sandbox_network_mode='no-network' cannot be used with networked MCP servers."
-            )
-
     def _build_environment(
         self,
         configurable: Configuration,
         config: RunnableConfig,
+        profile: SandboxProfile,
     ) -> dict[str, str]:
-        env: dict[str, str] = {
+        del config
+        return {
             "PYTHONUNBUFFERED": "1",
             "GET_API_KEYS_FROM_CONFIG": "false",
             "SANDBOX_TASK_PAYLOAD_PATH": f"{CONTAINER_WORKSPACE}/input/{TASK_PAYLOAD_NAME}",
             "SANDBOX_RESULT_PATH": f"{CONTAINER_WORKSPACE}/output/{TASK_RESULT_NAME}",
             "SANDBOX_LOG_PATH": f"{CONTAINER_WORKSPACE}/logs/worker.log",
-            "SANDBOX_NETWORK_MODE": configurable.sandbox_network_mode,
-            "SANDBOX_EGRESS_ALLOWED_DOMAINS": ",".join(
-                self._allowed_domains(configurable)
-            ),
+            "SANDBOX_NETWORK_POLICY_MODE": profile.network.mode,
+            "SANDBOX_GATEWAY_URL": configurable.sandbox_gateway_url,
+            "SANDBOX_PROFILE_ID": configurable.sandbox_profile_id,
+            "TMPDIR": f"{CONTAINER_WORKSPACE}/tmp",
+            "TMP": f"{CONTAINER_WORKSPACE}/tmp",
+            "TEMP": f"{CONTAINER_WORKSPACE}/tmp",
         }
-
-        api_keys = config.get("configurable", {}).get("apiKeys", {}) if config else {}
-        for key in _sandbox_secret_env_keys():
-            value = api_keys.get(key) or os.getenv(key)
-            if value:
-                env[key] = value
-
-        if configurable.sandbox_network_mode in {"allow-search-only", "allowlist-domain"}:
-            for key in PROXY_ENV_KEYS:
-                value = os.getenv(key)
-                if value:
-                    env[key] = value
-
-        return env
-
-    def _allowed_domains(self, configurable: Configuration) -> list[str]:
-        return allowed_domains(configurable)
-
-    def _proxy_configured(self, env: dict[str, str]) -> bool:
-        return bool(env.get("HTTPS_PROXY") or env.get("https_proxy"))
-
-
-def stop_sandbox_container(container_id: str) -> None:
-    """Stop a sandbox container by ID using a fresh Docker client."""
-    DockerSandboxManager().stop_container(container_id)

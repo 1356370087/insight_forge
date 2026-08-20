@@ -1,0 +1,112 @@
+version = 1
+deployment_id = "insightforge-local"
+default_profile = "research-gateway-only"
+role_priority = ["admin", "developer", "researcher", "viewer"]
+
+[profile_by_role]
+admin = "research-gateway-only"
+developer = "research-gateway-only"
+researcher = "research-gateway-only"
+
+[profiles.research-gateway-only]
+provider = "docker"
+approval_policy = "on_request"
+
+[profiles.research-gateway-only.filesystem]
+read_roots = ["/workspace/input"]
+write_roots = ["/workspace/output", "/workspace/logs", "/workspace/artifacts", "/workspace/tmp"]
+deny_read = []
+deny_write = []
+
+[profiles.research-gateway-only.network]
+mode = "gateway-only"
+allow_domains = []
+deny_domains = []
+allow_ports = [80, 443]
+allow_http_methods = ["GET", "HEAD", "OPTIONS"]
+allow_private_destinations = false
+unknown_target = "ask"
+
+[profiles.research-gateway-only.commands]
+enabled = false
+allow = []
+ask = []
+deny = ["*"]
+
+[profiles.research-gateway-only.tools]
+allow_effects = ["read_only"]
+ask_effects = []
+deny_effects = ["sensitive_read", "external_write", "local_write", "destructive"]
+deny_tools = []
+
+[profiles.research-gateway-only.resources]
+memory_bytes = 1073741824
+cpu_cores = 1.0
+pids = 256
+timeout_seconds = 900
+approval_timeout_seconds = 900
+output_bytes = 67108864
+log_bytes = 16777216
+artifact_bytes = 268435456
+tmp_bytes = 268435456
+max_files = 10000
+stop_grace_seconds = 5
+
+[profiles.research-gateway-only.runtime]
+# Replace this placeholder with the digest produced by the sandbox image build.
+worker_image_digest = "sha256:de473811244d13709f00f81b3162089b8e61f5718948fffffdf30959127d88a7"
+read_only_rootfs = true
+uid = 65532
+gid = 65532
+retention = "remove"
+
+[profiles.developer-workspace]
+provider = "bubblewrap"
+approval_policy = "on_request"
+
+[profiles.developer-workspace.filesystem]
+read_roots = ["/workspace/input", "/workspace"]
+write_roots = ["/workspace"]
+deny_read = ["~/.ssh", "~/.aws", "~/.config/gcloud"]
+deny_write = ["/bin", "/sbin", "/usr", "/etc"]
+
+[profiles.developer-workspace.network]
+mode = "allowlist"
+allow_domains = []
+deny_domains = []
+allow_ports = [80, 443]
+allow_http_methods = ["GET", "HEAD", "OPTIONS"]
+allow_private_destinations = false
+unknown_target = "ask"
+
+[profiles.developer-workspace.commands]
+enabled = true
+allow = []
+ask = ["*"]
+deny = []
+
+[profiles.developer-workspace.tools]
+allow_effects = ["read_only"]
+ask_effects = ["sensitive_read", "external_write", "local_write"]
+deny_effects = ["destructive"]
+deny_tools = []
+
+[profiles.developer-workspace.resources]
+memory_bytes = 1073741824
+cpu_cores = 1.0
+pids = 256
+timeout_seconds = 900
+approval_timeout_seconds = 900
+output_bytes = 67108864
+log_bytes = 16777216
+artifact_bytes = 268435456
+tmp_bytes = 268435456
+max_files = 10000
+stop_grace_seconds = 5
+
+[profiles.developer-workspace.runtime]
+worker_image_digest = "sha256:de473811244d13709f00f81b3162089b8e61f5718948fffffdf30959127d88a7"
+read_only_rootfs = true
+uid = 65532
+gid = 65532
+retention = "remove"

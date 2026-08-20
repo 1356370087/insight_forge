@@ -11,8 +11,21 @@ services:
       # 本地部署免 IAM：跳过自托管认证（无需 IAM_DATABASE_URL）。
       # 如需完整认证，改为 "false" 并提供 Postgres 的 IAM_DATABASE_URL。
       LOCAL_DEV_AUTH_BYPASS: "true"
+      SANDBOX_ENABLED: ${SANDBOX_ENABLED:-false}
+      ENABLE_ASYNC_RESEARCH: ${ENABLE_ASYNC_RESEARCH:-false}
+      ALLOW_CLARIFICATION: ${ALLOW_CLARIFICATION:-true}
+      WEB_PIPELINE_MODE: ${WEB_PIPELINE_MODE:-enforced}
+      QUALITY_EVALUATION_ENABLED: ${QUALITY_EVALUATION_ENABLED:-true}
+      SANDBOX_POLICY_PATH: /app/config/sandbox-policy.toml
+      SANDBOX_CONTROLLER_SOCKET: /run/insightforge/sandbox-controller.sock
+      SANDBOX_GATEWAY_URL: http://sandbox-gateway:8081
+      SANDBOX_ROOT_SIGNING_KEY: ${SANDBOX_ROOT_SIGNING_KEY:-}
     volumes:
       - research-runs:/data/runs
+      - sandbox-control:/run/insightforge
+    networks:
+      - default
+      - sandbox-control
 
   frontend:
     restart: unless-stopped
@@ -41,6 +54,77 @@ services:
       frontend:
         condition: service_healthy
 
+  sandbox-controller:
+    profiles: ["sandbox"]
+    build:
+      context: .
+      dockerfile: Dockerfile.sandbox-controller
+    env_file: .env
+    environment:
+      SANDBOX_ENABLED: "true"
+      ENABLE_ASYNC_RESEARCH: "true"
+      SANDBOX_POLICY_PATH: /app/config/sandbox-policy.toml
+      SANDBOX_CONTROLLER_SOCKET: /run/insightforge/sandbox-controller.sock
+      SANDBOX_GATEWAY_CONTAINER: insightforge-sandbox-gateway
+      SANDBOX_ROOT_SIGNING_KEY: ${SANDBOX_ROOT_SIGNING_KEY:-}
+    network_mode: none
+    depends_on:
+      sandbox-gateway:
+        condition: service_healthy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - sandbox-control:/run/insightforge
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid,nodev
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+  sandbox-gateway:
+    profiles: ["sandbox"]
+    container_name: insightforge-sandbox-gateway
+    build:
+      context: .
+      dockerfile: Dockerfile.sandbox-gateway
+    env_file: .env
+    environment:
+      SANDBOX_ENABLED: "true"
+      ENABLE_ASYNC_RESEARCH: "true"
+      SANDBOX_POLICY_PATH: /app/config/sandbox-policy.toml
+      SANDBOX_GATEWAY_PORT: "8081"
+      SANDBOX_GATEWAY_PROXY_PORT: "8080"
+      SANDBOX_API_INTERNAL_URL: http://api:2024
+      SANDBOX_ROOT_SIGNING_KEY: ${SANDBOX_ROOT_SIGNING_KEY:-}
+      SANDBOX_GATEWAY_PHYSICAL_PROCESS: "true"
+      SANDBOX_GATEWAY_FAKE_PROVIDER: ${SANDBOX_GATEWAY_FAKE_PROVIDER:-false}
+      APP_ENV: ${APP_ENV:-production}
+    networks:
+      - default
+      - sandbox-control
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,noexec,nosuid,nodev
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 1g
+    pids_limit: 512
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8081/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 3s
+      start_period: 20s
+      retries: 3
+    restart: unless-stopped
+
+  sandbox-worker-image:
+    profiles: ["sandbox-build"]
+    image: insightforge-sandbox-worker:local
+    build:
+      context: .
+      dockerfile: Dockerfile.sandbox-worker
+    command: ["python", "-c", "raise SystemExit('build-only image')"]
+
   # 可选：启用高级记忆后，取消注释以每天执行一次维护。
   # memory-maintenance:
   #   build:
@@ -56,3 +140,8 @@ services:
 
 volumes:
   research-runs:
+  sandbox-control:
+
+networks:
+  sandbox-control:
+    internal: true
