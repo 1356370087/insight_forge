@@ -1,6 +1,6 @@
 import { fetchEventSource } from "@microsoft/fetch-event-source";
 import { csrfHeaders, refreshBrowserSession } from "./auth";
-import type { PublicEvent, RunSnapshot, RunUsageResponse, TaskActivityEvent, TaskActivityKind, TaskActivityPage, UsageAnalyticsResponse } from "./types";
+import type { PublicEvent, RunSnapshot, RunUsageResponse, SecurityApproval, TaskActivityEvent, TaskActivityKind, TaskActivityPage, UsageAnalyticsResponse } from "./types";
 
 const API_BASE = process.env.NEXT_PUBLIC_RESEARCH_API_BASE ?? "/api/research";
 
@@ -37,6 +37,8 @@ export const researchApi = {
     body: JSON.stringify({ title, messages: [{ role: "user", content: query }], configurable }),
   }),
   humanAction: (runId: string, actionId: string, action: string, message = "") => apiFetch(`/runs/${runId}/human-actions/${actionId}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action, message }) }),
+  securityApprovals: (runId: string) => apiFetch<{ run_id: string; version: number; approvals: SecurityApproval[] }>(`/runs/${encodeURIComponent(runId)}/security-approvals?status=pending`),
+  resolveSecurityApproval: (runId: string, approvalId: string, decision: "allow_once" | "allow_run" | "deny", reason = "") => apiFetch<SecurityApproval>(`/runs/${encodeURIComponent(runId)}/security-approvals/${encodeURIComponent(approvalId)}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ decision, reason }) }),
   feedback: (runId: string, payload: Record<string, unknown>) => apiFetch(`/runs/${runId}/feedback`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }),
   cancel: (runId: string) => apiFetch(`/runs/${runId}/cancel`, { method: "POST" }),
   resume: (runId: string) => apiFetch(`/runs/${runId}/resume`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }),

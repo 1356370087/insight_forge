@@ -54,6 +54,18 @@ describe("reducePublicEvent", () => {
     expect(state.pendingHumanAction).toBeUndefined();
   });
 
+  it("tracks multiple security approvals independently", () => {
+    let state = reducePublicEvent(emptyRunState("run-1"), event(1, "security.approval.required", {
+      approval_id: "sec-1", task_id: "t1", kind: "network", capability: "tool.egress", target: { domain: "a.example" }, status: "pending",
+    }));
+    state = reducePublicEvent(state, event(2, "security.approval.required", {
+      approval_id: "sec-2", task_id: "t2", kind: "command", capability: "shell.execute", target: { command: "pytest" }, status: "pending",
+    }));
+    expect(state.pendingSecurityApprovals.map((item) => item.approval_id)).toEqual(["sec-1", "sec-2"]);
+    state = reducePublicEvent(state, event(3, "security.approval.resolved", { approval_id: "sec-1", decision: "allow_once", status: "resolved" }));
+    expect(state.pendingSecurityApprovals.map((item) => item.approval_id)).toEqual(["sec-2"]);
+  });
+
   it("closes on a terminal event without failing on unknown v1 events", () => {
     let state = reducePublicEvent(emptyRunState("run-1"), { ...event(1, "future.event", {}), schema_version: 1 });
     expect(state.diagnostics).toHaveLength(1);

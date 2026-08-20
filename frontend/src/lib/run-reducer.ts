@@ -16,7 +16,7 @@ export function emptyRunState(runId = ""): ResearchRunState {
   return {
     runId, title: runId, status: "pending", connectionState: "idle", stageProgress: {},
     plan: {}, wavesById: {}, tasksById: {}, sourcesById: {}, findingsByTaskId: {},
-    report: "", artifacts: [], warnings: [], diagnostics: [], lastEventId: 0,
+    pendingSecurityApprovals: [], report: "", artifacts: [], warnings: [], diagnostics: [], lastEventId: 0,
     isHydrated: false, isReconnecting: false, terminal: false,
   };
 }
@@ -56,6 +56,7 @@ export function hydrateSnapshot(state: ResearchRunState, snapshot: RunSnapshot):
     sourcesById: sources,
     findingsByTaskId: findings,
     pendingHumanAction: snapshot.pending_human_action ?? progress.pending_human_action,
+    pendingSecurityApprovals: snapshot.pending_security_approvals ?? progress.pending_security_approvals ?? [],
     report: snapshot.output?.markdown ?? "",
     artifacts: snapshot.output?.artifacts ?? [],
     qualityGate: snapshot.output?.quality_gate,
@@ -106,6 +107,12 @@ export function reducePublicEvent(state: ResearchRunState, event: PublicEvent): 
   } else if (event.type === "approval.resolved" || event.type === "clarification.resolved") {
     next.pendingHumanAction = undefined;
     next.status = "running";
+  } else if (event.type === "security.approval.required") {
+    const approvalId = String(payload.approval_id ?? "");
+    if (approvalId) next.pendingSecurityApprovals = [...state.pendingSecurityApprovals.filter((item) => item.approval_id !== approvalId), payload as unknown as typeof state.pendingSecurityApprovals[number]];
+  } else if (event.type === "security.approval.resolved") {
+    const approvalId = String(payload.approval_id ?? "");
+    next.pendingSecurityApprovals = state.pendingSecurityApprovals.filter((item) => item.approval_id !== approvalId);
   } else if (event.type === "system.warning") {
     next.warnings = [...state.warnings, { code: String(payload.warning_code ?? "warning"), message: String(payload.message ?? "") }];
   } else if (event.type === "model.circuit_state") {
@@ -121,6 +128,7 @@ export function reducePublicEvent(state: ResearchRunState, event: PublicEvent): 
   if (TERMINAL.has(event.type)) {
     next.terminal = true;
     next.pendingHumanAction = undefined;
+    next.pendingSecurityApprovals = [];
     next.connectionState = "closed";
   }
   return next;

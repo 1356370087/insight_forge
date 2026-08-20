@@ -84,6 +84,22 @@ export interface PendingHumanAction {
   allowed_actions?: Array<"approve" | "revise" | "answer" | "cancel">;
 }
 
+export interface SecurityApproval {
+  approval_id: string;
+  run_id: string;
+  task_id: string;
+  fence_token: number;
+  kind: "network" | "tool_effect" | "filesystem" | "command" | "mcp_oauth";
+  capability: string;
+  target: Record<string, unknown>;
+  target_fingerprint: string;
+  status: "pending" | "resolved" | "expired" | "consumed";
+  decision?: "allow_once" | "allow_run" | "deny";
+  reason?: string;
+  requested_at: number;
+  expires_at: number;
+}
+
 export interface Artifact { name?: string; type?: string; url?: string; path?: string; content?: unknown }
 
 export interface ResearchRunState {
@@ -99,6 +115,7 @@ export interface ResearchRunState {
   sourcesById: Record<string, ResearchSource>;
   findingsByTaskId: Record<string, { task_id: string; summary?: string; sources?: unknown[]; updatedAt: string }>;
   pendingHumanAction?: PendingHumanAction;
+  pendingSecurityApprovals: SecurityApproval[];
   report: string;
   artifacts: Artifact[];
   qualityGate?: Record<string, unknown>;
@@ -115,6 +132,7 @@ export interface RunSnapshot {
   title?: string;
   status: RunStatus;
   pending_human_action?: PendingHumanAction;
+  pending_security_approvals?: SecurityApproval[];
   progress?: {
     status?: RunStatus;
     current_stage?: StageId;
@@ -122,6 +140,7 @@ export interface RunSnapshot {
     sources?: ResearchSource[];
     latest_findings?: Array<Record<string, unknown>>;
     pending_human_action?: PendingHumanAction;
+    pending_security_approvals?: SecurityApproval[];
     plan?: Record<string, unknown>;
     last_event_id?: number;
   };
