@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from types import SimpleNamespace
 from typing import Any
 
@@ -424,6 +425,59 @@ def test_metrics_endpoint_returns_aggregated_metrics(tmp_path, monkeypatch):
     assert metrics["total_llm_tool_calls"] == 1
     assert metrics["rate_429"] == 1.0
     assert metrics["by_span"][0]["retry_count"] == 1
+
+
+def test_usage_business_endpoints_enforce_owner_and_history_scope(tmp_path, monkeypatch):
+    from open_deep_research.run_context import RunContextStore
+
+    trace_path = tmp_path / "usage-api.sqlite3"
+    runs_dir = tmp_path / "runs"
+    monkeypatch.setenv("TRACE_STORE_PATH", str(trace_path))
+    monkeypatch.setenv("RUNS_DIR", str(runs_dir))
+    store = SQLiteTraceStore(str(trace_path))
+    for run_id, owner, total in (("usage-mine", "user-1", 5), ("usage-theirs", "user-2", 99)):
+        RunContextStore(run_id, runs_dir=str(runs_dir)).initialize(
+            owner, {"configurable": {}, "metadata": {}}
+        )
+        store.start_run(run_id, owner, {})
+        store.start_span(
+            span_id=f"span-{run_id}",
+            run_id=run_id,
+            parent_span_id=None,
+            name="test.model",
+            kind="llm",
+            agent_role="researcher",
+            attributes={},
+            input_preview=None,
+            provider="openai",
+            model="gpt-test",
+        )
+        store.add_usage(
+            run_id,
+            f"span-{run_id}",
+            "openai",
+            "gpt-test",
+            TokenUsage(input_tokens=total - 1, output_tokens=1, total_tokens=total),
+            event_key=f"event-{run_id}",
+            stage="researching",
+            agent_role="researcher",
+        )
+
+    app.dependency_overrides[get_current_user] = lambda: research_principal("user-1")
+    try:
+        client = TestClient(app)
+        mine = client.get("/runs/usage-mine/usage")
+        hidden = client.get("/runs/usage-theirs/usage")
+        analytics = client.get("/usage/analytics?range=retained")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert mine.status_code == 200
+    assert mine.json()["totals"]["reported"]["total_tokens"] == 5
+    assert hidden.status_code == 404
+    assert analytics.status_code == 200
+    assert analytics.json()["summary"]["run_count"] == 1
+    assert analytics.json()["summary"]["reported"]["total_tokens"] == 5
 
 
 # ---------------------------------------------------------------------------
@@ -978,6 +1032,194 @@ def test_langfuse_bridge_uses_captured_external_parent_id():
         "parent_span_id": "b" * 16,
     }
     assert span.langfuse_observation_id == "c" * 16
+
+
+def test_usage_accounting_keeps_reported_estimated_and_unknown_separate(tmp_path):
+    store = SQLiteTraceStore(str(tmp_path / "accounting.sqlite3"))
+    store.start_run("usage-run", "owner-1", {})
+    for span_id in ("reported", "estimated", "unknown"):
+        store.start_span(
+            span_id=span_id,
+            run_id="usage-run",
+            parent_span_id=None,
+            name=f"test.{span_id}",
+            kind="llm",
+            agent_role="researcher",
+            attributes={},
+            input_preview=None,
+            provider="openai",
+            model="gpt-test",
+        )
+    store.add_usage(
+        "usage-run",
+        "reported",
+        "openai",
+        "gpt-test",
+        TokenUsage(input_tokens=10, output_tokens=5, total_tokens=15),
+        event_key="reported-1",
+        stage="researching",
+        agent_role="researcher",
+    )
+    store.add_usage(
+        "usage-run",
+        "estimated",
+        "openai",
+        "gpt-test",
+        TokenUsage(
+            estimated_input_tokens=8,
+            estimated_output_tokens=4,
+            estimated_total_tokens=12,
+            usage_source="tokenizer_estimated",
+        ),
+        event_key="estimated-1",
+        stage="researching",
+        agent_role="researcher",
+    )
+    store.add_usage(
+        "usage-run",
+        "unknown",
+        "openai",
+        "gpt-test",
+        TokenUsage(usage_source="missing"),
+        event_key="missing-1",
+        stage="researching",
+        agent_role="researcher",
+        response_status="unknown_failed",
+    )
+
+    accounting = store.get_usage_accounting("usage-run")
+
+    assert accounting["accounting_status"] == "partial"
+    assert accounting["totals"]["reported"]["total_tokens"] == 15
+    assert accounting["totals"]["estimated"]["total_tokens"] == 12
+    assert accounting["totals"]["calls"]["coverage_ratio"] == 0.5
+    assert accounting["totals"]["calls"]["unknown_failed_attempts"] == 1
+    assert accounting["totals"]["cost"]["estimated_cost_micro_usd"] is None
+
+
+def test_usage_event_key_is_idempotent(tmp_path):
+    store = SQLiteTraceStore(str(tmp_path / "dedupe.sqlite3"))
+    store.start_run("dedupe-run", "owner-1", {})
+    store.start_span(
+        span_id="span-1",
+        run_id="dedupe-run",
+        parent_span_id=None,
+        name="test.model",
+        kind="llm",
+        agent_role="researcher",
+        attributes={},
+        input_preview=None,
+        provider="openai",
+        model="gpt-test",
+    )
+    usage = TokenUsage(input_tokens=3, output_tokens=2, total_tokens=5)
+
+    first = store.add_usage(
+        "dedupe-run", "span-1", "openai", "gpt-test", usage, event_key="same"
+    )
+    second = store.add_usage(
+        "dedupe-run", "span-1", "openai", "gpt-test", usage, event_key="same"
+    )
+
+    assert first is not None
+    assert second is None
+    assert store.get_usage("dedupe-run")["total_tokens"] == 5
+
+
+def test_legacy_usage_rows_migrate_without_historical_estimation(tmp_path):
+    path = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """CREATE TABLE usage_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL,
+                span_id TEXT NOT NULL, provider TEXT, model TEXT,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                raw_usage_json TEXT NOT NULL DEFAULT '{}', created_at REAL NOT NULL
+            )"""
+        )
+        conn.execute(
+            "INSERT INTO usage_events (run_id, span_id, input_tokens, output_tokens, total_tokens, created_at) VALUES ('legacy-run', 'old-span', 4, 2, 6, 1)"
+        )
+
+    accounting = SQLiteTraceStore(str(path)).get_usage_accounting("legacy-run")
+
+    assert accounting["accounting_status"] == "partial"
+    assert accounting["totals"]["reported"]["total_tokens"] == 6
+    assert accounting["totals"]["estimated"]["total_tokens"] == 0
+    assert accounting["totals"]["calls"]["legacy_unclassified"] == 1
+
+
+@pytest.mark.asyncio
+async def test_accounting_persists_without_observability_or_payloads(tmp_path):
+    trace_path = tmp_path / "minimal.sqlite3"
+    config = _config(trace_path, run_id="minimal-run")
+    config["configurable"].update(
+        {
+            "observability_enabled": False,
+            "sqlite_observability_enabled": False,
+            "token_usage_accounting_enabled": True,
+        }
+    )
+    recorder = get_trace_recorder(config)
+    model = FakeModel(
+        AIMessage(
+            content="private output",
+            usage_metadata={"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+        )
+    )
+
+    with recorder.start_run("minimal-run", user_id="owner-1", input_payload="private prompt"):
+        await invoke_model_with_observability(
+            model,
+            [HumanMessage(content="private prompt")],
+            config,
+            span_name="minimal.model",
+            agent_role="researcher",
+            model_name="openai:gpt-test",
+        )
+
+    store = SQLiteTraceStore(str(trace_path))
+    accounting = store.get_usage_accounting("minimal-run")
+    model_span = next(span for span in store.list_spans("minimal-run") if span["kind"] == "llm")
+    assert accounting["totals"]["reported"]["total_tokens"] == 5
+    assert model_span["input_preview"] is None
+    assert model_span["output_preview"] is None
+
+
+@pytest.mark.asyncio
+async def test_model_budget_is_reserved_at_unified_callback_boundary(tmp_path):
+    from langchain_core.language_models.fake_chat_models import FakeListChatModel
+
+    from open_deep_research.budgets import BudgetExhausted
+
+    trace_path = tmp_path / "budget.sqlite3"
+    config = _config(trace_path, run_id="budget-boundary")
+    config["configurable"].update(
+        {"runs_dir": str(tmp_path / "runs"), "max_run_model_calls": 1}
+    )
+    recorder = get_trace_recorder(config)
+    model = FakeListChatModel(responses=["one", "two"])
+
+    with recorder.start_run("budget-boundary", user_id="owner-1"):
+        await invoke_model_with_observability(
+            model,
+            [HumanMessage(content="first")],
+            config,
+            span_name="budget.first",
+            agent_role="researcher",
+            model_name="openai:gpt-test",
+        )
+        with pytest.raises(BudgetExhausted):
+            await invoke_model_with_observability(
+                model,
+                [HumanMessage(content="second")],
+                config,
+                span_name="budget.second",
+                agent_role="researcher",
+                model_name="openai:gpt-test",
+            )
 
 
 @pytest.mark.asyncio

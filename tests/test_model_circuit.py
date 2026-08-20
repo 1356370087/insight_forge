@@ -312,14 +312,14 @@ def test_registry_reset_removes_breakers() -> None:
     assert get_model_circuit_registry().get("openai:test") is None
 
 
-def test_circuit_configuration_defaults_are_frozen_in_v5() -> None:
+def test_circuit_configuration_defaults_remain_frozen_in_v6() -> None:
     configuration = Configuration()
-    assert RUN_CONFIG_SCHEMA_VERSION == 5
+    assert RUN_CONFIG_SCHEMA_VERSION == 6
     assert configuration.model_circuit_breaker_enabled is True
     assert configuration.model_first_packet_probe == "shadow"
 
     frozen = freeze_run_config({"configurable": {}, "metadata": {}})
-    assert frozen["metadata"]["run_config_schema_version"] == 5
+    assert frozen["metadata"]["run_config_schema_version"] == 6
     for field_name in (
         "model_circuit_breaker_enabled",
         "model_circuit_failure_threshold",
