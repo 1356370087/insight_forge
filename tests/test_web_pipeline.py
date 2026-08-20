@@ -148,12 +148,9 @@ async def test_authority_fallback_uses_exact_trusted_domain_rules() -> None:
 
 
 @pytest.mark.asyncio
-async def test_allow_search_only_does_not_require_unreachable_sync_approval(
-    monkeypatch,
-) -> None:
-    monkeypatch.setenv("SANDBOX_NETWORK_MODE", "allow-search-only")
+async def test_disabled_sandbox_does_not_apply_domain_approval() -> None:
     config = {
-        "configurable": {"sandbox_network_mode": "allow-search-only"},
+        "configurable": {},
         "metadata": {"run_id": "sync-search"},
     }
 
@@ -168,15 +165,13 @@ async def test_allow_search_only_does_not_require_unreachable_sync_approval(
 
 
 @pytest.mark.asyncio
-async def test_allowlist_domain_keeps_explicit_domain_approval(monkeypatch) -> None:
-    monkeypatch.setenv("SANDBOX_NETWORK_MODE", "allowlist-domain")
-    utils.get_domain_approval_registry().clear_run("approval-required")
+async def test_gateway_physical_pipeline_uses_gateway_policy_boundary() -> None:
     config = {
-        "configurable": {
-            "sandbox_network_mode": "allowlist-domain",
-            "sandbox_allowed_domains": [],
+        "configurable": {},
+        "metadata": {
+            "run_id": "gateway-fetch",
+            "sandbox_gateway_physical": True,
         },
-        "metadata": {"run_id": "approval-required"},
     }
 
     batch = await utils._approve_candidate_batch(
@@ -185,7 +180,8 @@ async def test_allowlist_domain_keeps_explicit_domain_approval(monkeypatch) -> N
         config,
     )
 
-    assert batch.pending_domains == ["example.org"]
+    assert batch.pending_domains == []
+    assert batch.denied_domains == []
 
 
 def test_html_extraction_removes_navigation_and_preserves_metadata() -> None:

@@ -11,6 +11,7 @@ from open_deep_research.tools.base import (
     Tool,
     ToolContext,
     ToolEffect,
+    ToolExecutionZone,
     ToolOrigin,
     ToolResult,
     build_tool,
@@ -52,6 +53,7 @@ def test_plain_structural_object_satisfies_tool_protocol():
         origin: ToolOrigin = ToolOrigin.SYSTEM
         retryable: bool = False
         effect: ToolEffect = ToolEffect.READ_ONLY
+        execution_zone: ToolExecutionZone = ToolExecutionZone.SANDBOX_LOCAL
         concurrency_safe: bool = False
         max_output_chars: int | None = None
 

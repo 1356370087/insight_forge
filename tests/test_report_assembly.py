@@ -36,9 +36,16 @@ class _FakeStructuredModel:
     def with_structured_output(self, _schema, **_kwargs):
         return self
 
+    def with_config(self, _config):
+        return self
+
 
 def _patch_init_chat_model(monkeypatch):
-    monkeypatch.setattr(assembly_module, "init_chat_model", lambda **_kw: _FakeStructuredModel())
+    monkeypatch.setattr(
+        assembly_module,
+        "_writer_model_template",
+        _FakeStructuredModel(),
+    )
 
 
 def test_sectioned_assemble_ordering():

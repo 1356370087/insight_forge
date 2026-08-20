@@ -167,7 +167,7 @@ def test_new_rigor_wins_over_legacy_min_score(monkeypatch) -> None:
     )
 
 
-def test_frozen_v1_quality_policy_is_not_silently_upgraded() -> None:
+def test_frozen_v1_run_is_rejected_at_the_v7_security_boundary() -> None:
     configurable = Configuration().model_dump(mode="json")
     configurable.pop("quality_evaluation_rigor")
     configurable["quality_evaluation_min_score"] = 4
@@ -184,11 +184,11 @@ def test_frozen_v1_quality_policy_is_not_silently_upgraded() -> None:
         legacy
     )
 
-    restored = freeze_run_config(legacy)
-
-    assert restored["metadata"]["quality_policy_version"] == "quality-gate-v2"
-    assert restored["configurable"]["quality_evaluation_min_score"] == 4
-    assert "quality_evaluation_rigor" not in restored["configurable"]
+    with pytest.raises(
+        ValueError,
+        match="run_schema_not_resumable:sandbox_policy_v7_required",
+    ):
+        freeze_run_config(legacy)
 
 
 @pytest.mark.asyncio

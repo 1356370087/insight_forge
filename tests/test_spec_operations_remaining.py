@@ -372,6 +372,24 @@ async def test_memory_maintenance_loop_uses_configured_interval(monkeypatch) -> 
     assert delays == [7200]
 
 
-def test_sandbox_secret_injection_can_be_disabled(monkeypatch) -> None:
-    monkeypatch.setenv("SANDBOX_SECRET_ENV_KEYS", "")
-    assert sandbox_manager._sandbox_secret_env_keys() == ()
+def test_sandbox_worker_environment_never_contains_provider_secrets() -> None:
+    from open_deep_research.sandbox.schema import load_policy_bundle
+
+    profile = load_policy_bundle("config/sandbox-policy.toml").profiles[
+        "research-gateway-only"
+    ]
+    env = sandbox_manager.DockerSandboxManager(docker_client=object())._build_environment(
+        Configuration(), {}, profile
+    )
+    forbidden = {
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GOOGLE_API_KEY",
+        "TAVILY_API_KEY",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "HELICONE_API_KEY",
+        "LANGFUSE_SECRET_KEY",
+    }
+    assert forbidden.isdisjoint(env)

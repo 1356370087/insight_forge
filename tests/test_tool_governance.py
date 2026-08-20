@@ -11,6 +11,7 @@ researcher_tools and supervisor_tools end-to-end.
 from __future__ import annotations
 
 import asyncio
+import base64
 import importlib.util
 import json
 import os
@@ -25,7 +26,6 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool as lc_tool
 
 from open_deep_research.configuration import Configuration
-from open_deep_research.tasks.registry import TaskStatus
 from open_deep_research.tools.adapters import adapt_langchain_tool
 from open_deep_research.tools.base import Tool, ToolContext, ToolEffect, ToolOrigin
 from open_deep_research.tools.governance import (
@@ -1053,55 +1053,12 @@ class TestSupervisorToolsIntegration:
         assert len(good) == 1
         assert json.loads(good[0].content)["compressed_research"] == "GOOD-RAN"
 
-    def test_build_supervisor_tools_includes_approve_domain(self):
+    def test_build_supervisor_tools_excludes_llm_security_approval(self):
         from open_deep_research.agents.deep_researcher import build_supervisor_tools
 
         async_tools = build_supervisor_tools({"enable_async_research": True})
         names = [t.name for t in async_tools]
-        assert "ApproveResearchDomain" in names
-
-    @pytest.mark.asyncio
-    async def test_supervisor_dispatches_approve_research_domain(self):
-        """In async mode an ApproveResearchDomain tool call is routed to its handler."""
-        from open_deep_research.agents.deep_researcher import supervisor_tools
-        from open_deep_research.tools.supervisor.approve_research_domain import (
-            definition as approve_definition,
-        )
-
-        called: dict[str, Any] = {}
-
-        async def fake_approve(tool_call, config, registry, event_writer=None, state_store=None):
-            called["tool_call_id"] = tool_call["id"]
-            called["domain"] = tool_call["args"]["domain"]
-            from langchain_core.messages import ToolMessage
-
-            return ToolMessage(
-                content="approved", name="ApproveResearchDomain", tool_call_id=tool_call["id"]
-            )
-
-        orig = approve_definition.handle_approve_research_domain
-        approve_definition.handle_approve_research_domain = fake_approve
-        try:
-            ai_msg = AIMessage(content="", tool_calls=[{
-                "name": "ApproveResearchDomain",
-                "args": {"task_id": "t1", "domain": "x.example", "allow": True},
-                "id": "ard-1",
-            }])
-            state = {
-                "supervisor_messages": [ai_msg], "research_iterations": 1,
-                "research_brief": "b", "enable_async_research": True,
-                "memory_context": None, "notes": [], "raw_notes": [],
-            }
-            config = _config(max_researcher_iterations=100)
-            result = await supervisor_tools(state, config)
-        finally:
-            approve_definition.handle_approve_research_domain = orig
-
-        assert called.get("tool_call_id") == "ard-1"
-        assert called.get("domain") == "x.example"
-        msgs = result.update.get("supervisor_messages", [])
-        assert any(m.name == "ApproveResearchDomain" and m.content == "approved" for m in msgs)
-
+        assert "ApproveResearchDomain" not in names
 
 # ---------------------------------------------------------------------------
 # Egress domain allowlist (check_egress_domain inside execute_governed_tool_call)
@@ -1111,25 +1068,6 @@ class TestSupervisorToolsIntegration:
 async def _ok_fetch_fn(url: str) -> str:
     """A fetch_webpage stand-in that returns fixed content (no real network)."""
     return f"fetched:{url}"
-
-
-@pytest.fixture
-def egress_env(monkeypatch):
-    """Ensure in-process mode (no SANDBOX_NETWORK_MODE) and fresh registries."""
-    monkeypatch.delenv("SANDBOX_NETWORK_MODE", raising=False)
-    # Reset the registry singleton so prior tests' tasks don't leak in.
-    import open_deep_research.tasks.registry as registry_mod
-    from open_deep_research.tasks.domain_approvals import (
-        get_domain_approval_registry,
-        reset_domain_approval_registry,
-    )
-    from open_deep_research.tasks.registry import get_task_registry
-
-    registry_mod._registry = None
-    reset_domain_approval_registry()
-    yield get_task_registry(), get_domain_approval_registry()
-    reset_domain_approval_registry()
-    registry_mod._registry = None
 
 
 def _fetch_tool() -> Any:
@@ -1146,29 +1084,20 @@ def _fetch_tool() -> Any:
 
 def _egress_config(**configurable: Any) -> RunnableConfig:
     base = {
-        "sandbox_network_mode": "allowlist-domain",
-        "sandbox_allowed_domains": ["api.tavily.com"],
+        "sandbox_enabled": True,
+        "enable_async_research": True,
+        "sandbox_root_signing_key": base64.b64encode(b"k" * 32).decode(),
+        "sandbox_policy_path": "config/sandbox-policy.toml",
     }
     base.update(configurable)
     return RunnableConfig(
         configurable=base, metadata={"run_id": "egress-run"}
     )
-
-
-def _seed_task(registry, run_id="egress-run") -> Any:
-    """Create a RUNNING task in the registry and return it."""
-    rec = registry.create("topic", run_id=run_id)
-    registry.update_status(rec.task_id, TaskStatus.RUNNING)
-    return rec
-
-
 class TestEgressAllowlist:
-    def test_allowed_domain_passes(self, egress_env):
-        registry, _ = egress_env
+    def test_post_approval_authorized_domain_passes(self):
         tool = _fetch_tool()
-        cfg = _egress_config(sandbox_allowed_domains=["example.com"])
-        rec = _seed_task(registry)
-        cfg["metadata"]["task_id"] = rec.task_id
+        cfg = _egress_config()
+        cfg["metadata"]["sandbox_gateway_authorized_hosts"] = ["example.com"]
         msg = asyncio.run(
             execute_governed_tool_call(
                 {"name": "fetch_webpage", "id": "tc1", "args": {"url": "https://example.com/x"}},
@@ -1180,117 +1109,42 @@ class TestEgressAllowlist:
         )
         assert msg.content == "fetched:https://example.com/x"
 
-    def test_no_network_mode_denies_egress(self, egress_env):
-        registry, _ = egress_env
-        tool = _fetch_tool()
-        cfg = _egress_config(sandbox_network_mode="no-network")
-        rec = _seed_task(registry)
-        cfg["metadata"]["task_id"] = rec.task_id
-        msg = asyncio.run(
-            execute_governed_tool_call(
-                {"name": "fetch_webpage", "id": "tc1", "args": {"url": "https://untrusted.example/x"}},
-                {"fetch_webpage": tool},
-                AgentRole.RESEARCHER,
-                cfg,
-                apply_retry=False,
-            )
-        )
-        payload = json.loads(msg.content)
-        assert payload["error_type"] == "egress_domain_denied"
-        assert payload["detail"]["network_mode"] == "no-network"
-
-    def test_open_network_mode_skips_egress(self, egress_env):
-        registry, _ = egress_env
-        tool = _fetch_tool()
-        cfg = _egress_config(sandbox_network_mode="open-network")
-        rec = _seed_task(registry)
-        cfg["metadata"]["task_id"] = rec.task_id
-        msg = asyncio.run(
-            execute_governed_tool_call(
-                {"name": "fetch_webpage", "id": "tc1", "args": {"url": "https://untrusted.example/x"}},
-                {"fetch_webpage": tool},
-                AgentRole.RESEARCHER,
-                cfg,
-                apply_retry=False,
-            )
-        )
-        assert msg.content == "fetched:https://untrusted.example/x"
-
-    @pytest.mark.asyncio
-    async def test_unknown_domain_blocks_and_waits_then_resumes(self, egress_env):
-        registry, approvals = egress_env
-        tool = _fetch_tool()
-        cfg = _egress_config()  # allowlist only api.tavily.com
-        rec = _seed_task(registry)
-        cfg["metadata"]["task_id"] = rec.task_id
-
-        async def approve_after_pause():
-            # Wait until the task flips to WAITING, then approve the domain.
-            for _ in range(50):
-                if rec.status == TaskStatus.WAITING_FOR_CONFIRMATION:
-                    break
-                await asyncio.sleep(0.005)
-            approvals.record_decision("egress-run", "untrusted.example", True)
-
-        msg, _ = await asyncio.gather(
-            execute_governed_tool_call(
-                {"name": "fetch_webpage", "id": "tc1", "args": {"url": "https://untrusted.example/x"}},
-                {"fetch_webpage": tool},
-                AgentRole.RESEARCHER,
-                cfg,
-                apply_retry=False,
-            ),
-            approve_after_pause(),
-        )
-        assert msg.content == "fetched:https://untrusted.example/x"
-        assert rec.status == TaskStatus.RUNNING
-        # decision cached for the run
-        assert approvals.is_allowed("egress-run", "untrusted.example") is True
-
-    @pytest.mark.asyncio
-    async def test_unknown_domain_denied(self, egress_env):
-        registry, approvals = egress_env
+    def test_unknown_domain_is_fail_closed_before_durable_approval(self):
         tool = _fetch_tool()
         cfg = _egress_config()
-        rec = _seed_task(registry)
-        cfg["metadata"]["task_id"] = rec.task_id
-
-        async def deny_after_pause():
-            for _ in range(50):
-                if rec.status == TaskStatus.WAITING_FOR_CONFIRMATION:
-                    break
-                await asyncio.sleep(0.005)
-            approvals.record_decision("egress-run", "untrusted.example", False)
-
-        msg, _ = await asyncio.gather(
+        msg = asyncio.run(
             execute_governed_tool_call(
                 {"name": "fetch_webpage", "id": "tc1", "args": {"url": "https://untrusted.example/x"}},
                 {"fetch_webpage": tool},
                 AgentRole.RESEARCHER,
                 cfg,
                 apply_retry=False,
-            ),
-            deny_after_pause(),
+            )
         )
         payload = json.loads(msg.content)
         assert payload["error_type"] == "egress_domain_denied"
-        assert approvals.is_allowed("egress-run", "untrusted.example") is False
+        assert payload["detail"]["network_mode"] == "gateway-only"
+        assert payload["detail"]["profile_id"] == "research-gateway-only"
 
-    @pytest.mark.asyncio
-    async def test_decision_scoped_to_run(self, egress_env):
-        registry, approvals = egress_env
-        approvals.record_decision("run-A", "shared.example", True)
-        assert approvals.is_allowed("run-A", "shared.example") is True
-        assert approvals.is_allowed("run-B", "shared.example") is None
+    def test_disabled_sandbox_skips_egress_gate(self):
+        tool = _fetch_tool()
+        cfg = RunnableConfig(configurable={}, metadata={"run_id": "plain"})
+        msg = asyncio.run(
+            execute_governed_tool_call(
+                {"name": "fetch_webpage", "id": "tc1", "args": {"url": "https://untrusted.example/x"}},
+                {"fetch_webpage": tool},
+                AgentRole.RESEARCHER,
+                cfg,
+                apply_retry=False,
+            )
+        )
+        assert msg.content == "fetched:https://untrusted.example/x"
 
-    def test_search_tool_skipped_by_egress(self, egress_env):
+    def test_search_tool_without_url_is_delegated_to_gateway(self):
         # tavily_search is SEARCH origin with no url arg -> _egress_host_for_tool
         # returns None -> no egress check, tool would proceed (we only assert no
         # egress error is produced for a SEARCH tool targeting an unknown host).
-        registry, _ = egress_env
-        rec = _seed_task(registry)
         cfg = _egress_config()
-        cfg["metadata"]["task_id"] = rec.task_id
         # Use check_egress_domain directly with a SEARCH-origin tool.
         from open_deep_research.tools.governance import check_egress_domain
 
@@ -1303,64 +1157,5 @@ class TestEgressAllowlist:
             )
         )
         assert result is None  # SEARCH tool -> no egress interception
-
-    def test_pending_error_in_container_mode(self, egress_env, monkeypatch):
-        # Simulate the Docker worker: SANDBOX_NETWORK_MODE is set -> undecided
-        # domain returns egress_domain_pending instead of blocking.
-        monkeypatch.setenv("SANDBOX_NETWORK_MODE", "allowlist-domain")
-        tool = _fetch_tool()
-        cfg = _egress_config()
-        msg = asyncio.run(
-            execute_governed_tool_call(
-                {"name": "fetch_webpage", "id": "tc1", "args": {"url": "https://untrusted.example/x"}},
-                {"fetch_webpage": tool},
-                AgentRole.RESEARCHER,
-                cfg,
-                apply_retry=False,
-            )
-        )
-        payload = json.loads(msg.content)
-        assert payload["error_type"] == "egress_domain_pending"
-        assert payload["detail"]["pending"] is True
-
-    def test_allow_search_only_without_task_reports_mode_restriction(self, egress_env):
-        # No seeded task -> synchronous researcher has no approval channel; the
-        # denial must name the mode restriction instead of implying that a task
-        # context could have provided approval.
-        tool = _fetch_tool()
-        cfg = _egress_config(sandbox_network_mode="allow-search-only")
-        msg = asyncio.run(
-            execute_governed_tool_call(
-                {"name": "fetch_webpage", "id": "tc1", "args": {"url": "https://untrusted.example/x"}},
-                {"fetch_webpage": tool},
-                AgentRole.RESEARCHER,
-                cfg,
-                apply_retry=False,
-            )
-        )
-        payload = json.loads(msg.content)
-        assert payload["error_type"] == "egress_domain_denied"
-        assert payload["detail"]["network_mode"] == "allow-search-only"
-        assert "allow-search-only" in payload["message"]
-        assert "no active task context" not in payload["message"]
-
-    def test_allowlist_domain_without_task_keeps_approval_hint(self, egress_env):
-        # In allowlist-domain mode supervisor approval is the intended path, so
-        # the missing-task-context hint stays accurate there.
-        tool = _fetch_tool()
-        cfg = _egress_config()  # default sandbox_network_mode=allowlist-domain
-        msg = asyncio.run(
-            execute_governed_tool_call(
-                {"name": "fetch_webpage", "id": "tc1", "args": {"url": "https://untrusted.example/x"}},
-                {"fetch_webpage": tool},
-                AgentRole.RESEARCHER,
-                cfg,
-                apply_retry=False,
-            )
-        )
-        payload = json.loads(msg.content)
-        assert payload["error_type"] == "egress_domain_denied"
-        assert payload["detail"]["network_mode"] == "allowlist-domain"
-        assert "no active task context" in payload["message"]
 
 

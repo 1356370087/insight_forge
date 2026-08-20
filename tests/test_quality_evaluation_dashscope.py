@@ -123,20 +123,20 @@ class TestDashScopeQualityEvaluationConfiguration:
         captured: dict[str, object] = {}
 
         class FakeModel:
+            def with_config(self, kwargs):
+                captured["init"] = kwargs
+                return self
+
             def bind(self, **kwargs):
                 captured["bind"] = kwargs
                 return self
-
-        def fake_init_chat_model(**kwargs):
-            captured["init"] = kwargs
-            return FakeModel()
 
         for key, value in values.items():
             monkeypatch.setenv(key, value)
         monkeypatch.delenv("QUALITY_EVALUATION_API_KEY", raising=False)
         monkeypatch.setattr(
-            "open_deep_research.quality.gate.init_chat_model",
-            fake_init_chat_model,
+            "open_deep_research.models.resolution.get_configurable_model_template",
+            lambda: FakeModel(),
         )
 
         configurable = Configuration.from_runnable_config({"configurable": {}})
@@ -154,6 +154,7 @@ class TestDashScopeQualityEvaluationConfiguration:
             "max_retries": 0,
             "api_key": values["DASHSCOPE_API_KEY"],
             "base_url": values["QUALITY_EVALUATION_BASE_URL"],
+            "metadata": {"sandbox_model_role": "quality_evaluation"},
         }
         if model_spec.split(":", 1)[1].lower().startswith("qwen"):
             expected_init["extra_body"] = {
@@ -268,19 +269,19 @@ class TestQualityEvaluationProviderIsolation:
         captured: dict[str, object] = {}
 
         class FakeModel:
+            def with_config(self, kwargs):
+                captured["init"] = kwargs
+                return self
+
             def bind(self, **kwargs):
                 captured["bind"] = kwargs
                 return self
 
-        def fake_init_chat_model(**kwargs):
-            captured["init"] = kwargs
-            return FakeModel()
-
         monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-key")
         monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
         monkeypatch.setattr(
-            "open_deep_research.quality.gate.init_chat_model",
-            fake_init_chat_model,
+            "open_deep_research.models.resolution.get_configurable_model_template",
+            lambda: FakeModel(),
         )
         configurable = Configuration(
             quality_evaluation_model="openai:gpt-4.1-mini",
@@ -299,19 +300,19 @@ class TestQualityEvaluationProviderIsolation:
         captured: dict[str, object] = {}
 
         class FakeModel:
+            def with_config(self, kwargs):
+                captured["init"] = kwargs
+                return self
+
             def bind(self, **kwargs):
                 captured["bind"] = kwargs
                 return self
 
-        def fake_init_chat_model(**kwargs):
-            captured["init"] = kwargs
-            return FakeModel()
-
         monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-key")
         monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-key")
         monkeypatch.setattr(
-            "open_deep_research.quality.gate.init_chat_model",
-            fake_init_chat_model,
+            "open_deep_research.models.resolution.get_configurable_model_template",
+            lambda: FakeModel(),
         )
         configurable = Configuration(
             quality_evaluation_model="anthropic:claude-sonnet-4-5",
@@ -331,6 +332,10 @@ class TestQualityEvaluationProviderIsolation:
         captured: dict[str, object] = {}
 
         class FakeModel:
+            def with_config(self, kwargs):
+                captured.update(kwargs)
+                return self
+
             def bind(self, **_kwargs):
                 return self
 
@@ -338,8 +343,8 @@ class TestQualityEvaluationProviderIsolation:
         monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-key")
         monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
         monkeypatch.setattr(
-            "open_deep_research.quality.gate.init_chat_model",
-            lambda **kwargs: captured.update(kwargs) or FakeModel(),
+            "open_deep_research.models.resolution.get_configurable_model_template",
+            lambda: FakeModel(),
         )
         configurable = Configuration(
             quality_evaluation_model="openai:custom-model",

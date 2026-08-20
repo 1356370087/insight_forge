@@ -31,15 +31,18 @@ def test_quality_model_uses_json_mode_and_disables_thinking(monkeypatch) -> None
     captured: dict = {}
 
     class FakeModel:
+        def with_config(self, kwargs):
+            captured["init"] = kwargs
+            return self
+
         def bind(self, **kwargs):
             captured["bind"] = kwargs
             return self
 
-    def fake_init_chat_model(**kwargs):
-        captured["init"] = kwargs
-        return FakeModel()
-
-    monkeypatch.setattr("open_deep_research.quality.gate.init_chat_model", fake_init_chat_model)
+    monkeypatch.setattr(
+        "open_deep_research.models.resolution.get_configurable_model_template",
+        lambda: FakeModel(),
+    )
     configurable = Configuration(
         quality_evaluation_model="openai:qwen3.7-plus",
         quality_evaluation_base_url="https://example.test/v1",
@@ -56,15 +59,18 @@ def test_quality_model_enables_thinking_for_qwen_max_series(monkeypatch) -> None
     captured: dict = {}
 
     class FakeModel:
+        def with_config(self, kwargs):
+            captured["init"] = kwargs
+            return self
+
         def bind(self, **kwargs):
             captured["bind"] = kwargs
             return self
 
-    def fake_init_chat_model(**kwargs):
-        captured["init"] = kwargs
-        return FakeModel()
-
-    monkeypatch.setattr("open_deep_research.quality.gate.init_chat_model", fake_init_chat_model)
+    monkeypatch.setattr(
+        "open_deep_research.models.resolution.get_configurable_model_template",
+        lambda: FakeModel(),
+    )
     configurable = Configuration(
         quality_evaluation_model="openai:qwen3.7-max-2026-05-17",
         quality_evaluation_base_url=(

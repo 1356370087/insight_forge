@@ -45,13 +45,11 @@ def test_local_evaluation_accepts_one_custom_question() -> None:
     assert args.question_title == "Citation methods"
 
 
-def test_local_evaluation_uses_read_only_search_network_mode(monkeypatch) -> None:
-    monkeypatch.delenv("SANDBOX_NETWORK_MODE", raising=False)
-
+def test_local_evaluation_uses_enforced_web_pipeline() -> None:
     config = build_run_config()["configurable"]
 
     assert config["web_pipeline_mode"] == "enforced"
-    assert config["sandbox_network_mode"] == "allow-search-only"
+    assert "sandbox_network_mode" not in config
     assert config["enable_memory"] is False
     env_example = (Path(__file__).resolve().parents[1] / ".env.example").read_text(
         encoding="utf-8"
@@ -230,7 +228,6 @@ def test_local_run_disables_clarification(monkeypatch) -> None:
     monkeypatch.setenv("ALLOW_CLARIFICATION", "true")
     monkeypatch.setenv("ENABLE_MEMORY", "true")
     monkeypatch.setenv("WEB_PIPELINE_MODE", "legacy")
-    monkeypatch.setenv("SANDBOX_NETWORK_MODE", "full")
 
     config = build_run_config()
 
@@ -242,7 +239,7 @@ def test_local_run_disables_clarification(monkeypatch) -> None:
         assert resolved.allow_clarification is False
         assert resolved.enable_memory is False
         assert resolved.web_pipeline_mode == "enforced"
-        assert resolved.sandbox_network_mode == "allow-search-only"
+        assert resolved.sandbox_enabled is False
 
 
 def test_local_run_uses_fresh_isolated_context() -> None:

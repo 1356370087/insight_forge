@@ -78,12 +78,33 @@ async def test_alembic_upgrade_heads_from_empty(test_db_url):
                 "iam_email_tokens", "iam_audit_events", "iam_rate_limits", "alembic_version",
             ):
                 assert required in tables, f"missing table {required}"
-            assert (await conn.execute(text("SELECT count(*) FROM iam_permissions"))).scalar() >= 17
+            assert (await conn.execute(text("SELECT count(*) FROM iam_permissions"))).scalar() >= 25
             assert (await conn.execute(text("SELECT count(*) FROM iam_roles WHERE is_system"))).scalar() == 4
-            assert (await conn.execute(text("SELECT count(*) FROM iam_role_permissions"))).scalar() == 27
+            assert (await conn.execute(text("SELECT count(*) FROM iam_role_permissions"))).scalar() == 36
             rev = (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar()
-            assert rev == "0001_iam_initial"
+            assert rev == "0002_sandbox_permissions"
         await engine.dispose()
+
+        await asyncio.to_thread(command.downgrade, cfg, "0001_iam_initial")
+        engine = create_async_engine(target_dsn)
+        async with engine.connect() as conn:
+            remaining = (
+                await conn.execute(
+                    text(
+                        "SELECT count(*) FROM iam_permissions "
+                        "WHERE code LIKE 'research.security_approval.%' "
+                        "OR code LIKE 'research.tool.file.%' "
+                        "OR code = 'research.tool.shell.execute'"
+                    )
+                )
+            ).scalar()
+            revision = (
+                await conn.execute(text("SELECT version_num FROM alembic_version"))
+            ).scalar()
+            assert remaining == 0
+            assert revision == "0001_iam_initial"
+        await engine.dispose()
+        await asyncio.to_thread(command.upgrade, cfg, "head")
     finally:
         os.environ["IAM_DATABASE_URL"] = test_db_url  # restore for the rest of the session
         await _drop_database(admin_dsn, db_name)

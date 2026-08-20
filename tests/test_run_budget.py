@@ -5,6 +5,7 @@ import pytest
 from open_deep_research.budgets import (
     BudgetDimension,
     BudgetExhausted,
+    BudgetGate,
     RunBudgetLedger,
     RunBudgetPolicy,
 )
@@ -39,6 +40,20 @@ def test_budget_ledger_rejects_over_reservation(tmp_path):
 
     assert raised.value.dimension is BudgetDimension.TOOL_CALLS
     assert ledger.snapshot().exhausted is True
+
+
+def test_tool_budget_gate_settlement_is_idempotent(tmp_path) -> None:
+    ledger = RunBudgetLedger(
+        "run-tool-settle",
+        runs_dir=str(tmp_path),
+        policy=RunBudgetPolicy(max_tool_calls=2),
+    )
+    gate = BudgetGate(ledger=ledger)
+    gate.reserve_tool_call("tool:logical")
+    gate.settle_tool_call("tool:logical")
+    gate.settle_tool_call("tool:logical")
+    assert ledger.snapshot().tool_calls == 1
+    assert ledger.outstanding_by_dimension()[BudgetDimension.TOOL_CALLS.value] == 0
 
 
 def test_budget_ledger_survives_reconstruction(tmp_path):

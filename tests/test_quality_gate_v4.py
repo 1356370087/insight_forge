@@ -462,6 +462,9 @@ async def test_research_brief_exposes_contract_ids_to_supervisor(
     )
 
     class _FakeResearchModel:
+        def with_config(self, _config):
+            return self
+
         def with_structured_output(self, *_args, **_kwargs):
             return self
 
@@ -480,8 +483,8 @@ async def test_research_brief_exposes_contract_ids_to_supervisor(
     )
     monkeypatch.setattr(
         deep_researcher,
-        "init_chat_model",
-        lambda **_kwargs: _FakeResearchModel(),
+        "configurable_model",
+        _FakeResearchModel(),
     )
     monkeypatch.setattr(
         deep_researcher,

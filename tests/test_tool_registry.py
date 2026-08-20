@@ -10,18 +10,17 @@ from open_deep_research.tools.registry import assemble_toolset, prepare_toolset
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("mode", "search_api", "network_mode", "present", "absent"),
+    ("mode", "search_api", "present", "absent"),
     [
-        ("enforced", "tavily", "allow-search-only", {"web_research", "fetch_url"}, {"tavily_search", "fetch_webpage"}),
-        ("legacy", "tavily", "allow-search-only", {"tavily_search", "fetch_webpage"}, {"web_research", "fetch_url"}),
-        ("shadow", "openai", "allow-search-only", {"openai_web_search", "fetch_webpage"}, {"tavily_search", "web_research"}),
-        ("legacy", "anthropic", "no-network", {"fetch_webpage"}, {"anthropic_web_search", "web_research"}),
+        ("enforced", "tavily", {"web_research", "fetch_url"}, {"tavily_search", "fetch_webpage"}),
+        ("legacy", "tavily", {"tavily_search", "fetch_webpage"}, {"web_research", "fetch_url"}),
+        ("shadow", "openai", {"openai_web_search", "fetch_webpage"}, {"tavily_search", "web_research"}),
+        ("legacy", "anthropic", {"anthropic_web_search", "fetch_webpage"}, {"web_research"}),
     ],
 )
 async def test_researcher_is_enabled_matrix(
     mode,
     search_api,
-    network_mode,
     present,
     absent,
 ):
@@ -31,7 +30,6 @@ async def test_researcher_is_enabled_matrix(
             "configurable": {
                 "web_pipeline_mode": mode,
                 "search_api": search_api,
-                "sandbox_network_mode": network_mode,
             }
         },
     )

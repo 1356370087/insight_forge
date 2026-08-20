@@ -11,8 +11,6 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from open_deep_research.agents.query_engine import QueryEngine
 from open_deep_research.configuration import (
-    RUN_CONFIG_FROZEN_FIELDS,
-    RUN_CONFIG_FROZEN_FIELDS_V3,
     Configuration,
     freeze_run_config,
     run_config_fingerprint,
@@ -41,12 +39,8 @@ def _config(tmp_path, run_id: str, **overrides: Any) -> dict[str, Any]:
     }
 
 
-def test_v3_frozen_run_does_not_require_v4_quality_fields() -> None:
-    all_values = Configuration().model_dump(mode="json")
-    v3_values = {
-        field_name: all_values[field_name]
-        for field_name in RUN_CONFIG_FROZEN_FIELDS_V3
-    }
+def test_v3_frozen_run_is_rejected_at_the_v7_security_boundary() -> None:
+    v3_values = {"search_api": "none"}
     config = {
         "configurable": v3_values,
         "metadata": {
@@ -59,12 +53,11 @@ def test_v3_frozen_run_does_not_require_v4_quality_fields() -> None:
         config
     )
 
-    restored = freeze_run_config(config)
-
-    assert restored["metadata"]["quality_policy_version"] == "quality-gate-v3"
-    assert "quality_risk_mode" not in restored["configurable"]
-    assert "quality_caveat_admission_enabled" not in restored["configurable"]
-    assert "quality_gap_recovery_max_attempts" not in restored["configurable"]
+    with pytest.raises(
+        ValueError,
+        match="run_schema_not_resumable:sandbox_policy_v7_required",
+    ):
+        freeze_run_config(config)
 
 
 def _install_graph(monkeypatch, *, supervisor_error: Exception | None = None) -> dict[str, int]:
@@ -230,7 +223,7 @@ async def test_resume_rejects_explicit_frozen_model_conflict(
         )
 
 
-def test_legacy_resume_requires_explicit_full_migration_config(tmp_path) -> None:
+def test_unfrozen_legacy_run_is_never_migrated_across_v7_boundary(tmp_path) -> None:
     store = RunContextStore("legacy-unfrozen", runs_dir=str(tmp_path))
     store.initialize(
         "user-1",
@@ -240,23 +233,21 @@ def test_legacy_resume_requires_explicit_full_migration_config(tmp_path) -> None
         },
     )
 
-    with pytest.raises(RuntimeError, match="legacy_run_config_not_frozen"):
+    error = "run_schema_not_resumable:sandbox_policy_v7_required"
+    with pytest.raises(RuntimeError, match=error):
         QueryEngine.load("legacy-unfrozen", runs_dir=str(tmp_path))
 
     full_config = Configuration().model_dump(mode="json")
-    assert set(RUN_CONFIG_FROZEN_FIELDS) <= set(full_config)
-    migrated = QueryEngine.load(
-        "legacy-unfrozen",
-        runs_dir=str(tmp_path),
-        config={
-            "configurable": full_config,
-            "metadata": {"owner": "user-1"},
-        },
-        legacy_migration=True,
-    )
-
-    assert migrated.config["metadata"]["legacy_config_migration"] is True
-    assert migrated.config["metadata"]["runtime_config_frozen"] is True
+    with pytest.raises(RuntimeError, match=error):
+        QueryEngine.load(
+            "legacy-unfrozen",
+            runs_dir=str(tmp_path),
+            config={
+                "configurable": full_config,
+                "metadata": {"owner": "user-1"},
+            },
+            legacy_migration=True,
+        )
 
 
 @pytest.mark.asyncio
@@ -439,7 +430,9 @@ def test_resume_api_maps_legacy_schema_to_specific_409(monkeypatch) -> None:
     from security.auth import get_current_user
 
     def reject_legacy_schema(*_args, **_kwargs):
-        raise RunConfigurationError("run_schema_not_resumable")
+        raise RunConfigurationError(
+            "run_schema_not_resumable:sandbox_policy_v7_required"
+        )
 
     monkeypatch.setattr(server.QueryEngine, "load", reject_legacy_schema)
     server._runs.clear()
@@ -452,11 +445,14 @@ def test_resume_api_maps_legacy_schema_to_specific_409(monkeypatch) -> None:
         server._runs.clear()
 
     assert response.status_code == 409
-    assert response.json()["detail"] == "run_schema_not_resumable"
+    assert (
+        response.json()["detail"]
+        == "run_schema_not_resumable:sandbox_policy_v7_required"
+    )
 
 
 @pytest.mark.asyncio
-async def test_legacy_migration_restarts_before_stale_report(
+async def test_legacy_stale_report_cannot_cross_v7_security_boundary(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -523,25 +519,20 @@ async def test_legacy_migration_restarts_before_stale_report(
         quality_evaluation_enabled=True,
         quality_evaluation_fail_open=False,
     ).model_dump(mode="json")
-    engine = QueryEngine.load(
-        run_id,
-        runs_dir=str(tmp_path),
-        config={
-            "configurable": full_config,
-            "metadata": {"owner": "user-1"},
-        },
-        legacy_migration=True,
-    )
-
-    result = await engine.resume()
-
-    assert supervisor_calls == 1
-    assert result["result"]["status"] == "failed"
-    assert "STALE REPORT" not in str(result.get("final_report", ""))
-    assert (
-        "legacy_config_migration"
-        not in engine.context_store.load_manifest().config["metadata"]
-    )
+    with pytest.raises(
+        RuntimeError,
+        match="run_schema_not_resumable:sandbox_policy_v7_required",
+    ):
+        QueryEngine.load(
+            run_id,
+            runs_dir=str(tmp_path),
+            config={
+                "configurable": full_config,
+                "metadata": {"owner": "user-1"},
+            },
+            legacy_migration=True,
+        )
+    assert supervisor_calls == 0
 
 
 def test_resume_api_rejects_completed_run(monkeypatch) -> None:

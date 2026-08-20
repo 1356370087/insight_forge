@@ -84,6 +84,27 @@ def test_resolve_api_key_honors_config_only_mode(
     assert resolve_api_key("anthropic:claude-sonnet-4", config) == "config-key"
 
 
+def test_gateway_physical_key_vault_overrides_then_falls_back_to_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "gateway-environment-key")
+    physical = {
+        "configurable": {"apiKeys": {}},
+        "metadata": {"sandbox_gateway_physical": True},
+    }
+    assert (
+        resolve_api_key("anthropic:claude-sonnet-4", physical)
+        == "gateway-environment-key"
+    )
+    physical["configurable"]["apiKeys"] = {
+        "ANTHROPIC_API_KEY": "per-run-vault-key"
+    }
+    assert (
+        resolve_api_key("anthropic:claude-sonnet-4", physical)
+        == "per-run-vault-key"
+    )
+
+
 def test_resolve_base_url_includes_dashscope_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -123,6 +144,7 @@ def test_build_model_config_assembles_shared_fields(
         "api_key": "dashscope-key",
         "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "tags": ["langsmith:nostream"],
+        "metadata": {"sandbox_model_role": "quality_evaluation"},
         "extra_body": {
             "enable_thinking": True,
             "thinking_budget": 12_345,

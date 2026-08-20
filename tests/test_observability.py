@@ -1223,6 +1223,65 @@ async def test_model_budget_is_reserved_at_unified_callback_boundary(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_gateway_proxy_model_does_not_charge_api_model_budget(tmp_path):
+    class CountingBudgetGate:
+        enabled = True
+
+        def __init__(self) -> None:
+            self.reservations = 0
+            self.settlements = 0
+
+        def reserve_model_call(self, *_args, **_kwargs) -> None:
+            self.reservations += 1
+
+        def settle_model_call(self, *_args, **_kwargs) -> None:
+            self.settlements += 1
+
+        def fail_model_call(self, *_args, **_kwargs) -> None:
+            self.settlements += 1
+
+    class GatewayProxyModel:
+        is_sandbox_gateway_model = True
+
+    class StructuredGatewaySequence:
+        first = SimpleNamespace(bound=GatewayProxyModel())
+        middle = []
+        last = object()
+
+        @staticmethod
+        async def ainvoke(_messages, config=None):
+            del config
+            return AIMessage(
+                content="remote",
+                usage_metadata={
+                    "input_tokens": 3,
+                    "output_tokens": 2,
+                    "total_tokens": 5,
+                },
+            )
+
+    trace_path = tmp_path / "gateway-budget.sqlite3"
+    config = _config(trace_path, run_id="gateway-budget")
+    config["configurable"]["runs_dir"] = str(tmp_path / "runs")
+    gate = CountingBudgetGate()
+    recorder = get_trace_recorder(config)
+
+    with recorder.start_run("gateway-budget", user_id="owner-1"):
+        await invoke_model_with_observability(
+            StructuredGatewaySequence(),
+            [HumanMessage(content="request")],
+            config,
+            span_name="gateway.proxy",
+            agent_role="researcher",
+            model_name="gateway:proxy",
+            budget_gate=gate,
+        )
+
+    assert gate.reservations == 0
+    assert gate.settlements == 0
+
+
+@pytest.mark.asyncio
 async def test_optional_langchain_callback_is_passed_to_model(tmp_path, monkeypatch):
     import open_deep_research.observability.core as core
 

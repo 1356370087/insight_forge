@@ -1315,23 +1315,11 @@ async def test_redirect_target_rechecks_robots_before_fetch(monkeypatch) -> None
     assert result.result.failure_class == "robots_disallowed"
 
 
-def test_query_engine_clears_run_scoped_web_resources(monkeypatch) -> None:
-    cleared: list[str] = []
-
-    class _Registry:
-        def clear_run(self, run_id: str) -> None:
-            cleared.append(run_id)
-
-    monkeypatch.setattr(
-        "open_deep_research.tasks.domain_approvals.get_domain_approval_registry",
-        lambda: _Registry(),
-    )
+def test_query_engine_terminal_cleanup_needs_no_process_local_approval_registry() -> None:
     engine = object.__new__(QueryEngine)
     engine.run_id = "cleanup-run"
 
     engine._clear_run_resources()
-
-    assert cleared == ["cleanup-run"]
 
 
 def test_handoff_assessment_history_appends_across_supervisor_turns() -> None:

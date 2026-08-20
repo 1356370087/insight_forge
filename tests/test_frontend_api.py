@@ -1,6 +1,7 @@
 """Product-facing API contract tests for the research frontend."""
 
 import asyncio
+import time
 
 from fastapi.testclient import TestClient
 
@@ -8,6 +9,7 @@ from open_deep_research import server
 from open_deep_research.events.public import RunEventStore
 from open_deep_research.events.task_activity import TaskActivityStore
 from open_deep_research.run_context import RunContextStore
+from open_deep_research.sandbox.approvals import SecurityApprovalStore
 from security.auth import get_current_user
 from tests.auth_helpers import research_principal
 
@@ -141,3 +143,130 @@ def test_task_activity_is_owner_scoped_and_replays_terminal_stream(
     finally:
         server.app.dependency_overrides.clear()
     assert denied.status_code == 404
+
+
+def test_security_approvals_work_in_default_local_bypass_without_iam_db(
+    tmp_path, monkeypatch
+):
+    run_id = "bypass-approval"
+    monkeypatch.setenv("RUNS_DIR", str(tmp_path))
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv("LOCAL_DEV_AUTH_BYPASS", "true")
+    monkeypatch.delenv("IAM_DATABASE_URL", raising=False)
+    context = RunContextStore(run_id, runs_dir=str(tmp_path))
+    context.initialize(
+        "local-dev-user",
+        {
+            "configurable": {"runs_dir": str(tmp_path)},
+            "metadata": {"run_id": run_id, "owner": "local-dev-user"},
+        },
+    )
+    context._update_manifest(  # noqa: SLF001 - persisted fence fixture
+        allow_fence_advance=True,
+        fence_token=1,
+        fence_owner_id="test-owner",
+    )
+    SecurityApprovalStore(run_id, runs_dir=str(tmp_path)).request(
+        task_id="task-1",
+        fence_token=1,
+        kind="network",
+        capability="tool.egress",
+        target={"domain": "example.com", "port": 443},
+        operation_id="operation-1",
+        expires_at=time.time() + 60,
+    )
+    server._runs.clear()
+    server.app.dependency_overrides.clear()
+    client = TestClient(server.app, raise_server_exceptions=False)
+
+    response = client.get(f"/runs/{run_id}/security-approvals")
+
+    assert response.status_code == 200
+    assert len(response.json()["approvals"]) == 1
+
+
+def test_legacy_run_without_public_event_log_returns_empty_approvals(
+    tmp_path, monkeypatch
+):
+    run_id = "legacy-no-events"
+    monkeypatch.setenv("RUNS_DIR", str(tmp_path))
+    context = RunContextStore(run_id, runs_dir=str(tmp_path))
+    context.initialize(
+        "user-1",
+        {
+            "configurable": {"runs_dir": str(tmp_path)},
+            "metadata": {"run_id": run_id, "owner": "user-1"},
+        },
+    )
+    server._runs.clear()
+    server.app.dependency_overrides[get_current_user] = lambda: research_principal(
+        "user-1"
+    )
+    client = TestClient(server.app, raise_server_exceptions=False)
+    try:
+        response = client.get(f"/runs/{run_id}")
+    finally:
+        server.app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["pending_security_approvals"] == []
+
+
+def test_terminal_run_does_not_rehydrate_pending_security_approvals(
+    tmp_path, monkeypatch
+):
+    run_id = "terminal-approval"
+    monkeypatch.setenv("RUNS_DIR", str(tmp_path))
+    context = RunContextStore(run_id, runs_dir=str(tmp_path))
+    context.initialize(
+        "user-1",
+        {
+            "configurable": {"runs_dir": str(tmp_path)},
+            "metadata": {"run_id": run_id, "owner": "user-1"},
+        },
+    )
+    context._update_manifest(  # noqa: SLF001 - persisted terminal fixture
+        status="completed",
+        result={"status": "success"},
+        allow_fence_advance=True,
+        fence_token=1,
+        fence_owner_id="test-owner",
+    )
+    SecurityApprovalStore(run_id, runs_dir=str(tmp_path)).request(
+        task_id="task-1",
+        fence_token=1,
+        kind="network",
+        capability="tool.egress",
+        target={"domain": "example.com", "port": 443},
+        operation_id="operation-terminal",
+        expires_at=time.time() + 60,
+    )
+    asyncio.run(
+        RunEventStore(run_id, runs_dir=str(tmp_path)).append(
+            "run.completed",
+            stage="finalizing",
+            payload={
+                "status": "completed",
+                "result_ref": f"/runs/{run_id}",
+                "termination_reason": "completed",
+                "result_status": "success",
+                "permission_denial_count": 0,
+            },
+            dedupe_key="run:terminal",
+        )
+    )
+    server._runs.clear()
+    server.app.dependency_overrides[get_current_user] = lambda: research_principal(
+        "user-1"
+    )
+    client = TestClient(server.app, raise_server_exceptions=False)
+    try:
+        response = client.get(f"/runs/{run_id}")
+    finally:
+        server.app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["pending_security_approvals"] == []
+    assert SecurityApprovalStore(run_id, runs_dir=str(tmp_path)).list(
+        status="pending"
+    )[1] == []

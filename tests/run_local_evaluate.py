@@ -124,9 +124,6 @@ def build_run_config() -> dict[str, Any]:
         "max_react_tool_calls": _env_int("MAX_REACT_TOOL_CALLS", 8),
         # Quality experiments must exercise the evidence admission path.
         "web_pipeline_mode": "enforced",
-        # Read-only governed SEARCH tools may fetch their selected targets;
-        # arbitrary shell/MCP egress remains outside this policy.
-        "sandbox_network_mode": "allow-search-only",
         "web_min_source_authority": float(os.getenv("WEB_MIN_SOURCE_AUTHORITY", "0.65")),
         "web_rerank_model": os.getenv("WEB_RERANK_MODEL", summarization_model),
         "web_evidence_model": os.getenv("WEB_EVIDENCE_MODEL", summarization_model),
@@ -154,7 +151,6 @@ def evaluation_runtime_environment() -> Iterator[None]:
     overrides = {
         "ALLOW_CLARIFICATION": "false",
         "ENABLE_MEMORY": "false",
-        "SANDBOX_NETWORK_MODE": "allow-search-only",
         "WEB_PIPELINE_MODE": "enforced",
     }
     previous = {name: os.environ.get(name) for name in overrides}

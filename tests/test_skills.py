@@ -95,6 +95,9 @@ async def test_skill_report_context_injected_into_all_sectioned_writer_prompts(m
     prompts: list[str] = []
 
     class FakeStructuredModel:
+        def with_config(self, _config):
+            return self
+
         def with_structured_output(self, _schema, **_kwargs):
             return self
 
@@ -110,7 +113,9 @@ async def test_skill_report_context_injected_into_all_sectioned_writer_prompts(m
         assembly_module, "invoke_model_with_retry_observability", fake_invoke
     )
     monkeypatch.setattr(
-        assembly_module, "init_chat_model", lambda **_kw: FakeStructuredModel()
+        assembly_module,
+        "_writer_model_template",
+        FakeStructuredModel(),
     )
     state = {
         "messages": [],

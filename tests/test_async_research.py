@@ -30,6 +30,7 @@ from open_deep_research.tasks.state import (
     TaskSnapshot,
     reset_memory_task_state_store,
 )
+from open_deep_research.tasks.teammate_pool import TeammatePool
 
 
 @pytest.fixture(autouse=True)
@@ -63,7 +64,6 @@ class TestWaitingForConfirmation:
         rec = registry.create("topic", run_id="run-1")
         registry.update_status(rec.task_id, TaskStatus.WAITING_FOR_CONFIRMATION)
         assert registry.all_completed(run_id="run-1") is False
-
     def test_pending_domain_fields_serialize_in_snapshot(self):
         record = TaskRecord(task_id="t1", run_id="run-1", research_topic="topic")
         record.status = TaskStatus.WAITING_FOR_CONFIRMATION
@@ -76,6 +76,29 @@ class TestWaitingForConfirmation:
         # Round-trips through JSON for the file-backed task snapshot.
         dumped = snapshot.model_dump_json()
         assert "untrusted.example.com" in dumped
+
+
+def test_teammate_pool_propagates_inherited_fence_to_lease_manager(tmp_path) -> None:
+    async def execute(_state, _config):
+        return {}
+
+    pool = TeammatePool(
+        config={
+            "configurable": {
+                "runs_dir": str(tmp_path),
+                "task_state_backend": "memory",
+            },
+            "metadata": {
+                "run_id": "inherited-fence",
+                "run_fence_token": 7,
+                "run_lease_owner_id": "query-owner",
+            },
+        },
+        registry=TaskRegistry(),
+        execute_research=execute,
+    )
+    assert pool.fence_token == 7
+    assert pool.lease.fence_token == 7
 
 
 # ---------------------------------------------------------------------------
@@ -441,16 +464,6 @@ class TestAsyncToolModels:
         assert tool.task_ids == ["a"]
         assert tool.reason == "not needed"
 
-    def test_approve_research_domain(self):
-        from open_deep_research.tools.supervisor.approve_research_domain import (
-            ApproveResearchDomain,
-        )
-        tool = ApproveResearchDomain(task_id="x", domain="example.com", allow=True)
-        assert tool.task_id == "x"
-        assert tool.domain == "example.com"
-        assert tool.allow is True
-
-
 # ---------------------------------------------------------------------------
 # Async Tools — handler functions (unit-level)
 # ---------------------------------------------------------------------------
@@ -731,21 +744,13 @@ class TestHandleCancelResearchTask:
     @pytest.mark.asyncio
     async def test_cancel_waiting_task_preserves_sibling_approvals(self):
         from open_deep_research.tasks.async_tools import handle_cancel_research_task
-        from open_deep_research.tasks.domain_approvals import (
-            get_domain_approval_registry,
-            reset_domain_approval_registry,
-        )
         from open_deep_research.tasks.registry import TaskRegistry, TaskStatus
 
-        reset_domain_approval_registry()
         registry = TaskRegistry()
         r = registry.create("topic", run_id="run-x")
         registry.update_status(r.task_id, TaskStatus.WAITING_FOR_CONFIRMATION)
         sibling = registry.create("sibling", run_id="run-x")
         registry.update_status(sibling.task_id, TaskStatus.RUNNING)
-        approvals = get_domain_approval_registry()
-        req = approvals.request_decision("run-x", "pending.example", "fetch_webpage")
-        req.future = asyncio.get_running_loop().create_future()
         tool_call = {
             "id": "x",
             "name": "CancelResearchTask",
@@ -754,118 +759,10 @@ class TestHandleCancelResearchTask:
         await handle_cancel_research_task(tool_call, registry)
         assert r.status == TaskStatus.CANCELLED
         # A single task cancellation must not cancel other tasks in the run.
-        assert not req.future.cancelled()
-        reset_domain_approval_registry()
+        assert sibling.status == TaskStatus.RUNNING
 
 
-class TestHandleApproveResearchDomain:
-    """Tests for handle_approve_research_domain + the waiting snapshot branch."""
-
-    @pytest.fixture(autouse=True)
-    def _reset_approvals(self):
-        from open_deep_research.tasks.domain_approvals import (
-            reset_domain_approval_registry,
-        )
-
-        reset_domain_approval_registry()
-        yield
-        reset_domain_approval_registry()
-
-    @pytest.mark.asyncio
-    async def test_approve_waiting_task_resolves_and_resumes(self):
-        from open_deep_research.tasks.async_tools import handle_approve_research_domain
-        from open_deep_research.tasks.domain_approvals import (
-            get_domain_approval_registry,
-        )
-        from open_deep_research.tasks.registry import TaskRegistry, TaskStatus
-
-        registry = TaskRegistry()
-        r = registry.create("topic", run_id="run-x")
-        registry.update_status(r.task_id, TaskStatus.WAITING_FOR_CONFIRMATION)
-        r.pending_domain = "untrusted.example"
-        r.pending_domain_tool = "fetch_webpage"
-        approvals = get_domain_approval_registry()
-        req = approvals.request_decision("run-x", "untrusted.example", "fetch_webpage")
-        req.future = asyncio.get_running_loop().create_future()
-
-        tool_call = {
-            "id": "ap1",
-            "name": "ApproveResearchDomain",
-            "args": {"task_id": r.task_id, "domain": "untrusted.example", "allow": True},
-        }
-        config = {"configurable": {"search_api": "none"}, "metadata": {"run_id": "run-x"}}
-        result = await handle_approve_research_domain(tool_call, config, registry)
-
-        assert "approved" in result.content
-        assert r.status == TaskStatus.RUNNING
-        assert r.pending_domain is None
-        # future resolved True
-        assert req.future.result() is True
-        # decision cached for the run
-        assert approvals.is_allowed("run-x", "untrusted.example") is True
-        # The approval Future is the single wake-up path; no duplicate control
-        # marker should remain to race with later supervisor updates.
-        assert r.control_queue.empty()
-
-    @pytest.mark.asyncio
-    async def test_deny_waiting_task(self):
-        from open_deep_research.tasks.async_tools import handle_approve_research_domain
-        from open_deep_research.tasks.domain_approvals import (
-            get_domain_approval_registry,
-        )
-        from open_deep_research.tasks.registry import TaskRegistry, TaskStatus
-
-        registry = TaskRegistry()
-        r = registry.create("topic", run_id="run-x")
-        registry.update_status(r.task_id, TaskStatus.WAITING_FOR_CONFIRMATION)
-        approvals = get_domain_approval_registry()
-        req = approvals.request_decision("run-x", "bad.example", "fetch_webpage")
-        req.future = asyncio.get_running_loop().create_future()
-
-        tool_call = {
-            "id": "ap1",
-            "name": "ApproveResearchDomain",
-            "args": {"task_id": r.task_id, "domain": "bad.example", "allow": False},
-        }
-        config = {"configurable": {"search_api": "none"}, "metadata": {"run_id": "run-x"}}
-        result = await handle_approve_research_domain(tool_call, config, registry)
-
-        assert "denied" in result.content
-        assert approvals.is_allowed("run-x", "bad.example") is False
-        assert req.future.result() is False
-
-    @pytest.mark.asyncio
-    async def test_approve_requires_waiting_or_running(self):
-        from open_deep_research.tasks.async_tools import handle_approve_research_domain
-        from open_deep_research.tasks.registry import TaskRegistry, TaskStatus
-
-        registry = TaskRegistry()
-        r = registry.create("topic", run_id="run-x")
-        registry.update_status(r.task_id, TaskStatus.COMPLETED)
-        tool_call = {
-            "id": "ap1",
-            "name": "ApproveResearchDomain",
-            "args": {"task_id": r.task_id, "domain": "x.example", "allow": True},
-        }
-        config = {"configurable": {"search_api": "none"}, "metadata": {"run_id": "run-x"}}
-        result = await handle_approve_research_domain(tool_call, config, registry)
-        assert "completed" in result.content
-
-    @pytest.mark.asyncio
-    async def test_approve_unknown_task(self):
-        from open_deep_research.tasks.async_tools import handle_approve_research_domain
-        from open_deep_research.tasks.registry import TaskRegistry
-
-        registry = TaskRegistry()
-        tool_call = {
-            "id": "ap1",
-            "name": "ApproveResearchDomain",
-            "args": {"task_id": "nope", "domain": "x.example", "allow": True},
-        }
-        config = {"configurable": {"search_api": "none"}, "metadata": {"run_id": "run-x"}}
-        result = await handle_approve_research_domain(tool_call, config, registry)
-        assert "not found" in result.content
-
+class TestSecurityApprovalProjection:
     def test_format_snapshot_waiting_branch(self):
         from open_deep_research.tasks.async_tools import (
             format_task_snapshot_for_context,
@@ -879,7 +776,7 @@ class TestHandleApproveResearchDomain:
         text = format_task_snapshot_for_context(snapshot)
         assert "WAITING FOR DOMAIN APPROVAL" in text
         assert "untrusted.example" in text
-        assert "ApproveResearchDomain" in text
+        assert "security-approvals API" in text
         assert "t1" in text
 
 
