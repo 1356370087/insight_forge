@@ -593,6 +593,84 @@ async def test_structured_single_value_is_not_recorded_as_ttft() -> None:
     assert result.probe_status == "non_streaming_wrapper"
 
 
+def _clarify_model_cls():
+    from pydantic import BaseModel
+
+    class ClarifyProbe(BaseModel):
+        need_clarification: bool = False
+        verification: str = ""
+
+    return ClarifyProbe
+
+
+@pytest.mark.asyncio
+async def test_structured_output_partials_return_final_parsed_value() -> None:
+    # Regression for DeepSeek-compatible endpoints: runnables built via
+    # ``with_structured_output(..., method="function_calling")`` stream one
+    # same-typed pydantic partial per chunk and the final item is complete.
+    # The probe must return it without a second (ainvoke) request.
+    clarify = _clarify_model_cls()
+    model = StreamModel(
+        [
+            clarify(need_clarification=False, verification=""),
+            clarify(need_clarification=False, verification="go"),
+            clarify(need_clarification=False, verification="go ahead"),
+        ]
+    )
+    config = probe_config("shadow")
+    result = await observability_core._ainvoke_model(
+        model,
+        [HumanMessage(content="question")],
+        observability_core.get_trace_recorder(config),
+        config,
+    )
+    assert result.response.verification == "go ahead"
+    assert result.ttft_seconds is not None
+    assert result.probe_status == "non_streaming_wrapper"
+    assert model.invoke_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_fragment_style_stream_falls_back_to_plain_invoke() -> None:
+    # String fragments cannot be merged faithfully (the last fragment is not
+    # the full value), so the probe degrades to the non-streaming invoke.
+    model = StreamModel(["hel", "lo", "!"])
+    config = probe_config("shadow")
+    result = await observability_core._ainvoke_model(
+        model,
+        [HumanMessage(content="question")],
+        observability_core.get_trace_recorder(config),
+        config,
+    )
+    assert result.response.content == "ainvoke"
+    assert result.probe_status == "fallback"
+    assert model.invoke_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_mixed_chunk_types_degrade_in_every_probe_mode() -> None:
+    # A chunk-type change mid-stream used to raise TypeError even in shadow
+    # mode (the first packet had already arrived, so the fallback guard was
+    # bypassed); shape violations must degrade in shadow and enforced alike.
+    for mode in ("shadow", "enforced"):
+        model = StreamModel(
+            [
+                observability_core.AIMessageChunk(content="hel"),
+                "lo",
+            ]
+        )
+        config = probe_config(mode)
+        result = await observability_core._ainvoke_model(
+            model,
+            [HumanMessage(content="question")],
+            observability_core.get_trace_recorder(config),
+            config,
+        )
+        assert result.response.content == "ainvoke"
+        assert result.probe_status == "fallback"
+        assert model.invoke_calls == 1
+
+
 class UnsupportedStreamModel(StreamModel):
     async def astream(self, _messages, config=None):
         self.stream_calls += 1

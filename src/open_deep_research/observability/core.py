@@ -29,6 +29,7 @@ from langchain_core.messages import (
     message_chunk_to_message,
 )
 from langchain_core.runnables import RunnableConfig
+from pydantic import BaseModel
 
 from open_deep_research.configuration import Configuration
 from open_deep_research.events.public import event_publisher_from_config
@@ -1627,22 +1628,44 @@ async def _ainvoke_model(
 
         if isinstance(first, AIMessageChunk):
             merged = first
+            shape_ok = True
             async for chunk in iterator:
                 if not isinstance(chunk, AIMessageChunk):
-                    raise TypeError("model stream changed chunk type after first packet")
+                    shape_ok = False
+                    break
                 merged = merged + chunk
-            return _ModelInvocationResult(
-                message_chunk_to_message(merged),
-                ttft_seconds=max(0.0, first_elapsed),
-                probe_status="streamed",
-            )
-
-        trailing = [item async for item in iterator]
-        if trailing:
-            raise TypeError("non-message model stream yielded multiple values")
+            if shape_ok:
+                return _ModelInvocationResult(
+                    message_chunk_to_message(merged),
+                    ttft_seconds=max(0.0, first_elapsed),
+                    probe_status="streamed",
+                )
+        else:
+            trailing = [item async for item in iterator]
+            if not trailing:
+                return _ModelInvocationResult(
+                    first,
+                    probe_status="non_streaming_wrapper",
+                )
+            # Structured-output runnables stream incremental parser partials
+            # of one result; every item is the same pydantic type and the
+            # final item is the complete parsed value (verified against
+            # ``with_structured_output(..., method="function_calling")``).
+            if isinstance(first, BaseModel) and all(
+                isinstance(item, type(first)) for item in trailing
+            ):
+                return _ModelInvocationResult(
+                    trailing[-1],
+                    ttft_seconds=max(0.0, first_elapsed),
+                    probe_status="non_streaming_wrapper",
+                )
+        # The stream shape cannot be merged faithfully (mixed chunk types or
+        # fragment-style non-message items). The probe must never change call
+        # semantics, so degrade to the plain non-streaming invoke instead of
+        # raising — this also keeps shadow mode observation-only.
         return _ModelInvocationResult(
-            first,
-            probe_status="non_streaming_wrapper",
+            await _call_model_ainvoke(model, messages, invoke_config),
+            probe_status="fallback",
         )
     except Exception as exc:
         if not received_first and (
