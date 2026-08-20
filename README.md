@@ -556,12 +556,36 @@ uv run python -m security.cli bootstrap-admin \
 - HTTP 抓取校验 DNS、连接对端和私有地址，降低 SSRF 风险
 - 严格网络模式批量收集目标域名并等待显式批准
 
-启用 `enable_docker_sandbox=true` 后，异步 Researcher 可以运行在独立 Docker 容器中。支持只读根文件系统、非 root 用户、CPU/内存/PID 限制、超时、清理策略和以下网络模式：
+V7 沙箱通过 `SANDBOX_ENABLED=true` 启用，并强制要求
+`ENABLE_ASYNC_RESEARCH=true`。API 不持有 Docker Socket：独立 Controller
+管理固定 digest 的 Worker 容器，Gateway 负责模型/搜索/MCP 凭据、预算 RPC
+和受控出网。Worker 使用只读 RootFS、非 root 用户、CPU/内存/PID/tmpfs
+限制及每任务内部网络；任何依赖或策略不可用都会 fail-closed。
 
-- `no-network`
-- `allow-search-only`，默认
-- `allowlist-domain`
-- `open-network`
+管理员通过 `config/sandbox-policy.toml` 配置默认的
+`research-gateway-only` 或可选 `developer-workspace` Profile。旧
+`enable_docker_sandbox`、`sandbox_network_mode` 与其他平铺 `sandbox_*`
+字段已删除，迁移与验收规范见
+[`docs/07-Docker沙箱隔离修复SPEC.md`](docs/07-Docker沙箱隔离修复SPEC.md)。
+当前默认策略未把任何角色映射到 `developer-workspace`；在 Linux/WSL2
+的 bwrap+socat 与短生命周期 command task 验收通过前不得启用。沙箱内
+Browser MCP 同样保持关闭，直到管理员提供并验收独立 Browser Gateway
+镜像 digest。
+
+首次启用或 Worker 源码变化后，先构建镜像并把本机内容 ID 固定到策略，
+再启动沙箱服务：
+
+```bash
+docker compose --profile sandbox-build build sandbox-worker-image
+uv run python -m open_deep_research.sandbox.pin_image \
+  --image insightforge-sandbox-worker:local \
+  --policy config/sandbox-policy.toml
+docker compose --profile sandbox up --build -d
+uv run python -m open_deep_research.sandbox.doctor
+```
+
+`pin_image` 只接受 `sha256:` image ID 并原子改写、重新校验 TOML；未固定、
+镜像不存在或 Controller/Gateway/资源预算不满足时，API readiness 会拒绝流量。
 
 ### 可观测性
 
@@ -877,11 +901,11 @@ uv run python -m open_deep_research.memory.maintenance daily --loop --interval-h
 
 ## 沙箱密钥威胁模型
 
-Docker 沙箱提供资源和文件系统隔离，但不等于密钥隔离。通过
-`SANDBOX_SECRET_ENV_KEYS` 注入的变量可被容器内运行的不可信代码读取，因此只应
-注入研究任务必需且权限最小、可轮换的凭据。将环境变量显式设置为空字符串
-`SANDBOX_SECRET_ENV_KEYS=` 可完全关闭沙箱密钥注入；关闭后依赖这些凭据的沙箱
-搜索或模型调用会失败，需要改用宿主机代理或无密钥工具。
+V7 Worker 不接收真实 Provider、Search 或 MCP 凭据。环境模式凭据仅存在于
+Gateway 服务；OAP 的 per-run `apiKeys` 通过内部认证控制面注册到 Gateway
+内存 Vault，既不写入 Run manifest，也不进入 payload、日志、结果、制品或
+`docker inspect`。Worker 仅持有绑定 run/task/fence/profile/policy digest 且有
+期限的 capability token。
 
 ## 许可证
 

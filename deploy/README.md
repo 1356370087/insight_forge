@@ -82,6 +82,10 @@ For advanced memory, use an external daily timer or enable the commented
 `memory-maintenance` Compose service. Its loop holds one file lock and exits
 immediately if another maintenance process already owns it.
 
-Sandbox resource isolation does not protect environment secrets from code
-inside the container. Inject only minimum-privilege credentials. Set
-`SANDBOX_SECRET_ENV_KEYS=` explicitly to disable all sandbox secret injection.
+Sandbox V7 never injects provider credentials into Worker containers. Build
+`sandbox-worker-image`, run
+`python -m open_deep_research.sandbox.pin_image`, then set
+`SANDBOX_ENABLED=true`, `ENABLE_ASYNC_RESEARCH=true`, an immutable policy image
+digest, and a shared `SANDBOX_ROOT_SIGNING_KEY`, then start the Compose
+`sandbox` profile. Run `python -m open_deep_research.sandbox.doctor` before
+admitting traffic.
