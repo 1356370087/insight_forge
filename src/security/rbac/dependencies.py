@@ -174,6 +174,18 @@ def require_permissions(*codes: str, mode: PermissionMode = "all") -> Callable[.
     return _dependency
 
 
+async def _check_ownership(
+    checker: OwnershipChecker,
+    principal: Principal,
+    resource_id: Any,
+) -> bool:
+    """Run filesystem ownership checks without requiring an IAM DB in bypass."""
+    if local_dev_bypass_enabled():
+        return bool(await checker(None, principal, resource_id))  # type: ignore[arg-type]
+    async with session_scope() as db:
+        return bool(await checker(db, principal, resource_id))
+
+
 def require_run_owner(permission: str) -> Callable[..., Any]:
     """Return a dependency that checks ``permission`` *and* run ownership.
 
@@ -192,8 +204,35 @@ def require_run_owner(permission: str) -> Callable[..., Any]:
         if checker is None:
             logger.error("Run ownership checker is not registered")
             raise HTTPException(status_code=503, detail="authorization_unavailable")
-        async with session_scope() as db:
-            is_owner = await checker(db, principal, run_id)
+        is_owner = await _check_ownership(checker, principal, run_id)
+        if not is_owner:
+            raise HTTPException(status_code=404, detail="Run not found")
+        return principal
+
+    return _dependency
+
+
+def require_run_owner_or_any(
+    own_permission: str,
+    any_permission: str,
+) -> Callable[..., Any]:
+    """Authorize cross-run access explicitly, otherwise require run ownership."""
+
+    async def _dependency(
+        run_id: str,
+        principal: Principal = Depends(get_current_principal),
+    ) -> Principal:
+        if not principal.is_active:
+            raise HTTPException(status_code=403, detail="pending_approval")
+        if principal.has(any_permission):
+            return principal
+        if not principal.has(own_permission):
+            raise HTTPException(status_code=403, detail="permission_denied")
+        checker = _ownership_checkers.get("run")
+        if checker is None:
+            logger.error("Run ownership checker is not registered")
+            raise HTTPException(status_code=503, detail="authorization_unavailable")
+        is_owner = await _check_ownership(checker, principal, run_id)
         if not is_owner:
             raise HTTPException(status_code=404, detail="Run not found")
         return principal
@@ -220,8 +259,7 @@ def require_task_owner(permission: str) -> Callable[..., Any]:
         if checker is None:
             logger.error("Task ownership checker is not registered")
             raise HTTPException(status_code=503, detail="authorization_unavailable")
-        async with session_scope() as db:
-            is_owner = await checker(db, principal, (run_id, task_id))
+        is_owner = await _check_ownership(checker, principal, (run_id, task_id))
         if not is_owner:
             raise HTTPException(status_code=404, detail="Task not found")
         return principal
@@ -275,5 +313,6 @@ __all__ = [
     "require_active_user",
     "require_permissions",
     "require_run_owner",
+    "require_run_owner_or_any",
     "require_task_owner",
 ]

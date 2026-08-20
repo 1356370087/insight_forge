@@ -61,11 +61,17 @@ from open_deep_research.run_context import (
     RunContextStore,
 )
 from open_deep_research.run_control import RunControlStore
+from open_deep_research.sandbox.approvals import SecurityApprovalStore
+from open_deep_research.sandbox.internal_api import (
+    InternalRunContext,
+    build_internal_sandbox_router,
+)
 from open_deep_research.security.inputs import (
     validate_http_configurable,
     validate_http_metadata,
 )
 from open_deep_research.tasks.lease import LeaderLeaseManager, LeaseConflictError
+from open_deep_research.tasks.registry import TaskStatus, get_task_registry
 from security.rbac import (
     Principal,
     apply_principal_to_config,
@@ -74,6 +80,7 @@ from security.rbac import (
     register_ownership_checker,
     require_active_user,
     require_permissions,
+    require_run_owner_or_any,
     shutdown_rbac,
     startup_checks,
 )
@@ -87,6 +94,10 @@ from security.rbac.permissions import (
     RESEARCH_RUN_CREATE,
     RESEARCH_RUN_INTERACT_OWN,
     RESEARCH_RUN_READ_OWN,
+    RESEARCH_SECURITY_APPROVAL_READ_ANY,
+    RESEARCH_SECURITY_APPROVAL_READ_OWN,
+    RESEARCH_SECURITY_APPROVAL_RESOLVE_ANY,
+    RESEARCH_SECURITY_APPROVAL_RESOLVE_OWN,
     RESEARCH_TASK_ACTIVITY_READ_OWN,
 )
 from security.rbac.settings import get_settings as get_iam_settings
@@ -117,6 +128,13 @@ class HumanActionRequest(BaseModel):
 
     action: Literal["approve", "revise", "answer", "cancel"]
     message: str | None = None
+
+
+class SecurityApprovalDecisionRequest(BaseModel):
+    """Resolve one sandbox security approval without changing permanent policy."""
+
+    decision: Literal["allow_once", "allow_run", "deny"]
+    reason: str = Field(default="", max_length=1000)
 
 
 class HumanFeedbackRequest(BaseModel):
@@ -150,8 +168,38 @@ async def _lifespan(_app: FastAPI):
     _shutting_down.clear()
     _sse_shutdown.clear()
     await startup_checks()
-    await assert_schema_current()
+    await assert_schema_current("0002_sandbox_permissions")
     configurable = Configuration.from_runnable_config(None)
+    if configurable.sandbox_enabled:
+        from open_deep_research.sandbox.controller_client import (
+            SandboxControllerClient,
+        )
+        from open_deep_research.sandbox.doctor import diagnose
+        from open_deep_research.sandbox.schema import load_policy_bundle
+
+        startup_grace = min(
+            120.0,
+            max(0.0, float(os.getenv("SANDBOX_STARTUP_GRACE_SECONDS", "30"))),
+        )
+        startup_deadline = time.monotonic() + startup_grace
+        while True:
+            sandbox_report = await asyncio.to_thread(diagnose)
+            if sandbox_report.get("ready"):
+                break
+            if time.monotonic() >= startup_deadline:
+                raise RuntimeError(
+                    "sandbox_unavailable:"
+                    + ",".join(
+                        str(item)
+                        for item in sandbox_report.get("failures", [])
+                    )
+                )
+            await asyncio.sleep(1)
+        # A fresh API process owns no live task leases yet. Stop every Worker
+        # from this deployment before recovery can schedule replacements; the
+        # Controller label scope prevents touching unrelated Docker resources.
+        bundle = load_policy_bundle(configurable.sandbox_policy_path)
+        await SandboxControllerClient(configurable, bundle).reconcile_tasks([])
     if configurable.run_recovery_sweep_on_startup:
         try:
             await _run_recovery_sweep(configurable)
@@ -291,6 +339,23 @@ _TERMINAL_RUN_STATUSES = frozenset(
     {"success", "completed", "failed", "interrupted", "cancelled"}
 )
 _metrics_path = Configuration.from_runnable_config(None).prometheus_metrics_path
+
+
+def _resolve_internal_sandbox_run(run_id: str) -> InternalRunContext | None:
+    """Resolve the live, fenced API authority for trusted sandbox services."""
+    record = _runs.get(run_id)
+    if record is None or record.engine.run_fence_token is None:
+        return None
+    config = record.engine.config
+    return InternalRunContext(
+        config=config,
+        configurable=Configuration.from_runnable_config(config),
+        fence_token=int(record.engine.run_fence_token),
+        started_at=float(record.engine.started_at),
+    )
+
+
+app.include_router(build_internal_sandbox_router(_resolve_internal_sandbox_run))
 
 
 def _new_run_record(
@@ -591,6 +656,16 @@ async def _readiness_report() -> tuple[dict[str, Any], bool]:
             critical_ok = False
     else:
         components["iam_database"] = {"status": "disabled"}
+
+    if configurable.sandbox_enabled:
+        from open_deep_research.sandbox.doctor import diagnose
+
+        sandbox_report = await asyncio.to_thread(diagnose)
+        components["sandbox"] = sandbox_report
+        if not sandbox_report.get("ready"):
+            critical_ok = False
+    else:
+        components["sandbox"] = {"status": "disabled"}
 
     components["search"] = _search_readiness(configurable)
     overall_status = "ok" if critical_ok else "failed"
@@ -1505,6 +1580,35 @@ def _augment_run_projection(
     """Attach task activity summaries without changing the public event reducer."""
     if projection is None:
         return None
+    if projection.status in _TERMINAL_RUN_STATUSES:
+        try:
+            SecurityApprovalStore(
+                run_id,
+                runs_dir=configurable.runs_dir,
+            ).deny_pending(actor="system", reason="run_terminal")
+        except (OSError, RuntimeError, ValueError):
+            pass
+        projection.pending_security_approvals = []
+    else:
+        try:
+            _version, approvals = SecurityApprovalStore(
+                run_id,
+                runs_dir=configurable.runs_dir,
+            ).list(status="pending")
+            projection.pending_security_approvals = [
+                {
+                    "approval_id": item.approval_id,
+                    "task_id": item.task_id,
+                    "kind": item.kind,
+                    "capability": item.capability,
+                    "target": item.target,
+                    "status": item.status,
+                    "expires_at": item.expires_at,
+                }
+                for item in approvals
+            ]
+        except (OSError, RuntimeError, ValueError):
+            pass
     for task_id, task in projection.task_items.items():
         try:
             store = TaskActivityStore(run_id, task_id, runs_dir=configurable.runs_dir)
@@ -1563,6 +1667,29 @@ def _span_tree_rows(spans: list[dict[str, Any]]) -> str:
     return "".join(rows)
 
 
+async def _release_gateway_run(record: RunRecord, config: dict[str, Any]) -> None:
+    """Erase ephemeral Gateway credentials after all run work has terminated."""
+    configurable = Configuration.from_runnable_config(config)
+    fence_token = getattr(record.engine, "run_fence_token", None)
+    if not configurable.sandbox_enabled or fence_token is None:
+        return
+    try:
+        from open_deep_research.sandbox.gateway_client import (
+            SandboxGatewayControlClient,
+        )
+
+        await SandboxGatewayControlClient(configurable).unregister_run(
+            run_id=record.run_id,
+            fence_token=int(fence_token),
+        )
+    except Exception as exc:  # noqa: BLE001 - task tokens still expire independently
+        logger.warning(
+            "sandbox gateway credential cleanup failed run_id=%s error=%s",
+            record.run_id,
+            str(exc)[:500],
+        )
+
+
 async def _run_background(record: RunRecord, request: RunRequest, config: dict[str, Any]) -> None:
     record.status = "running"
     control_task = asyncio.create_task(_run_control_listener(record, config))
@@ -1598,6 +1725,7 @@ async def _run_background(record: RunRecord, request: RunRequest, config: dict[s
     finally:
         control_task.cancel()
         await asyncio.gather(control_task, return_exceptions=True)
+        await _release_gateway_run(record, config)
         _schedule_run_eviction(record, config)
 
 
@@ -1629,6 +1757,7 @@ async def _run_resumed_background(record: RunRecord) -> None:
     finally:
         control_task.cancel()
         await asyncio.gather(control_task, return_exceptions=True)
+        await _release_gateway_run(record, config or {})
         _schedule_run_eviction(record, config)
 
 
@@ -1894,6 +2023,9 @@ async def get_run(
             "updated_at": manifest.updated_at,
             "runtime_seconds": max(0.0, manifest.updated_at - manifest.created_at),
             "pending_human_action": manifest.pending_human_action,
+            "pending_security_approvals": (
+                projection.pending_security_approvals if projection else []
+            ),
             "result": result,
             "output": _stable_output(manifest.result, report_text),
             "event_count": manifest.last_journal_seq,
@@ -1926,6 +2058,7 @@ async def get_run(
             or (manifest.pending_human_action if manifest else None)
             or projection.pending_human_action
         ),
+        "pending_security_approvals": projection.pending_security_approvals,
         "result": record.result,
         "output": _stable_output(record.result),
         "event_count": projection.last_event_id,
@@ -1977,10 +2110,10 @@ async def resume_run(
             raise JournalCorruptedError("run_not_recoverable")
         replay = engine.context_store.replay()
     except RunContextError as exc:
-        if str(exc) == "run_schema_not_resumable":
+        if str(exc).startswith("run_schema_not_resumable:"):
             raise HTTPException(
                 status_code=409,
-                detail="run_schema_not_resumable",
+                detail=str(exc),
             ) from None
         raise HTTPException(status_code=409, detail="run_not_recoverable") from None
     except (ValueError, OSError):
@@ -2055,6 +2188,132 @@ async def submit_human_action(
         command_id=f"human-action-{action_id}",
     )
     return {"status": "accepted", "command_id": command.command_id, "action": request.action}
+
+
+def _sandbox_store_context(
+    run_id: str,
+    *,
+    require_live_fence: bool = False,
+) -> tuple[Configuration, int, dict[str, Any]]:
+    """Resolve store configuration and current fence after RBAC authorization."""
+    record = _runs.get(run_id)
+    if record is not None:
+        if require_live_fence and record.status in _TERMINAL_RUN_STATUSES:
+            raise HTTPException(status_code=409, detail="stale_fence")
+        token = record.engine.run_fence_token
+        if token is None:
+            raise HTTPException(status_code=409, detail="run_not_active")
+        return (
+            Configuration.from_runnable_config(record.engine.config),
+            int(token),
+            record.engine.config,
+        )
+    if require_live_fence:
+        raise HTTPException(status_code=409, detail="stale_fence")
+    configurable = Configuration.from_runnable_config(None)
+    try:
+        manifest = RunContextStore(run_id, runs_dir=configurable.runs_dir).load_manifest()
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail="Run not found") from exc
+    if not manifest.fence_token:
+        raise HTTPException(status_code=409, detail="run_has_no_fence")
+    config = {
+        "configurable": {"runs_dir": configurable.runs_dir},
+        "metadata": {"run_id": run_id, "run_fence_token": manifest.fence_token},
+    }
+    return configurable, int(manifest.fence_token), config
+
+
+@app.get("/runs/{run_id}/security-approvals")
+async def list_security_approvals(
+    run_id: str,
+    status: Literal["pending", "resolved", "expired", "consumed"] | None = "pending",
+    user: Principal = Depends(
+        require_run_owner_or_any(
+            RESEARCH_SECURITY_APPROVAL_READ_OWN.code,
+            RESEARCH_SECURITY_APPROVAL_READ_ANY.code,
+        )
+    ),
+) -> dict[str, Any]:
+    """List the caller-authorized run's durable sandbox approval queue."""
+    del user
+    configurable, _fence_token, _config = _sandbox_store_context(run_id)
+    version, approvals = await asyncio.to_thread(
+        SecurityApprovalStore(run_id, runs_dir=configurable.runs_dir).list,
+        status=status,
+    )
+    return {
+        "run_id": run_id,
+        "version": version,
+        "approvals": [approval.model_dump(mode="json") for approval in approvals],
+    }
+
+
+@app.post("/runs/{run_id}/security-approvals/{approval_id}")
+async def resolve_security_approval(
+    run_id: str,
+    approval_id: str,
+    request: SecurityApprovalDecisionRequest,
+    user: Principal = Depends(
+        require_run_owner_or_any(
+            RESEARCH_SECURITY_APPROVAL_RESOLVE_OWN.code,
+            RESEARCH_SECURITY_APPROVAL_RESOLVE_ANY.code,
+        )
+    ),
+) -> dict[str, Any]:
+    """Resolve one approval for exactly the live run ownership epoch."""
+    configurable, fence_token, config = _sandbox_store_context(
+        run_id,
+        require_live_fence=True,
+    )
+    try:
+        approval = await asyncio.to_thread(
+            SecurityApprovalStore(run_id, runs_dir=configurable.runs_dir).resolve,
+            approval_id,
+            decision=request.decision,
+            actor=user.user_id,
+            reason=request.reason,
+            expected_fence_token=fence_token,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="security_approval_not_found") from exc
+    except ValueError as exc:
+        status_code = 409 if str(exc) == "stale_fence" else 400
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+    await event_publisher_from_config(config).publish(
+        "security.approval.resolved",
+        stage="researching",
+        payload={
+            "approval_id": approval.approval_id,
+            "task_id": approval.task_id,
+            "kind": approval.kind,
+            "capability": approval.capability,
+            "decision": approval.decision,
+            "status": approval.status,
+        },
+        dedupe_key=f"security-approval:{approval.approval_id}:resolved:{approval.version}",
+    )
+    task = get_task_registry().get(approval.task_id)
+    if task is not None and task.run_id == run_id:
+        _version, pending = await asyncio.to_thread(
+            SecurityApprovalStore(run_id, runs_dir=configurable.runs_dir).list,
+            status="pending",
+        )
+        task_pending = [item for item in pending if item.task_id == approval.task_id]
+        if task_pending:
+            task.pending_domain = str(
+                task_pending[0].target.get("domain") or ""
+            ) or None
+            task.pending_domain_tool = task_pending[0].capability
+        else:
+            task.pending_domain = None
+            task.pending_domain_tool = None
+        if (
+            not task_pending
+            and task.status == TaskStatus.WAITING_FOR_CONFIRMATION
+        ):
+            get_task_registry().update_status(approval.task_id, TaskStatus.RUNNING)
+    return approval.model_dump(mode="json")
 
 
 @app.post("/runs/{run_id}/feedback")

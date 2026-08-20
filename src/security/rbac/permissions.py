@@ -51,6 +51,22 @@ RESEARCH_DIAGNOSTICS_PREVIEW = Permission(
     "research.diagnostics.preview", "Diagnostics preview",
     "View bounded diagnostic previews (e.g. task activity previews).", "research",
 )
+RESEARCH_SECURITY_APPROVAL_READ_OWN = Permission(
+    "research.security_approval.read_own", "Read own security approvals",
+    "Read sandbox security approvals for the caller's own runs.", "research",
+)
+RESEARCH_SECURITY_APPROVAL_RESOLVE_OWN = Permission(
+    "research.security_approval.resolve_own", "Resolve own security approvals",
+    "Resolve sandbox security approvals for the caller's own runs.", "research",
+)
+RESEARCH_SECURITY_APPROVAL_READ_ANY = Permission(
+    "research.security_approval.read_any", "Read any security approval",
+    "Read sandbox security approvals across run owners.", "research",
+)
+RESEARCH_SECURITY_APPROVAL_RESOLVE_ANY = Permission(
+    "research.security_approval.resolve_any", "Resolve any security approval",
+    "Resolve sandbox security approvals across run owners.", "research",
+)
 
 # --- Tool-source gates (compose with existing agent tool governance) ---
 
@@ -73,6 +89,18 @@ RESEARCH_TOOL_BROWSER = Permission(
 RESEARCH_TOOL_SKILL = Permission(
     "research.tool.skill", "Skill tools",
     "Use skill tool sources.", "research",
+)
+RESEARCH_TOOL_SHELL_EXECUTE = Permission(
+    "research.tool.shell.execute", "Execute sandbox shell",
+    "Execute commands inside an administrator-approved developer sandbox profile.", "research",
+)
+RESEARCH_TOOL_FILE_READ = Permission(
+    "research.tool.file.read", "Read sandbox files",
+    "Read files inside administrator-approved sandbox roots.", "research",
+)
+RESEARCH_TOOL_FILE_WRITE = Permission(
+    "research.tool.file.write", "Write sandbox files",
+    "Write files inside administrator-approved sandbox roots.", "research",
 )
 
 # --- Identity & access management (never grants cross-user research access) ---
@@ -112,11 +140,18 @@ PERMISSIONS: tuple[Permission, ...] = (
     RESEARCH_TASK_ACTIVITY_READ_OWN,
     RESEARCH_OBSERVABILITY_READ_OWN,
     RESEARCH_DIAGNOSTICS_PREVIEW,
+    RESEARCH_SECURITY_APPROVAL_READ_OWN,
+    RESEARCH_SECURITY_APPROVAL_RESOLVE_OWN,
+    RESEARCH_SECURITY_APPROVAL_READ_ANY,
+    RESEARCH_SECURITY_APPROVAL_RESOLVE_ANY,
     RESEARCH_TOOL_SEARCH,
     RESEARCH_TOOL_PROVIDER_NATIVE,
     RESEARCH_TOOL_MCP,
     RESEARCH_TOOL_BROWSER,
     RESEARCH_TOOL_SKILL,
+    RESEARCH_TOOL_SHELL_EXECUTE,
+    RESEARCH_TOOL_FILE_READ,
+    RESEARCH_TOOL_FILE_WRITE,
     IAM_USERS_READ,
     IAM_USERS_WRITE,
     IAM_ROLES_READ,

@@ -23,6 +23,7 @@ from .dependencies import (
     require_active_user,
     require_permissions,
     require_run_owner,
+    require_run_owner_or_any,
     require_task_owner,
 )
 from .principal import Principal, synthetic_dev_principal
@@ -44,6 +45,7 @@ __all__ = [
     "require_active_user",
     "require_permissions",
     "require_run_owner",
+    "require_run_owner_or_any",
     "require_task_owner",
     "shutdown_rbac",
     "startup_checks",

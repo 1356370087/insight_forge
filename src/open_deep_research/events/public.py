@@ -120,6 +120,12 @@ _PAYLOAD_KEYS: dict[str, set[str]] = {
         "action_id", "question", "status", "allowed_actions",
     },
     "clarification.resolved": {"action_id", "action", "status"},
+    "security.approval.required": {
+        "approval_id", "task_id", "kind", "capability", "target", "status", "expires_at",
+    },
+    "security.approval.resolved": {
+        "approval_id", "task_id", "kind", "capability", "decision", "status",
+    },
     "feedback.received": {"feedback_id", "feedback_type", "task_id", "status"},
     "query.model_fallback": {"turn", "from_model", "to_model", "reason"},
     "model.circuit_state": {
@@ -181,6 +187,7 @@ class PublicRunProjection(BaseModel):
     task_items: dict[str, dict[str, Any]] = Field(default_factory=dict)
     sources: list[dict[str, Any]] = Field(default_factory=list)
     pending_human_action: Optional[dict[str, Any]] = None
+    pending_security_approvals: list[dict[str, Any]] = Field(default_factory=list)
     last_event_id: int = 0
 
 
@@ -281,16 +288,18 @@ async def summarize_public_findings(
         return None
     configurable = Configuration.from_runnable_config(config)
     try:
-        from langchain.chat_models import init_chat_model
         from langchain_core.messages import HumanMessage
 
-        from open_deep_research.models.resolution import build_model_config
+        from open_deep_research.models.resolution import (
+            build_model_config,
+            get_configurable_model_template,
+        )
         from open_deep_research.observability.core import (
             invoke_model_with_retry_observability,
         )
 
-        model = init_chat_model(
-            **build_model_config(
+        model = get_configurable_model_template().with_config(
+            build_model_config(
                 configurable.summarization_model,
                 min(configurable.summarization_model_max_tokens, 800),
                 config,
@@ -671,6 +680,7 @@ def project_public_events(events: list[PublicEvent]) -> PublicRunProjection:
             projection.status = str(payload["status"])
             if event.type in TERMINAL_EVENT_TYPES:
                 projection.pending_human_action = None
+                projection.pending_security_approvals = []
         if event.type.startswith("stage.") and payload.get("stage_id"):
             projection.current_stage = str(payload["stage_id"])
             projection.stage_index = int(payload.get("stage_index", 0))
@@ -735,6 +745,20 @@ def project_public_events(events: list[PublicEvent]) -> PublicRunProjection:
             if pending.get("action_id") == payload.get("action_id"):
                 projection.pending_human_action = None
             projection.status = "running"
+        elif event.type == "security.approval.required":
+            approval_id = str(payload.get("approval_id") or "")
+            projection.pending_security_approvals = [
+                item
+                for item in projection.pending_security_approvals
+                if str(item.get("approval_id")) != approval_id
+            ] + [dict(payload)]
+        elif event.type == "security.approval.resolved":
+            approval_id = str(payload.get("approval_id") or "")
+            projection.pending_security_approvals = [
+                item
+                for item in projection.pending_security_approvals
+                if str(item.get("approval_id")) != approval_id
+            ]
 
     counts = {key: 0 for key in ("pending", "running", "completed", "failed", "cancelled", "timed_out")}
     for status in task_statuses.values():
