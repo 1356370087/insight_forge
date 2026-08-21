@@ -41,6 +41,8 @@
 
 信任假设：API、Controller 和 Gateway 镜像及其管理员配置可信；Docker daemon 与宿主内核属于可信计算基；Worker 镜像内运行时代码按不可信处理；HTTP 租户输入、网页、MCP 描述与工具结果均不可信。
 
+已知风险：Task token 到期与 RPC 时间戳校验使用可信宿主墙钟；能够持续回拨宿主时钟的攻击者已控制可信计算基，超出本威胁模型。生产部署必须保持宿主时钟同步，Controller 的运行时 watchdog 仍使用单调时钟限制单任务执行。
+
 ## 4. 强制需求
 
 ### 4.1 运行与配置
@@ -65,6 +67,7 @@
 - **SAN-LIFE-008**：Watchdog 必须把每个容器的状态探测放入相互隔离的有界任务；单容器的 Docker exec 阻塞不得阻塞其他容器的 deadline、孤儿与 fence 回收。
 - **SAN-LIFE-009**：任务 deadline 从容器实际 `StartedAt` 起算；检查 deadline 前必须先检查结果哨兵，避免边界时刻误杀已完成任务。
 - **SAN-LIFE-010**：相同 fence 的运行中容器可以幂等收养，相同 fence 的已停止容器必须清理后重建；create 请求被取消时，Manager 必须等待有界 create 结果并停止已创建资源，消除未登记孤儿窗口。
+- **SAN-LIFE-011**：Manager 不得接受或返回动态注入的 Docker SDK client；遗留宿主 bind-mount 执行入口即使被直接调用也必须以 `sandbox_controller_required` 硬失败。
 
 ### 4.3 Worker 数据与文件隔离
 
@@ -91,6 +94,7 @@
 - **SAN-SEC-004**：Task token 绑定 run、task、fence、profile、policy digest、expiry 和 jti；每个 mutating RPC/代理连接另带 timestamp+nonce，重复 nonce 在 token TTL 内拒绝。
 - **SAN-SEC-005**：`sandbox_profile`、Profile 定义和 Gateway 授权主机元数据均属于管理员边界，HTTP metadata/config 不得覆盖。
 - **SAN-SEC-006**：`/internal/sandbox/*` 只能位于服务控制网络；边缘 Nginx 必须在通用 `/api/research/*` 转发前显式拒绝该路径，内部 HMAC 不替代网络层隔离。
+- **SAN-SEC-007**：API unregister 遇到网络或 5xx 故障必须使用新 nonce 有界重试；Gateway 必须把 Run Credential Vault 条目绑定到已注册 task token 的最大到期时间，周期驱逐时同步擦除 API keys、MCP/OAuth vault 与 operation locks。
 
 ### 4.5 模型与预算
 
@@ -124,6 +128,7 @@
 - **SAN-OS-005**：WSL2 默认不暴露 `/mnt/c` 与 Windows 互操作 socket。
 - **SAN-OS-006**：API 自身运行在容器时不嵌套 bubblewrap，Developer 命令改由 Controller 创建短生命周期 command task。
 - **SAN-OS-007**：bubblewrap 不得以 `--ro-bind / /` 暴露完整宿主根；只读映射必须收敛到执行所需系统运行库，workspace 单独映射，`/home`、`/root`、`/run`、`/tmp` 与宿主挂载根默认遮蔽。
+- **SAN-OS-008**：`sandbox doctor` 在管理员把 `developer-workspace` 映射到非 Linux 平台时必须输出未通过发布验收的显式 warning。
 
 ## 5. 策略模型
 
@@ -220,4 +225,4 @@ M1 验收必须覆盖 SAN-RUN、SAN-LIFE、SAN-FS、SAN-NET、SAN-SEC、SAN-BUDG
 - M2 的持久化审批、IAM、API/SSE、前端并发审批和 MCP OAuth elicitation 已接线；独立 Browser Gateway 镜像尚未进入发布门，沙箱模式下不得启用 Browser MCP。
 - M3 只完成 execution-zone、默认关闭的 Shell/Read/Write、最小系统只读映射与 bubblewrap fail-closed 基础实现；bwrap+socat Unix Socket 出网和容器化 API 的短生命周期 command task 尚未通过 Linux/WSL2 E2E。默认策略没有把任何角色映射到 `developer-workspace`，管理员不得提前启用。
 
-本轮评审修复后的 Windows 单元/集成测试结果为 `10 failed, 1077 passed, 55 skipped`；失败集合与第 10 节基线完全一致。新增回归覆盖 Controller 生命周期、恶意 FIFO、egress proxy、审批 HTTP 层、预算单一记账和 transient journal retry。
+本轮二次加固后的 Windows 单元/集成测试结果为 `10 failed, 1084 passed, 55 skipped`；失败集合与第 10 节基线完全一致。新增回归覆盖 Controller 生命周期、恶意 FIFO、跨 deployment reconcile、egress proxy、审批 HTTP 层、预算单一记账、Credential Vault TTL/retry 和 transient journal retry。
