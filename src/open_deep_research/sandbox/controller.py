@@ -283,6 +283,14 @@ class DockerControllerRuntime:
     def _container_labels(container: Any) -> dict[str, str]:
         return dict((container.attrs.get("Config") or {}).get("Labels") or {})
 
+    def _owns_resource_labels(self, labels: dict[str, str], kind: str) -> bool:
+        """Recheck deployment ownership after Docker returns filtered resources."""
+        return (
+            labels.get("com.insightforge.sandbox.deployment_id")
+            == self.bundle.deployment_id
+            and labels.get("com.insightforge.sandbox.resource_kind") == kind
+        )
+
     def _owned_worker(self, container_id: str) -> Any:
         container = self.client.containers.get(container_id)
         container.reload()
@@ -775,6 +783,10 @@ class DockerControllerRuntime:
         worker.start()
         worker.join(max(0.01, timeout_seconds))
         if worker.is_alive():
+            # docker-py cannot cancel an exec blocked inside the daemon. The
+            # daemon thread may therefore survive until Docker recovers or the
+            # Controller exits; watchdog probes are independently bounded, so
+            # the accepted leak rate is at most one thread per timed-out probe.
             raise TimeoutError("sandbox_container_exec_timeout")
         succeeded, value = outcomes.get_nowait()
         if not succeeded:
@@ -933,6 +945,8 @@ class DockerControllerRuntime:
         for container in self.client.containers.list(all=True, filters=filters):
             container.reload()
             labels = self._container_labels(container)
+            if not self._owns_resource_labels(labels, "worker"):
+                continue
             identity = (
                 labels.get("com.insightforge.sandbox.run_id", ""),
                 labels.get("com.insightforge.sandbox.task_id", ""),
@@ -959,6 +973,8 @@ class DockerControllerRuntime:
         }
         for seed in self.client.containers.list(all=True, filters=seed_filters):
             labels = self._container_labels(seed)
+            if not self._owns_resource_labels(labels, "seed"):
+                continue
             identity = (
                 (
                     labels.get("com.insightforge.sandbox.run_id", ""),
@@ -978,6 +994,8 @@ class DockerControllerRuntime:
             }
         ):
             labels = dict(network.attrs.get("Labels") or {})
+            if not self._owns_resource_labels(labels, "network"):
+                continue
             identity = (
                 (
                     labels.get("com.insightforge.sandbox.run_id", ""),
@@ -1002,6 +1020,8 @@ class DockerControllerRuntime:
             }
         ):
             labels = dict(volume.attrs.get("Labels") or {})
+            if not self._owns_resource_labels(labels, "input"):
+                continue
             identity = (
                 (
                     labels.get("com.insightforge.sandbox.run_id", ""),

@@ -14,13 +14,25 @@ from open_deep_research.sandbox.crypto import SandboxDerivedKeys
 from open_deep_research.sandbox.schema import load_policy_bundle, policy_digest
 
 
+def _developer_profile_warnings(bundle: object | None) -> list[str]:
+    """Return non-blocking release warnings for mapped Developer profiles."""
+    profile_by_role = getattr(bundle, "profile_by_role", {}) if bundle is not None else {}
+    developer_mapped = "developer-workspace" in set(profile_by_role.values())
+    if developer_mapped and not sys.platform.startswith("linux"):
+        return [
+            "developer-workspace is mapped but the current platform is not Linux; "
+            "this profile is not release-qualified"
+        ]
+    return []
+
+
 def diagnose() -> dict:
     """Return a content-free readiness report for administrator use."""
     failures: list[str] = []
     try:
         configurable = Configuration.from_runnable_config(None)
     except Exception as exc:
-        return {"ready": False, "failures": [str(exc)]}
+        return {"ready": False, "failures": [str(exc)], "warnings": []}
     if not configurable.sandbox_enabled:
         failures.append("SANDBOX_ENABLED is false")
     if not configurable.enable_async_research:
@@ -65,6 +77,7 @@ def diagnose() -> dict:
         bundle is not None
         and "developer-workspace" in set(bundle.profile_by_role.values())
     )
+    warnings = _developer_profile_warnings(bundle)
     inside_container = Path("/.dockerenv").exists()
     if developer_needed and not inside_container and shutil.which("bwrap") is None:
         failures.append("bubblewrap unavailable for developer-workspace")
@@ -73,6 +86,7 @@ def diagnose() -> dict:
     return {
         "ready": not failures,
         "failures": failures,
+        "warnings": warnings,
         "policy_digest": policy_digest(bundle) if bundle is not None else None,
         "controller": controller,
         "gateway": gateway,

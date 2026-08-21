@@ -8,7 +8,7 @@ import json
 import logging
 import os
 import time
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -75,6 +75,8 @@ from open_deep_research.sandbox.wire import (
 )
 
 logger = logging.getLogger(__name__)
+GATEWAY_CREDENTIAL_MAX_TTL_SECONDS = 86_460.0
+GATEWAY_CREDENTIAL_SWEEP_SECONDS = 5.0
 
 
 class GatewayRunRegistrationRequest(ServiceRequest):
@@ -86,6 +88,7 @@ class GatewayRunRegistrationRequest(ServiceRequest):
     fence_token: int = Field(ge=1)
     frozen_config: dict[str, Any]
     api_keys: dict[str, str] = Field(default_factory=dict)
+    expires_at: float = Field(gt=0)
 
 
 class GatewayRunUnregisterRequest(ServiceRequest):
@@ -103,6 +106,7 @@ class GatewayRunContext:
 
     config: dict[str, Any]
     fence_token: int
+    expires_at: float
     api_keys: dict[str, str] = field(default_factory=dict)
     registered_at: float = field(default_factory=time.time)
 
@@ -249,6 +253,12 @@ class GatewayRuntime:
             request.service_nonce,
             expires_at=time.time() + 60,
         )
+        now = time.time()
+        if request.expires_at <= now:
+            raise ValueError("sandbox_gateway_registration_expired")
+        if request.expires_at > now + GATEWAY_CREDENTIAL_MAX_TTL_SECONDS + 30:
+            raise ValueError("sandbox_gateway_registration_ttl_out_of_range")
+        self.evict_expired_runs(now=now)
         existing = self.runs.get(request.run_id)
         if existing is not None and existing.fence_token > request.fence_token:
             raise ValueError("stale_fence")
@@ -269,6 +279,9 @@ class GatewayRuntime:
                 and current_fingerprint != next_fingerprint
             ):
                 raise ValueError("sandbox_gateway_frozen_config_mismatch")
+        if existing is not None and existing.fence_token < request.fence_token:
+            self._remove_run_context(request.run_id)
+            existing = None
         config = {
             "configurable": dict(request.frozen_config.get("configurable") or {}),
             "metadata": {
@@ -307,7 +320,57 @@ class GatewayRuntime:
                 and existing.fence_token == request.fence_token
                 else time.time()
             ),
+            expires_at=(
+                max(existing.expires_at, request.expires_at)
+                if existing is not None
+                and existing.fence_token == request.fence_token
+                else request.expires_at
+            ),
         )
+
+    @staticmethod
+    def _wipe_run_context(context: GatewayRunContext) -> None:
+        """Remove every in-memory reference to per-run credential material."""
+        configurable = context.config.get("configurable")
+        if isinstance(configurable, dict):
+            for key in ("apiKeys", "_sandbox_credential_vault"):
+                secret_map = configurable.pop(key, None)
+                if isinstance(secret_map, dict):
+                    secret_map.clear()
+            configurable.pop("mcp_subject_token", None)
+        context.api_keys.clear()
+        context.config.clear()
+
+    def _remove_run_context(self, run_id: str) -> bool:
+        """Wipe one run context and all per-operation synchronization state."""
+        context = self.runs.pop(run_id, None)
+        if context is not None:
+            self._wipe_run_context(context)
+        for key in [key for key in self.operation_locks if key[0] == run_id]:
+            self.operation_locks.pop(key, None)
+        return context is not None
+
+    def evict_expired_runs(self, *, now: float | None = None) -> list[str]:
+        """Wipe run credentials after their maximum registered task-token TTL."""
+        current = time.time() if now is None else now
+        expired = sorted(
+            run_id
+            for run_id, context in self.runs.items()
+            if context.expires_at <= current
+        )
+        for run_id in expired:
+            self._remove_run_context(run_id)
+        return expired
+
+    async def reap_expired_runs(
+        self,
+        *,
+        interval_seconds: float = GATEWAY_CREDENTIAL_SWEEP_SECONDS,
+    ) -> None:
+        """Continuously enforce Credential Vault expiry without API cleanup."""
+        while True:
+            self.evict_expired_runs()
+            await asyncio.sleep(max(0.01, interval_seconds))
 
     def unregister(self, request: GatewayRunUnregisterRequest) -> None:
         """Replay-protected deletion of ephemeral run credentials and locks."""
@@ -324,9 +387,7 @@ class GatewayRuntime:
         context = self.runs.get(request.run_id)
         if context is not None and context.fence_token != request.fence_token:
             raise ValueError("stale_fence")
-        self.runs.pop(request.run_id, None)
-        for key in [key for key in self.operation_locks if key[0] == request.run_id]:
-            self.operation_locks.pop(key, None)
+        self._remove_run_context(request.run_id)
 
     def authorize_task(
         self,
@@ -347,6 +408,7 @@ class GatewayRuntime:
             raise ValueError("sandbox_task_token_missing")
         claims = decode_task_token(authorization[7:], self.keys.task_token)
         self.nonces.consume(claims.jti, nonce, expires_at=claims.expires_at)
+        self.evict_expired_runs()
         context = self.runs.get(request.run_id)
         if context is None:
             raise ValueError("sandbox_gateway_run_not_registered")
@@ -369,6 +431,7 @@ class GatewayRuntime:
     ) -> GatewayRunContext:
         """Authenticate one trusted API model request with the service key."""
         validate_timestamp(timestamp)
+        self.evict_expired_runs()
         context = self.runs.get(request.run_id)
         if context is None:
             raise ValueError("sandbox_gateway_run_not_registered")
@@ -1200,12 +1263,41 @@ class GatewayRuntime:
             return outcome
 
 
-def create_gateway_app(runtime: GatewayRuntime) -> FastAPI:
+def create_gateway_app(
+    runtime: GatewayRuntime,
+    *,
+    credential_sweep_seconds: float = GATEWAY_CREDENTIAL_SWEEP_SECONDS,
+) -> FastAPI:
     """Create the task-data and trusted-control Gateway application."""
-    app = FastAPI(title="InsightForge Sandbox Gateway", docs_url=None, redoc_url=None)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        reaper = getattr(runtime, "reap_expired_runs", None)
+        if not callable(reaper):
+            yield
+            return
+        task = asyncio.create_task(
+            reaper(interval_seconds=credential_sweep_seconds)
+        )
+        try:
+            yield
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+    app = FastAPI(
+        title="InsightForge Sandbox Gateway",
+        docs_url=None,
+        redoc_url=None,
+        lifespan=lifespan,
+    )
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
+        evict = getattr(runtime, "evict_expired_runs", None)
+        if callable(evict):
+            evict()
         return {"status": "ok", "registered_runs": len(runtime.runs)}
 
     @app.post("/internal/v1/runs/register")

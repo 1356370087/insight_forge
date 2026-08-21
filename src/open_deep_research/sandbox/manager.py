@@ -36,6 +36,8 @@ from open_deep_research.tasks.registry import TaskRecord
 CONTAINER_WORKSPACE = "/workspace"
 TASK_PAYLOAD_NAME = "task_payload.json"
 TASK_RESULT_NAME = "result.json"
+# Security allowlist: every future Configuration field is excluded until it is
+# explicitly reviewed for Worker semantics and added here.
 _SANDBOX_RUNTIME_CONFIG_KEYS = frozenset(
     {
         "max_structured_output_retries",
@@ -299,8 +301,10 @@ class DockerSandboxManager:
     """Prepare workspaces and run Researcher workers inside Docker containers."""
 
     def __init__(self, docker_client: Any = None) -> None:
-        """Create a manager, optionally with an injected Docker client."""
-        self._client = docker_client
+        """Create a Controller-only manager and reject the removed SDK seam."""
+        if docker_client is not None:
+            raise RuntimeError("sandbox_controller_required")
+        self._client = None
 
     async def _create_controller_task(
         self,
@@ -366,6 +370,10 @@ class DockerSandboxManager:
 
             metadata = config.get("metadata", {}) if config else {}
             fence_token = max(1, int(metadata.get("run_fence_token") or 1))
+            now = time.time()
+            task_token_expires_at = (
+                now + profile.resources.timeout_seconds + 60
+            )
             frozen_for_gateway, credentials = split_gateway_registration(
                 dict(config or {})
             )
@@ -374,6 +382,7 @@ class DockerSandboxManager:
                 fence_token=fence_token,
                 frozen_config=frozen_for_gateway,
                 api_keys=credentials,
+                expires_at=task_token_expires_at,
             )
 
             payload = self.build_payload(
@@ -383,7 +392,6 @@ class DockerSandboxManager:
                 profile_id=profile_id,
                 policy_digest_value=policy_digest(bundle),
             )
-            now = time.time()
             claims = TaskTokenClaimsV1(
                 run_id=payload.run_id,
                 task_id=payload.task_id,
@@ -391,7 +399,7 @@ class DockerSandboxManager:
                 profile_id=profile_id,
                 policy_digest=payload.policy_digest,
                 issued_at=now,
-                expires_at=now + profile.resources.timeout_seconds + 60,
+                expires_at=task_token_expires_at,
                 jti=str(uuid.uuid4()),
             )
             keys = SandboxDerivedKeys.from_root(configurable.sandbox_root_signing_key or "")
@@ -876,8 +884,7 @@ class DockerSandboxManager:
                     pass
 
     def _get_client(self) -> Any:
-        if self._client is not None:
-            return self._client
+        """Reject the removed direct Docker execution path unconditionally."""
         raise RuntimeError("sandbox_controller_required")
 
     def _coerce_mounts_for_docker(self, mount_specs: list[dict[str, Any]]) -> list[Any]:
