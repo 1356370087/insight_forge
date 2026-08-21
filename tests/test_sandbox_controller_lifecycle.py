@@ -192,6 +192,90 @@ def test_existing_container_disposition_covers_all_fence_branches() -> None:
     assert disposition("running", existing_fence=1, requested_fence=2) == "replace"
 
 
+def test_reconcile_rechecks_deployment_labels_before_mutation() -> None:
+    actions: list[str] = []
+
+    class Resource:
+        def __init__(self, resource_id: str, deployment_id: str, kind: str) -> None:
+            self.id = resource_id
+            self.status = "running"
+            labels = {
+                "com.insightforge.sandbox.deployment_id": deployment_id,
+                "com.insightforge.sandbox.resource_kind": kind,
+                "com.insightforge.sandbox.run_id": f"run-{resource_id}",
+                "com.insightforge.sandbox.task_id": f"task-{resource_id}",
+                "com.insightforge.sandbox.fence_token": "1",
+                "com.insightforge.sandbox.profile_id": "research-gateway-only",
+                "com.insightforge.sandbox.deadline_at": "0",
+            }
+            self.attrs = (
+                {"Config": {"Labels": labels}, "State": {}}
+                if kind in {"worker", "seed"}
+                else {"Labels": labels, "Containers": {}}
+            )
+
+        def reload(self) -> None:
+            return None
+
+        def remove(self, *, force: bool = False) -> None:
+            actions.append(f"remove:{self.id}:{force}")
+
+    owned_worker = Resource("owned-worker", "deployment-a", "worker")
+    foreign_worker = Resource("foreign-worker", "deployment-b", "worker")
+    owned_seed = Resource("owned-seed", "deployment-a", "seed")
+    foreign_seed = Resource("foreign-seed", "deployment-b", "seed")
+    owned_network = Resource("owned-network", "deployment-a", "network")
+    foreign_network = Resource("foreign-network", "deployment-b", "network")
+    owned_volume = Resource("owned-volume", "deployment-a", "input")
+    foreign_volume = Resource("foreign-volume", "deployment-b", "input")
+    observed_filters: list[dict] = []
+
+    def list_containers(*, all: bool, filters: dict):
+        del all
+        observed_filters.append(filters)
+        labels = filters["label"]
+        if "com.insightforge.sandbox.resource_kind=worker" in labels:
+            return [owned_worker, foreign_worker]
+        return [owned_seed, foreign_seed]
+
+    runtime = object.__new__(DockerControllerRuntime)
+    runtime.bundle = SimpleNamespace(
+        deployment_id="deployment-a",
+        profiles={
+            "research-gateway-only": SimpleNamespace(
+                resources=SimpleNamespace(stop_grace_seconds=5)
+            )
+        },
+    )
+    runtime.client = SimpleNamespace(
+        containers=SimpleNamespace(list=list_containers),
+        networks=SimpleNamespace(
+            list=lambda **_kwargs: [owned_network, foreign_network]
+        ),
+        volumes=SimpleNamespace(
+            list=lambda **_kwargs: [owned_volume, foreign_volume]
+        ),
+    )
+    runtime._authorize_service = lambda *_args, **_kwargs: None
+    runtime._terminate = lambda container, **_kwargs: actions.append(
+        f"terminate:{container.id}"
+    )
+
+    stopped = runtime.reconcile(SimpleNamespace(active_tasks=[]))
+
+    assert stopped == ["owned-worker"]
+    assert actions == [
+        "terminate:owned-worker",
+        "remove:owned-seed:True",
+        "remove:owned-network:False",
+        "remove:owned-volume:True",
+    ]
+    assert all(
+        "com.insightforge.sandbox.deployment_id=deployment-a" in item["label"]
+        for item in observed_filters
+    )
+
+
 def test_terminate_escalates_from_term_to_kill() -> None:
     calls: list[str] = []
 

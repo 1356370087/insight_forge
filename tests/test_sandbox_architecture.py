@@ -5,6 +5,10 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+
+from open_deep_research.sandbox.manager import DockerSandboxManager
+
 ROOT = Path(__file__).parents[1] / "src" / "open_deep_research"
 WORKER_BOUNDARY = (
     ROOT / "sandbox" / "worker.py",
@@ -51,6 +55,16 @@ def test_only_controller_opens_the_docker_sdk() -> None:
             if (module == "docker" or module.startswith("docker.")) and relative != "sandbox/controller.py":
                 violations.append(f"{relative}:{line}:{module}")
     assert not violations, violations
+
+
+def test_manager_rejects_legacy_docker_client_injection() -> None:
+    """A dynamically supplied SDK client must never revive the host path."""
+    with pytest.raises(RuntimeError, match="sandbox_controller_required"):
+        DockerSandboxManager(docker_client=object())
+
+    manager = DockerSandboxManager()
+    with pytest.raises(RuntimeError, match="sandbox_controller_required"):
+        manager._get_client()
 
 
 def test_public_nginx_denies_internal_sandbox_control_plane() -> None:

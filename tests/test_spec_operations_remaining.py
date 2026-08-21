@@ -378,7 +378,7 @@ def test_sandbox_worker_environment_never_contains_provider_secrets() -> None:
     profile = load_policy_bundle("config/sandbox-policy.toml").profiles[
         "research-gateway-only"
     ]
-    env = sandbox_manager.DockerSandboxManager(docker_client=object())._build_environment(
+    env = sandbox_manager.DockerSandboxManager()._build_environment(
         Configuration(), {}, profile
     )
     forbidden = {

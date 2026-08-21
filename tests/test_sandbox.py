@@ -1,5 +1,6 @@
 """Sandbox Policy V7 contracts, payload safety and durable control state."""
 
+import asyncio
 import base64
 import io
 import json
@@ -9,6 +10,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage, HumanMessage, message_to_dict
@@ -20,6 +22,8 @@ from open_deep_research.configuration import (
     Configuration,
     freeze_run_config,
 )
+from open_deep_research.sandbox import doctor as sandbox_doctor
+from open_deep_research.sandbox import gateway_client
 from open_deep_research.sandbox.approvals import SecurityApprovalStore
 from open_deep_research.sandbox.controller import DockerControllerRuntime, _tar_payload
 from open_deep_research.sandbox.crypto import (
@@ -164,7 +168,7 @@ def test_payload_filters_callback_and_credentials():
         "metadata": {"run_id": "run-payload", "run_fence_token": 3},
     }
     record = TaskRecord(task_id="task-payload", research_topic="topic", run_id="run-payload")
-    payload = DockerSandboxManager(docker_client=object()).build_payload(
+    payload = DockerSandboxManager().build_payload(
         task_record=record,
         config=config,
         researcher_state={
@@ -188,6 +192,25 @@ def test_payload_filters_callback_and_credentials():
     }
     assert "allowed_model_endpoints" not in payload.runtime_config
     assert payload.runtime_config["model_fallbacks"] == {}
+
+
+def test_payload_runtime_allowlist_never_admits_credential_fields() -> None:
+    sensitive_suffixes = (
+        "_api_key",
+        "_secret_key",
+        "_access_token",
+        "_auth_token",
+        "_password",
+    )
+    sensitive_fields = {
+        name
+        for name in Configuration.model_fields
+        if name == "mcp_subject_token"
+        or name == "apiKeys"
+        or name.endswith(sensitive_suffixes)
+    }
+    assert sensitive_fields
+    assert sensitive_fields.isdisjoint(_SANDBOX_RUNTIME_CONFIG_KEYS)
 
 
 def test_complete_result_preserves_evidence_contract():
@@ -311,6 +334,7 @@ def test_gateway_accepts_service_signed_api_model_request() -> None:
             "metadata": {"run_config_fingerprint": "frozen"},
         },
         api_keys={},
+        expires_at=now + 60,
         service_timestamp=now,
         service_nonce=secrets.token_urlsafe(24),
         service_signature="pending",
@@ -355,6 +379,103 @@ def test_gateway_accepts_service_signed_api_model_request() -> None:
             fence_token=3,
             signature=signature,
         )
+
+
+@pytest.mark.asyncio
+async def test_gateway_unregister_retries_with_fresh_nonces(monkeypatch) -> None:
+    attempts: list[dict] = []
+
+    class AsyncClient:
+        def __init__(self, **_kwargs) -> None:
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, url, *, content, headers):
+            del headers
+            attempts.append(json.loads(content))
+            status = 503 if len(attempts) < 3 else 200
+            return httpx.Response(status, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(gateway_client.httpx, "AsyncClient", AsyncClient)
+    client = gateway_client.SandboxGatewayControlClient(_sandbox_config())
+
+    await client.unregister_run(run_id="run-retry", fence_token=7)
+
+    assert len(attempts) == 3
+    assert len({item["service_nonce"] for item in attempts}) == 3
+
+
+def test_gateway_expiry_wipes_run_credentials_and_operation_locks() -> None:
+    runtime = GatewayRuntime(_sandbox_config())
+    now = time.time()
+    registration = GatewayRunRegistrationRequest(
+        run_id="run-expiring",
+        fence_token=4,
+        frozen_config={"configurable": {}, "metadata": {}},
+        api_keys={"OPENAI_API_KEY": "ephemeral-secret"},
+        expires_at=now + 1,
+        service_timestamp=now,
+        service_nonce=secrets.token_urlsafe(24),
+        service_signature="pending",
+    )
+    registration.service_signature = sign_payload(
+        registration.signed_payload(), runtime.keys.service_auth
+    )
+    runtime.register(registration)
+    context = runtime.runs["run-expiring"]
+    runtime.operation_locks[("run-expiring", "operation")] = asyncio.Lock()
+
+    assert runtime.evict_expired_runs(now=now + 2) == ["run-expiring"]
+    assert "run-expiring" not in runtime.runs
+    assert not any(key[0] == "run-expiring" for key in runtime.operation_locks)
+    assert context.api_keys == {}
+    assert context.config == {}
+
+
+def test_gateway_app_lifespan_reaps_expired_credentials_without_api_cleanup() -> None:
+    runtime = GatewayRuntime(_sandbox_config())
+    now = time.time()
+    registration = GatewayRunRegistrationRequest(
+        run_id="run-background-expiry",
+        fence_token=2,
+        frozen_config={"configurable": {}, "metadata": {}},
+        api_keys={"OPENAI_API_KEY": "background-secret"},
+        expires_at=now + 60,
+        service_timestamp=now,
+        service_nonce=secrets.token_urlsafe(24),
+        service_signature="pending",
+    )
+    registration.service_signature = sign_payload(
+        registration.signed_payload(), runtime.keys.service_auth
+    )
+    runtime.register(registration)
+    runtime.runs["run-background-expiry"].expires_at = 0
+
+    with TestClient(
+        create_gateway_app(runtime, credential_sweep_seconds=0.01)
+    ):
+        deadline = time.monotonic() + 0.5
+        while "run-background-expiry" in runtime.runs and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    assert "run-background-expiry" not in runtime.runs
+
+
+def test_doctor_warns_when_developer_profile_is_mapped_off_linux(monkeypatch) -> None:
+    bundle = SimpleNamespace(
+        profile_by_role={"developer": "developer-workspace"}
+    )
+    monkeypatch.setattr(sandbox_doctor.sys, "platform", "win32")
+
+    assert sandbox_doctor._developer_profile_warnings(bundle) == [
+        "developer-workspace is mapped but the current platform is not Linux; "
+        "this profile is not release-qualified"
+    ]
 
 
 def test_gateway_model_binds_pydantic_structured_output_schema() -> None:
