@@ -361,3 +361,265 @@ class TestTurnAdvancePolicyWiring:
         # same transcript burns an extra research turn.
         assert await completed_turn(with_policy=True) == 1
         assert await completed_turn(with_policy=False) == 2
+
+
+class _CapturePublisher:
+    def __init__(self):
+        self.published: list[tuple[str, dict[str, Any]]] = []
+
+    async def publish(self, event_type, stage=None, payload=None, **kwargs):
+        self.published.append((event_type, dict(payload or {})))
+
+
+class _FakeTaskStateStore:
+    def __init__(self, snapshots):
+        self._snapshots = snapshots
+        self.upserted: list[TaskSnapshot] = []
+
+    async def get(self, task_id, run_id=None):
+        return self._snapshots.get(task_id)
+
+    async def list(self, run_id=None):
+        return list(self._snapshots.values())
+
+    async def upsert(self, snapshot):
+        self.upserted.append(snapshot)
+
+
+def _rejected_assessment():
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        accepted=False,
+        admission_status=None,
+        missing_information=["gap-1"],
+        unsupported_claims=[],
+        follow_up_tasks=[],
+        model_dump=lambda: {
+            "missing_information": ["gap-1"],
+            "unsupported_claims": [],
+            "follow_up_tasks": [],
+        },
+    )
+
+
+class TestFinalizeAsyncOutputs:
+    def _patch(self, monkeypatch, tmp_path, *, outputs, snapshots):
+        published: list[dict[str, Any]] = []
+
+        async def fake_collect(registry, *, run_id, state_store):
+            return list(outputs)
+
+        async def fake_evaluate(*args, **kwargs):
+            return _rejected_assessment()
+
+        async def fake_publish_activity(config, **kwargs):
+            published.append(kwargs)
+
+        monkeypatch.setattr(
+            deep_researcher, "collect_completed_task_outputs", fake_collect
+        )
+        monkeypatch.setattr(
+            deep_researcher, "get_task_state_store", lambda _c: _FakeTaskStateStore(snapshots)
+        )
+        monkeypatch.setattr(
+            deep_researcher,
+            "_load_handoff_artifact_for_quality",
+            lambda output, *, task_id, run_id, configurable: {},
+        )
+        monkeypatch.setattr(
+            deep_researcher, "evaluate_subagent_handoff", fake_evaluate
+        )
+        monkeypatch.setattr(
+            deep_researcher, "publish_task_activity", fake_publish_activity
+        )
+        monkeypatch.setattr(
+            deep_researcher, "summarize_public_findings", _async_none
+        )
+        monkeypatch.setattr(
+            deep_researcher, "extract_public_sources", lambda output, *, limit: []
+        )
+        return published
+
+    @pytest.mark.asyncio
+    async def test_rejected_handoff_reads_source_count_from_metrics(self, monkeypatch, tmp_path):
+        snapshot = TaskSnapshot(
+            task_id="task-1",
+            status=TaskStatus.COMPLETED,
+            wave_id="wave-1",
+            metrics={"source_count": 36},
+        )
+        published = self._patch(
+            monkeypatch,
+            tmp_path,
+            outputs=[{"task_id": "task-1", "research_topic": "t", "requirement_ids": []}],
+            snapshots={"task-1": snapshot},
+        )
+        finalize_config = _config(runs_dir=str(tmp_path))
+        finalize_config["configurable"]["quality_evaluation_enabled"] = True
+        update = await deep_researcher._finalize_async_research_outputs(
+            {"coverage_ledger": {}, "coverage_contract": None, "research_risk_profile": None},
+            finalize_config,
+            Configuration.from_runnable_config(finalize_config),
+            _CapturePublisher(),
+        )
+        warnings = [
+            p for p in published
+            if p.get("event_type") == "task.completed" and "source_count" in p.get("payload", {})
+        ]
+        assert warnings, "rejected handoff must publish a warning activity"
+        assert warnings[0]["payload"]["source_count"] == 36
+        assert update["completed_task_outputs"] == []
+
+    @pytest.mark.asyncio
+    async def test_single_output_failure_does_not_abort_remaining(self, monkeypatch, tmp_path):
+        snapshots = {
+            "task-bad": TaskSnapshot(task_id="task-bad", status=TaskStatus.COMPLETED, wave_id="w"),
+            "task-good": TaskSnapshot(
+                task_id="task-good",
+                status=TaskStatus.COMPLETED,
+                wave_id="w",
+                metrics={"source_count": 5},
+            ),
+        }
+        published = self._patch(
+            monkeypatch,
+            tmp_path,
+            outputs=[
+                {"task_id": "task-bad", "research_topic": "t", "requirement_ids": []},
+                {"task_id": "task-good", "research_topic": "t", "requirement_ids": []},
+            ],
+            snapshots=snapshots,
+        )
+        original_evaluate = deep_researcher.evaluate_subagent_handoff
+
+        async def failing_evaluate(*args, **kwargs):
+            # 第一个输出在评估阶段崩溃，第二个正常评估
+            if not hasattr(failing_evaluate, "calls"):
+                failing_evaluate.calls = 0
+            failing_evaluate.calls += 1
+            if failing_evaluate.calls == 1:
+                raise RuntimeError("assessment exploded")
+            return await original_evaluate(*args, **kwargs)
+
+        monkeypatch.setattr(
+            deep_researcher, "evaluate_subagent_handoff", failing_evaluate
+        )
+        finalize_config = _config(runs_dir=str(tmp_path))
+        finalize_config["configurable"]["quality_evaluation_enabled"] = True
+        await deep_researcher._finalize_async_research_outputs(
+            {"coverage_ledger": {}, "coverage_contract": None, "research_risk_profile": None},
+            finalize_config,
+            Configuration.from_runnable_config(finalize_config),
+            _CapturePublisher(),
+        )
+        good_warnings = [
+            p for p in published
+            if p.get("payload", {}).get("admission_status") == "rejected"
+            and p.get("payload", {}).get("source_count") == 5
+        ]
+        assert good_warnings, "second output must still be finalized"
+
+
+async def _async_none(*args, **kwargs):
+    return None
+
+
+class TestTerminalProjectionOverrides:
+    @pytest.mark.asyncio
+    async def test_stuck_running_tasks_render_cancelled_on_failed_run(self, tmp_path):
+        from open_deep_research.events.public import RunEventStore
+
+        store = RunEventStore("run-terminal-override", runs_dir=str(tmp_path))
+        await store.append("run.created", payload={"status": "pending"}, dedupe_key="run:created")
+        await store.append(
+            "research.task.created",
+            payload={"task_id": "t1", "wave_id": "w1", "mode": "async", "status": "pending"},
+            dedupe_key="task:t1:created",
+        )
+        await store.append(
+            "research.task.started",
+            payload={"task_id": "t1", "wave_id": "w1", "mode": "async", "status": "researching"},
+            dedupe_key="task:t1:started",
+        )
+        await store.append(
+            "run.failed",
+            payload={
+                "status": "failed",
+                "error_code": "internal_error",
+                "result_status": "error",
+            },
+            dedupe_key="run:terminal",
+        )
+        projection = store.project()
+        assert projection.status == "failed"
+        assert projection.tasks["running"] == 0
+        assert projection.tasks["cancelled"] == 1
+        assert projection.task_items["t1"]["status"] == "cancelled"
+
+    @pytest.mark.asyncio
+    async def test_live_run_keeps_running_tasks(self, tmp_path):
+        from open_deep_research.events.public import RunEventStore
+
+        store = RunEventStore("run-live-override", runs_dir=str(tmp_path))
+        await store.append("run.created", payload={"status": "pending"}, dedupe_key="run:created")
+        await store.append(
+            "research.task.started",
+            payload={"task_id": "t1", "wave_id": "w1", "mode": "async", "status": "researching"},
+            dedupe_key="task:t1:started",
+        )
+        projection = store.project()
+        assert projection.tasks["running"] == 1
+        assert projection.tasks["cancelled"] == 0
+
+
+class TestGetRunTerminalManifestPreference:
+    def test_stale_memory_record_yields_to_terminal_manifest(self, tmp_path, monkeypatch):
+        import time as time_module
+        from types import SimpleNamespace
+
+        from fastapi.testclient import TestClient
+
+        from open_deep_research import server
+        from open_deep_research.run_context import RunContextStore
+
+        run_id = "stale-record-run"
+        monkeypatch.setenv("RUNS_DIR", str(tmp_path))
+        monkeypatch.setenv("APP_ENV", "development")
+        monkeypatch.setenv("LOCAL_DEV_AUTH_BYPASS", "true")
+        monkeypatch.delenv("IAM_DATABASE_URL", raising=False)
+        context = RunContextStore(run_id, runs_dir=str(tmp_path))
+        context.initialize(
+            "local-dev-user",
+            {
+                "configurable": {"runs_dir": str(tmp_path)},
+                "metadata": {"run_id": run_id, "owner": "local-dev-user"},
+            },
+        )
+        context._update_manifest(  # noqa: SLF001
+            status="failed",
+            result={"status": "error", "error": "boom"},
+        )
+        engine = SimpleNamespace(
+            config={
+                "configurable": {"runs_dir": str(tmp_path)},
+                "metadata": {"run_id": run_id, "owner": "local-dev-user"},
+            },
+            context_store=context,
+            started_at=time_module.time() - 60,
+        )
+        server._runs.clear()
+        server._runs[run_id] = server.RunRecord(
+            run_id=run_id,
+            engine=engine,
+            status="running",
+        )
+        client = TestClient(server.app, raise_server_exceptions=False)
+        try:
+            response = client.get(f"/runs/{run_id}")
+        finally:
+            server._runs.clear()
+        assert response.status_code == 200
+        assert response.json()["status"] == "failed"
+
+
