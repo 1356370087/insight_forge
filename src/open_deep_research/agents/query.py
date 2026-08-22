@@ -220,6 +220,10 @@ DurableToolBatchHook = Callable[
     Awaitable[ToolResultsHookResult],
 ]
 CallModel = Callable[[list[BaseMessage]], Awaitable[BaseMessage]]
+TurnAdvancePolicy = Callable[
+    [list[BaseMessage], "QueryLoopState", RunnableConfig],
+    Awaitable[int],
+]
 
 
 @dataclass
@@ -237,6 +241,7 @@ class QueryParams:
     model_config: dict[str, Any] = field(default_factory=dict)
     max_turns: int | None = None
     initial_turn: int = 0
+    turn_advance_policy: TurnAdvancePolicy | None = None
     max_tool_description_chars: int | None = None
     context_policy: ContextPolicy = field(default_factory=ContextPolicy)
     before_turn_hooks: Sequence[BeforeTurnHook] = field(default_factory=list)
@@ -979,6 +984,18 @@ async def query(params: QueryParams) -> AsyncIterator[QueryEvent]:
                     },
                 )
                 return
+            turn_delta = 1
+            if params.turn_advance_policy is not None:
+                turn_delta = max(
+                    0,
+                    int(
+                        await params.turn_advance_policy(
+                            messages,
+                            state,
+                            params.config,
+                        )
+                    ),
+                )
             state = advance(
                 state,
                 QueryStateAction(
@@ -986,7 +1003,7 @@ async def query(params: QueryParams) -> AsyncIterator[QueryEvent]:
                     reason=ContinueReason.NEXT_TURN.value,
                     changes={
                         "messages": tuple(messages),
-                        "turn": state.turn + 1,
+                        "turn": state.turn + turn_delta,
                         "stop_hook_active": False,
                     },
                 ),

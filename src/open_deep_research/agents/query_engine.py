@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import logging
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -17,6 +18,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from langchain_core.messages import (
+    AIMessage,
     BaseMessage,
     HumanMessage,
     get_buffer_string,
@@ -103,6 +105,8 @@ from open_deep_research.tasks.lease import (
 from open_deep_research.tool_taxonomy import classify_tool_name
 from open_deep_research.tools.governance import GovernedToolCallResult
 
+logger = logging.getLogger(__name__)
+
 
 def _ensure_config(config: RunnableConfig | None, fallback: RunnableConfig | None = None) -> RunnableConfig:
     merged: RunnableConfig = {"configurable": {}, "metadata": {}}
@@ -114,6 +118,47 @@ def _ensure_config(config: RunnableConfig | None, fallback: RunnableConfig | Non
     merged["metadata"].setdefault("run_id", merged["configurable"].get("thread_id") or str(uuid.uuid4()))
     merged["configurable"].setdefault("thread_id", merged["metadata"]["run_id"])
     return merged
+
+_PASSIVE_COORDINATION_TOOLS = frozenset({
+    "WaitForResearchUpdates",
+    "CheckResearchTask",
+    "ListResearchTasks",
+    "ReadResearchArtifact",
+})
+
+
+async def _supervisor_turn_advance_policy(
+    messages: list[BaseMessage],
+    _state: QueryLoopState,
+    config: RunnableConfig,
+) -> int:
+    """Keep passive coordination waits off the research-turn budget.
+
+    A turn stays budget-free only when every tool call it issued is a
+    read-only coordination call AND at least one async task is unfinished;
+    waits with nothing in flight keep counting so the loop cannot spin
+    forever on an empty mailbox.
+    """
+    last_ai = next(
+        (m for m in reversed(messages) if isinstance(m, AIMessage)),
+        None,
+    )
+    calls = list(getattr(last_ai, "tool_calls", None) or [])
+    if not calls or any(
+        str(call.get("name")) not in _PASSIVE_COORDINATION_TOOLS
+        for call in calls
+    ):
+        return 1
+    from open_deep_research.agents.deep_researcher import (
+        has_unfinished_async_tasks,
+    )
+
+    try:
+        return 0 if await has_unfinished_async_tasks(config) else 1
+    except Exception:  # noqa: BLE001 - a broken task store must not stall turns
+        logger.exception("supervisor turn policy failed; counting the turn")
+        return 1
+
 
 def _message_text(messages: list[Any]) -> str:
     normalized = [m for m in normalize_messages(messages) if isinstance(m, BaseMessage)]
@@ -376,6 +421,9 @@ class QueryEngine:
 
     async def _shutdown_teammates_before_gateway_release(self) -> None:
         """Stop every task container before erasing its Gateway run context."""
+        from open_deep_research.agents.deep_researcher import (
+            finalize_interrupted_task_snapshots,
+        )
         from open_deep_research.tasks.teammate_pool import shutdown_teammate_pool
 
         cleanup = asyncio.create_task(shutdown_teammate_pool(self.config))
@@ -386,6 +434,14 @@ class QueryEngine:
             # or erase the Gateway context while that Worker is still alive.
             await cleanup
             raise
+        finally:
+            try:
+                await finalize_interrupted_task_snapshots(
+                    self.config,
+                    reason="run_terminal",
+                )
+            except Exception:  # noqa: BLE001 - snapshot close is best-effort cleanup
+                logger.exception("failed to finalize interrupted task snapshots")
 
     async def _lease_heartbeat(self) -> None:
         configurable = Configuration.from_runnable_config(self.config)
@@ -3231,6 +3287,33 @@ class QueryEngine:
                 )
                 update = dict(command.update)
                 tool_messages = normalize_messages(update.pop("supervisor_messages", []))
+                drained_update: dict[str, Any] | None = None
+                if (
+                    turn >= configurable.max_researcher_iterations
+                    and configurable.enable_async_research
+                ):
+                    from open_deep_research.agents.deep_researcher import (
+                        drain_unfinished_async_tasks,
+                        has_unfinished_async_tasks,
+                    )
+
+                    try:
+                        if await has_unfinished_async_tasks(_config):
+                            drained_update = await drain_unfinished_async_tasks(
+                                supervisor_state,
+                                _config,
+                                configurable,
+                                event_publisher_from_config(_config),
+                                timeout_seconds=(
+                                    configurable.task_timeout_seconds + 60
+                                ),
+                            )
+                    except Exception:  # noqa: BLE001 - drain is a best-effort rescue
+                        logger.exception(
+                            "supervisor budget drain failed; terminating undrained"
+                        )
+                    if drained_update:
+                        update.update(drained_update)
                 projected_state = dict(supervisor_state)
                 apply_update_to_state(projected_state, update)
                 requested = any(call.get("name") == "ResearchComplete" for call in _tool_calls)
@@ -3240,7 +3323,9 @@ class QueryEngine:
                     explicit_completion_succeeded=successful,
                     explicit_completion_failed=requested and not successful,
                     has_remaining_budget=turn < configurable.max_researcher_iterations,
-                    exhausted_reason="max_turns",
+                    exhausted_reason=(
+                        "max_turns_drained" if drained_update else "max_turns"
+                    ),
                 ))
                 decision_update = {
                     "action": decision.action.value,
@@ -3271,9 +3356,36 @@ class QueryEngine:
                 _config: RunnableConfig,
             ) -> StopHookResult:
                 turn = int(supervisor_state.get("research_iterations", 0) or 0)
+                drained_update: dict[str, Any] | None = None
+                if (
+                    turn >= configurable.max_researcher_iterations
+                    and configurable.enable_async_research
+                ):
+                    from open_deep_research.agents.deep_researcher import (
+                        drain_unfinished_async_tasks,
+                        has_unfinished_async_tasks,
+                    )
+
+                    try:
+                        if await has_unfinished_async_tasks(_config):
+                            drained_update = await drain_unfinished_async_tasks(
+                                supervisor_state,
+                                _config,
+                                configurable,
+                                event_publisher_from_config(_config),
+                                timeout_seconds=(
+                                    configurable.task_timeout_seconds + 60
+                                ),
+                            )
+                    except Exception:  # noqa: BLE001 - drain is a best-effort rescue
+                        logger.exception(
+                            "supervisor budget drain failed; terminating undrained"
+                        )
                 decision = completion_policy.evaluate(supervisor_completion_context(
                     has_remaining_budget=turn < configurable.max_researcher_iterations,
-                    exhausted_reason="max_turns",
+                    exhausted_reason=(
+                        "max_turns_drained" if drained_update else "max_turns"
+                    ),
                 ))
                 if decision.action is CompletionDecision.CONTINUE_WITH_GAPS:
                     return StopHookResult(
@@ -3283,15 +3395,20 @@ class QueryEngine:
                             "Use research tools and resolve: "
                             + ", ".join(decision.gaps)
                         ))],
-                        updates={"completion_decision": {
-                            "action": decision.action.value,
-                            "reason": decision.reason,
-                            "gaps": list(decision.gaps),
-                        }},
+                        updates={
+                            **(drained_update or {}),
+                            "completion_decision": {
+                                "action": decision.action.value,
+                                "reason": decision.reason,
+                                "gaps": list(decision.gaps),
+                            },
+                        },
                         reason="stop_hook_blocked",
                     )
                 command = await execute_supervisor_tools(messages, turn)
                 update = dict(command.update)
+                if drained_update:
+                    update.update(drained_update)
                 tool_messages = normalize_messages(update.pop("supervisor_messages", []))
                 return StopHookResult(
                     should_continue=command.goto != END,
@@ -3326,6 +3443,7 @@ class QueryEngine:
                 model_span_name="supervisor.model",
                 model_config=model_candidates[0].model_config,
                 initial_turn=completed_turn,
+                turn_advance_policy=_supervisor_turn_advance_policy,
                 max_tool_description_chars=configurable.max_tool_description_chars,
                 context_policy=ContextPolicy(
                     max_tool_result_chars=configurable.max_mcp_output_chars,

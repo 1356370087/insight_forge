@@ -1114,6 +1114,99 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
     )
 
 
+_TERMINAL_TASK_STATUSES = {
+    TaskStatus.COMPLETED,
+    TaskStatus.FAILED,
+    TaskStatus.CANCELLED,
+    TaskStatus.TIMED_OUT,
+}
+
+
+async def has_unfinished_async_tasks(config: RunnableConfig) -> bool:
+    """Return whether any async research task is still pending or active."""
+    configurable = Configuration.from_runnable_config(config)
+    if not configurable.enable_async_research:
+        return False
+    run_id = str(config.get("metadata", {}).get("run_id", "default"))
+    snapshots = await get_task_state_store(configurable).list(run_id=run_id)
+    return any(
+        snapshot.status not in _TERMINAL_TASK_STATUSES
+        for snapshot in snapshots
+    )
+
+
+async def drain_unfinished_async_tasks(
+    state: SupervisorState,
+    config: RunnableConfig,
+    configurable: Configuration,
+    publisher: Any,
+    *,
+    timeout_seconds: float,
+    poll_seconds: float = 0.5,
+) -> dict[str, Any] | None:
+    """Bounded no-LLM drain of in-flight tasks before a budget-forced stop.
+
+    Waits until every async task reaches a terminal status or the deadline
+    passes, then admits whatever completed through the normal finalizer so
+    handoff evidence and artifact refs are never silently dropped when the
+    research-turn budget runs out mid-handoff.
+    """
+    if not await has_unfinished_async_tasks(config):
+        return None
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    while time.monotonic() < deadline:
+        if not await has_unfinished_async_tasks(config):
+            break
+        await asyncio.sleep(poll_seconds)
+    return await _finalize_async_research_outputs(
+        state,
+        config,
+        configurable,
+        publisher,
+    )
+
+
+async def finalize_interrupted_task_snapshots(
+    config: RunnableConfig,
+    *,
+    reason: str,
+) -> None:
+    """Close still-active task snapshots once the run itself is terminal."""
+    configurable = Configuration.from_runnable_config(config)
+    if not configurable.enable_async_research:
+        return
+    run_id = str(config.get("metadata", {}).get("run_id", "default"))
+    store = get_task_state_store(configurable)
+    snapshots = await store.list(run_id=run_id)
+    for snapshot in snapshots:
+        if snapshot.status in _TERMINAL_TASK_STATUSES:
+            continue
+        task_id = str(snapshot.task_id)
+        snapshot.status = TaskStatus.CANCELLED
+        await store.upsert(snapshot)
+        task_config: RunnableConfig = dict(config)  # type: ignore[assignment]
+        task_config["metadata"] = {
+            **(config.get("metadata") or {}),
+            "task_id": task_id,
+            "research_mode": "async",
+        }
+        await publish_task_activity(
+            task_config,
+            task_id=task_id,
+            event_type="task.cancelled",
+            kind="lifecycle",
+            phase="terminal",
+            status="error",
+            title="任务随运行终止而中断",
+            summary=f"Run reached a terminal state ({reason}) before this task finished.",
+            iteration=None,
+            duration_ms=None,
+            payload={"mode": "async", "reason": reason},
+            dedupe_key=f"task:{task_id}:activity:cancelled:run_terminal",
+            update_run_summary=True,
+        )
+
+
 async def _collect_task_update_context(
     configurable: Configuration,
     run_id: str,
@@ -2382,12 +2475,7 @@ async def _execute_supervisor_tools(
         unfinished_snapshots = [
             snapshot
             for snapshot in snapshots
-            if snapshot.status not in {
-                TaskStatus.COMPLETED,
-                TaskStatus.FAILED,
-                TaskStatus.CANCELLED,
-                TaskStatus.TIMED_OUT,
-            }
+            if snapshot.status not in _TERMINAL_TASK_STATUSES
         ]
         if unfinished_snapshots:
             successful_complete = False

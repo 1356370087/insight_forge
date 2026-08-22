@@ -28,7 +28,7 @@ from open_deep_research.tools.supervisor.wait_for_research_updates.prompt import
 class WaitForResearchUpdates(BaseModel):
     """Wait for durable SubAgent mailbox updates without another model call."""
 
-    timeout_seconds: int = Field(default=15, ge=1, le=60)
+    timeout_seconds: int = Field(default=30, ge=1, le=300)
 
 
 async def _call(
