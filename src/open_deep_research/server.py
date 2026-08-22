@@ -2590,14 +2590,17 @@ def _load_run_usage_response(
     *,
     status: str,
     configurable: Configuration,
+    duration_ms: int | None = None,
 ) -> dict[str, Any]:
     if not configurable.token_usage_accounting_enabled:
-        return _unavailable_usage_response(
+        response = _unavailable_usage_response(
             run_id,
             status=status,
             configurable=configurable,
             reason="accounting_disabled",
         )
+        response["duration_ms"] = duration_ms
+        return response
     try:
         store = SQLiteTraceStore(configurable.trace_store_path)
         reserved = _outstanding_usage_budget(configurable, run_id)
@@ -2611,7 +2614,7 @@ def _load_run_usage_response(
             run_id,
             exc_info=True,
         )
-        return _unavailable_usage_response(
+        response = _unavailable_usage_response(
             run_id,
             status=status,
             configurable=configurable,
@@ -2619,6 +2622,8 @@ def _load_run_usage_response(
         )
     if response["status"] == "unknown":
         response["status"] = status
+    if not response.get("duration_ms"):
+        response["duration_ms"] = duration_ms
     return response
 
 
@@ -2629,18 +2634,37 @@ async def get_run_usage_accounting(
 ) -> dict[str, Any]:
     """Return content-free token accounting for one owned research run."""
     record, configurable = _require_run_owner(run_id, user)
-    status = record.status if record is not None else "unknown"
+    manifest = None
+    with contextlib.suppress(ValueError, JournalCorruptedError, OSError):
+        manifest = RunContextStore(
+            run_id,
+            runs_dir=configurable.runs_dir,
+        ).load_manifest()
+    manifest_status = manifest.status if manifest is not None else None
     if record is None:
-        with contextlib.suppress(ValueError, JournalCorruptedError, OSError):
-            status = RunContextStore(
-                run_id,
-                runs_dir=configurable.runs_dir,
-            ).load_manifest().status
+        status = manifest_status or "unknown"
+    elif (
+        manifest_status in {"completed", "failed", "cancelled", "interrupted"}
+        and record.status != manifest_status
+    ):
+        # The durable manifest is authoritative once terminal; an in-memory
+        # record can lag behind a just-finished run.
+        status = manifest_status
+    else:
+        status = record.status
+    duration_ms = (
+        max(0, int((manifest.updated_at - manifest.created_at) * 1000))
+        if manifest is not None and status in {
+            "completed", "failed", "cancelled", "interrupted",
+        }
+        else None
+    )
     return await asyncio.to_thread(
         _load_run_usage_response,
         run_id,
         status=status,
         configurable=configurable,
+        duration_ms=duration_ms,
     )
 
 
