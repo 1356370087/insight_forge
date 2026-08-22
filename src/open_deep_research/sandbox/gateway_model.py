@@ -48,6 +48,7 @@ class GatewayChatModel(BaseChatModel):
     task_token: str = Field(default_factory=lambda: os.environ.get("SANDBOX_TASK_TOKEN", ""))
     role: str = "researcher"
     bound_tools: list[dict[str, Any]] = Field(default_factory=list)
+    bound_tool_choice: str | dict[str, Any] | bool | None = None
     is_sandbox_gateway_model: bool = True
 
     @property
@@ -66,11 +67,11 @@ class GatewayChatModel(BaseChatModel):
         self,
         tools: Sequence[dict[str, Any] | Any],
         *,
-        tool_choice: str | None = None,
+        tool_choice: str | dict[str, Any] | bool | None = None,
         **kwargs: Any,
     ) -> GatewayChatModel:
         """Bind JSON tool definitions without importing their implementations."""
-        del tool_choice, kwargs
+        del kwargs
         definitions = []
         for tool in tools:
             try:
@@ -79,7 +80,12 @@ class GatewayChatModel(BaseChatModel):
                 raise TypeError(
                     "GatewayChatModel accepts JSON tool definitions only"
                 ) from exc
-        return self.model_copy(update={"bound_tools": definitions})
+        return self.model_copy(
+            update={
+                "bound_tools": definitions,
+                "bound_tool_choice": tool_choice,
+            }
+        )
 
     def _operation_id(
         self,
@@ -96,6 +102,7 @@ class GatewayChatModel(BaseChatModel):
             "turn": metadata.get("query_turn", metadata.get("turn", 0)),
             "messages": [message_to_dict(message) for message in messages],
             "tools": self.bound_tools,
+            "tool_choice": self.bound_tool_choice,
             "model_kwargs": model_kwargs,
         }
         digest = hashlib.sha256(
@@ -131,6 +138,7 @@ class GatewayChatModel(BaseChatModel):
             ),
             messages=[message_to_dict(message) for message in messages],
             tools=self.bound_tools,
+            tool_choice=self.bound_tool_choice,
             model_kwargs=safe_model_kwargs,
         )
 

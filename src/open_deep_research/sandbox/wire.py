@@ -173,8 +173,19 @@ class GatewayModelRequestV1(BaseModel):
     logical_operation_id: str = Field(min_length=1)
     messages: list[dict[str, Any]]
     tools: list[dict[str, Any]] = Field(default_factory=list)
+    tool_choice: str | dict[str, Any] | bool | None = None
     structured_schema: dict[str, Any] | None = None
     model_kwargs: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("tool_choice")
+    @classmethod
+    def validate_tool_choice(
+        cls,
+        value: str | dict[str, Any] | bool | None,
+    ) -> str | dict[str, Any] | bool | None:
+        """Keep tool selection JSON-safe across the Worker trust boundary."""
+        _assert_json_safe(value, "$.tool_choice")
+        return value
 
     @field_validator("model_kwargs")
     @classmethod

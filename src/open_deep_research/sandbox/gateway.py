@@ -1160,7 +1160,10 @@ class GatewayRuntime:
             else:
                 model = get_configurable_model_template()
             if request.tools and hasattr(model, "bind_tools"):
-                model = model.bind_tools(request.tools)
+                model = model.bind_tools(
+                    request.tools,
+                    tool_choice=request.tool_choice,
+                )
             if request.model_kwargs and hasattr(model, "bind"):
                 model = model.bind(**request.model_kwargs)
             model_config = (

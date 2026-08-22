@@ -39,6 +39,14 @@ def _official_postgresql_contract() -> dict:
     return contract
 
 
+def _official_python_contract() -> dict:
+    contract = _official_langgraph_contract()
+    contract["requirements"][0]["text"] = (
+        "只使用一个 Python 官方来源确认 Python 3.13 的发布日期。"
+    )
+    return contract
+
+
 def _record(evidence_id: str, url: str) -> dict:
     return {
         "evidence_id": evidence_id,
@@ -147,6 +155,38 @@ def test_official_postgresql_docs_and_newsroom_are_in_scope() -> None:
     assert newsroom.source_kind is SourceKind.FIRST_PARTY_DOCS
     assert release_notes.source_scope_status is SourceScopeStatus.IN_SCOPE
     assert newsroom.source_scope_status is SourceScopeStatus.IN_SCOPE
+    assert third_party.source_scope_status is SourceScopeStatus.UNVERIFIED
+
+
+def test_official_python_sites_and_repository_are_in_scope() -> None:
+    contract = _official_python_contract()
+    decisions = [
+        classify_evidence_source(
+            _record("EV-PYTHON-RELEASE", "https://www.python.org/downloads/release/python-3130/"),
+            contract,
+        ),
+        classify_evidence_source(
+            _record("EV-PYTHON-DOCS", "https://docs.python.org/3/whatsnew/3.13.html"),
+            contract,
+        ),
+        classify_evidence_source(
+            _record("EV-PYTHON-PEP", "https://peps.python.org/pep-0719/"),
+            contract,
+        ),
+        classify_evidence_source(
+            _record("EV-CPYTHON", "https://github.com/python/cpython/blob/main/README.rst"),
+            contract,
+        ),
+    ]
+    third_party = classify_evidence_source(
+        _record("EV-PYTHON-BLOG", "https://example.com/python-313"),
+        contract,
+    )
+
+    assert all(
+        decision.source_scope_status is SourceScopeStatus.IN_SCOPE
+        for decision in decisions
+    )
     assert third_party.source_scope_status is SourceScopeStatus.UNVERIFIED
 
 

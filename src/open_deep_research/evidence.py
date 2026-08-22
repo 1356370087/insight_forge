@@ -130,6 +130,17 @@ _OFFICIAL_SOURCE_PROFILES = (
         ),
         repositories=(("postgres", "postgres"),),
     ),
+    _OfficialSourceProfile(
+        aliases=("python", "python.org", "cpython"),
+        documentation_paths=(
+            ("www.python.org", "/"),
+            ("python.org", "/"),
+            ("docs.python.org", "/"),
+            ("peps.python.org", "/"),
+            ("blog.python.org", "/"),
+        ),
+        repositories=(("python", "cpython"),),
+    ),
 )
 
 

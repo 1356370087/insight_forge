@@ -482,9 +482,22 @@ def test_gateway_model_binds_pydantic_structured_output_schema() -> None:
     class StructuredResult(BaseModel):
         answer: str
 
-    bound = GatewayChatModel().bind_tools([StructuredResult])
+    bound = GatewayChatModel().bind_tools(
+        [StructuredResult],
+        tool_choice="any",
+    )
     assert bound.bound_tools[0]["function"]["name"] == "StructuredResult"
     assert "answer" in bound.bound_tools[0]["function"]["parameters"]["properties"]
+    request = bound._request(
+        [HumanMessage(content="Return a structured answer")],
+        {
+            "metadata": {
+                "run_id": "run-structured",
+                "task_id": "task-structured",
+            }
+        },
+    )
+    assert request.tool_choice == "any"
 
 
 @pytest.mark.asyncio

@@ -54,7 +54,7 @@ stop_grace_seconds = 5
 
 [profiles.research-gateway-only.runtime]
 # Replace this placeholder with the digest produced by the sandbox image build.
-worker_image_digest = "sha256:de473811244d13709f00f81b3162089b8e61f5718948fffffdf30959127d88a7"
+worker_image_digest = "sha256:01d9b1ec2cabac1cfd21b930cb945358c16a55de36c559ddc746a9b14788ec19"
 read_only_rootfs = true
 uid = 65532
 gid = 65532
@@ -105,7 +105,7 @@ max_files = 10000
 stop_grace_seconds = 5
 
 [profiles.developer-workspace.runtime]
-worker_image_digest = "sha256:de473811244d13709f00f81b3162089b8e61f5718948fffffdf30959127d88a7"
+worker_image_digest = "sha256:01d9b1ec2cabac1cfd21b930cb945358c16a55de36c559ddc746a9b14788ec19"
 read_only_rootfs = true
 uid = 65532
 gid = 65532
