@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import logging
 import re
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
@@ -174,6 +175,7 @@ from open_deep_research.tools.registry import (
 )
 from open_deep_research.tools.think_tool import think_tool
 
+logger = logging.getLogger(__name__)
 
 def get_model_connection_kwargs(
     model_name: str,
@@ -1421,207 +1423,217 @@ async def _finalize_async_research_outputs(
     assessment_updates: list[dict[str, Any]] = []
     coverage_ledger = dict(state.get("coverage_ledger", {}))
     for output in outputs:
-        task_id = str(output["task_id"])
-        admission_status = AdmissionStatus.ACCEPTED.value
-        snapshot = await state_store.get(task_id, run_id=run_id)
-        task_config: RunnableConfig = dict(config)  # type: ignore[assignment]
-        task_config["metadata"] = {
-            **(config.get("metadata") or {}),
-            "task_id": task_id,
-            "research_mode": "async",
-            "research_wave_id": snapshot.wave_id if snapshot else "",
-        }
-        if configurable.quality_evaluation_enabled:
-            quality_handoff = _load_handoff_artifact_for_quality(
-                output,
-                task_id=task_id,
-                run_id=run_id,
-                configurable=configurable,
-            )
-            resolved_contract_payload = (
-                quality_handoff.get("coverage_contract")
-                or state.get("coverage_contract")
-            )
-            if resolved_contract_payload:
-                assessment = await evaluate_subagent_handoff(
-                    str(output.get("research_topic", "")),
-                    quality_handoff,
-                    task_config,
-                    coverage_contract=resolved_contract_payload,
-                    requirement_ids=list(
-                        quality_handoff.get("requirement_ids", [])
-                    ),
-                    risk_profile=ResearchRiskProfile.model_validate(
-                        quality_handoff.get("research_risk_profile")
-                        or state.get("research_risk_profile")
-                        or {"level": "standard"}
-                    ),
+        try:
+            task_id = str(output["task_id"])
+            admission_status = AdmissionStatus.ACCEPTED.value
+            snapshot = await state_store.get(task_id, run_id=run_id)
+            task_config: RunnableConfig = dict(config)  # type: ignore[assignment]
+            task_config["metadata"] = {
+                **(config.get("metadata") or {}),
+                "task_id": task_id,
+                "research_mode": "async",
+                "research_wave_id": snapshot.wave_id if snapshot else "",
+            }
+            if configurable.quality_evaluation_enabled:
+                quality_handoff = _load_handoff_artifact_for_quality(
+                    output,
+                    task_id=task_id,
+                    run_id=run_id,
+                    configurable=configurable,
                 )
-            else:
-                assessment = await evaluate_subagent_handoff(
-                    str(output.get("research_topic", "")),
-                    quality_handoff,
-                    task_config,
+                resolved_contract_payload = (
+                    quality_handoff.get("coverage_contract")
+                    or state.get("coverage_contract")
                 )
-            admission_status = (
-                assessment.admission_status.value
-                if assessment.admission_status is not None
-                else "accepted"
-                if assessment.accepted
-                else "rejected"
-            )
-            if snapshot is not None:
-                snapshot.admission_status = admission_status
-                await state_store.upsert(snapshot)
-            assessment_updates.append({
-                "tool_call_id": task_id,
-                **assessment.model_dump(),
-            })
-            await publish_task_activity(
-                task_config,
-                task_id=task_id,
-                event_type="quality.completed",
-                kind="quality",
-                phase="handoff",
-                status="success" if assessment.accepted else "warning",
-                title=(
-                    "研究交接已接纳"
+                if resolved_contract_payload:
+                    assessment = await evaluate_subagent_handoff(
+                        str(output.get("research_topic", "")),
+                        quality_handoff,
+                        task_config,
+                        coverage_contract=resolved_contract_payload,
+                        requirement_ids=list(
+                            quality_handoff.get("requirement_ids", [])
+                        ),
+                        risk_profile=ResearchRiskProfile.model_validate(
+                            quality_handoff.get("research_risk_profile")
+                            or state.get("research_risk_profile")
+                            or {"level": "standard"}
+                        ),
+                    )
+                else:
+                    assessment = await evaluate_subagent_handoff(
+                        str(output.get("research_topic", "")),
+                        quality_handoff,
+                        task_config,
+                    )
+                admission_status = (
+                    assessment.admission_status.value
+                    if assessment.admission_status is not None
+                    else "accepted"
                     if assessment.accepted
-                    else "研究交接需补证"
-                ),
-                summary=(
-                    "结构化研究证据已通过 Supervisor 交接质量门禁。"
-                    if assessment.accepted
-                    else "当前交接未被完整接纳，Supervisor 将依据稳定缺口继续补证。"
-                ),
-                iteration=None,
-                duration_ms=None,
-                payload={
-                    "evaluation_type": "subagent_handoff",
-                    "decision": "accepted" if assessment.accepted else "rejected",
-                    "admission_status": admission_status,
-                    "gap_count": len(assessment.missing_information)
-                    + len(assessment.unsupported_claims)
-                    + len(assessment.follow_up_tasks),
-                },
-                dedupe_key=f"handoff:{task_id}:{admission_status}",
-                update_run_summary=True,
-            )
-            if not assessment.accepted:
+                    else "rejected"
+                )
+                if snapshot is not None:
+                    snapshot.admission_status = admission_status
+                    await state_store.upsert(snapshot)
+                assessment_updates.append({
+                    "tool_call_id": task_id,
+                    **assessment.model_dump(),
+                })
                 await publish_task_activity(
                     task_config,
                     task_id=task_id,
-                    event_type="task.completed",
-                    kind="lifecycle",
-                    phase="terminal",
-                    status="warning",
-                    title="Subagent 已完成，交接需补证",
-                    summary="研究执行已经结束，但当前交接未通过 Supervisor 质量门禁。",
+                    event_type="quality.completed",
+                    kind="quality",
+                    phase="handoff",
+                    status="success" if assessment.accepted else "warning",
+                    title=(
+                        "研究交接已接纳"
+                        if assessment.accepted
+                        else "研究交接需补证"
+                    ),
+                    summary=(
+                        "结构化研究证据已通过 Supervisor 交接质量门禁。"
+                        if assessment.accepted
+                        else "当前交接未被完整接纳，Supervisor 将依据稳定缺口继续补证。"
+                    ),
                     iteration=None,
                     duration_ms=None,
                     payload={
-                        "mode": "async",
-                        "wave_id": snapshot.wave_id if snapshot else "",
-                        "source_count": snapshot.source_count if snapshot else 0,
+                        "evaluation_type": "subagent_handoff",
+                        "decision": "accepted" if assessment.accepted else "rejected",
                         "admission_status": admission_status,
+                        "gap_count": len(assessment.missing_information)
+                        + len(assessment.unsupported_claims)
+                        + len(assessment.follow_up_tasks),
                     },
-                    dedupe_key=f"task:{task_id}:activity:completed:{admission_status}",
+                    dedupe_key=f"handoff:{task_id}:{admission_status}",
                     update_run_summary=True,
                 )
-                await publisher.publish(
-                    "research.task.completed",
-                    stage="researching",
-                    payload={
-                        "task_id": task_id,
-                        "wave_id": snapshot.wave_id if snapshot else "",
-                        "mode": "async",
-                        "status": "completed",
-                        "phase": "completed",
-                        "admission_status": "rejected",
-                        "reason_code": "quality_gate_rejected",
-                        "summary_status": "not_applicable",
-                    },
-                    dedupe_key=f"task:{task_id}:admission:rejected",
+                if not assessment.accepted:
+                    await publish_task_activity(
+                        task_config,
+                        task_id=task_id,
+                        event_type="task.completed",
+                        kind="lifecycle",
+                        phase="terminal",
+                        status="warning",
+                        title="Subagent 已完成，交接需补证",
+                        summary="研究执行已经结束，但当前交接未通过 Supervisor 质量门禁。",
+                        iteration=None,
+                        duration_ms=None,
+                        payload={
+                            "mode": "async",
+                            "wave_id": snapshot.wave_id if snapshot else "",
+                            "source_count": (
+                                (snapshot.metrics or {}).get("source_count", 0)
+                                if snapshot
+                                else 0
+                            ),
+                            "admission_status": admission_status,
+                        },
+                        dedupe_key=f"task:{task_id}:activity:completed:{admission_status}",
+                        update_run_summary=True,
+                    )
+                    await publisher.publish(
+                        "research.task.completed",
+                        stage="researching",
+                        payload={
+                            "task_id": task_id,
+                            "wave_id": snapshot.wave_id if snapshot else "",
+                            "mode": "async",
+                            "status": "completed",
+                            "phase": "completed",
+                            "admission_status": "rejected",
+                            "reason_code": "quality_gate_rejected",
+                            "summary_status": "not_applicable",
+                        },
+                        dedupe_key=f"task:{task_id}:admission:rejected",
+                    )
+                    continue
+                coverage_ledger = merge_coverage_ledger(
+                    coverage_ledger,
+                    task_id=task_id,
+                    assessment=assessment,
+                    owned_requirement_ids=output.get("requirement_ids", []),
                 )
-                continue
-            coverage_ledger = merge_coverage_ledger(
-                coverage_ledger,
-                task_id=task_id,
-                assessment=assessment,
-                owned_requirement_ids=output.get("requirement_ids", []),
-            )
-            output["handoff_assessment"] = assessment.model_dump()
-        elif snapshot is not None:
-            snapshot.admission_status = "accepted"
-            await state_store.upsert(snapshot)
+                output["handoff_assessment"] = assessment.model_dump()
+            elif snapshot is not None:
+                snapshot.admission_status = "accepted"
+                await state_store.upsert(snapshot)
 
-        accepted_outputs.append(output)
-        summary = await summarize_public_findings(output, config)
-        sources = extract_public_sources(
-            output,
-            limit=configurable.public_event_source_limit,
-        )
-        for source in sources:
-            await publisher.publish(
-                "research.source.discovered",
-                stage="researching",
-                payload={"task_id": task_id, **source},
-                dedupe_key=f"source:{source['source_id']}",
+            accepted_outputs.append(output)
+            summary = await summarize_public_findings(output, config)
+            sources = extract_public_sources(
+                output,
+                limit=configurable.public_event_source_limit,
             )
-        await publish_task_activity(
-            task_config,
-            task_id=task_id,
-            event_type="task.completed",
-            kind="lifecycle",
-            phase="terminal",
-            status="success",
-            title="Subagent 已完成",
-            summary=f"研究交接已接纳，共确认 {len(sources)} 个公开来源。",
-            iteration=None,
-            duration_ms=None,
-            payload={
-                "mode": "async",
-                "wave_id": snapshot.wave_id if snapshot else "",
-                "source_count": len(sources),
-                "admission_status": admission_status,
-            },
-            dedupe_key=f"task:{task_id}:activity:completed:{admission_status}",
-            update_run_summary=True,
-        )
-        await publisher.publish(
-            "research.task.completed",
-            stage="researching",
-            payload={
-                "task_id": task_id,
-                "wave_id": snapshot.wave_id if snapshot else "",
-                "mode": "async",
-                "status": "completed",
-                "phase": "completed",
-                "admission_status": admission_status,
-                "source_count": len(sources),
-                "summary_status": "available" if summary else "unavailable",
-                "message": (
-                    "Research summary is temporarily unavailable."
-                    if summary is None
-                    else None
-                ),
-            },
-            dedupe_key=f"task:{task_id}:admission:{admission_status}",
-        )
-        if summary:
+            for source in sources:
+                await publisher.publish(
+                    "research.source.discovered",
+                    stage="researching",
+                    payload={"task_id": task_id, **source},
+                    dedupe_key=f"source:{source['source_id']}",
+                )
+            await publish_task_activity(
+                task_config,
+                task_id=task_id,
+                event_type="task.completed",
+                kind="lifecycle",
+                phase="terminal",
+                status="success",
+                title="Subagent 已完成",
+                summary=f"研究交接已接纳，共确认 {len(sources)} 个公开来源。",
+                iteration=None,
+                duration_ms=None,
+                payload={
+                    "mode": "async",
+                    "wave_id": snapshot.wave_id if snapshot else "",
+                    "source_count": len(sources),
+                    "admission_status": admission_status,
+                },
+                dedupe_key=f"task:{task_id}:activity:completed:{admission_status}",
+                update_run_summary=True,
+            )
             await publisher.publish(
-                "findings.updated",
+                "research.task.completed",
                 stage="researching",
                 payload={
                     "task_id": task_id,
                     "wave_id": snapshot.wave_id if snapshot else "",
-                    "summary": summary,
-                    "sources": sources,
+                    "mode": "async",
+                    "status": "completed",
+                    "phase": "completed",
+                    "admission_status": admission_status,
                     "source_count": len(sources),
+                    "summary_status": "available" if summary else "unavailable",
+                    "message": (
+                        "Research summary is temporarily unavailable."
+                        if summary is None
+                        else None
+                    ),
                 },
-                dedupe_key=f"task:{task_id}:findings",
+                dedupe_key=f"task:{task_id}:admission:{admission_status}",
             )
+            if summary:
+                await publisher.publish(
+                    "findings.updated",
+                    stage="researching",
+                    payload={
+                        "task_id": task_id,
+                        "wave_id": snapshot.wave_id if snapshot else "",
+                        "summary": summary,
+                        "sources": sources,
+                        "source_count": len(sources),
+                    },
+                    dedupe_key=f"task:{task_id}:findings",
+                )
 
+        except Exception:  # noqa: BLE001 - one failed handoff must not abort the rest
+            logger.exception(
+                "async handoff finalization failed for task %s",
+                output.get("task_id"),
+            )
     update: dict[str, Any] = {"completed_task_outputs": accepted_outputs}
     if assessment_updates:
         update["handoff_assessments"] = assessment_updates

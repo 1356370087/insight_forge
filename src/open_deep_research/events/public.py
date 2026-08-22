@@ -760,6 +760,21 @@ def project_public_events(events: list[PublicEvent]) -> PublicRunProjection:
                 if str(item.get("approval_id")) != approval_id
             ]
 
+    if projection.status in {"completed", "failed", "cancelled"}:
+        # A terminal run is authoritative: any task still projected as
+        # pending/running lost its terminal event (crash mid-handoff, killed
+        # worker) and must not render as live forever.
+        for task_id, task_status in task_statuses.items():
+            normalized = (
+                "running"
+                if task_status in {"created", "researching", "compressing"}
+                else task_status
+            )
+            if normalized in {"pending", "running"}:
+                task_statuses[task_id] = "cancelled"
+                item = dict(projection.task_items.get(task_id) or {})
+                item["status"] = "cancelled"
+                projection.task_items[task_id] = item
     counts = {key: 0 for key in ("pending", "running", "completed", "failed", "cancelled", "timed_out")}
     for status in task_statuses.values():
         normalized = "running" if status in {"created", "researching", "compressing"} else status

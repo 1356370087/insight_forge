@@ -2046,10 +2046,20 @@ async def get_run(
         else None
     )
     now = time.time()
+    manifest_status = manifest.status if manifest is not None else None
+    if (
+        manifest_status in {"completed", "failed", "cancelled", "interrupted"}
+        and record.status != manifest_status
+    ):
+        # The durable manifest is authoritative once terminal; the in-memory
+        # record can lag behind a just-finished run.
+        run_status = manifest_status
+    else:
+        run_status = record.status
     return {
         "run_id": run_id,
         "title": (manifest.title if manifest else None) or run_id,
-        "status": record.status,
+        "status": run_status,
         "created_at": manifest.created_at if manifest else record.engine.started_at,
         "updated_at": manifest.updated_at if manifest else now,
         "runtime_seconds": max(0.0, now - record.engine.started_at),
